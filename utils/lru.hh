@@ -44,6 +44,12 @@ protected:
 private:
     lru_link_type _lru_link;
     lru_segment _segment = lru_segment::none;
+    // Stable key used by the Count-Min Sketch for frequency tracking.
+    // Defaults to the object's pointer address but should be overridden with a
+    // content-derived stable identifier (e.g. the partition key token) so that
+    // eviction followed by re-insertion of the same logical entry does not lose
+    // its accumulated frequency.
+    uint64_t _sketch_key = 0;
 protected:
     // Prevent destruction via evictable pointer. LRU is not aware of allocation strategy.
     // Prevent destruction of a linked evictable. While we could unlink the evictable here
@@ -67,10 +73,18 @@ public:
     void swap(evictable& o) noexcept {
         _lru_link.swap_nodes(o._lru_link);
         std::swap(_segment, o._segment);
+        std::swap(_sketch_key, o._sketch_key);
     }
 
     virtual bool is_index() const noexcept {
         return false;
+    }
+
+    // Set a stable key for the Count-Min Sketch frequency tracker.
+    // Must be called before the entry is inserted into the LRU (i.e. before
+    // cache_tracker::insert()) so that record_access() uses the correct key.
+    void set_sketch_key(uint64_t key) noexcept {
+        _sketch_key = key;
     }
 };
 
@@ -150,7 +164,9 @@ private:
     }
 
     static uint64_t entry_key(const evictable& e) noexcept {
-        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
+        // Use the stable sketch key if set; fall back to pointer address.
+        uint64_t k = e._sketch_key;
+        return k != 0 ? k : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
     }
 
     void record_access(const evictable& e) noexcept {

@@ -239,6 +239,14 @@ void cache_tracker::touch(rows_entry& e) {
 }
 
 void cache_tracker::insert(cache_entry& entry) {
+    // Tag every rows_entry with the partition token so the Count-Min Sketch can
+    // track frequency with a stable key that survives eviction + re-insertion.
+    uint64_t sketch_key = entry.key().token().raw();
+    for (partition_version& pv : entry.partition().versions_from_oldest()) {
+        for (rows_entry& row : pv.partition().clustered_rows()) {
+            row.set_sketch_key(sketch_key);
+        }
+    }
     insert(entry.partition());
     ++_stats.partition_insertions;
     ++_stats.partitions;
