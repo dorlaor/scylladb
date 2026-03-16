@@ -57,22 +57,31 @@ row_cache::create_underlying_reader(read_context& ctx, mutation_source& src, con
 
 static thread_local mutation_application_stats dummy_app_stats;
 static thread_local utils::updateable_value<double> dummy_index_cache_fraction(1.0);
+static thread_local utils::updateable_value<double> dummy_tinylfu_sketch_entries_per_mb(1024.0);
 
 cache_tracker::cache_tracker()
-    : cache_tracker(dummy_index_cache_fraction, dummy_app_stats, register_metrics::no)
+    : cache_tracker(dummy_index_cache_fraction, dummy_tinylfu_sketch_entries_per_mb, dummy_app_stats, register_metrics::no)
 {}
 
 cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), dummy_app_stats, with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb, dummy_app_stats, with_metrics)
+{}
+
+cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats& app_stats, register_metrics with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb, app_stats, with_metrics)
 {}
 
 static thread_local cache_tracker* current_tracker;
 
-cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats& app_stats, register_metrics with_metrics)
+cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction,
+                             utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                             mutation_application_stats& app_stats, register_metrics with_metrics)
     : _garbage(_region, this, app_stats)
     , _memtable_cleaner(_region, nullptr, app_stats)
     , _app_stats(app_stats)
     , _index_cache_fraction(std::move(index_cache_fraction))
+    , _tinylfu_sketch_entries_per_mb(std::move(tinylfu_sketch_entries_per_mb))
+    , _sketch_ratio_observer(utils::dummy_observer<double>())
 {
     if (with_metrics) {
         setup_metrics();
@@ -90,29 +99,6 @@ cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fractio
             }
             current_tracker = this;
 
-            // Cache replacement algorithm:
-            //
-            // if sstable index caches occupy more than index_cache_fraction of cache memory:
-            //     evict the least recently used index entry
-            // else:
-            //     evict the least recently used entry (data or index)
-            //
-            // This algorithm has the following good properties:
-            // 1. When index and data entries contend for cache space, it prevents
-            //    index cache from taking more than index_cache_fraction of memory.
-            //    This makes sure that the index cache doesn't catastrophically
-            //    deprive the data cache of memory in small-partition workloads.
-            // 2. Since it doesn't enforce a lower limit on the index space, but only
-            //    the upper limit, the parameter shouldn't require careful balancing.
-            //    In workloads where it makes sense to cache the index (usually: where
-            //    the index is small enough to fit in RAM), setting the fraction to any big number (e.g. 1.0)
-            //    should work well enough. In workloads where it doesn't make sense to cache the index,
-            //    setting the fraction to any small number (e.g. 0.0) should work well enough.
-            //    Setting it to a medium number (something like 0.2) should work well enough
-            //    for both extremes, although it might be suboptimal for non-extremes.
-            // 3. The parameter is trivially live-updateable.
-            //
-            // Perhaps this logic should be encapsulated somewhere else, maybe in `class lru` itself.
             size_t total_cache_space = _region.occupancy().total_space();
             size_t index_cache_space = _partition_index_cache_stats.used_bytes + _index_cached_file_stats.cached_bytes;
             bool should_evict_index = index_cache_space > total_cache_space * _index_cache_fraction.get();
@@ -120,7 +106,23 @@ cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fractio
             return _lru.evict(should_evict_index);
         });
     });
+
+    // Observe ratio changes: resize the sketch whenever the config is updated.
+    _sketch_ratio_observer = _tinylfu_sketch_entries_per_mb.observe([this](const double&) noexcept {
+        resize_sketch();
+    });
+
+    // Set initial sketch size based on the current available memory.
+    // At construction time the LSA region is empty, so we use the total
+    // per-shard memory as a proxy for the eventual cache size.
+    resize_sketch();
 }
+
+cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction,
+                             utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                             register_metrics with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), std::move(tinylfu_sketch_entries_per_mb), dummy_app_stats, with_metrics)
+{}
 
 cache_tracker::~cache_tracker() {
     clear();
@@ -131,6 +133,22 @@ memory::reclaiming_result cache_tracker::evict_from_lru_shallow() noexcept {
         current_tracker = this;
         return _lru.evict_shallow();
     });
+}
+
+void cache_tracker::resize_sketch() noexcept {
+    // Use total_space() if the region is already populated, otherwise fall
+    // back to the total per-shard memory (appropriate at construction time).
+    size_t cache_bytes = _region.occupancy().total_space();
+    if (cache_bytes == 0) {
+        cache_bytes = memory::stats().total_memory();
+    }
+    double entries_per_mb = _tinylfu_sketch_entries_per_mb.get();
+    size_t new_log2 = lru::compute_sketch_width_log2(cache_bytes, entries_per_mb);
+    _lru.resize_sketch(new_log2);
+}
+
+void cache_tracker::reset_sketch() noexcept {
+    _lru.reset_sketch();
 }
 
 void cache_tracker::set_compaction_scheduling_group(seastar::scheduling_group sg) {
@@ -204,6 +222,9 @@ void cache_tracker::clear() {
         _memtable_cleaner.clear();
         current_tracker = this;
         _lru.evict_all();
+        // Reset the frequency sketch so stale history doesn't bias admission
+        // decisions after a full cache clear (e.g. truncate, schema change).
+        _lru.reset_sketch();
         // Eviction could have produced garbage.
         _garbage.clear();
         _memtable_cleaner.clear();

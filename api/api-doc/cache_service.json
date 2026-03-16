@@ -696,6 +696,55 @@
           "parameters": []
         }
       ]
+    },
+    {
+      "path": "/cache_service/tinylfu_sketch_ratio",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get the W-TinyLFU sketch entries-per-MB ratio",
+          "type": "double",
+          "nickname": "get_tinylfu_sketch_entries_per_mb",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        },
+        {
+          "method": "POST",
+          "summary": "Set the W-TinyLFU sketch entries-per-MB ratio and trigger a sketch resize",
+          "type": "void",
+          "nickname": "set_tinylfu_sketch_entries_per_mb",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": [
+            {
+              "name": "value",
+              "description": "Number of sketch entries per MB of row cache. Default: 1024 (1 entry per KB).",
+              "required": true,
+              "allowMultiple": false,
+              "type": "double",
+              "paramType": "query"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "/cache_service/tinylfu_sketch_resize",
+      "operations": [
+        {
+          "method": "POST",
+          "summary": "Manually trigger a W-TinyLFU sketch resize based on current cache size",
+          "type": "void",
+          "nickname": "tinylfu_sketch_resize",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        }
+      ]
     }
    ]
 }

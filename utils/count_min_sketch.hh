@@ -21,6 +21,10 @@ namespace utils {
 /// Each counter is 4 bits (max value 15), and counters are packed 16 per
 /// uint64_t word. The sketch uses 4 independent hash functions (rows) and
 /// returns the minimum count across all rows for frequency estimation.
+///
+/// The sketch width (number of counters per row) is dynamic and can be changed
+/// at runtime via resize(). The total memory used is:
+///   depth * (2^width_log2 / 16) * sizeof(uint64_t)  =  depth * 2^width_log2 / 2  bytes
 class count_min_sketch {
     static constexpr size_t depth = 4;
     static constexpr uint64_t reset_mask = 0x7777777777777777ULL;
@@ -34,6 +38,7 @@ class count_min_sketch {
     };
 
     std::vector<uint64_t> _table;
+    size_t _width_log2;
     size_t _width;
     size_t _width_mask;
     size_t _words_per_row;
@@ -63,7 +68,8 @@ public:
     /// \param width_log2 Log base 2 of the number of counters per row.
     ///                   Total memory is approximately depth * 2^width_log2 / 2 bytes.
     explicit count_min_sketch(size_t width_log2 = 16)
-        : _width(size_t(1) << width_log2)
+        : _width_log2(width_log2)
+        , _width(size_t(1) << width_log2)
         , _width_mask(_width - 1)
         , _words_per_row(_width / 16)
     {
@@ -100,7 +106,77 @@ public:
         }
     }
 
+    /// Zeroes all counters (full reset, as opposed to aging via reset()).
+    void clear() noexcept {
+        std::fill(_table.begin(), _table.end(), uint64_t(0));
+    }
+
     size_t width() const noexcept { return _width; }
+    size_t width_log2() const noexcept { return _width_log2; }
+
+    /// Resize the sketch to a new width (given as log2).
+    ///
+    /// Counter values are scaled in-place so that the relative frequency
+    /// estimates are approximately preserved.  Because counter positions are
+    /// determined by hash(key) % width, a width change reshuffles bucket
+    /// assignments entirely; scaling the packed words is therefore a lossy
+    /// but O(table) approximation that is consistent with the probabilistic
+    /// nature of the sketch.
+    ///
+    /// Growing (new_width > old_width): each old counter is copied to every
+    /// corresponding new bucket (1-to-N fan-out).
+    /// Shrinking (new_width < old_width): N old counters that map to the same
+    /// new bucket are combined by taking their maximum.
+    void resize(size_t new_width_log2) noexcept {
+        if (new_width_log2 == _width_log2) {
+            return;
+        }
+        size_t new_width = size_t(1) << new_width_log2;
+        size_t new_words_per_row = new_width / 16;
+        std::vector<uint64_t> new_table(depth * new_words_per_row, 0);
+
+        if (new_width > _width) {
+            // Growing: fan out each old counter to (new_width / _width) new counters.
+            size_t factor = new_width / _width;
+            for (size_t row = 0; row < depth; ++row) {
+                for (size_t old_col = 0; old_col < _width; ++old_col) {
+                    size_t old_wi  = row * _words_per_row + old_col / 16;
+                    size_t old_pos = old_col & 15;
+                    uint8_t val = get_counter(_table[old_wi], old_pos);
+                    for (size_t f = 0; f < factor; ++f) {
+                        size_t new_col = old_col * factor + f;
+                        size_t new_wi  = row * new_words_per_row + new_col / 16;
+                        size_t new_pos = new_col & 15;
+                        new_table[new_wi] |= (static_cast<uint64_t>(val) << (new_pos * 4));
+                    }
+                }
+            }
+        } else {
+            // Shrinking: combine (old_width / new_width) old counters per new
+            // bucket by taking the maximum.
+            size_t factor = _width / new_width;
+            for (size_t row = 0; row < depth; ++row) {
+                for (size_t new_col = 0; new_col < new_width; ++new_col) {
+                    uint8_t best = 0;
+                    for (size_t f = 0; f < factor; ++f) {
+                        size_t old_col = new_col * factor + f;
+                        size_t old_wi  = row * _words_per_row + old_col / 16;
+                        size_t old_pos = old_col & 15;
+                        best = std::max(best, get_counter(_table[old_wi], old_pos));
+                    }
+                    size_t new_wi  = row * new_words_per_row + new_col / 16;
+                    size_t new_pos = new_col & 15;
+                    new_table[new_wi] |= (static_cast<uint64_t>(best) << (new_pos * 4));
+                }
+            }
+        }
+
+        _width_log2    = new_width_log2;
+        _width         = new_width;
+        _width_mask    = new_width - 1;
+        _words_per_row = new_words_per_row;
+        _table         = std::move(new_table);
+    }
 };
 
 } // namespace utils

@@ -13,6 +13,7 @@
 #include <boost/intrusive/list.hpp>
 #include <seastar/core/memory.hh>
 #include <algorithm>
+#include <cmath>
 
 // Identifies which W-TinyLFU segment an evictable belongs to.
 enum class lru_segment : uint8_t {
@@ -118,19 +119,23 @@ private:
 
     using reclaiming_result = seastar::memory::reclaiming_result;
 
-    static constexpr size_t sketch_width_log2 = 16;
-    static constexpr size_t sketch_width = size_t(1) << sketch_width_log2;
-    static constexpr size_t sample_threshold = sketch_width * 10;
+    // Default sketch width log2.  Results in 65536 counters per row (128 KiB total).
+    static constexpr size_t default_sketch_width_log2 = 16;
+    // Minimum / maximum sketch width log2, clamped during resize.
+    static constexpr size_t min_sketch_width_log2 = 10; // 1 K counters per row
+    static constexpr size_t max_sketch_width_log2 = 24; // 16 M counters per row
     // Window segment target: ~1% of total cache entries.
     static constexpr size_t window_percent = 1;
     // Protected segment target: ~80% of total cache entries.
     static constexpr size_t protected_percent = 80;
 
-    utils::count_min_sketch _sketch{sketch_width_log2};
+    utils::count_min_sketch _sketch{default_sketch_width_log2};
     size_t _window_size = 0;
     size_t _probation_size = 0;
     size_t _protected_size = 0;
     size_t _sample_count = 0;
+    // sample_threshold = sketch_width * 10 — recomputed whenever the sketch is resized.
+    size_t _sample_threshold = _sketch.width() * 10;
 
     size_t total_size() const noexcept {
         return _window_size + _probation_size + _protected_size;
@@ -150,7 +155,7 @@ private:
 
     void record_access(const evictable& e) noexcept {
         _sketch.increment(entry_key(e));
-        if (++_sample_count >= sample_threshold) {
+        if (++_sample_count >= _sample_threshold) {
             _sketch.reset();
             _sample_count = 0;
         }
@@ -374,5 +379,46 @@ public:
     // May stall the reactor, use only in tests.
     void evict_all() {
         while (evict() == reclaiming_result::reclaimed_something) {}
+    }
+
+    /// Resize the Count-Min Sketch to match the given width_log2.
+    ///
+    /// Existing counter values are scaled in-place (see count_min_sketch::resize).
+    /// _sample_count is reset to 0 because the counter magnitudes changed.
+    /// This is safe to call at any time; on-going record_access() calls will
+    /// use the new threshold on the next invocation.
+    void resize_sketch(size_t new_width_log2) noexcept {
+        new_width_log2 = std::clamp(new_width_log2, min_sketch_width_log2, max_sketch_width_log2);
+        _sketch.resize(new_width_log2);
+        _sample_threshold = _sketch.width() * 10;
+        _sample_count = 0;
+    }
+
+    /// Fully reset the Count-Min Sketch (zero all counters) and clear the
+    /// sample counter.  Call after evict_all() when a completely clean slate
+    /// is needed (e.g. cache_tracker::clear(), test teardown).
+    void reset_sketch() noexcept {
+        _sketch.clear();
+        _sample_count = 0;
+    }
+
+    /// Compute an appropriate sketch width_log2 given the cache size in bytes
+    /// and a desired number of sketch entries per MB of cache.
+    ///
+    /// Formula:  estimated_entries = cache_bytes / 1MB * entries_per_mb
+    ///           width_log2 = ceil(log2(estimated_entries)), clamped to
+    ///           [min_sketch_width_log2, max_sketch_width_log2].
+    ///
+    /// With the default entries_per_mb = 1024 (i.e. 1 entry per KB) and a
+    /// 100 MB per-shard cache, this gives:
+    ///   100 * 1024 = 102400 entries → width_log2 = ceil(log2(102400)) = 17
+    static size_t compute_sketch_width_log2(size_t cache_bytes, double entries_per_mb) noexcept {
+        constexpr double bytes_per_mb = 1024.0 * 1024.0;
+        double estimated_entries = (static_cast<double>(cache_bytes) / bytes_per_mb) * entries_per_mb;
+        if (estimated_entries < 1.0) {
+            return min_sketch_width_log2;
+        }
+        size_t log2 = static_cast<size_t>(std::ceil(std::log2(estimated_entries)));
+        return std::clamp(log2, min_sketch_width_log2, max_sketch_width_log2);
     }
 };
