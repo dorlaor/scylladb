@@ -15,86 +15,106 @@
 
 namespace utils {
 
-/// A Count-Min Sketch with 4-bit counters for frequency estimation.
+/// A Count-Min Sketch with 4-bit counters, cache-line optimized layout.
 ///
 /// Used by the W-TinyLFU cache admission policy to estimate access frequency.
-/// Each counter is 4 bits (max value 15), and counters are packed 16 per
-/// uint64_t word. The sketch uses 4 independent hash functions (rows) and
-/// returns the minimum count across all rows for frequency estimation.
+/// The sketch uses a depth of 4 and returns the minimum count across all rows.
 ///
-/// The sketch width (number of counters per row) is dynamic and can be changed
-/// at runtime via resize(). The total memory used is:
-///   depth * (2^width_log2 / 16) * sizeof(uint64_t)  =  depth * 2^width_log2 / 2  bytes
+/// Hardware optimization (matches Caffeine's FrequencySketch):
+/// All 4 row counters for a given key are co-located in the same 64-byte
+/// block (one L1 cache line).  This is achieved with two-level hashing:
+///   1. spread(key) selects the block (shared by all 4 rows)
+///   2. rehash(spread) is split into 4 bytes; each byte selects the
+///      counter position within that row's 2-word segment of the block.
+///
+/// Block layout (8 uint64_t words = 64 bytes):
+///   words 0-1: row 0 (32 counters)
+///   words 2-3: row 1
+///   words 4-5: row 2
+///   words 6-7: row 3
+///
+/// This turns 4 cache misses per operation into 1.
+///
+/// The sketch width (number of counters per row) is dynamic and can be
+/// changed at runtime via resize().  Total memory:
+///   2^width_log2 / 4 * sizeof(uint64_t) bytes  (= 2^width_log2 / 2 bytes)
+///
+/// Minimum width_log2 is 5 (32 counters per row = 1 block).
 class count_min_sketch {
     static constexpr size_t depth = 4;
     static constexpr uint64_t reset_mask = 0x7777777777777777ULL;
-
-    // Hash seeds from splitmix64 sequence, chosen for low correlation between rows.
-    static constexpr uint64_t seeds[depth] = {
-        0x9e3779b97f4a7c15ULL,
-        0xbf58476d1ce4e5b9ULL,
-        0x94d049bb133111ebULL,
-        0xd6e8feb86659fd93ULL,
-    };
+    static constexpr size_t words_per_block = 8;  // depth * 2
+    static constexpr size_t min_width_log2 = 5;   // 32 counters per row = 1 block
 
     std::vector<uint64_t> _table;
     size_t _width_log2;
-    size_t _width;
-    size_t _width_mask;
-    size_t _words_per_row;
+    size_t _width;       // counters per row (= num_blocks * 32)
+    size_t _block_mask;  // num_blocks - 1
 
-    static uint64_t mix(uint64_t key, uint64_t seed) noexcept {
-        uint64_t h = key * seed;
+    // First hash: selects the block (shared by all 4 rows).
+    // Uses splitmix64-style mixing for 64-bit keys.
+    static uint32_t spread(uint64_t key) noexcept {
+        uint64_t h = key * 0x9e3779b97f4a7c15ULL;
         h ^= h >> 32;
         h *= 0xd6e8feb86659fd93ULL;
         h ^= h >> 32;
-        return h;
+        return static_cast<uint32_t>(h);
     }
 
-    size_t counter_index(size_t row, uint64_t key) const noexcept {
-        return mix(key, seeds[row]) & _width_mask;
+    // Second hash: rehash of spread for within-block counter selection.
+    // Matches Caffeine's rehash().
+    static uint32_t rehash(uint32_t x) noexcept {
+        x *= 0x31848babU;
+        x ^= x >> 14;
+        return x;
     }
 
     static uint8_t get_counter(uint64_t word, size_t pos) noexcept {
         return (word >> (pos * 4)) & 0x0FULL;
     }
 
-    size_t word_index(size_t row, size_t col) const noexcept {
-        return row * _words_per_row + col / 16;
-    }
-
 public:
     /// Construct a sketch with the given number of counters per row.
     /// \param width_log2 Log base 2 of the number of counters per row.
-    ///                   Total memory is approximately depth * 2^width_log2 / 2 bytes.
+    ///                   Clamped to minimum of 5 (32 counters = 1 block).
     explicit count_min_sketch(size_t width_log2 = 16)
-        : _width_log2(width_log2)
-        , _width(size_t(1) << width_log2)
-        , _width_mask(_width - 1)
-        , _words_per_row(_width / 16)
+        : _width_log2(std::max(width_log2, min_width_log2))
+        , _width(size_t(1) << _width_log2)
+        , _block_mask(_width / 32 - 1)
     {
-        _table.resize(depth * _words_per_row, 0);
+        // table_size = num_blocks * 8 = (width / 32) * 8 = width / 4
+        _table.resize(_width / 4, 0);
     }
 
     void increment(uint64_t key) noexcept {
+        uint32_t block_hash = spread(key);
+        uint32_t counter_hash = rehash(block_hash);
+        size_t block = static_cast<size_t>(block_hash & _block_mask) * words_per_block;
+
         for (size_t row = 0; row < depth; ++row) {
-            size_t col = counter_index(row, key);
-            size_t wi = word_index(row, col);
-            size_t pos = col & 15;
-            uint8_t val = get_counter(_table[wi], pos);
+            uint32_t h = counter_hash >> (row * 8);
+            size_t index = (h >> 1) & 15;       // which of 16 counters in the word
+            size_t offset = h & 1;               // which of 2 words for this row
+            size_t slot = block + offset + (row * 2);
+            uint8_t val = get_counter(_table[slot], index);
             if (val < 15) {
-                _table[wi] += (1ULL << (pos * 4));
+                _table[slot] += (1ULL << (index * 4));
             }
         }
     }
 
     uint8_t estimate(uint64_t key) const noexcept {
+        uint32_t block_hash = spread(key);
+        uint32_t counter_hash = rehash(block_hash);
+        size_t block = static_cast<size_t>(block_hash & _block_mask) * words_per_block;
+
         uint8_t min_val = 15;
         for (size_t row = 0; row < depth; ++row) {
-            size_t col = counter_index(row, key);
-            size_t wi = word_index(row, col);
-            size_t pos = col & 15;
-            min_val = std::min(min_val, get_counter(_table[wi], pos));
+            uint32_t h = counter_hash >> (row * 8);
+            size_t index = (h >> 1) & 15;
+            size_t offset = h & 1;
+            size_t slot = block + offset + (row * 2);
+            min_val = std::min(min_val, get_counter(_table[slot], index));
         }
         return min_val;
     }
@@ -116,66 +136,21 @@ public:
 
     /// Resize the sketch to a new width (given as log2).
     ///
-    /// Counter values are scaled in-place so that the relative frequency
-    /// estimates are approximately preserved.  Because counter positions are
-    /// determined by hash(key) % width, a width change reshuffles bucket
-    /// assignments entirely; scaling the packed words is therefore a lossy
-    /// but O(table) approximation that is consistent with the probabilistic
-    /// nature of the sketch.
-    ///
-    /// Growing (new_width > old_width): each old counter is copied to every
-    /// corresponding new bucket (1-to-N fan-out).
-    /// Shrinking (new_width < old_width): N old counters that map to the same
-    /// new bucket are combined by taking their maximum.
+    /// Because the block layout uses two-level hashing, resizing changes
+    /// both block assignment and within-block positions for every key.
+    /// We cannot preserve individual counter values.  Instead, resize
+    /// simply allocates a new zeroed table — the sketch will re-learn
+    /// frequencies from subsequent accesses.  This matches Caffeine's
+    /// ensureCapacity() which also discards old counts on resize.
     void resize(size_t new_width_log2) noexcept {
+        new_width_log2 = std::max(new_width_log2, min_width_log2);
         if (new_width_log2 == _width_log2) {
             return;
         }
-        size_t new_width = size_t(1) << new_width_log2;
-        size_t new_words_per_row = new_width / 16;
-        std::vector<uint64_t> new_table(depth * new_words_per_row, 0);
-
-        if (new_width > _width) {
-            // Growing: fan out each old counter to (new_width / _width) new counters.
-            size_t factor = new_width / _width;
-            for (size_t row = 0; row < depth; ++row) {
-                for (size_t old_col = 0; old_col < _width; ++old_col) {
-                    size_t old_wi  = row * _words_per_row + old_col / 16;
-                    size_t old_pos = old_col & 15;
-                    uint8_t val = get_counter(_table[old_wi], old_pos);
-                    for (size_t f = 0; f < factor; ++f) {
-                        size_t new_col = old_col * factor + f;
-                        size_t new_wi  = row * new_words_per_row + new_col / 16;
-                        size_t new_pos = new_col & 15;
-                        new_table[new_wi] |= (static_cast<uint64_t>(val) << (new_pos * 4));
-                    }
-                }
-            }
-        } else {
-            // Shrinking: combine (old_width / new_width) old counters per new
-            // bucket by taking the maximum.
-            size_t factor = _width / new_width;
-            for (size_t row = 0; row < depth; ++row) {
-                for (size_t new_col = 0; new_col < new_width; ++new_col) {
-                    uint8_t best = 0;
-                    for (size_t f = 0; f < factor; ++f) {
-                        size_t old_col = new_col * factor + f;
-                        size_t old_wi  = row * _words_per_row + old_col / 16;
-                        size_t old_pos = old_col & 15;
-                        best = std::max(best, get_counter(_table[old_wi], old_pos));
-                    }
-                    size_t new_wi  = row * new_words_per_row + new_col / 16;
-                    size_t new_pos = new_col & 15;
-                    new_table[new_wi] |= (static_cast<uint64_t>(best) << (new_pos * 4));
-                }
-            }
-        }
-
-        _width_log2    = new_width_log2;
-        _width         = new_width;
-        _width_mask    = new_width - 1;
-        _words_per_row = new_words_per_row;
-        _table         = std::move(new_table);
+        _width_log2 = new_width_log2;
+        _width = size_t(1) << _width_log2;
+        _block_mask = _width / 32 - 1;
+        _table.assign(_width / 4, 0);
     }
 };
 
