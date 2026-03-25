@@ -158,15 +158,36 @@ private:
     // Simple LCG for jitter (avoids #include <random>; one per lru instance).
     uint32_t _jitter_state = 0x12345678;
 
+    // -- Hill climber state (adaptive window/protected sizing) --
+    // Constants match Caffeine's BoundedLocalCache.
+    static constexpr double hill_climber_restart_threshold = 0.05;
+    static constexpr double hill_climber_step_percent = 0.0625;
+    static constexpr double hill_climber_step_decay = 0.98;
+
+    size_t _hits_in_sample = 0;
+    size_t _misses_in_sample = 0;
+    double _previous_hit_rate = 0.0;
+    double _step_size = 0.0;
+    bool _step_size_initialized = false;
+    // Overrides set by the climber; 0 = use percentage-based default.
+    size_t _max_window_override = 0;
+    size_t _max_protected_override = 0;
+
     size_t total_size() const noexcept {
         return _window_size + _probation_size + _protected_size;
     }
 
     size_t max_window_size() const noexcept {
+        if (_max_window_override > 0) {
+            return _max_window_override;
+        }
         return std::max(size_t(1), total_size() * window_percent / 100);
     }
 
     size_t max_protected_size() const noexcept {
+        if (_max_protected_override > 0) {
+            return _max_protected_override;
+        }
         return total_size() * protected_percent / 100;
     }
 
@@ -190,6 +211,7 @@ private:
             _sketch.reset();
             _sample_count = 0;
             _sample_threshold = std::max(min_sample_threshold, total_size() * 10);
+            do_climb();
         }
     }
 
@@ -234,6 +256,67 @@ private:
         e._segment = seg;
         segment_list(seg).push_back(e);
         increment_size(seg);
+    }
+
+    // Hill climber: adjust window/protected ratio based on observed hit rate.
+    // Called once per sketch reset cycle (every ~10*N accesses).
+    // Algorithm matches Caffeine's BoundedLocalCache.determineAdjustment().
+    void do_climb() noexcept {
+        size_t total = total_size();
+        if (total < 2) {
+            _hits_in_sample = 0;
+            _misses_in_sample = 0;
+            return;
+        }
+
+        if (!_step_size_initialized) {
+            _step_size = -(hill_climber_step_percent * total);
+            _step_size_initialized = true;
+        }
+
+        size_t request_count = _hits_in_sample + _misses_in_sample;
+        if (request_count == 0) {
+            return;
+        }
+
+        double hit_rate = static_cast<double>(_hits_in_sample) / request_count;
+        double hit_rate_change = hit_rate - _previous_hit_rate;
+
+        // If hit rate improved, keep going in the same direction; otherwise reverse.
+        double amount = (hit_rate_change >= 0) ? _step_size : -_step_size;
+
+        // Large change: restart with full step.  Small change: decay step.
+        double next_step;
+        if (std::abs(hit_rate_change) >= hill_climber_restart_threshold) {
+            next_step = hill_climber_step_percent * total * (amount >= 0 ? 1.0 : -1.0);
+        } else {
+            next_step = hill_climber_step_decay * amount;
+        }
+
+        _previous_hit_rate = hit_rate;
+        _step_size = next_step;
+        _hits_in_sample = 0;
+        _misses_in_sample = 0;
+
+        long adjustment = static_cast<long>(std::round(amount));
+        if (adjustment == 0) {
+            return;
+        }
+
+        size_t cur_window = max_window_size();
+        size_t cur_protected = max_protected_size();
+
+        if (adjustment > 0) {
+            // Increase window, decrease protected.
+            size_t increase = std::min(static_cast<size_t>(adjustment), cur_protected - 1);
+            _max_window_override = cur_window + increase;
+            _max_protected_override = cur_protected - increase;
+        } else {
+            // Decrease window, increase protected.
+            size_t decrease = std::min(static_cast<size_t>(-adjustment), cur_window - 1);
+            _max_window_override = cur_window - decrease;
+            _max_protected_override = cur_protected + decrease;
+        }
     }
 
     // Move excess protected entries to probation.
@@ -360,6 +443,7 @@ public:
     }
 
     void add(evictable& e) noexcept {
+        ++_misses_in_sample;
         record_access(e);
         add_to_segment(e, lru_segment::window);
         if (e.is_index()) {
@@ -383,6 +467,11 @@ public:
     //  - In protected: moves to back of protected.
     //  - Not linked: adds to window.
     void touch(evictable& e) noexcept {
+        if (e._segment != lru_segment::none) {
+            ++_hits_in_sample;
+        } else {
+            ++_misses_in_sample;
+        }
         record_access(e);
 
         switch (e._segment) {
@@ -441,6 +530,15 @@ public:
     uint8_t sketch_estimate(uint64_t key) const noexcept {
         return _sketch.estimate(key);
     }
+
+    /// Hill-climbing accessors (testing/debugging/metrics).
+    size_t hits_in_sample() const noexcept { return _hits_in_sample; }
+    size_t misses_in_sample() const noexcept { return _misses_in_sample; }
+    size_t current_max_window_size() const noexcept { return max_window_size(); }
+    size_t current_max_protected_size() const noexcept { return max_protected_size(); }
+
+    /// Trigger a hill-climbing adjustment cycle (public for testing).
+    void climb() noexcept { do_climb(); }
 
     /// Fully reset the Count-Min Sketch (zero all counters) and clear the
     /// sample counter.  Call after evict_all() when a completely clean slate

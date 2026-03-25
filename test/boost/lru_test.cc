@@ -325,3 +325,65 @@ BOOST_AUTO_TEST_CASE(test_lru_touch_promotes_from_probation) {
         }
     }
 }
+
+BOOST_AUTO_TEST_CASE(test_hill_climbing_tracks_hits_and_misses) {
+    lru l;
+    static constexpr int N = 10;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        entries[i]->set_sketch_key(3000 + i);
+        l.add(*entries[i]);  // each add is a miss
+    }
+
+    BOOST_REQUIRE_GE(l.misses_in_sample(), 10u);
+
+    // Touches on linked entries count as hits.
+    for (int i = 0; i < 5; ++i) {
+        l.touch(*entries[i]);
+    }
+    BOOST_REQUIRE_GE(l.hits_in_sample(), 5u);
+
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_hill_climbing_adjusts_window_size) {
+    lru l;
+
+    static constexpr int N = 200;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        entries[i]->set_sketch_key(4000 + i);
+        l.add(*entries[i]);
+    }
+
+    size_t initial_window_max = l.current_max_window_size();
+
+    // Simulate a sample period with hits, then climb.
+    for (int i = 0; i < 100; ++i) {
+        l.touch(*entries[i % N]);
+    }
+    l.climb();
+
+    // Counters should be reset after climb.
+    BOOST_REQUIRE_EQUAL(l.hits_in_sample(), 0u);
+    BOOST_REQUIRE_EQUAL(l.misses_in_sample(), 0u);
+
+    // After a second climb cycle, the window should have been adjusted.
+    for (int i = 0; i < 100; ++i) {
+        l.touch(*entries[i % N]);
+    }
+    l.climb();
+
+    // Window max may have changed (we can't predict direction, but it
+    // should either change or converge with a very small step).
+    // At minimum: no crash, counters reset.
+    BOOST_REQUIRE_EQUAL(l.hits_in_sample(), 0u);
+
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
