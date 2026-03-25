@@ -247,6 +247,42 @@ BOOST_AUTO_TEST_CASE(test_lru_frequency_based_eviction) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Caffeine-parity tests
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(test_aging_reset_uses_entry_count) {
+    // The sketch reset threshold should be based on cache entry count,
+    // not sketch width.  With 5 entries the threshold is max(1000, 50) = 1000.
+    // After enough touches we expect at least one reset (halving), so a
+    // previously-saturated counter (15) should decay.
+    lru l;
+    static constexpr int N = 5;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        entries[i]->set_sketch_key(i + 1);
+        l.add(*entries[i]);
+    }
+
+    // Saturate entry 0's counter to 15.
+    for (int i = 0; i < 20; ++i) {
+        l.touch(*entries[0]);
+    }
+    BOOST_REQUIRE_EQUAL(l.sketch_estimate(1), 15);
+
+    // Generate 1100 touches on entry 1 to trigger at least one reset.
+    for (int i = 0; i < 1100; ++i) {
+        l.touch(*entries[1]);
+    }
+    // After at least one halving, 15 should have decayed.
+    BOOST_REQUIRE_LE(l.sketch_estimate(1), 7);
+
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(test_lru_touch_promotes_from_probation) {
     lru l;
 

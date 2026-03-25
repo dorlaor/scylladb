@@ -148,8 +148,10 @@ private:
     size_t _probation_size = 0;
     size_t _protected_size = 0;
     size_t _sample_count = 0;
-    // sample_threshold = sketch_width * 10 — recomputed whenever the sketch is resized.
-    size_t _sample_threshold = _sketch.width() * 10;
+    // Aging threshold: reset sketch every max(min_sample_threshold, total_entries * 10)
+    // accesses.  Matches Caffeine's sampleSize = 10 * maximumEntries.
+    static constexpr size_t min_sample_threshold = 1000;
+    size_t _sample_threshold = min_sample_threshold;
 
     size_t total_size() const noexcept {
         return _window_size + _probation_size + _protected_size;
@@ -174,6 +176,7 @@ private:
         if (++_sample_count >= _sample_threshold) {
             _sketch.reset();
             _sample_count = 0;
+            _sample_threshold = std::max(min_sample_threshold, total_size() * 10);
         }
     }
 
@@ -406,8 +409,13 @@ public:
     void resize_sketch(size_t new_width_log2) noexcept {
         new_width_log2 = std::clamp(new_width_log2, min_sketch_width_log2, max_sketch_width_log2);
         _sketch.resize(new_width_log2);
-        _sample_threshold = _sketch.width() * 10;
         _sample_count = 0;
+        // _sample_threshold stays entry-based; recomputed on next reset cycle.
+    }
+
+    /// Expose sketch frequency estimate for testing/debugging.
+    uint8_t sketch_estimate(uint64_t key) const noexcept {
+        return _sketch.estimate(key);
     }
 
     /// Fully reset the Count-Min Sketch (zero all counters) and clear the
