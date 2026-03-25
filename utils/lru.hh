@@ -264,7 +264,7 @@ private:
                 uint8_t w_freq = _sketch.estimate(entry_key(w_victim));
                 uint8_t p_freq = _sketch.estimate(entry_key(p_victim));
 
-                if (w_freq >= p_freq) {
+                if (w_freq > p_freq) {
                     // Admit window victim to probation; evict probation victim.
                     remove_from_segment(w_victim);
                     add_to_segment(w_victim, lru_segment::probation);
