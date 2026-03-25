@@ -153,6 +153,11 @@ private:
     static constexpr size_t min_sample_threshold = 1000;
     size_t _sample_threshold = min_sample_threshold;
 
+    // Hash-DoS jitter: minimum frequency for randomized admission (matches Caffeine).
+    static constexpr uint8_t admit_hashdos_threshold = 6;
+    // Simple LCG for jitter (avoids #include <random>; one per lru instance).
+    uint32_t _jitter_state = 0x12345678;
+
     size_t total_size() const noexcept {
         return _window_size + _probation_size + _protected_size;
     }
@@ -169,6 +174,14 @@ private:
         // Use the stable sketch key if set; fall back to pointer address.
         uint64_t k = e._sketch_key;
         return k != 0 ? k : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
+    }
+
+    // xorshift32 — fast, no extra includes, sufficient for jitter.
+    uint32_t jitter_next() noexcept {
+        _jitter_state ^= _jitter_state << 13;
+        _jitter_state ^= _jitter_state >> 17;
+        _jitter_state ^= _jitter_state << 5;
+        return _jitter_state;
     }
 
     void record_access(const evictable& e) noexcept {
@@ -264,7 +277,18 @@ private:
                 uint8_t w_freq = _sketch.estimate(entry_key(w_victim));
                 uint8_t p_freq = _sketch.estimate(entry_key(p_victim));
 
+                // Admission decision: candidate wins on higher frequency,
+                // or with ~1/128 probability if warm (freq >= 6) — hash-DoS jitter.
+                bool admit_candidate;
                 if (w_freq > p_freq) {
+                    admit_candidate = true;
+                } else if (w_freq >= admit_hashdos_threshold) {
+                    admit_candidate = (jitter_next() & 127) == 0;
+                } else {
+                    admit_candidate = false;
+                }
+
+                if (admit_candidate) {
                     // Admit window victim to probation; evict probation victim.
                     remove_from_segment(w_victim);
                     add_to_segment(w_victim, lru_segment::probation);
