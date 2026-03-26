@@ -745,6 +745,74 @@
           "parameters": []
         }
       ]
+    },
+    {
+      "path": "/cache_service/tinylfu_initial_window_percent",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get the W-TinyLFU initial window segment percentage",
+          "type": "double",
+          "nickname": "get_tinylfu_initial_window_percent",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        },
+        {
+          "method": "POST",
+          "summary": "Set the W-TinyLFU initial window segment percentage (1=frequency-based, 99=LRU-like)",
+          "type": "void",
+          "nickname": "set_tinylfu_initial_window_percent",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": [
+            {
+              "name": "value",
+              "description": "Window percentage of total cache entries. Range: [1, 99]. Default: 1.",
+              "required": true,
+              "allowMultiple": false,
+              "type": "double",
+              "paramType": "query"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "path": "/cache_service/tinylfu_hill_climbing_enabled",
+      "operations": [
+        {
+          "method": "GET",
+          "summary": "Get whether the W-TinyLFU hill-climbing adaptive window sizing is enabled",
+          "type": "boolean",
+          "nickname": "get_tinylfu_hill_climbing_enabled",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": []
+        },
+        {
+          "method": "POST",
+          "summary": "Enable or disable the W-TinyLFU hill-climbing adaptive window sizing",
+          "type": "void",
+          "nickname": "set_tinylfu_hill_climbing_enabled",
+          "produces": [
+            "application/json"
+          ],
+          "parameters": [
+            {
+              "name": "value",
+              "description": "true to enable hill climbing, false to disable. Default: true.",
+              "required": true,
+              "allowMultiple": false,
+              "type": "boolean",
+              "paramType": "query"
+            }
+          ]
+        }
+      ]
     }
    ]
 }

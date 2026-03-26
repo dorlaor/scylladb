@@ -58,30 +58,44 @@ row_cache::create_underlying_reader(read_context& ctx, mutation_source& src, con
 static thread_local mutation_application_stats dummy_app_stats;
 static thread_local utils::updateable_value<double> dummy_index_cache_fraction(1.0);
 static thread_local utils::updateable_value<double> dummy_tinylfu_sketch_entries_per_mb(1024.0);
+static thread_local utils::updateable_value<double> dummy_tinylfu_initial_window_percent(1.0);
+static thread_local utils::updateable_value<bool> dummy_tinylfu_hill_climbing_enabled(true);
 
 cache_tracker::cache_tracker()
-    : cache_tracker(dummy_index_cache_fraction, dummy_tinylfu_sketch_entries_per_mb, dummy_app_stats, register_metrics::no)
+    : cache_tracker(dummy_index_cache_fraction, dummy_tinylfu_sketch_entries_per_mb,
+                    dummy_tinylfu_initial_window_percent, dummy_tinylfu_hill_climbing_enabled,
+                    dummy_app_stats, register_metrics::no)
 {}
 
 cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb, dummy_app_stats, with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb,
+                    dummy_tinylfu_initial_window_percent, dummy_tinylfu_hill_climbing_enabled,
+                    dummy_app_stats, with_metrics)
 {}
 
 cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats& app_stats, register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb, app_stats, with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb,
+                    dummy_tinylfu_initial_window_percent, dummy_tinylfu_hill_climbing_enabled,
+                    app_stats, with_metrics)
 {}
 
 static thread_local cache_tracker* current_tracker;
 
 cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction,
                              utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                             utils::updateable_value<double> tinylfu_initial_window_percent,
+                             utils::updateable_value<bool> tinylfu_hill_climbing_enabled,
                              mutation_application_stats& app_stats, register_metrics with_metrics)
     : _garbage(_region, this, app_stats)
     , _memtable_cleaner(_region, nullptr, app_stats)
     , _app_stats(app_stats)
     , _index_cache_fraction(std::move(index_cache_fraction))
     , _tinylfu_sketch_entries_per_mb(std::move(tinylfu_sketch_entries_per_mb))
+    , _tinylfu_initial_window_percent(std::move(tinylfu_initial_window_percent))
+    , _tinylfu_hill_climbing_enabled(std::move(tinylfu_hill_climbing_enabled))
     , _sketch_ratio_observer(utils::dummy_observer<double>())
+    , _window_percent_observer(utils::dummy_observer<double>())
+    , _hill_climbing_observer(utils::dummy_observer<bool>())
 {
     if (with_metrics) {
         setup_metrics();
@@ -112,6 +126,20 @@ cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fractio
         resize_sketch();
     });
 
+    // Observe window percent changes.
+    _window_percent_observer = _tinylfu_initial_window_percent.observe([this](const double& v) noexcept {
+        _lru.set_window_percent(v);
+    });
+
+    // Observe hill climbing toggle changes.
+    _hill_climbing_observer = _tinylfu_hill_climbing_enabled.observe([this](const bool& v) noexcept {
+        _lru.set_hill_climbing_enabled(v);
+    });
+
+    // Apply initial config values.
+    _lru.set_window_percent(_tinylfu_initial_window_percent.get());
+    _lru.set_hill_climbing_enabled(_tinylfu_hill_climbing_enabled.get());
+
     // Set initial sketch size based on the current available memory.
     // At construction time the LSA region is empty, so we use the total
     // per-shard memory as a proxy for the eventual cache size.
@@ -120,8 +148,12 @@ cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fractio
 
 cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction,
                              utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                             utils::updateable_value<double> tinylfu_initial_window_percent,
+                             utils::updateable_value<bool> tinylfu_hill_climbing_enabled,
                              register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), std::move(tinylfu_sketch_entries_per_mb), dummy_app_stats, with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), std::move(tinylfu_sketch_entries_per_mb),
+                    std::move(tinylfu_initial_window_percent), std::move(tinylfu_hill_climbing_enabled),
+                    dummy_app_stats, with_metrics)
 {}
 
 cache_tracker::~cache_tracker() {

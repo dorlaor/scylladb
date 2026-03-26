@@ -138,10 +138,13 @@ private:
     // Minimum / maximum sketch width log2, clamped during resize.
     static constexpr size_t min_sketch_width_log2 = 10; // 1 K counters per row
     static constexpr size_t max_sketch_width_log2 = 24; // 16 M counters per row
-    // Window segment target: ~1% of total cache entries.
-    static constexpr size_t window_percent = 1;
-    // Protected segment target: ~80% of total cache entries.
-    static constexpr size_t protected_percent = 80;
+    // Window segment target as a percentage of total cache entries (default 1%).
+    // Configurable at runtime via set_window_percent().
+    size_t _window_percent = 1;
+    // Protected segment target: (100 - window_percent - 1)% approximated as 80%.
+    static constexpr size_t default_protected_percent = 80;
+    // Whether hill climbing is enabled.
+    bool _hill_climbing_enabled = true;
 
     utils::count_min_sketch _sketch{default_sketch_width_log2};
     size_t _window_size = 0;
@@ -181,14 +184,14 @@ private:
         if (_max_window_override > 0) {
             return _max_window_override;
         }
-        return std::max(size_t(1), total_size() * window_percent / 100);
+        return std::max(size_t(1), total_size() * _window_percent / 100);
     }
 
     size_t max_protected_size() const noexcept {
         if (_max_protected_override > 0) {
             return _max_protected_override;
         }
-        return total_size() * protected_percent / 100;
+        return total_size() * default_protected_percent / 100;
     }
 
     static uint64_t entry_key(const evictable& e) noexcept {
@@ -262,6 +265,11 @@ private:
     // Called once per sketch reset cycle (every ~10*N accesses).
     // Algorithm matches Caffeine's BoundedLocalCache.determineAdjustment().
     void do_climb() noexcept {
+        if (!_hill_climbing_enabled) {
+            _hits_in_sample = 0;
+            _misses_in_sample = 0;
+            return;
+        }
         size_t total = total_size();
         if (total < 2) {
             _hits_in_sample = 0;
@@ -558,6 +566,29 @@ public:
     /// With the default entries_per_mb = 1024 (i.e. 1 entry per KB) and a
     /// 100 MB per-shard cache, this gives:
     ///   100 * 1024 = 102400 entries → width_log2 = ceil(log2(102400)) = 17
+    /// Set the window segment percentage (clamped to [1, 99]).
+    /// Resets hill-climbing overrides so the new percentage takes effect.
+    void set_window_percent(double percent) noexcept {
+        size_t p = static_cast<size_t>(std::clamp(percent, 1.0, 99.0));
+        _window_percent = p;
+        _max_window_override = 0;
+        _max_protected_override = 0;
+        _step_size_initialized = false;
+    }
+
+    /// Enable or disable the hill-climbing adaptive window sizing.
+    void set_hill_climbing_enabled(bool enabled) noexcept {
+        _hill_climbing_enabled = enabled;
+        if (!enabled) {
+            _max_window_override = 0;
+            _max_protected_override = 0;
+            _step_size_initialized = false;
+        }
+    }
+
+    size_t window_percent() const noexcept { return _window_percent; }
+    bool hill_climbing_enabled() const noexcept { return _hill_climbing_enabled; }
+
     static size_t compute_sketch_width_log2(size_t cache_bytes, double entries_per_mb) noexcept {
         constexpr double bytes_per_mb = 1024.0 * 1024.0;
         double estimated_entries = (static_cast<double>(cache_bytes) / bytes_per_mb) * entries_per_mb;

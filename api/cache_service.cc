@@ -342,6 +342,38 @@ void set_cache_service(http_context& ctx, sharded<replica::database>& db, routes
         });
         co_return json::json_return_type(json_void());
     });
+
+    cs::get_tinylfu_initial_window_percent.set(r, [&db] (std::unique_ptr<http::request> req) {
+        double pct = db.local().get_config().tinylfu_initial_window_percent();
+        return make_ready_future<json::json_return_type>(pct);
+    });
+
+    cs::set_tinylfu_initial_window_percent.set(r, [&db] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto& cfg = const_cast<db::config&>(db.local().get_config());
+        try {
+            co_await cfg.tinylfu_initial_window_percent.set_value_on_all_shards(
+                req->get_query_param("value"), utils::config_file::config_source::API);
+        } catch (...) {
+            throw bad_param_exception(fmt::format("{}", std::current_exception()));
+        }
+        co_return json::json_return_type(json_void());
+    });
+
+    cs::get_tinylfu_hill_climbing_enabled.set(r, [&db] (std::unique_ptr<http::request> req) {
+        bool enabled = db.local().get_config().tinylfu_hill_climbing_enabled();
+        return make_ready_future<json::json_return_type>(enabled);
+    });
+
+    cs::set_tinylfu_hill_climbing_enabled.set(r, [&db] (std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        auto& cfg = const_cast<db::config&>(db.local().get_config());
+        try {
+            co_await cfg.tinylfu_hill_climbing_enabled.set_value_on_all_shards(
+                req->get_query_param("value"), utils::config_file::config_source::API);
+        } catch (...) {
+            throw bad_param_exception(fmt::format("{}", std::current_exception()));
+        }
+        co_return json::json_return_type(json_void());
+    });
 }
 
 void unset_cache_service(http_context& ctx, routes& r) {
@@ -390,6 +422,10 @@ void unset_cache_service(http_context& ctx, routes& r) {
     cs::get_tinylfu_sketch_entries_per_mb.unset(r);
     cs::set_tinylfu_sketch_entries_per_mb.unset(r);
     cs::tinylfu_sketch_resize.unset(r);
+    cs::get_tinylfu_initial_window_percent.unset(r);
+    cs::set_tinylfu_initial_window_percent.unset(r);
+    cs::get_tinylfu_hill_climbing_enabled.unset(r);
+    cs::set_tinylfu_hill_climbing_enabled.unset(r);
 }
 
 }

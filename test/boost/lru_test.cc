@@ -448,3 +448,71 @@ BOOST_AUTO_TEST_CASE(test_count_min_sketch_many_keys) {
     // With 65536 counters and 10000 keys, most should be collision-free.
     BOOST_REQUIRE_GT(exact_count, 8000);
 }
+
+BOOST_AUTO_TEST_CASE(test_lru_set_window_percent) {
+    lru l;
+    // Default is 1%.
+    BOOST_REQUIRE_EQUAL(l.window_percent(), 1u);
+
+    // Set to 50% (LRU-like).
+    l.set_window_percent(50.0);
+    BOOST_REQUIRE_EQUAL(l.window_percent(), 50u);
+
+    // Clamped to [1, 99].
+    l.set_window_percent(0.0);
+    BOOST_REQUIRE_EQUAL(l.window_percent(), 1u);
+    l.set_window_percent(100.0);
+    BOOST_REQUIRE_EQUAL(l.window_percent(), 99u);
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_hill_climbing_disabled) {
+    lru l;
+    BOOST_REQUIRE(l.hill_climbing_enabled());
+
+    l.set_hill_climbing_enabled(false);
+    BOOST_REQUIRE(!l.hill_climbing_enabled());
+
+    // With hill climbing disabled, climb() should be a no-op (no crash).
+    static constexpr int N = 50;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        entries[i]->set_sketch_key(5000 + i);
+        l.add(*entries[i]);
+    }
+
+    for (int i = 0; i < 100; ++i) {
+        l.touch(*entries[i % N]);
+    }
+    l.climb();
+
+    // Window max should remain at default (percentage-based), not adjusted.
+    // With 50 entries and 1% window, max_window = max(1, 50*1/100) = 1.
+    BOOST_REQUIRE_EQUAL(l.current_max_window_size(), std::max(size_t(1), size_t(N) * l.window_percent() / 100));
+
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_large_window_behaves_like_lru) {
+    lru l;
+    l.set_window_percent(99.0);
+    l.set_hill_climbing_enabled(false);
+
+    // With 99% window, almost all entries stay in window (pure LRU behavior).
+    static constexpr int N = 20;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        l.add(*entries[i]);
+    }
+
+    // In a large window, the oldest entry should be evicted first (LRU order).
+    l.evict();
+    BOOST_REQUIRE(entries[0]->was_evicted);
+
+    for (int i = 1; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}

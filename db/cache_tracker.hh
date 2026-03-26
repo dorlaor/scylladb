@@ -90,7 +90,11 @@ private:
     mutation_application_stats& _app_stats;
     utils::updateable_value<double> _index_cache_fraction;
     utils::updateable_value<double> _tinylfu_sketch_entries_per_mb;
+    utils::updateable_value<double> _tinylfu_initial_window_percent;
+    utils::updateable_value<bool> _tinylfu_hill_climbing_enabled;
     utils::observer<double> _sketch_ratio_observer;
+    utils::observer<double> _window_percent_observer;
+    utils::observer<bool> _hill_climbing_observer;
 private:
     void setup_metrics();
 public:
@@ -99,9 +103,13 @@ public:
     cache_tracker(utils::updateable_value<double> index_cache_fraction, register_metrics);
     cache_tracker(utils::updateable_value<double> index_cache_fraction,
                   utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                  utils::updateable_value<double> tinylfu_initial_window_percent,
+                  utils::updateable_value<bool> tinylfu_hill_climbing_enabled,
                   mutation_application_stats&, register_metrics);
     cache_tracker(utils::updateable_value<double> index_cache_fraction,
                   utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                  utils::updateable_value<double> tinylfu_initial_window_percent,
+                  utils::updateable_value<bool> tinylfu_hill_climbing_enabled,
                   register_metrics);
     cache_tracker();
     ~cache_tracker();

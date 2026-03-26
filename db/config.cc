@@ -1530,6 +1530,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "The default value of 1024 assumes an average partition size of ~1 KB. "
         "Increase for smaller partitions (more entries per MB), decrease for larger ones. "
         "Valid range: [64, 1048576]. The sketch width is clamped to [2^10, 2^24] counters per row.")
+    , tinylfu_initial_window_percent(this, "tinylfu_initial_window_percent", liveness::LiveUpdate, value_status::Used, 1.0,
+        "Initial W-TinyLFU window segment size as a percentage of total cache entries. "
+        "A value of 1 (the default) favours frequency-based eviction; higher values (e.g. 99) "
+        "make the cache behave more like a pure LRU. Valid range: [1, 99].")
+    , tinylfu_hill_climbing_enabled(this, "tinylfu_hill_climbing_enabled", liveness::LiveUpdate, value_status::Used, true,
+        "Enable the W-TinyLFU hill-climbing algorithm that adaptively adjusts the window/protected "
+        "segment ratio based on observed hit rates. When disabled, the window size stays at the "
+        "initial percentage set by tinylfu_initial_window_percent.")
     , consistent_cluster_management(this, "consistent_cluster_management", value_status::Deprecated, true, "Use RAFT for cluster management and DDL.")
     , force_gossip_topology_changes(this, "force_gossip_topology_changes", value_status::Deprecated, false, "Force gossip-based topology operations in a fresh cluster. Only the first node in the cluster must use it. The rest will fall back to gossip-based operations anyway. This option should be used only for testing.  Note: gossip topology changes are incompatible with tablets.")
     , recovery_leader(this, "recovery_leader", liveness::LiveUpdate, value_status::Used, utils::null_uuid(), "Host ID of the node restarted first while performing the Manual Raft-based Recovery Procedure. Warning: this option disables some guardrails for the needs of the Manual Raft-based Recovery Procedure. Make sure you unset it at the end of the procedure.")

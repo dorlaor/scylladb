@@ -438,6 +438,8 @@ database::database(const db::config& cfg, database_config dbcfg, service::migrat
     , _row_cache_tracker(
             _cfg.index_cache_fraction.operator utils::updateable_value<double>(),
             _cfg.tinylfu_sketch_entries_per_mb.operator utils::updateable_value<double>(),
+            _cfg.tinylfu_initial_window_percent.operator utils::updateable_value<double>(),
+            _cfg.tinylfu_hill_climbing_enabled.operator utils::updateable_value<bool>(),
             cache_tracker::register_metrics::yes)
     , _apply_stage("db_apply", &database::do_apply)
     , _version(empty_version)

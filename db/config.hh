@@ -513,6 +513,8 @@ public:
     named_value<bool> cache_index_pages;
     named_value<double> index_cache_fraction;
     named_value<double> tinylfu_sketch_entries_per_mb;
+    named_value<double> tinylfu_initial_window_percent;
+    named_value<bool> tinylfu_hill_climbing_enabled;
 
     named_value<bool> consistent_cluster_management;
     named_value<bool> force_gossip_topology_changes;
