@@ -86,6 +86,11 @@ public:
     void set_sketch_key(uint64_t key) noexcept {
         _sketch_key = key;
     }
+
+    // Returns the stable sketch key, or 0 if none was set.
+    uint64_t sketch_key() const noexcept {
+        return _sketch_key;
+    }
 };
 
 // Sstable index cache shares memory with the data cache.
