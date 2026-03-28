@@ -512,3 +512,76 @@ BOOST_AUTO_TEST_CASE(test_lru_large_window_behaves_like_lru) {
         if (entries[i]->is_linked()) l.remove(*entries[i]);
     }
 }
+
+// Rows within the same partition track independent frequencies via their
+// distinct pointer addresses, enabling row-granularity eviction decisions.
+BOOST_AUTO_TEST_CASE(test_rows_in_same_partition_have_independent_frequency) {
+    lru l;
+    // Simulate two rows belonging to the same partition.
+    auto row_hot  = std::make_unique<test_evictable>(0);
+    auto row_cold = std::make_unique<test_evictable>(1);
+    l.add(*row_hot);
+    l.add(*row_cold);
+
+    // Access row_hot many times, row_cold only once (via add).
+    for (int i = 0; i < 20; ++i) {
+        l.touch(*row_hot);
+    }
+
+    auto key_hot  = reinterpret_cast<uint64_t>(row_hot.get());
+    auto key_cold = reinterpret_cast<uint64_t>(row_cold.get());
+
+    // The hot row should have a much higher frequency estimate than the cold row.
+    BOOST_REQUIRE_GE(l.sketch_estimate(key_hot), 10);
+    BOOST_REQUIRE_LE(l.sketch_estimate(key_cold), 2);
+
+    l.remove(*row_hot);
+    l.remove(*row_cold);
+}
+
+// Under eviction pressure, a cold row from a hot partition is evicted before
+// a warm row, demonstrating row-level (not partition-level) eviction.
+BOOST_AUTO_TEST_CASE(test_cold_row_evicted_before_warm_row_in_same_partition) {
+    lru l;
+    // Fill cache: one "hot" row, one "cold" row (same partition), plus filler.
+    static constexpr int FILLER = 20;
+    auto row_hot  = std::make_unique<test_evictable>(100);
+    auto row_cold = std::make_unique<test_evictable>(101);
+
+    // Add filler first so they age into probation.
+    std::unique_ptr<test_evictable> filler[FILLER];
+    for (int i = 0; i < FILLER; ++i) {
+        filler[i] = std::make_unique<test_evictable>(i);
+        l.add(*filler[i]);
+    }
+
+    l.add(*row_cold);
+    l.add(*row_hot);
+
+    // Build frequency for row_hot but not row_cold.
+    for (int i = 0; i < 30; ++i) {
+        l.touch(*row_hot);
+    }
+
+    // Evict repeatedly until one of our rows is evicted.
+    bool cold_evicted_first = false;
+    for (int round = 0; round < FILLER + 5; ++round) {
+        l.evict();
+        if (row_cold->was_evicted && !row_hot->was_evicted) {
+            cold_evicted_first = true;
+            break;
+        }
+        if (row_hot->was_evicted) {
+            break;
+        }
+    }
+
+    BOOST_REQUIRE_MESSAGE(cold_evicted_first,
+        "Cold row from the same partition should be evicted before hot row");
+
+    if (row_hot->is_linked()) l.remove(*row_hot);
+    if (row_cold->is_linked()) l.remove(*row_cold);
+    for (int i = 0; i < FILLER; ++i) {
+        if (filler[i]->is_linked()) l.remove(*filler[i]);
+    }
+}
