@@ -89,12 +89,28 @@ private:
     mutation_cleaner _memtable_cleaner;
     mutation_application_stats& _app_stats;
     utils::updateable_value<double> _index_cache_fraction;
+    utils::updateable_value<double> _tinylfu_sketch_entries_per_mb;
+    utils::updateable_value<double> _tinylfu_initial_window_percent;
+    utils::updateable_value<bool> _tinylfu_hill_climbing_enabled;
+    utils::observer<double> _sketch_ratio_observer;
+    utils::observer<double> _window_percent_observer;
+    utils::observer<bool> _hill_climbing_observer;
 private:
     void setup_metrics();
 public:
     using register_metrics = bool_class<class register_metrics_tag>;
     cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats&, register_metrics);
     cache_tracker(utils::updateable_value<double> index_cache_fraction, register_metrics);
+    cache_tracker(utils::updateable_value<double> index_cache_fraction,
+                  utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                  utils::updateable_value<double> tinylfu_initial_window_percent,
+                  utils::updateable_value<bool> tinylfu_hill_climbing_enabled,
+                  mutation_application_stats&, register_metrics);
+    cache_tracker(utils::updateable_value<double> index_cache_fraction,
+                  utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
+                  utils::updateable_value<double> tinylfu_initial_window_percent,
+                  utils::updateable_value<bool> tinylfu_hill_climbing_enabled,
+                  register_metrics);
     cache_tracker();
     ~cache_tracker();
     void clear();
@@ -140,6 +156,15 @@ public:
     cached_file_stats& get_index_cached_file_stats() { return _index_cached_file_stats; }
     partition_index_cache_stats& get_partition_index_cache_stats() { return _partition_index_cache_stats; }
     seastar::memory::reclaiming_result evict_from_lru_shallow() noexcept;
+
+    /// Resize the W-TinyLFU Count-Min Sketch based on the current cache region
+    /// size and the configured tinylfu_sketch_entries_per_mb ratio.
+    /// Safe to call at any time; called automatically when the config changes.
+    void resize_sketch() noexcept;
+
+    /// Fully reset the W-TinyLFU sketch (zero all counters).
+    /// Called by clear() to ensure a clean slate after full cache eviction.
+    void reset_sketch() noexcept;
 };
 
 inline
