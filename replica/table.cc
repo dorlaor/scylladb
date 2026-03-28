@@ -1975,7 +1975,11 @@ void table::set_metrics() {
                     ms::make_histogram("cas_prepare_latency", ms::description("CAS prepare round latency histogram"), [this] {return to_metrics_histogram(_stats.cas_prepare.histogram());})(cf)(ks).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
                     ms::make_histogram("cas_propose_latency", ms::description("CAS accept round latency histogram"), [this] {return to_metrics_histogram(_stats.cas_accept.histogram());})(cf)(ks).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
                     ms::make_histogram("cas_commit_latency", ms::description("CAS learn round latency histogram"), [this] {return to_metrics_histogram(_stats.cas_learn.histogram());})(cf)(ks).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
-                    ms::make_gauge("cache_hit_rate", ms::description("Cache hit rate"), [this] {return float(_global_cache_hit_rate);})(cf)(ks)
+                    ms::make_gauge("cache_hit_rate", ms::description("Cache hit rate"), [this] {return float(_global_cache_hit_rate);})(cf)(ks),
+                    ms::make_counter("cache_row_hits", ms::description("Total row cache hits"), [this] { return _cache.stats().row_hits; })(cf)(ks).set_skip_when_empty(),
+                    ms::make_counter("cache_row_misses", ms::description("Total row cache misses"), [this] { return _cache.stats().row_misses; })(cf)(ks).set_skip_when_empty(),
+                    ms::make_counter("cache_partition_hits", ms::description("Total partition cache hits"), [this] { return _cache.stats().partition_hits; })(cf)(ks).set_skip_when_empty(),
+                    ms::make_counter("cache_partition_misses", ms::description("Total partition cache misses"), [this] { return _cache.stats().partition_misses; })(cf)(ks).set_skip_when_empty()
             });
         }
     } else {
@@ -1992,6 +1996,12 @@ void table::set_metrics() {
                 ms::make_gauge("live_disk_space", ms::description("Live disk space used"), _stats.live_disk_space_used.on_disk)(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}),
                 ms::make_histogram("read_latency", ms::description("Read latency histogram"), [this] {return to_metrics_histogram(_stats.reads.histogram());})(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
                 ms::make_histogram("write_latency", ms::description("Write latency histogram"), [this] {return to_metrics_histogram(_stats.writes.histogram());})(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty()
+            });
+            _metrics.add_group("column_family", {
+                ms::make_counter("cache_row_hits", ms::description("Total row cache hits"), [this] { return _cache.stats().row_hits; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+                ms::make_counter("cache_row_misses", ms::description("Total row cache misses"), [this] { return _cache.stats().row_misses; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+                ms::make_counter("cache_partition_hits", ms::description("Total partition cache hits"), [this] { return _cache.stats().partition_hits; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+                ms::make_counter("cache_partition_misses", ms::description("Total partition cache misses"), [this] { return _cache.stats().partition_misses; })(cf)(ks)(node_table_metrics).aggregate({seastar::metrics::shard_label}).set_skip_when_empty()
             });
             if (uses_tablets()) {
                 _metrics.add_group("column_family", {

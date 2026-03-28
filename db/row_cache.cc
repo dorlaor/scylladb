@@ -546,14 +546,17 @@ void cache_tracker::clear_continuity(cache_entry& ce) noexcept {
 }
 
 void row_cache::on_partition_hit() {
+    ++_stats.partition_hits;
     _tracker.on_partition_hit();
 }
 
 void row_cache::on_partition_miss() {
+    ++_stats.partition_misses;
     _tracker.on_partition_miss();
 }
 
 void row_cache::on_row_hit() {
+    ++_stats.row_hits;
     _stats.hits.mark();
     _tracker.on_row_hit();
 }
@@ -563,6 +566,7 @@ void row_cache::on_mispopulate() {
 }
 
 void row_cache::on_row_miss() {
+    ++_stats.row_misses;
     _stats.misses.mark();
     _tracker.on_row_miss();
 }
