@@ -204,6 +204,9 @@ void cache_tracker::clear() {
         _memtable_cleaner.clear();
         current_tracker = this;
         _lru.evict_all();
+        // Reset the frequency sketch so stale history doesn't bias admission
+        // decisions after a full cache clear (e.g. truncate, schema change).
+        _lru.reset_sketch();
         // Eviction could have produced garbage.
         _garbage.clear();
         _memtable_cleaner.clear();
@@ -214,11 +217,7 @@ void cache_tracker::clear() {
 }
 
 void cache_tracker::touch(rows_entry& e) {
-    // last dummy may not be linked if evicted
-    if (e.is_linked()) {
-        _lru.remove(e);
-    }
-    _lru.add(e);
+    _lru.touch(e);
 }
 
 void cache_tracker::insert(cache_entry& entry) {

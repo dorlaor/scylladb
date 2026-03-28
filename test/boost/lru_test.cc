@@ -148,3 +148,242 @@ BOOST_AUTO_TEST_CASE(test_count_min_sketch_many_keys) {
     // With 65536 counters and 10000 keys, most should be collision-free.
     BOOST_REQUIRE_GT(exact_count, 8000);
 }
+
+// ---------------------------------------------------------------------------
+// W-TinyLFU LRU Tests
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(test_lru_add_and_evict) {
+    lru l;
+    test_evictable e1(1), e2(2), e3(3);
+
+    l.add(e1);
+    l.add(e2);
+    l.add(e3);
+
+    BOOST_REQUIRE(e1.is_linked());
+    BOOST_REQUIRE(e2.is_linked());
+    BOOST_REQUIRE(e3.is_linked());
+
+    // Evict removes at least one entry.
+    auto r = l.evict();
+    BOOST_REQUIRE(r == seastar::memory::reclaiming_result::reclaimed_something);
+
+    // At least one entry should have been evicted.
+    int evicted_count = (e1.was_evicted ? 1 : 0) + (e2.was_evicted ? 1 : 0) + (e3.was_evicted ? 1 : 0);
+    BOOST_REQUIRE_GE(evicted_count, 1);
+
+    // Clean up remaining linked entries.
+    if (e1.is_linked()) l.remove(e1);
+    if (e2.is_linked()) l.remove(e2);
+    if (e3.is_linked()) l.remove(e3);
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_evict_empty) {
+    lru l;
+    auto r = l.evict();
+    BOOST_REQUIRE(r == seastar::memory::reclaiming_result::reclaimed_nothing);
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_touch_keeps_entry_alive) {
+    lru l;
+
+    // Create entries with different access patterns.
+    test_evictable hot(1), cold1(2), cold2(3);
+
+    l.add(hot);
+    l.add(cold1);
+    l.add(cold2);
+
+    // Touch 'hot' many times to build frequency.
+    for (int i = 0; i < 10; ++i) {
+        l.touch(hot);
+    }
+
+    // Evict all - the hot entry may survive longer than cold entries.
+    l.evict();
+    l.evict();
+
+    // Hot entry should still be linked (survived eviction of cold entries).
+    BOOST_REQUIRE(hot.is_linked());
+
+    // Clean up.
+    l.remove(hot);
+    // cold entries may or may not still be linked, clean up if needed.
+    if (cold1.is_linked()) l.remove(cold1);
+    if (cold2.is_linked()) l.remove(cold2);
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_evict_all) {
+    lru l;
+    test_evictable e1(1), e2(2), e3(3);
+
+    l.add(e1);
+    l.add(e2);
+    l.add(e3);
+
+    l.evict_all();
+
+    BOOST_REQUIRE(!e1.is_linked());
+    BOOST_REQUIRE(!e2.is_linked());
+    BOOST_REQUIRE(!e3.is_linked());
+    BOOST_REQUIRE(e1.was_evicted);
+    BOOST_REQUIRE(e2.was_evicted);
+    BOOST_REQUIRE(e3.was_evicted);
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_remove) {
+    lru l;
+    test_evictable e1(1), e2(2), e3(3);
+
+    l.add(e1);
+    l.add(e2);
+    l.add(e3);
+
+    l.remove(e2);
+    BOOST_REQUIRE(!e2.is_linked());
+    BOOST_REQUIRE(!e2.was_evicted); // remove does not call on_evicted
+
+    l.evict_all();
+    BOOST_REQUIRE(e1.was_evicted);
+    BOOST_REQUIRE(e3.was_evicted);
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_add_before) {
+    lru l;
+    test_evictable e1(1), e2(2), e3(3);
+
+    l.add(e1);
+    l.add(e2);
+
+    // Insert e3 before e2 so e3 is evicted before e2.
+    l.add_before(e2, e3);
+
+    BOOST_REQUIRE(e1.is_linked());
+    BOOST_REQUIRE(e2.is_linked());
+    BOOST_REQUIRE(e3.is_linked());
+
+    // Clean up.
+    l.evict_all();
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_frequency_based_eviction) {
+    lru l;
+
+    // Create entries with different access patterns.
+    // Use a fixed-size array to avoid move construction issues.
+    static constexpr int N = 20;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+    }
+
+    for (int i = 0; i < N; ++i) {
+        l.add(*entries[i]);
+    }
+
+    // Touch entries 15-19 many times (they should be "hot").
+    for (int round = 0; round < 10; ++round) {
+        for (int i = 15; i < N; ++i) {
+            l.touch(*entries[i]);
+        }
+    }
+
+    // Evict half the entries.
+    for (int i = 0; i < 10; ++i) {
+        l.evict();
+    }
+
+    // Hot entries (15-19) should still be linked.
+    for (int i = 15; i < N; ++i) {
+        BOOST_REQUIRE_MESSAGE(entries[i]->is_linked(),
+            "Hot entry " << i << " should survive eviction");
+    }
+
+    // Clean up remaining entries.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) {
+            l.remove(*entries[i]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Caffeine-parity tests
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(test_aging_reset_uses_entry_count) {
+    // The sketch reset threshold should be based on cache entry count,
+    // not sketch width.  With 5 entries the threshold is max(1000, 50) = 1000.
+    // After enough touches we expect at least one reset (halving), so a
+    // previously-saturated counter (15) should decay.
+    lru l;
+    static constexpr int N = 5;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+
+        l.add(*entries[i]);
+    }
+
+    // Saturate entry 0's counter to 15.
+    for (int i = 0; i < 20; ++i) {
+        l.touch(*entries[0]);
+    }
+    auto key0 = reinterpret_cast<uint64_t>(entries[0].get());
+    BOOST_REQUIRE_EQUAL(l.sketch_estimate(key0), 15);
+
+    // Generate 1100 touches on entry 1 to trigger at least one reset.
+    for (int i = 0; i < 1100; ++i) {
+        l.touch(*entries[1]);
+    }
+    // After at least one halving, 15 should have decayed.
+    BOOST_REQUIRE_LE(l.sketch_estimate(key0), 7);
+
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_touch_promotes_from_probation) {
+    lru l;
+
+    // Create entries.
+    static constexpr int N = 10;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+    }
+    for (int i = 0; i < N; ++i) {
+        l.add(*entries[i]);
+    }
+
+    // Evict and re-add some to force entries into probation via the eviction logic.
+    // The eviction drains excess from window to probation.
+    // After enough evictions, remaining entries should be in probation or protected.
+
+    // Touch entries 0-4 multiple times to build frequency.
+    for (int round = 0; round < 5; ++round) {
+        for (int i = 0; i < 5; ++i) {
+            l.touch(*entries[i]);
+        }
+    }
+
+    // Evict 5 entries - cold entries (5-9) should be evicted.
+    for (int i = 0; i < 5; ++i) {
+        l.evict();
+    }
+
+    // Entries 0-4 (frequently touched) should survive.
+    for (int i = 0; i < 5; ++i) {
+        BOOST_REQUIRE_MESSAGE(entries[i]->is_linked(),
+            "Frequently touched entry " << i << " should survive eviction");
+    }
+
+    // Clean up.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) {
+            l.remove(*entries[i]);
+        }
+    }
+}
