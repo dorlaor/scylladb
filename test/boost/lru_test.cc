@@ -32,6 +32,13 @@ struct test_evictable final: public evictable {
     }
 };
 
+static uint64_t next_test_key = 1;
+
+// Helper: set a unique sketch key per entry, mimicking logical key hashing.
+void assign_unique_sketch_key(test_evictable& e) {
+    e.set_sketch_key(next_test_key++);
+}
+
 // ---------------------------------------------------------------------------
 // Count-Min Sketch Tests
 // ---------------------------------------------------------------------------
@@ -156,6 +163,9 @@ BOOST_AUTO_TEST_CASE(test_count_min_sketch_many_keys) {
 BOOST_AUTO_TEST_CASE(test_lru_add_and_evict) {
     lru l;
     test_evictable e1(1), e2(2), e3(3);
+    assign_unique_sketch_key(e1);
+    assign_unique_sketch_key(e2);
+    assign_unique_sketch_key(e3);
 
     l.add(e1);
     l.add(e2);
@@ -190,6 +200,9 @@ BOOST_AUTO_TEST_CASE(test_lru_touch_keeps_entry_alive) {
 
     // Create entries with different access patterns.
     test_evictable hot(1), cold1(2), cold2(3);
+    assign_unique_sketch_key(hot);
+    assign_unique_sketch_key(cold1);
+    assign_unique_sketch_key(cold2);
 
     l.add(hot);
     l.add(cold1);
@@ -217,6 +230,9 @@ BOOST_AUTO_TEST_CASE(test_lru_touch_keeps_entry_alive) {
 BOOST_AUTO_TEST_CASE(test_lru_evict_all) {
     lru l;
     test_evictable e1(1), e2(2), e3(3);
+    assign_unique_sketch_key(e1);
+    assign_unique_sketch_key(e2);
+    assign_unique_sketch_key(e3);
 
     l.add(e1);
     l.add(e2);
@@ -235,6 +251,9 @@ BOOST_AUTO_TEST_CASE(test_lru_evict_all) {
 BOOST_AUTO_TEST_CASE(test_lru_remove) {
     lru l;
     test_evictable e1(1), e2(2), e3(3);
+    assign_unique_sketch_key(e1);
+    assign_unique_sketch_key(e2);
+    assign_unique_sketch_key(e3);
 
     l.add(e1);
     l.add(e2);
@@ -252,6 +271,9 @@ BOOST_AUTO_TEST_CASE(test_lru_remove) {
 BOOST_AUTO_TEST_CASE(test_lru_add_before) {
     lru l;
     test_evictable e1(1), e2(2), e3(3);
+    assign_unique_sketch_key(e1);
+    assign_unique_sketch_key(e2);
+    assign_unique_sketch_key(e3);
 
     l.add(e1);
     l.add(e2);
@@ -276,6 +298,7 @@ BOOST_AUTO_TEST_CASE(test_lru_frequency_based_eviction) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
     }
 
     for (int i = 0; i < N; ++i) {
@@ -322,7 +345,7 @@ BOOST_AUTO_TEST_CASE(test_aging_reset_uses_entry_count) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
-
+        assign_unique_sketch_key(*entries[i]);
         l.add(*entries[i]);
     }
 
@@ -330,7 +353,7 @@ BOOST_AUTO_TEST_CASE(test_aging_reset_uses_entry_count) {
     for (int i = 0; i < 20; ++i) {
         l.touch(*entries[0]);
     }
-    auto key0 = reinterpret_cast<uint64_t>(entries[0].get());
+    auto key0 = entries[0]->sketch_key();
     BOOST_REQUIRE_EQUAL(l.sketch_estimate(key0), 15);
 
     // Generate 1100 touches on entry 1 to trigger at least one reset.
@@ -353,6 +376,7 @@ BOOST_AUTO_TEST_CASE(test_lru_touch_promotes_from_probation) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
     }
     for (int i = 0; i < N; ++i) {
         l.add(*entries[i]);
@@ -394,6 +418,7 @@ BOOST_AUTO_TEST_CASE(test_hill_climbing_tracks_hits_and_misses) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
         l.add(*entries[i]);  // each add is a miss
     }
 
@@ -417,6 +442,7 @@ BOOST_AUTO_TEST_CASE(test_hill_climbing_adjusts_window_size) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
         l.add(*entries[i]);
     }
 
@@ -474,6 +500,7 @@ BOOST_AUTO_TEST_CASE(test_lru_hill_climbing_disabled) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
         l.add(*entries[i]);
     }
 
@@ -501,6 +528,7 @@ BOOST_AUTO_TEST_CASE(test_lru_large_window_behaves_like_lru) {
     std::unique_ptr<test_evictable> entries[N];
     for (int i = 0; i < N; ++i) {
         entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
         l.add(*entries[i]);
     }
 
@@ -520,6 +548,8 @@ BOOST_AUTO_TEST_CASE(test_rows_in_same_partition_have_independent_frequency) {
     // Simulate two rows belonging to the same partition.
     auto row_hot  = std::make_unique<test_evictable>(0);
     auto row_cold = std::make_unique<test_evictable>(1);
+    assign_unique_sketch_key(*row_hot);
+    assign_unique_sketch_key(*row_cold);
     l.add(*row_hot);
     l.add(*row_cold);
 
@@ -528,8 +558,8 @@ BOOST_AUTO_TEST_CASE(test_rows_in_same_partition_have_independent_frequency) {
         l.touch(*row_hot);
     }
 
-    auto key_hot  = reinterpret_cast<uint64_t>(row_hot.get());
-    auto key_cold = reinterpret_cast<uint64_t>(row_cold.get());
+    auto key_hot  = row_hot->sketch_key();
+    auto key_cold = row_cold->sketch_key();
 
     // The hot row should have a much higher frequency estimate than the cold row.
     BOOST_REQUIRE_GE(l.sketch_estimate(key_hot), 10);
@@ -547,11 +577,14 @@ BOOST_AUTO_TEST_CASE(test_cold_row_evicted_before_warm_row_in_same_partition) {
     static constexpr int FILLER = 20;
     auto row_hot  = std::make_unique<test_evictable>(100);
     auto row_cold = std::make_unique<test_evictable>(101);
+    assign_unique_sketch_key(*row_hot);
+    assign_unique_sketch_key(*row_cold);
 
     // Add filler first so they age into probation.
     std::unique_ptr<test_evictable> filler[FILLER];
     for (int i = 0; i < FILLER; ++i) {
         filler[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*filler[i]);
         l.add(*filler[i]);
     }
 
@@ -583,5 +616,38 @@ BOOST_AUTO_TEST_CASE(test_cold_row_evicted_before_warm_row_in_same_partition) {
     if (row_cold->is_linked()) l.remove(*row_cold);
     for (int i = 0; i < FILLER; ++i) {
         if (filler[i]->is_linked()) l.remove(*filler[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_sketch_key_used_for_frequency) {
+    // Two evictables with different sketch keys should track frequency independently.
+    // Two evictables with the SAME sketch key should share frequency.
+    lru l;
+    auto e1 = std::make_unique<test_evictable>(1);
+    auto e2 = std::make_unique<test_evictable>(2);
+    auto e3 = std::make_unique<test_evictable>(3);
+
+    // e1 and e3 share a logical key (simulates eviction + reinsertion of same row)
+    e1->set_sketch_key(0xCAFE0001);
+    e2->set_sketch_key(0xCAFE0002);
+    e3->set_sketch_key(0xCAFE0001); // same as e1
+
+    l.add(*e1);
+    l.add(*e2);
+
+    // Touch e1 many times to build frequency
+    for (int i = 0; i < 10; ++i) {
+        l.touch(*e1);
+    }
+
+    // e3 (same sketch key) should see the accumulated frequency
+    BOOST_REQUIRE_GE(l.sketch_estimate(0xCAFE0001), 5);
+    // e2 (different key) should have low frequency
+    BOOST_REQUIRE_LE(l.sketch_estimate(0xCAFE0002), 3);
+
+    // Clean up
+    l.add(*e3);
+    for (auto* e : {e1.get(), e2.get(), e3.get()}) {
+        if (e->is_linked()) l.remove(*e);
     }
 }

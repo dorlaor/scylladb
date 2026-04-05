@@ -44,6 +44,7 @@ protected:
 private:
     lru_link_type _lru_link;
     lru_segment _segment = lru_segment::none;
+    uint64_t _sketch_key = 0;
 protected:
     // Prevent destruction via evictable pointer. LRU is not aware of allocation strategy.
     // Prevent destruction of a linked evictable. While we could unlink the evictable here
@@ -67,11 +68,15 @@ public:
     void swap(evictable& o) noexcept {
         _lru_link.swap_nodes(o._lru_link);
         std::swap(_segment, o._segment);
+        std::swap(_sketch_key, o._sketch_key);
     }
 
     virtual bool is_index() const noexcept {
         return false;
     }
+
+    void set_sketch_key(uint64_t key) noexcept { _sketch_key = key; }
+    uint64_t sketch_key() const noexcept { return _sketch_key; }
 };
 
 // Sstable index cache shares memory with the data cache.
@@ -181,7 +186,10 @@ private:
     }
 
     static uint64_t entry_key(const evictable& e) noexcept {
-        return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
+        // Fall back to address if no sketch key set yet (safe standalone
+        // until callers are updated to set logical keys).
+        return e._sketch_key ? e._sketch_key
+                             : static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&e));
     }
 
     // xorshift32 — fast, no extra includes, sufficient for jitter.
