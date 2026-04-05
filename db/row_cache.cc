@@ -271,6 +271,12 @@ void cache_tracker::touch(rows_entry& e) {
 }
 
 void cache_tracker::insert(cache_entry& entry) {
+    uint64_t skey = compute_sketch_key(entry.key().token());
+    for (partition_version& pv : entry.partition().versions_from_oldest()) {
+        for (rows_entry& row : pv.partition().clustered_rows()) {
+            row.set_sketch_key(skey);
+        }
+    }
     insert(entry.partition());
     ++_stats.partition_insertions;
     ++_stats.partitions;

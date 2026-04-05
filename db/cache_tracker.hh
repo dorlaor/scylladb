@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "dht/token.hh"
 #include "utils/lru.hh"
 #include "utils/logalloc.hh"
 #include "utils/updateable_value.hh"
@@ -167,6 +168,21 @@ public:
     void reset_sketch() noexcept;
 };
 
+// Compute a stable sketch key from a partition token.
+// All rows in the same partition share this key — partition-level
+// frequency tracking is sufficient because the SLRU handles
+// intra-partition row-level eviction ordering.
+inline uint64_t compute_sketch_key(const dht::token& tok) noexcept {
+    // splitmix64 mixing for good distribution.
+    uint64_t h = static_cast<uint64_t>(tok.raw());
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
+    return h ? h : 1; // avoid 0 which triggers address fallback
+}
+
 inline
 void cache_tracker::remove(rows_entry& entry) noexcept {
     --_stats.rows;
@@ -187,6 +203,7 @@ inline
 void cache_tracker::insert(rows_entry& more_recent, rows_entry& entry) noexcept {
     ++_stats.row_insertions;
     ++_stats.rows;
+    entry.set_sketch_key(more_recent.sketch_key());
     _lru.add_before(more_recent, entry);
 }
 
