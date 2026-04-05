@@ -374,18 +374,15 @@ private:
         }
 
         size_t cur_window = max_window_size();
-        size_t cur_protected = max_protected_size();
 
         if (adjustment > 0) {
-            // Increase window, decrease protected.
-            size_t increase = std::min(static_cast<size_t>(adjustment), cur_protected - 1);
-            _max_window_override = cur_window + increase;
-            _max_protected_override = cur_protected - increase;
+            // Increase window. Probation absorbs the loss.
+            // Protected stays at its percentage-based default.
+            _max_window_override = cur_window + static_cast<size_t>(adjustment);
         } else {
-            // Decrease window, increase protected.
+            // Decrease window. Probation gains the freed space.
             size_t decrease = std::min(static_cast<size_t>(-adjustment), cur_window - 1);
             _max_window_override = cur_window - decrease;
-            _max_protected_override = cur_protected + decrease;
         }
     }
 
