@@ -414,7 +414,13 @@ private:
 
         rebalance_protected();
 
-        // Drain excess from window using TinyLFU admission.
+        // Drain ALL excess from window using TinyLFU admission.
+        // This must run to completion (not return after one eviction) so
+        // the window converges to its target.  Insertions via add() grow
+        // the window without triggering eviction; LSA calls evict() later.
+        // If we only drained one entry per call the window would never
+        // catch up with the insertion rate.
+        bool drained_any = false;
         while (_window_size > max_window_size() && !_window.empty()) {
             evictable& w_victim = _window.front();
 
@@ -460,13 +466,18 @@ private:
                         w_victim.on_evicted_shallow();
                     }
                 }
-                return reclaiming_result::reclaimed_something;
+                drained_any = true;
+                continue; // keep draining until window reaches target
             }
 
             // Probation is empty: move window victim to probation and retry.
             ++_stats.window_to_probation;
             remove_from_segment(w_victim);
             add_to_segment(w_victim, lru_segment::probation);
+        }
+
+        if (drained_any) {
+            return reclaiming_result::reclaimed_something;
         }
 
         // Window is within target. Evict from probation, then window, then protected.
