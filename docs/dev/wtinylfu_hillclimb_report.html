@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html><head><meta charset="UTF-8">
+<title>W-TinyLFU Hill Climbing Report (w2, hill_climbing=true)</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #0f1117; color: #e2e4eb; max-width: 1200px; margin: 0 auto; padding: 2rem; }
+  h1 { color: #fff; } h2 { color: #6c8aff; border-bottom: 1px solid #2e3346; padding-bottom: 0.5rem; margin-top: 2rem; }
+  .chart { margin: 1rem 0; }
+  .summary { background: #1a1d27; border: 1px solid #3d5199; border-radius: 8px; padding: 1.2rem; margin: 1.5rem 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th { background: #242836; padding: 0.5rem; text-align: left; color: #6c8aff; border-bottom: 2px solid #2e3346; }
+  td { padding: 0.5rem; border-bottom: 1px solid #2e3346; }
+  .finding { background: #3a1c20; border-left: 4px solid #ff5e6c; padding: 1rem; border-radius: 0 8px 8px 0; margin: 1rem 0; }
+  .finding-title { color: #ff5e6c; font-weight: 700; margin-bottom: 0.5rem; }
+</style></head><body>
+<h1>W-TinyLFU Hill Climbing Report</h1>
+<p style="color:#9499ad">Config: 2% initial window, hill_climbing=true | Duration: 271s | 10 samples</p>
+
+<div class="summary">
+<strong>Key Finding:</strong> The hill climber oscillates between two extremes every ~30s, never converging:
+<ul>
+<li>State A: max_window=722, max_protected=1 (window-dominant)</li>
+<li>State B: max_window=1, max_protected=722 (protected-dominant)</li>
+</ul>
+This happens because the climber adjusts window and protected in opposite directions, but can't measure
+which state produces better hit rates in the 30s sample window. The oscillation prevents the SLRU from
+functioning: protected swings between 5 and 1162 entries, never stabilizing.
+</div>
+
+<h2>Segment Sizes Over Time</h2>
+<div id="seg_sizes" class="chart"></div>
+
+<h2>Hill Climber Targets (max_window / max_protected)</h2>
+<div id="targets" class="chart"></div>
+
+<h2>Average Sketch Frequency by Segment</h2>
+<div id="freq" class="chart"></div>
+
+<h2>Cumulative Admission/Rejection/Direct Eviction</h2>
+<div id="counters" class="chart"></div>
+
+<h2>Raw Data</h2>
+<table>
+<tr><th>Time (s)</th><th>Window</th><th>Probation</th><th>Protected</th><th>Max Win</th><th>Max Prot</th><th>Admissions</th><th>Rejections</th><th>Direct Evict</th><th>Promotions</th></tr>
+<tr><td>0</td><td>46</td><td>74081</td><td>725</td><td>1</td><td>722</td><td>119769</td><td>91812</td><td>522505</td><td>1135735</td></tr>
+<tr><td>30</td><td>907</td><td>72252</td><td>5</td><td>722</td><td>1</td><td>214614</td><td>302110</td><td>1694701</td><td>1394120</td></tr>
+<tr><td>60</td><td>1025</td><td>72968</td><td>193</td><td>722</td><td>1</td><td>307053</td><td>506282</td><td>2880384</td><td>1650047</td></tr>
+<tr><td>91</td><td>875</td><td>72628</td><td>252</td><td>722</td><td>1</td><td>378714</td><td>659629</td><td>4098847</td><td>1914144</td></tr>
+<tr><td>121</td><td>1</td><td>73538</td><td>1126</td><td>1</td><td>722</td><td>430751</td><td>775184</td><td>5354025</td><td>2178526</td></tr>
+<tr><td>151</td><td>1346</td><td>72284</td><td>161</td><td>722</td><td>1</td><td>516918</td><td>962928</td><td>6555205</td><td>2424521</td></tr>
+<tr><td>181</td><td>37</td><td>72727</td><td>1151</td><td>1</td><td>722</td><td>568264</td><td>1073592</td><td>7812041</td><td>2695456</td></tr>
+<tr><td>211</td><td>1025</td><td>73795</td><td>5</td><td>722</td><td>1</td><td>655990</td><td>1272918</td><td>8992892</td><td>2955507</td></tr>
+<tr><td>241</td><td>13</td><td>72284</td><td>1162</td><td>1</td><td>722</td><td>711885</td><td>1390304</td><td>10227734</td><td>3238165</td></tr>
+<tr><td>271</td><td>1229</td><td>72923</td><td>288</td><td>722</td><td>1</td><td>811098</td><td>1616223</td><td>11386159</td><td>3492131</td></tr>
+</table>
+
+<div class="finding">
+<div class="finding-title">Hill Climbing Bug: Oscillation Without Convergence</div>
+<p>The hill climber's step size starts at 6.25% of total cache (~4700 entries), which is much larger
+than the window target (722 for 2%). One step overshoots from "small window" to "tiny window" and the
+next reversal overshoots to "large window". The decay rate (0.98) is too slow to converge within the
+30s sample window.</p>
+<p>Caffeine avoids this because its cache has a fixed capacity and the step size is bounded relative to
+that fixed capacity. In ScyllaDB, total_size fluctuates with LSA pressure, making the step size
+unstable.</p>
+</div>
+
+<script>
+var layout = {paper_bgcolor:'#0f1117', plot_bgcolor:'#1a1d27', font:{color:'#e2e4eb'},
+  xaxis:{title:'Time (s)',gridcolor:'#2e3346'}, yaxis:{gridcolor:'#2e3346'}, margin:{t:30}};
+
+Plotly.newPlot('seg_sizes', [
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[46.0, 907.0, 1025.0, 875.0, 1.0, 1346.0, 37.0, 1025.0, 13.0, 1229.0], name:'Window', stackgroup:'one'},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[74081.0, 72252.0, 72968.0, 72628.0, 73538.0, 72284.0, 72727.0, 73795.0, 72284.0, 72923.0], name:'Probation', stackgroup:'one'},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[725.0, 5.0, 193.0, 252.0, 1126.0, 161.0, 1151.0, 5.0, 1162.0, 288.0], name:'Protected', stackgroup:'one'}
+], {...layout, yaxis:{...layout.yaxis, title:'Entries'}});
+
+Plotly.newPlot('targets', [
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[1.0, 722.0, 722.0, 722.0, 1.0, 722.0, 1.0, 722.0, 1.0, 722.0], name:'Max Window', line:{dash:'dash'}},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[722.0, 1.0, 1.0, 1.0, 722.0, 1.0, 722.0, 1.0, 722.0, 1.0], name:'Max Protected', line:{dash:'dash'}}
+], {...layout, yaxis:{...layout.yaxis, title:'Target Size'}});
+
+Plotly.newPlot('freq', [
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[4.813097, 2.970549, 4.090175, 2.992, 4.55102, 2.271186, 4.432432, 2.622951, 3.0, 2.625], name:'Window'},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[5.114, 3.944, 2.644, 4.026, 2.66, 3.789, 2.619, 3.706, 2.992, 3.614], name:'Probation'},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[6.789474, 7.0, 7.0, 6.783784, 6.581, 6.058233, 6.357, 5.548796, 5.678129, 5.899], name:'Protected'}
+], {...layout, yaxis:{...layout.yaxis, title:'Avg Frequency'}});
+
+Plotly.newPlot('counters', [
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[119769.0, 214614.0, 307053.0, 378714.0, 430751.0, 516918.0, 568264.0, 655990.0, 711885.0, 811098.0], name:'Admissions'},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[91812.0, 302110.0, 506282.0, 659629.0, 775184.0, 962928.0, 1073592.0, 1272918.0, 1390304.0, 1616223.0], name:'Rejections'},
+  {x:[0.0, 30.0, 60.0, 91.0, 121.0, 151.0, 181.0, 211.0, 241.0, 271.0], y:[522505.0, 1694701.0, 2880384.0, 4098847.0, 5354025.0, 6555205.0, 7812041.0, 8992892.0, 10227734.0, 11386159.0], name:'Direct Evictions'}
+], {...layout, yaxis:{...layout.yaxis, title:'Cumulative Count'}});
+</script>
+
+<p style="color:#9499ad; margin-top:2rem; border-top:1px solid #2e3346; padding-top:1rem">
+Generated 2026-04-06 00:33 | Config: w2 + hill_climbing=true
+</p></body></html>
