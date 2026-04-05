@@ -239,6 +239,37 @@ cache_tracker::setup_metrics() {
             sm::description("total amount of attempts to compact expired rows during read")),
         sm::make_counter("rows_compacted_away", _stats.rows_compacted_away,
             sm::description("total amount of compacted and removed rows during read")),
+        // W-TinyLFU segment sizes
+        sm::make_gauge("tinylfu_window_size", sm::description("current entries in W-TinyLFU window segment"), [this] { return _lru.window_size(); }),
+        sm::make_gauge("tinylfu_probation_size", sm::description("current entries in W-TinyLFU probation segment"), [this] { return _lru.probation_size(); }),
+        sm::make_gauge("tinylfu_protected_size", sm::description("current entries in W-TinyLFU protected segment"), [this] { return _lru.protected_size(); }),
+        sm::make_gauge("tinylfu_max_window_size", sm::description("target window segment size"), [this] { return _lru.current_max_window_size(); }),
+        sm::make_gauge("tinylfu_max_protected_size", sm::description("target protected segment size"), [this] { return _lru.current_max_protected_size(); }),
+        // W-TinyLFU sampled frequency
+        sm::make_gauge("tinylfu_avg_freq_window", sm::description("sampled average sketch frequency in window segment"), [this] { return _lru.get_stats().sampled_avg_freq_window; }),
+        sm::make_gauge("tinylfu_avg_freq_probation", sm::description("sampled average sketch frequency in probation segment"), [this] { return _lru.get_stats().sampled_avg_freq_probation; }),
+        sm::make_gauge("tinylfu_avg_freq_protected", sm::description("sampled average sketch frequency in protected segment"), [this] { return _lru.get_stats().sampled_avg_freq_protected; }),
+        // W-TinyLFU sketch aging
+        sm::make_gauge("tinylfu_sample_count", sm::description("accesses since last sketch reset"), [this] { return _lru.sample_count(); }),
+        sm::make_gauge("tinylfu_sample_threshold", sm::description("accesses needed to trigger next sketch reset"), [this] { return _lru.sample_threshold(); }),
+        // W-TinyLFU admission gate
+        sm::make_counter("tinylfu_admissions", sm::description("entries admitted through TinyLFU frequency gate"), [this] { return _lru.get_stats().tinylfu_admissions; }),
+        sm::make_counter("tinylfu_rejections", sm::description("entries rejected by TinyLFU frequency gate"), [this] { return _lru.get_stats().tinylfu_rejections; }),
+        sm::make_counter("tinylfu_jitter_admissions", sm::description("admissions via hash-DoS jitter (freq >= 6, 1/128 chance)"), [this] { return _lru.get_stats().tinylfu_jitter_admissions; }),
+        sm::make_counter("tinylfu_direct_evictions", sm::description("evictions bypassing admission gate (path 2)"), [this] { return _lru.get_stats().direct_evictions; }),
+        // W-TinyLFU segment flow
+        sm::make_counter("tinylfu_protected_promotions", sm::description("entries promoted from probation to protected on hit"), [this] { return _lru.get_stats().protected_promotions; }),
+        sm::make_counter("tinylfu_protected_demotions", sm::description("entries demoted from protected to probation on overflow"), [this] { return _lru.get_stats().protected_demotions; }),
+        sm::make_counter("tinylfu_window_to_probation", sm::description("entries moved from window to probation"), [this] { return _lru.get_stats().window_to_probation; }),
+        sm::make_counter("tinylfu_sketch_resets", sm::description("number of sketch aging/reset cycles"), [this] { return _lru.get_stats().sketch_resets; }),
+        // W-TinyLFU admission frequency histogram
+        sm::make_counter("tinylfu_admission_freq_0_1", sm::description("admission decisions where entry frequency was 0-1"), [this] { return _lru.get_stats().admission_freq_bucket_0_1; }),
+        sm::make_counter("tinylfu_admission_freq_2_3", sm::description("admission decisions where entry frequency was 2-3"), [this] { return _lru.get_stats().admission_freq_bucket_2_3; }),
+        sm::make_counter("tinylfu_admission_freq_4_7", sm::description("admission decisions where entry frequency was 4-7"), [this] { return _lru.get_stats().admission_freq_bucket_4_7; }),
+        sm::make_counter("tinylfu_admission_freq_8_15", sm::description("admission decisions where entry frequency was 8-15"), [this] { return _lru.get_stats().admission_freq_bucket_8_15; }),
+        // LSA eviction tracking
+        sm::make_counter("tinylfu_eviction_calls", sm::description("total LSA-triggered eviction calls"), [this] { return _lru.get_stats().eviction_calls; }),
+        sm::make_counter("tinylfu_eviction_calls_empty", sm::description("eviction calls that found nothing to evict"), [this] { return _lru.get_stats().eviction_calls_empty; }),
     });
     sstables::register_index_page_cache_metrics(_metrics, _index_cached_file_stats);
     sstables::register_index_page_metrics(_metrics, _partition_index_cache_stats);
