@@ -332,8 +332,15 @@ private:
             return;
         }
 
+        // Use the window target (not total cache size) to scale the step.
+        // With total_size, the step (6.25% of 74K = 4625) overshoots the
+        // window target (722 for 2%) in a single step, causing oscillation.
+        // With window target, the step (6.25% of 722 = 45) makes gentle
+        // adjustments that can converge.
+        double step_base = static_cast<double>(max_window_size());
+
         if (!_step_size_initialized) {
-            _step_size = -(hill_climber_step_percent * total);
+            _step_size = -(hill_climber_step_percent * step_base);
             _step_size_initialized = true;
         }
 
@@ -351,7 +358,7 @@ private:
         // Large change: restart with full step.  Small change: decay step.
         double next_step;
         if (std::abs(hit_rate_change) >= hill_climber_restart_threshold) {
-            next_step = hill_climber_step_percent * total * (amount >= 0 ? 1.0 : -1.0);
+            next_step = hill_climber_step_percent * step_base * (amount >= 0 ? 1.0 : -1.0);
         } else {
             next_step = hill_climber_step_decay * amount;
         }
