@@ -596,6 +596,11 @@
           "expr": "rate(scylla_cache_tinylfu_direct_evictions{instance=\"scylla-bench\"}[30s])",
           "legendFormat": "Direct Evictions (no gate)",
           "refId": "C"
+        },
+        {
+          "expr": "rate(scylla_cache_tinylfu_jitter_admissions{instance=\"scylla-bench\"}[30s])",
+          "legendFormat": "Jitter Admissions (hash-DoS)",
+          "refId": "D"
         }
       ],
       "id": 20
@@ -819,6 +824,11 @@
           "expr": "scylla_lsa_occupancy{instance=\"scylla-bench\"}",
           "legendFormat": "LSA Occupancy",
           "refId": "C"
+        },
+        {
+          "expr": "rate(scylla_cache_tinylfu_eviction_calls_empty{instance=\"scylla-bench\"}[30s])",
+          "legendFormat": "Empty Eviction Calls/s",
+          "refId": "D"
         }
       ],
       "fieldConfig": {
