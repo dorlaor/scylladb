@@ -167,6 +167,67 @@ private:
     size_t _max_window_override = 0;
     size_t _max_protected_override = 0;
 
+public:
+    struct stats {
+        // Admission gate
+        uint64_t tinylfu_admissions = 0;
+        uint64_t tinylfu_rejections = 0;
+        uint64_t tinylfu_jitter_admissions = 0;
+
+        // Path 2: evictions bypassing the admission gate
+        uint64_t direct_evictions = 0;
+
+        // Segment flow
+        uint64_t protected_promotions = 0;
+        uint64_t protected_demotions = 0;
+        uint64_t window_to_probation = 0;
+
+        // Sketch lifecycle
+        uint64_t sketch_resets = 0;
+
+        // Sampled avg frequency per segment (updated once per sketch reset)
+        double sampled_avg_freq_window = 0;
+        double sampled_avg_freq_probation = 0;
+        double sampled_avg_freq_protected = 0;
+
+        // Frequency histogram for entries at admission time
+        uint64_t admission_freq_bucket_0_1 = 0;
+        uint64_t admission_freq_bucket_2_3 = 0;
+        uint64_t admission_freq_bucket_4_7 = 0;
+        uint64_t admission_freq_bucket_8_15 = 0;
+
+        // LSA eviction trigger tracking
+        uint64_t eviction_calls = 0;
+        uint64_t eviction_calls_empty = 0;
+    };
+
+private:
+    stats _stats{};
+
+    void record_freq_bucket(uint8_t freq) noexcept {
+        if (freq <= 1) ++_stats.admission_freq_bucket_0_1;
+        else if (freq <= 3) ++_stats.admission_freq_bucket_2_3;
+        else if (freq <= 7) ++_stats.admission_freq_bucket_4_7;
+        else ++_stats.admission_freq_bucket_8_15;
+    }
+
+    void sample_segment_frequencies() noexcept {
+        auto avg_freq = [this](const lru_type& list, size_t count) -> double {
+            if (count == 0) return 0.0;
+            uint64_t sum = 0;
+            size_t sampled = 0;
+            constexpr size_t max_sample = 1000;
+            for (const auto& e : list) {
+                sum += _sketch.estimate(entry_key(e));
+                if (++sampled >= max_sample) break;
+            }
+            return sampled > 0 ? static_cast<double>(sum) / sampled : 0.0;
+        };
+        _stats.sampled_avg_freq_window = avg_freq(_window, _window_size);
+        _stats.sampled_avg_freq_probation = avg_freq(_probation, _probation_size);
+        _stats.sampled_avg_freq_protected = avg_freq(_protected, _protected_size);
+    }
+
     size_t total_size() const noexcept {
         return _window_size + _probation_size + _protected_size;
     }
@@ -206,6 +267,8 @@ private:
             _sketch.reset();
             _sample_count = 0;
             _sample_threshold = std::max(min_sample_threshold, total_size() * 10);
+            ++_stats.sketch_resets;
+            sample_segment_frequencies();
             do_climb();
         }
     }
@@ -323,6 +386,7 @@ private:
     void rebalance_protected() noexcept {
         size_t max_prot = max_protected_size();
         while (_protected_size > max_prot && !_protected.empty()) {
+            ++_stats.protected_demotions;
             evictable& victim = _protected.front();
             remove_from_segment(victim);
             add_to_segment(victim, lru_segment::probation);
@@ -367,12 +431,16 @@ private:
                     admit_candidate = true;
                 } else if (w_freq >= admit_hashdos_threshold) {
                     admit_candidate = (jitter_next() & 127) == 0;
+                    if (admit_candidate) ++_stats.tinylfu_jitter_admissions;
                 } else {
                     admit_candidate = false;
                 }
 
                 if (admit_candidate) {
                     // Admit window victim to probation; evict probation victim.
+                    ++_stats.tinylfu_admissions;
+                    ++_stats.window_to_probation;
+                    record_freq_bucket(w_freq);
                     remove_from_segment(w_victim);
                     add_to_segment(w_victim, lru_segment::probation);
                     remove(p_victim);
@@ -383,6 +451,8 @@ private:
                     }
                 } else {
                     // Reject window victim.
+                    ++_stats.tinylfu_rejections;
+                    record_freq_bucket(w_freq);
                     remove(w_victim);
                     if constexpr (!Shallow) {
                         w_victim.on_evicted();
@@ -394,11 +464,13 @@ private:
             }
 
             // Probation is empty: move window victim to probation and retry.
+            ++_stats.window_to_probation;
             remove_from_segment(w_victim);
             add_to_segment(w_victim, lru_segment::probation);
         }
 
         // Window is within target. Evict from probation, then window, then protected.
+        ++_stats.direct_evictions;
         evictable* victim = nullptr;
         if (!_probation.empty()) {
             victim = &_probation.front();
@@ -483,6 +555,7 @@ public:
                 _window.push_back(e);
                 break;
             case lru_segment::probation:
+                ++_stats.protected_promotions;
                 _probation.erase(_probation.iterator_to(e));
                 --_probation_size;
                 e._segment = lru_segment::protected_;
@@ -498,13 +571,23 @@ public:
 
     // Evicts a single element using the W-TinyLFU policy.
     reclaiming_result evict(bool should_evict_index = false) noexcept {
-        return do_evict<false>(should_evict_index);
+        ++_stats.eviction_calls;
+        auto result = do_evict<false>(should_evict_index);
+        if (result == reclaiming_result::reclaimed_nothing) {
+            ++_stats.eviction_calls_empty;
+        }
+        return result;
     }
 
     // Evicts a single element using the W-TinyLFU policy.
     // Will call on_evicted_shallow() instead of on_evicted().
     reclaiming_result evict_shallow() noexcept {
-        return do_evict<true>(false);
+        ++_stats.eviction_calls;
+        auto result = do_evict<true>(false);
+        if (result == reclaiming_result::reclaimed_nothing) {
+            ++_stats.eviction_calls_empty;
+        }
+        return result;
     }
 
     // Evicts all elements.
@@ -580,6 +663,15 @@ public:
 
     size_t window_percent() const noexcept { return _window_percent; }
     bool hill_climbing_enabled() const noexcept { return _hill_climbing_enabled; }
+
+    stats& get_stats() noexcept { return _stats; }
+    const stats& get_stats() const noexcept { return _stats; }
+
+    size_t window_size() const noexcept { return _window_size; }
+    size_t probation_size() const noexcept { return _probation_size; }
+    size_t protected_size() const noexcept { return _protected_size; }
+    size_t sample_count() const noexcept { return _sample_count; }
+    size_t sample_threshold() const noexcept { return _sample_threshold; }
 
     static size_t compute_sketch_width_log2(size_t cache_bytes, double entries_per_mb) noexcept {
         constexpr double bytes_per_mb = 1024.0 * 1024.0;
