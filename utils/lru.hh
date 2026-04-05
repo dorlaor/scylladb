@@ -232,11 +232,17 @@ private:
         return _window_size + _probation_size + _protected_size;
     }
 
+    // Minimum window: 1% of total, so new entries have time to be
+    // re-accessed before facing the admission gate.
+    static constexpr size_t min_window_percent = 1;
+
     size_t max_window_size() const noexcept {
+        size_t total = total_size();
+        size_t floor = std::max(size_t(1), total * min_window_percent / 100);
         if (_max_window_override > 0) {
-            return _max_window_override;
+            return std::max(_max_window_override, floor);
         }
-        return std::max(size_t(1), total_size() * _window_percent / 100);
+        return std::max(floor, total * _window_percent / 100);
     }
 
     size_t max_protected_size() const noexcept {
