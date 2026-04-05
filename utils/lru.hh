@@ -393,6 +393,68 @@ private:
         }
     }
 
+    // Drain excess entries from the window segment using TinyLFU admission.
+    // Returns true if any entries were evicted.
+    //
+    // Each excess window entry competes against the probation LRU victim:
+    // if the window entry has higher frequency it replaces the victim in
+    // probation; otherwise the window entry is evicted.  This runs to
+    // completion so the window converges to its target size.
+    template <bool Shallow = false>
+    bool drain_window() noexcept {
+        bool drained_any = false;
+        while (_window_size > max_window_size() && !_window.empty()) {
+            evictable& w_victim = _window.front();
+
+            if (!_probation.empty()) {
+                evictable& p_victim = _probation.front();
+                uint8_t w_freq = _sketch.estimate(entry_key(w_victim));
+                uint8_t p_freq = _sketch.estimate(entry_key(p_victim));
+
+                bool admit_candidate;
+                if (w_freq > p_freq) {
+                    admit_candidate = true;
+                } else if (w_freq >= admit_hashdos_threshold) {
+                    admit_candidate = (jitter_next() & 127) == 0;
+                    if (admit_candidate) ++_stats.tinylfu_jitter_admissions;
+                } else {
+                    admit_candidate = false;
+                }
+
+                if (admit_candidate) {
+                    ++_stats.tinylfu_admissions;
+                    ++_stats.window_to_probation;
+                    record_freq_bucket(w_freq);
+                    remove_from_segment(w_victim);
+                    add_to_segment(w_victim, lru_segment::probation);
+                    remove(p_victim);
+                    if constexpr (!Shallow) {
+                        p_victim.on_evicted();
+                    } else {
+                        p_victim.on_evicted_shallow();
+                    }
+                } else {
+                    ++_stats.tinylfu_rejections;
+                    record_freq_bucket(w_freq);
+                    remove(w_victim);
+                    if constexpr (!Shallow) {
+                        w_victim.on_evicted();
+                    } else {
+                        w_victim.on_evicted_shallow();
+                    }
+                }
+                drained_any = true;
+                continue;
+            }
+
+            // Probation is empty: move window victim to probation and retry.
+            ++_stats.window_to_probation;
+            remove_from_segment(w_victim);
+            add_to_segment(w_victim, lru_segment::probation);
+        }
+        return drained_any;
+    }
+
     // Evicts a single element using W-TinyLFU policy.
     template <bool Shallow = false>
     reclaiming_result do_evict(bool should_evict_index) noexcept {
@@ -414,69 +476,7 @@ private:
 
         rebalance_protected();
 
-        // Drain ALL excess from window using TinyLFU admission.
-        // This must run to completion (not return after one eviction) so
-        // the window converges to its target.  Insertions via add() grow
-        // the window without triggering eviction; LSA calls evict() later.
-        // If we only drained one entry per call the window would never
-        // catch up with the insertion rate.
-        bool drained_any = false;
-        while (_window_size > max_window_size() && !_window.empty()) {
-            evictable& w_victim = _window.front();
-
-            if (!_probation.empty()) {
-                // Competition: window victim vs. probation victim.
-                evictable& p_victim = _probation.front();
-                uint8_t w_freq = _sketch.estimate(entry_key(w_victim));
-                uint8_t p_freq = _sketch.estimate(entry_key(p_victim));
-
-                // Admission decision: candidate wins on higher frequency,
-                // or with ~1/128 probability if warm (freq >= 6) — hash-DoS jitter.
-                bool admit_candidate;
-                if (w_freq > p_freq) {
-                    admit_candidate = true;
-                } else if (w_freq >= admit_hashdos_threshold) {
-                    admit_candidate = (jitter_next() & 127) == 0;
-                    if (admit_candidate) ++_stats.tinylfu_jitter_admissions;
-                } else {
-                    admit_candidate = false;
-                }
-
-                if (admit_candidate) {
-                    // Admit window victim to probation; evict probation victim.
-                    ++_stats.tinylfu_admissions;
-                    ++_stats.window_to_probation;
-                    record_freq_bucket(w_freq);
-                    remove_from_segment(w_victim);
-                    add_to_segment(w_victim, lru_segment::probation);
-                    remove(p_victim);
-                    if constexpr (!Shallow) {
-                        p_victim.on_evicted();
-                    } else {
-                        p_victim.on_evicted_shallow();
-                    }
-                } else {
-                    // Reject window victim.
-                    ++_stats.tinylfu_rejections;
-                    record_freq_bucket(w_freq);
-                    remove(w_victim);
-                    if constexpr (!Shallow) {
-                        w_victim.on_evicted();
-                    } else {
-                        w_victim.on_evicted_shallow();
-                    }
-                }
-                drained_any = true;
-                continue; // keep draining until window reaches target
-            }
-
-            // Probation is empty: move window victim to probation and retry.
-            ++_stats.window_to_probation;
-            remove_from_segment(w_victim);
-            add_to_segment(w_victim, lru_segment::probation);
-        }
-
-        if (drained_any) {
+        if (drain_window<Shallow>()) {
             return reclaiming_result::reclaimed_something;
         }
 
@@ -531,6 +531,23 @@ public:
         add_to_segment(e, lru_segment::window);
         if (e.is_index()) {
             _index_list.push_back(static_cast<index_evictable&>(e));
+        }
+        // Move excess window entries to probation when the window grows
+        // significantly past its target.  This doesn't evict anything
+        // (eviction only happens from LSA's evict() path), but it keeps
+        // entries flowing into the SLRU segments so the admission filter
+        // and probation->protected promotion can function.
+        //
+        // Without this, the window bloats between LSA evict() calls
+        // and the SLRU segments starve.
+        size_t max_win = max_window_size();
+        if (_window_size > max_win + std::max(max_win, size_t(64))) {
+            while (_window_size > max_win && !_window.empty()) {
+                ++_stats.window_to_probation;
+                evictable& victim = _window.front();
+                remove_from_segment(victim);
+                add_to_segment(victim, lru_segment::probation);
+            }
         }
     }
 
