@@ -651,3 +651,226 @@ BOOST_AUTO_TEST_CASE(test_sketch_key_used_for_frequency) {
         if (e->is_linked()) l.remove(*e);
     }
 }
+
+// ---------------------------------------------------------------------------
+// W-TinyLFU Instrumentation Counter Tests
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(test_lru_admission_counters) {
+    lru l;
+    static constexpr int N = 20;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
+        l.add(*entries[i]);
+    }
+
+    // Touch entries 15-19 many times to build frequency so they get admitted.
+    for (int round = 0; round < 10; ++round) {
+        for (int i = 15; i < N; ++i) {
+            l.touch(*entries[i]);
+        }
+    }
+
+    // Evict 10 times to trigger admission decisions.
+    for (int i = 0; i < 10; ++i) {
+        l.evict();
+    }
+
+    auto& st = l.get_stats();
+    // The admission gate must have been exercised at least once.
+    BOOST_REQUIRE_GT(st.tinylfu_admissions + st.tinylfu_rejections, 0u);
+    // We called evict() exactly 10 times.
+    BOOST_REQUIRE_EQUAL(st.eviction_calls, 10u);
+
+    // Clean up.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_direct_eviction_counter) {
+    lru l;
+    static constexpr int N = 5;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
+        l.add(*entries[i]);
+    }
+
+    // Touch all entries several times so they move through segments.
+    // With 5 entries and 1% window, max_window = max(1, 5*1/100) = 1.
+    // Touching entries in probation promotes them to protected.
+    // First, trigger evictions to drain window -> probation.
+    for (int i = 0; i < 5; ++i) {
+        l.evict();
+    }
+
+    // Re-add evicted entries and touch them to fill protected.
+    for (int i = 0; i < N; ++i) {
+        if (!entries[i]->is_linked()) {
+            entries[i] = std::make_unique<test_evictable>(i);
+            assign_unique_sketch_key(*entries[i]);
+            l.add(*entries[i]);
+        }
+    }
+
+    // Touch all to promote from probation to protected.
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < N; ++i) {
+            if (entries[i]->is_linked()) {
+                l.touch(*entries[i]);
+            }
+        }
+    }
+
+    // Now call evict - window should be within target, so direct eviction path is taken.
+    auto& st = l.get_stats();
+    auto direct_before = st.direct_evictions;
+    l.evict();
+    BOOST_REQUIRE_GT(st.direct_evictions, direct_before);
+
+    // Clean up.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_promotion_demotion_counters) {
+    lru l;
+    static constexpr int N = 20;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
+        l.add(*entries[i]);
+    }
+
+    // Evict some to move entries from window to probation.
+    for (int i = 0; i < 10; ++i) {
+        l.evict();
+    }
+
+    // Touch surviving entries to promote from probation to protected.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) {
+            l.touch(*entries[i]);
+        }
+    }
+
+    BOOST_REQUIRE_GT(l.get_stats().protected_promotions, 0u);
+
+    // Add more entries to grow the cache and then touch them to fill protected.
+    static constexpr int M = 30;
+    std::unique_ptr<test_evictable> extra[M];
+    for (int i = 0; i < M; ++i) {
+        extra[i] = std::make_unique<test_evictable>(100 + i);
+        assign_unique_sketch_key(*extra[i]);
+        l.add(*extra[i]);
+    }
+
+    // Touch extras to promote them all to protected, causing overflow.
+    for (int i = 0; i < M; ++i) {
+        if (extra[i]->is_linked()) {
+            // Move to probation first via eviction drain, then touch to promote.
+            l.touch(*extra[i]);
+        }
+    }
+
+    // Evict to trigger rebalance_protected which demotes excess protected entries.
+    for (int i = 0; i < 5; ++i) {
+        l.evict();
+    }
+
+    BOOST_REQUIRE_GT(l.get_stats().protected_demotions, 0u);
+
+    // Clean up.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+    for (int i = 0; i < M; ++i) {
+        if (extra[i]->is_linked()) l.remove(*extra[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_sampled_frequencies) {
+    lru l;
+    static constexpr int N = 10;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
+        l.add(*entries[i]);
+    }
+
+    // Touch entries[0] many times to saturate its frequency.
+    for (int i = 0; i < 20; ++i) {
+        l.touch(*entries[0]);
+    }
+
+    // With 10 entries, threshold = max(1000, 10*10) = 1000.
+    // Generate enough touches to trigger at least one sketch reset.
+    // Each touch increments sample_count; we need >= 1000 total accesses.
+    // We already have 10 adds + 20 touches = 30. Need ~970 more.
+    for (int i = 0; i < 980; ++i) {
+        l.touch(*entries[i % N]);
+    }
+
+    auto& st = l.get_stats();
+    BOOST_REQUIRE_GE(st.sketch_resets, 1u);
+    // Sampled average frequencies should be non-negative.
+    BOOST_REQUIRE_GE(st.sampled_avg_freq_window, 0.0);
+    BOOST_REQUIRE_GE(st.sampled_avg_freq_probation, 0.0);
+    BOOST_REQUIRE_GE(st.sampled_avg_freq_protected, 0.0);
+
+    // Clean up.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(test_lru_freq_histogram_buckets) {
+    lru l;
+    static constexpr int N = 20;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
+        l.add(*entries[i]);
+    }
+
+    // Give entries 15-19 high frequency.
+    for (int round = 0; round < 10; ++round) {
+        for (int i = 15; i < N; ++i) {
+            l.touch(*entries[i]);
+        }
+    }
+    // Entries 0-14 have low frequency (only from add).
+
+    // Trigger evictions that go through the admission gate.
+    for (int i = 0; i < 10; ++i) {
+        l.evict();
+    }
+
+    auto& st = l.get_stats();
+    uint64_t total_gate = st.tinylfu_admissions + st.tinylfu_rejections;
+    // The admission gate should have been exercised.
+    BOOST_REQUIRE_GT(total_gate, 0u);
+
+    // At least one frequency bucket should have a non-zero count.
+    uint64_t bucket_sum = st.admission_freq_bucket_0_1
+                        + st.admission_freq_bucket_2_3
+                        + st.admission_freq_bucket_4_7
+                        + st.admission_freq_bucket_8_15;
+    BOOST_REQUIRE_GT(bucket_sum, 0u);
+
+    // Sum of all bucket counters must equal total admission gate decisions.
+    BOOST_REQUIRE_EQUAL(bucket_sum, total_gate);
+
+    // Clean up.
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) l.remove(*entries[i]);
+    }
+}
