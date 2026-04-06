@@ -852,6 +852,76 @@
         ]
       },
       "id": 26
+    },
+    {
+      "title": "Hill Climber",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 100
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "P1809F7CD0C75ACF3"
+      },
+      "targets": [
+        {
+          "expr": "scylla_cache_tinylfu_climb_step_size{instance=\"scylla-bench\"}",
+          "legendFormat": "Step Size (entries)",
+          "refId": "A"
+        },
+        {
+          "expr": "scylla_cache_tinylfu_climb_hit_rate{instance=\"scylla-bench\"}",
+          "legendFormat": "Hit Rate",
+          "refId": "B"
+        },
+        {
+          "expr": "scylla_cache_tinylfu_climb_hit_rate_change{instance=\"scylla-bench\"}",
+          "legendFormat": "Hit Rate Change",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(scylla_cache_tinylfu_climb_increases{instance=\"scylla-bench\"}[30s])",
+          "legendFormat": "Window Increases/s",
+          "refId": "D"
+        },
+        {
+          "expr": "rate(scylla_cache_tinylfu_climb_decreases{instance=\"scylla-bench\"}[30s])",
+          "legendFormat": "Window Decreases/s",
+          "refId": "E"
+        }
+      ],
+      "fieldConfig": {
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Hit Rate"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Hit Rate Change"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "id": 27
     }
   ],
   "schemaVersion": 39,

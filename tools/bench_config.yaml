@@ -203,6 +203,10 @@ snapshots:
       panel_id: 26
       title: LSA Eviction Pressure
 
+    - name: tinylfu_hill_climber
+      panel_id: 27
+      title: Hill Climber
+
 # --- Output ---
 results_dir: .bench/results             # per-config subdirs: w1/, w50/, w99/
 report: docs/dev/wtinylfu_real_benchmark_results.html

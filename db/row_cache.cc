@@ -270,6 +270,12 @@ cache_tracker::setup_metrics() {
         // LSA eviction tracking
         sm::make_counter("tinylfu_eviction_calls", sm::description("total LSA-triggered eviction calls"), [this] { return _lru.get_stats().eviction_calls; }),
         sm::make_counter("tinylfu_eviction_calls_empty", sm::description("eviction calls that found nothing to evict"), [this] { return _lru.get_stats().eviction_calls_empty; }),
+        // Hill climber state
+        sm::make_gauge("tinylfu_climb_step_size", sm::description("current hill climber step size (positive=grow window, negative=shrink)"), [this] { return _lru.get_stats().climb_step_size; }),
+        sm::make_gauge("tinylfu_climb_hit_rate", sm::description("hit rate observed in last hill climber sample"), [this] { return _lru.get_stats().climb_hit_rate; }),
+        sm::make_gauge("tinylfu_climb_hit_rate_change", sm::description("hit rate change from previous sample (drives climb direction)"), [this] { return _lru.get_stats().climb_hit_rate_change; }),
+        sm::make_counter("tinylfu_climb_increases", sm::description("times the hill climber grew the window"), [this] { return _lru.get_stats().climb_increases; }),
+        sm::make_counter("tinylfu_climb_decreases", sm::description("times the hill climber shrank the window"), [this] { return _lru.get_stats().climb_decreases; }),
     });
     sstables::register_index_page_cache_metrics(_metrics, _index_cached_file_stats);
     sstables::register_index_page_metrics(_metrics, _partition_index_cache_stats);

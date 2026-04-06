@@ -199,6 +199,13 @@ public:
         // LSA eviction trigger tracking
         uint64_t eviction_calls = 0;
         uint64_t eviction_calls_empty = 0;
+
+        // Hill climber state (updated each climb cycle)
+        double climb_step_size = 0;         // current step (positive = grow window, negative = shrink)
+        double climb_hit_rate = 0;          // hit rate observed in last sample
+        double climb_hit_rate_change = 0;   // delta from previous sample
+        uint64_t climb_increases = 0;       // times the climber grew the window
+        uint64_t climb_decreases = 0;       // times the climber shrank the window
     };
 
 private:
@@ -377,6 +384,11 @@ private:
         _hits_in_sample = 0;
         _misses_in_sample = 0;
 
+        // Expose climber state for monitoring.
+        _stats.climb_step_size = _step_size;
+        _stats.climb_hit_rate = hit_rate;
+        _stats.climb_hit_rate_change = hit_rate_change;
+
         long adjustment = static_cast<long>(std::round(amount));
         if (adjustment == 0) {
             return;
@@ -386,8 +398,10 @@ private:
         size_t floor = std::max(size_t(1), total * min_window_percent / 100);
 
         if (adjustment > 0) {
+            ++_stats.climb_increases;
             _max_window_override = cur_window + static_cast<size_t>(adjustment);
         } else {
+            ++_stats.climb_decreases;
             size_t decrease = std::min(static_cast<size_t>(-adjustment), cur_window - floor);
             _max_window_override = cur_window - decrease;
         }
