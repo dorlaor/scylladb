@@ -322,9 +322,17 @@ private:
         increment_size(seg);
     }
 
-    // Hill climber: adjust window/protected ratio based on observed hit rate.
+    // Hill climber: adjust window size based on observed hit rate.
     // Called once per sketch reset cycle (every ~10*N accesses).
-    // Algorithm matches Caffeine's BoundedLocalCache.determineAdjustment().
+    //
+    // Each cycle, the window is shifted by 1% of the total cache size
+    // in the direction that improved the hit rate (or reversed if it
+    // worsened).  The 1% step is large enough to produce a measurable
+    // hit rate change, unlike Caffeine's original 6.25%-of-window
+    // which was invisible at ~0.07% of total.
+    //
+    // The window is clamped to [1%, 99%] of total (the 1% floor is
+    // also enforced in max_window_size()).
     void do_climb() noexcept {
         if (!_hill_climbing_enabled) {
             _hits_in_sample = 0;
@@ -338,15 +346,12 @@ private:
             return;
         }
 
-        // Use the window target (not total cache size) to scale the step.
-        // With total_size, the step (6.25% of 74K = 4625) overshoots the
-        // window target (722 for 2%) in a single step, causing oscillation.
-        // With window target, the step (6.25% of 722 = 45) makes gentle
-        // adjustments that can converge.
-        double step_base = static_cast<double>(max_window_size());
+        // Step = 1% of total cache.  With 87K entries this is ~870,
+        // moving the window by a meaningful amount each cycle.
+        double step = static_cast<double>(total) / 100.0;
 
         if (!_step_size_initialized) {
-            _step_size = -(hill_climber_step_percent * step_base);
+            _step_size = -step; // start by shrinking window
             _step_size_initialized = true;
         }
 
@@ -361,16 +366,14 @@ private:
         // If hit rate improved, keep going in the same direction; otherwise reverse.
         double amount = (hit_rate_change >= 0) ? _step_size : -_step_size;
 
-        // Large change: restart with full step.  Small change: decay step.
-        double next_step;
+        // Large change (>5%): restart with full step.  Small change: decay.
         if (std::abs(hit_rate_change) >= hill_climber_restart_threshold) {
-            next_step = hill_climber_step_percent * step_base * (amount >= 0 ? 1.0 : -1.0);
+            _step_size = step * (amount >= 0 ? 1.0 : -1.0);
         } else {
-            next_step = hill_climber_step_decay * amount;
+            _step_size = hill_climber_step_decay * amount;
         }
 
         _previous_hit_rate = hit_rate;
-        _step_size = next_step;
         _hits_in_sample = 0;
         _misses_in_sample = 0;
 
@@ -380,14 +383,12 @@ private:
         }
 
         size_t cur_window = max_window_size();
+        size_t floor = std::max(size_t(1), total * min_window_percent / 100);
 
         if (adjustment > 0) {
-            // Increase window. Probation absorbs the loss.
-            // Protected stays at its percentage-based default.
             _max_window_override = cur_window + static_cast<size_t>(adjustment);
         } else {
-            // Decrease window. Probation gains the freed space.
-            size_t decrease = std::min(static_cast<size_t>(-adjustment), cur_window - 1);
+            size_t decrease = std::min(static_cast<size_t>(-adjustment), cur_window - floor);
             _max_window_override = cur_window - decrease;
         }
     }
