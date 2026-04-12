@@ -440,22 +440,15 @@ public:
         if (e.is_index()) {
             _index_list.push_back(static_cast<index_evictable&>(e));
         }
-        // Move excess window entries to probation when the window grows
-        // significantly past its target.  This doesn't evict anything
-        // (eviction only happens from LSA's evict() path), but it keeps
-        // entries flowing into the SLRU segments so the admission filter
-        // and probation->protected promotion can function.
+        // Drain excess window entries when the window grows significantly
+        // past its target. Use the same TinyLFU admission path as evict()
+        // so add-time rebalancing does not bypass frequency information.
         //
-        // Without this, the window bloats between LSA evict() calls
-        // and the SLRU segments starve.
+        // Without this, the window bloats between LSA evict() calls and
+        // the SLRU segments starve.
         size_t max_win = max_window_size();
         if (_window_size > max_win + std::max(max_win, size_t(64))) {
-            while (_window_size > max_win && !_window.empty()) {
-                ++_stats.window_to_probation;
-                evictable& victim = _window.front();
-                remove_from_segment(victim);
-                add_to_segment(victim, lru_segment::probation);
-            }
+            (void)drain_window<true>();
         }
     }
 

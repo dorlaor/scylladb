@@ -421,6 +421,29 @@ BOOST_AUTO_TEST_CASE(test_lru_set_window_percent) {
     BOOST_REQUIRE_EQUAL(l.window_percent(), 99u);
 }
 
+BOOST_AUTO_TEST_CASE(test_lru_add_path_uses_tinylfu_admission) {
+    lru l;
+
+    // Keep the default 1% window so the oversized-window add path triggers.
+    static constexpr int N = 80;
+    std::unique_ptr<test_evictable> entries[N];
+    for (int i = 0; i < N; ++i) {
+        entries[i] = std::make_unique<test_evictable>(i);
+        assign_unique_sketch_key(*entries[i]);
+        l.add(*entries[i]);
+    }
+
+    // Oversized-window rebalancing from add() should exercise TinyLFU gate.
+    const auto& st = l.get_stats();
+    BOOST_REQUIRE_GT(st.tinylfu_admissions + st.tinylfu_rejections, 0u);
+
+    for (int i = 0; i < N; ++i) {
+        if (entries[i]->is_linked()) {
+            l.remove(*entries[i]);
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(test_lru_large_window_behaves_like_lru) {
     lru l;
     l.set_window_percent(99.0);
