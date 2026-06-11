@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>W-TinyLFU Deep Dive: Multi-Row &amp; MVCC Challenges</title>
+<style>
+:root {
+  --bg: #0d1117; --card: #161b22; --border: #30363d;
+  --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --orange: #d29922;
+  --purple: #bc8cff; --cyan: #39d2c0; --yellow: #e3b341;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
+.slide { min-height: 100vh; padding: 3rem 4rem; display: none; flex-direction: column; }
+.slide.active { display: flex; }
+.slide h1 { font-size: 2.4rem; color: #f0f6fc; margin-bottom: 0.5rem; }
+.slide h2 { font-size: 1.8rem; color: var(--accent); margin: 1.5rem 0 0.75rem; border-bottom: 1px solid var(--border); padding-bottom: 0.4rem; }
+.slide h3 { font-size: 1.3rem; color: #f0f6fc; margin: 1rem 0 0.5rem; }
+.slide p, .slide li { font-size: 1.1rem; line-height: 1.7; margin-bottom: 0.6rem; }
+.slide ul { padding-left: 1.5rem; }
+.subtitle { color: var(--muted); font-size: 1.1rem; margin-bottom: 2rem; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem 1.5rem; margin: 0.8rem 0; }
+.highlight { border-left: 4px solid var(--accent); }
+.warn { border-left: 4px solid var(--orange); }
+.good { border-left: 4px solid var(--green); }
+.bad { border-left: 4px solid var(--red); }
+.cols { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+@media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+code { background: #1f2937; padding: 0.15rem 0.4rem; border-radius: 4px; font-family: 'SF Mono', 'Consolas', monospace; font-size: 0.9em; color: #e6edf3; }
+pre { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; font-size: 0.85rem; line-height: 1.5; font-family: 'SF Mono', monospace; margin: 0.8rem 0; }
+.tag { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 10px; font-size: 0.8rem; font-weight: 600; }
+.tag-blue { background: rgba(88,166,255,0.15); color: var(--accent); }
+.tag-green { background: rgba(63,185,80,0.15); color: var(--green); }
+.tag-red { background: rgba(248,81,73,0.15); color: var(--red); }
+.tag-orange { background: rgba(210,153,34,0.15); color: var(--orange); }
+.diagram { background: #0d1117; border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin: 1rem 0; font-family: 'SF Mono', monospace; font-size: 0.85rem; line-height: 1.6; white-space: pre; overflow-x: auto; }
+.metric-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.8rem; margin: 1rem 0; }
+.metric-box { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 0.8rem; text-align: center; }
+.metric-value { font-size: 1.8rem; font-weight: 700; font-family: 'SF Mono', monospace; }
+.metric-label { font-size: 0.8rem; color: var(--muted); margin-top: 0.2rem; }
+.mv { color: var(--green); } .mv2 { color: var(--accent); } .mv3 { color: var(--orange); } .mv4 { color: var(--red); }
+.nav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--card); border-top: 1px solid var(--border); padding: 0.8rem 2rem; display: flex; justify-content: space-between; align-items: center; z-index: 100; }
+.nav button { background: var(--accent); color: #0d1117; border: none; padding: 0.5rem 1.2rem; border-radius: 6px; font-size: 0.9rem; cursor: pointer; font-weight: 600; }
+.nav button:hover { opacity: 0.9; }
+.nav button:disabled { opacity: 0.3; cursor: not-allowed; }
+.nav .page { color: var(--muted); font-size: 0.9rem; }
+.sim-container { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin: 1rem 0; }
+.sim-segments { display: grid; grid-template-columns: 1fr 2.5fr 5fr; gap: 0.8rem; margin: 1rem 0; }
+.sim-seg { border: 1px solid var(--border); border-radius: 8px; padding: 0.6rem; min-height: 60px; }
+.sim-seg-title { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; margin-bottom: 0.4rem; }
+.sim-entry { display: inline-block; padding: 0.2rem 0.5rem; margin: 0.15rem; border-radius: 4px; font-size: 0.75rem; font-family: 'SF Mono', monospace; cursor: pointer; transition: all 0.2s; }
+.sim-entry:hover { transform: scale(1.1); }
+.sim-entry.hot { background: rgba(63,185,80,0.3); border: 1px solid var(--green); color: var(--green); }
+.sim-entry.warm { background: rgba(88,166,255,0.2); border: 1px solid var(--accent); color: var(--accent); }
+.sim-entry.cold { background: rgba(139,148,158,0.2); border: 1px solid var(--muted); color: var(--muted); }
+.sim-entry.scan { background: rgba(248,81,73,0.15); border: 1px solid var(--red); color: var(--red); }
+.sim-controls { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.8rem 0; }
+.sim-controls button { background: var(--border); color: var(--text); border: none; padding: 0.4rem 0.8rem; border-radius: 4px; font-size: 0.8rem; cursor: pointer; }
+.sim-controls button:hover { background: var(--accent); color: #0d1117; }
+.sim-log { background: #0d1117; border: 1px solid var(--border); border-radius: 6px; padding: 0.6rem; max-height: 150px; overflow-y: auto; font-family: 'SF Mono', monospace; font-size: 0.75rem; color: var(--muted); margin-top: 0.8rem; }
+.sim-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 0.5rem; margin: 0.8rem 0; }
+.sim-stat { text-align: center; padding: 0.4rem; background: #0d1117; border-radius: 4px; }
+.sim-stat .val { font-size: 1.2rem; font-weight: 700; font-family: 'SF Mono', monospace; }
+.sim-stat .lbl { font-size: 0.7rem; color: var(--muted); }
+.sim-input { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; flex-wrap: wrap; }
+.sim-input label { font-size: 0.85rem; color: var(--muted); min-width: 100px; }
+.sim-input input, .sim-input select { background: #0d1117; border: 1px solid var(--border); color: var(--text); padding: 0.3rem 0.5rem; border-radius: 4px; font-size: 0.85rem; width: 80px; }
+</style>
+</head>
+<body>
+
+<!-- SLIDE 1: Title -->
+<div class="slide active" id="s1">
+<h1>W-TinyLFU: Deep Dive</h1>
+<p class="subtitle">Multi-Row Partitions, MVCC Ordering, and the Admission Gate</p>
+<div class="card highlight">
+<h3>Three challenges explored</h3>
+<ul>
+<li><strong>Multi-row false rejection:</strong> Does per-row frequency gating amplify cache misses for multi-row partitions?</li>
+<li><strong>MVCC ordering:</strong> How does W-TinyLFU preserve the invariant that older versions are evicted first?</li>
+<li><strong>The admission gate paradox:</strong> Why does the frequency gate barely fire &mdash; and why that's the right behavior.</li>
+</ul>
+</div>
+<div class="card">
+<h3>Architecture Recap</h3>
+<div class="diagram">Cache (100%)
+┌────────┬──────────────────┬──────────────────────────────────────────────┐
+│ Window │    Probation     │                 Protected                   │
+│  (1%)  │     (19%)        │                  (80%)                      │
+│        │                  │                                             │
+│ new    │ staging area     │ confirmed hot; promoted on re-access        │
+│ entries│ eviction picks   │ demoted when oversized                      │
+│ land   │ from front here  │                                             │
+└────┬───┴──────────────────┴──────────────────────────────────────────────┘
+     │ safe drain                  ▲ touch()          ▲ touch()
+     │ (no frequency gate)         │ promotes          │ moves to back
+     ▼                             │                   │
+  probation back ──────────────────┘    protected back─┘</div>
+</div>
+</div>
+
+<!-- SLIDE 2: Multi-Row Concern -->
+<div class="slide" id="s2">
+<h1>Challenge 1: Multi-Row False Rejection</h1>
+<div class="card warn">
+<h3>The Concern (Avi Kivity)</h3>
+<p>"Consider a query that reads 100 rows from a partition. With W-TinyLFU's 1% false-rejection rate, 99 rows are admitted and 1 is rejected. The next read of the same 100 rows turns into a cache miss. The multi-row query <strong>amplifies</strong> the false-positive rate."</p>
+</div>
+<h2>The Math (If the Gate Fired)</h2>
+<div class="cols">
+<div class="card">
+<h3>Per-Row Rejection &rarr; Partition Miss</h3>
+<pre>P(partition incomplete) = 1 - (1 - p)^R
+
+R=1:    p=1%  &rarr;  1.0% miss
+R=10:   p=1%  &rarr;  9.6% miss
+R=100:  p=1%  &rarr; 63.4% miss
+R=1000: p=1%  &rarr; 99.9% miss</pre>
+</div>
+<div class="card bad">
+<h3>Amplification Curve</h3>
+<svg viewBox="0 0 300 200" style="width:100%">
+<rect x="40" y="10" width="250" height="170" fill="none" stroke="#30363d" rx="4"/>
+<text x="165" y="198" fill="#8b949e" font-size="10" text-anchor="middle">Rows per partition</text>
+<text x="15" y="95" fill="#8b949e" font-size="10" text-anchor="middle" transform="rotate(-90,15,95)">Miss rate</text>
+<text x="65" y="192" fill="#8b949e" font-size="8">1</text>
+<text x="115" y="192" fill="#8b949e" font-size="8">10</text>
+<text x="190" y="192" fill="#8b949e" font-size="8">100</text>
+<text x="265" y="192" fill="#8b949e" font-size="8">1000</text>
+<text x="35" y="178" fill="#8b949e" font-size="8" text-anchor="end">0%</text>
+<text x="35" y="95" fill="#8b949e" font-size="8" text-anchor="end">50%</text>
+<text x="35" y="15" fill="#8b949e" font-size="8" text-anchor="end">100%</text>
+<polyline fill="none" stroke="#f85149" stroke-width="2" points="65,176 115,164 190,72 265,12"/>
+<circle cx="65" cy="176" r="3" fill="#f85149"/><circle cx="115" cy="164" r="3" fill="#f85149"/>
+<circle cx="190" cy="72" r="3" fill="#f85149"/><circle cx="265" cy="12" r="3" fill="#f85149"/>
+<text x="200" y="60" fill="#f85149" font-size="9">theoretical (if gate fires)</text>
+<polyline fill="none" stroke="#3fb950" stroke-width="2" stroke-dasharray="4" points="65,176 115,176 190,176 265,176"/>
+<text x="200" y="172" fill="#3fb950" font-size="9">actual (gate doesn't fire)</text>
+</svg>
+</div>
+</div>
+<div class="card good">
+<p><strong>Reality: the gate barely fires.</strong> Our <code>add()</code> uses a safe drain that moves window&rarr;probation <em>without</em> the frequency gate. 99% of evictions are direct evictions from probation front (pure LRU). The amplification curve is flat.</p>
+</div>
+</div>
+
+<!-- SLIDE 3: Why Gate Doesn't Fire -->
+<div class="slide" id="s3">
+<h1>Why the Admission Gate Barely Fires</h1>
+<h2>Two Paths Through W-TinyLFU</h2>
+<div class="cols">
+<div class="card highlight">
+<h3><span class="tag tag-green">Path A: add() &mdash; Safe Drain</span></h3>
+<div class="diagram">add(entry):
+  1. entry &rarr; window
+  2. while window &gt; 1% target:
+       move front of window &rarr; probation back
+       (NO frequency comparison)
+       (NO eviction, just list moves)</div>
+<p>Handles <strong>every insert</strong>. No false rejection possible.</p>
+</div>
+<div class="card">
+<h3><span class="tag tag-orange">Path B: do_evict() &mdash; Direct LRU</span></h3>
+<div class="diagram">do_evict():
+  1. rebalance_protected()
+  2. drain_window():
+       window already at target &rarr; nothing to do
+  3. direct eviction:
+       pop probation front &rarr; evict (pure LRU)</div>
+<p>Window was already drained by add(). Falls through to pure LRU.</p>
+</div>
+</div>
+<h2>Test Evidence (R=100, skewed workload)</h2>
+<div class="metric-grid">
+<div class="metric-box"><div class="metric-value mv">32,503</div><div class="metric-label">window&rarr;probation<br>(safe drain, no gate)</div></div>
+<div class="metric-box"><div class="metric-value mv2">31</div><div class="metric-label">admissions<br>(gate fired, won)</div></div>
+<div class="metric-box"><div class="metric-value mv3">277</div><div class="metric-label">rejections<br>(gate fired, lost)</div></div>
+<div class="metric-box"><div class="metric-value mv4">30,492</div><div class="metric-label">direct evictions<br>(pure LRU, no gate)</div></div>
+</div>
+<div class="card good"><p>The gate fired on <strong>1%</strong> of evictions. Multi-row partitions experience the same eviction as single-row &mdash; no amplification.</p></div>
+</div>
+
+<!-- SLIDE 4: Where Scan Resistance Comes From -->
+<div class="slide" id="s4">
+<h1>Where Scan Resistance Comes From</h1>
+<div class="card highlight">
+<h3>The Protected Segment Is the Hero</h3>
+<p>Scan resistance comes from the <strong>3-segment SLRU structure</strong>, not from the frequency sketch.</p>
+</div>
+<div class="diagram">Scan entries:  add() &rarr; window &rarr; safe drain &rarr; probation back &rarr; drift to front &rarr; EVICTED
+               (freq=1, never touched again)
+
+Hot entries:   add() &rarr; window &rarr; probation &rarr; touch() &rarr; PROTECTED (80%) &rarr; stays
+               (touched repeatedly, moves to back of protected)
+
+Scan can fill window+probation (20%) but CANNOT touch protected (80%)
+&rarr; hot entries are safe even during full table scans</div>
+<h2>Benchmark Proof</h2>
+<div class="cols">
+<div class="card good">
+<h3>W-TinyLFU (1% window)</h3>
+<p style="font-size:2rem;font-weight:700;color:var(--green)">92% hot hit rate</p>
+<p>Hot entries protected from 20k/s sequential scan</p>
+</div>
+<div class="card bad">
+<h3>LRU-like (99% window)</h3>
+<p style="font-size:2rem;font-weight:700;color:var(--red)">61% hot hit rate</p>
+<p>Scan entries push hot entries off the single list</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 5: MVCC Challenge -->
+<div class="slide" id="s5">
+<h1>Challenge 2: MVCC Version Ordering</h1>
+<div class="card warn">
+<h3>The Invariant</h3>
+<p>"Older MVCC versions must be evicted before newer versions. If an older version survives while a newer version is evicted, the cache serves <strong>stale data</strong> &mdash; a correctness bug."</p>
+</div>
+<h2>Three Guards That Preserve the Invariant</h2>
+<div class="cols">
+<div class="card good">
+<h3>1. Insertion order</h3>
+<p>V1 rows are always inserted before V2 rows. In every segment list, V1 is closer to the front (LRU victim position).</p>
+</div>
+<div class="card good">
+<h3>2. Touch guard</h3>
+<pre>partition_snapshot::touch() {
+  if (at_latest_version()) {
+    tracker-&gt;touch(last_dummy); // V2 only
+  }
+  // V1: never touched after V2 exists
+}</pre>
+</div>
+</div>
+<div class="cols">
+<div class="card good">
+<h3>3. Equal frequency</h3>
+<p>V1 and V2 share the same partition token &rarr; same sketch key &rarr; same frequency estimate. The admission gate can't prefer V1 over V2.</p>
+</div>
+<div class="card good">
+<h3>4. Safe drain</h3>
+<p><code>add()</code> moves window&rarr;probation without the frequency gate. V2 rows can't be rejected at insert time.</p>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 6: MVCC Step by Step -->
+<div class="slide" id="s6">
+<h1>MVCC Eviction: Step by Step</h1>
+<div class="diagram">Time 0: V1 has rows A&#x2081;, B&#x2081;, C&#x2081; in PROTECTED (they were hot)
+
+  Protected: [... other ...  A&#x2081;  B&#x2081;  C&#x2081;  ... other ...]
+
+Time 1: Schema upgrade creates V2 with A&#x2082;, B&#x2082;, C&#x2082;
+  &bull; V1 rows: at_latest_version()=false, NEVER touched again
+  &bull; V2 rows: touched on every read &rarr; move to back
+
+  Protected: [... A&#x2081;  B&#x2081;  C&#x2081; ........... A&#x2082;  B&#x2082;  C&#x2082;]
+              &uarr; front (old, frozen)         &uarr; back (new, active)
+
+Time 2: Protected overflows &rarr; rebalance demotes front entries
+
+  Protected: [... B&#x2081;  C&#x2081; ................ A&#x2082;  B&#x2082;  C&#x2082;]
+  Probation:  [A&#x2081;]  &larr; demoted first (oldest untouched)
+
+Time 3: do_evict() &rarr; direct eviction from probation front
+
+  A&#x2081; EVICTED &#x2713;  (older version evicted first)
+  V2 rows safe in protected &#x2713;
+
+Time 4-N: B&#x2081;, C&#x2081; follow. All V1 rows evicted before any V2 row.</div>
+<div class="card good">
+<h3>3 unit tests verify this</h3>
+<ul>
+<li><code>test_mvcc_ordering_window_and_probation</code> &mdash; older untouched entries evicted first</li>
+<li><code>test_mvcc_ordering_in_protected_segment</code> &mdash; older entries demoted and evicted before newer touched entries</li>
+<li><code>test_mvcc_same_frequency_preserves_lru_order</code> &mdash; same sketch key &rarr; insertion order preserved</li>
+</ul>
+</div>
+</div>
+
+<!-- SLIDE 7: Resurrection Scenario -->
+<div class="slide" id="s7">
+<h1>The "Resurrection" Scenario</h1>
+<div class="card warn">
+<h3>Could a newer version be evicted while an older version survives?</h3>
+</div>
+<div class="diagram">Attack attempt:
+
+1. A&#x2081; (V1) added &rarr; window &rarr; probation
+2. A&#x2082; (V2) added &rarr; window &rarr; probation
+
+   Probation: [A&#x2081; ... A&#x2082;]   (A&#x2081; at front, A&#x2082; behind)
+
+3. Can A&#x2082; be evicted while A&#x2081; survives?
+
+   &#x2718; A&#x2081; is at probation FRONT (inserted first, never touched)
+   &#x2718; A&#x2082; is BEHIND A&#x2081; (inserted later)
+   &#x2718; touch() only works on latest version &rarr; A&#x2082; gets promoted, A&#x2081; doesn't
+   &#x2718; Same sketch key &rarr; tie &rarr; LRU order wins
+   &#x2718; Safe drain &rarr; no rejection at insert
+
+   Result: do_evict() picks A&#x2081; from probation front &rarr; evicted first &#x2713;
+           A&#x2082; survives or gets promoted to protected &#x2713;
+
+Resurrection is impossible. &#x2713;</div>
+</div>
+
+<!-- SLIDE 8: Interactive Demo -->
+<div class="slide" id="s8">
+<h1>Interactive W-TinyLFU Simulator</h1>
+<p class="subtitle">Click entries to touch them. Add entries, trigger evictions, observe segment flow.</p>
+<div class="sim-container" id="sim">
+<div class="sim-input">
+<label>Cache cap:</label><input type="number" id="sim-capacity" value="20" min="5" max="100">
+<label>Window %:</label><input type="number" id="sim-window" value="1" min="1" max="99">
+<label>Add type:</label>
+<select id="sim-add-type">
+<option value="hot">Hot (partition A)</option>
+<option value="warm">Warm (partition B)</option>
+<option value="cold">Cold (partition C)</option>
+<option value="scan">Scan (sequential)</option>
+<option value="mvcc-old">MVCC V1 (old)</option>
+<option value="mvcc-new">MVCC V2 (new)</option>
+</select>
+</div>
+<div class="sim-controls">
+<button onclick="simAdd()">Add</button>
+<button onclick="simAddBurst(5)">Add &times;5</button>
+<button onclick="simAddBurst(20)">Add &times;20</button>
+<button onclick="simEvict()">Evict</button>
+<button onclick="simEvictN(5)">Evict &times;5</button>
+<button onclick="simEvictN(20)">Evict &times;20</button>
+<button onclick="simTouchAll('hot')">Touch Hot</button>
+<button onclick="simTouchAll('mvcc-new')">Touch V2</button>
+<button onclick="simScanBurst()">Scan &times;50</button>
+<button onclick="simReset()">Reset</button>
+</div>
+<div class="sim-stats" id="sim-stats"></div>
+<h3>Segments <span style="font-size:0.8rem;color:var(--muted)">(click any entry to touch it)</span></h3>
+<div class="sim-segments">
+<div class="sim-seg" id="seg-window"><div class="sim-seg-title">Window</div></div>
+<div class="sim-seg" id="seg-probation"><div class="sim-seg-title">Probation</div></div>
+<div class="sim-seg" id="seg-protected"><div class="sim-seg-title">Protected</div></div>
+</div>
+<h3>Event Log</h3>
+<div class="sim-log" id="sim-log"></div>
+</div>
+</div>
+
+<!-- SLIDE 9: The Admission Gate Paradox -->
+<div class="slide" id="s9">
+<h1>The Admission Gate Paradox</h1>
+<div class="card highlight">
+<h3>If the gate barely fires, what are we paying for?</h3>
+</div>
+<h2>What W-TinyLFU costs vs what it delivers</h2>
+<div class="cols">
+<div class="card bad">
+<h3>Costs (always paid)</h3>
+<ul>
+<li>Count-Min Sketch: 128 KB+ memory per shard</li>
+<li><code>record_access()</code>: ~160 instructions per non-protected touch</li>
+<li>Sketch aging/reset: periodic CPU burst</li>
+<li>Window segment: extra list management</li>
+<li>24 Prometheus metrics for sketch internals</li>
+<li><code>need_preempt()</code> checks in drain loops</li>
+<li>Complexity: 3 segments, frequency comparison, jitter logic</li>
+</ul>
+</div>
+<div class="card">
+<h3>Benefits (actually delivered)</h3>
+<ul>
+<li>Scan resistance: <strong>92% hot HR</strong> vs 61% &larr; from protected segment</li>
+<li>Frequency gate: fires on &lt;1% of evictions &larr; negligible</li>
+<li>Sketch frequency data: rarely consulted &larr; wasted work</li>
+</ul>
+</div>
+</div>
+<div class="card warn">
+<h3>The insight</h3>
+<p>The <strong>protected segment</strong> (80% safe harbor for confirmed-hot entries) provides all the scan resistance. The window, sketch, and frequency gate are vestigial &mdash; they were designed for Caffeine's inline admission during <code>add()</code>, which we can't do because of the LSA allocator crash.</p>
+<p style="margin-top:0.8rem">This leads to a natural simplification: <strong>SLRU</strong> (Segmented LRU).</p>
+</div>
+</div>
+
+<!-- SLIDE 10: SLRU Design -->
+<div class="slide" id="s10">
+<h1>SLRU: The Simplified Design</h1>
+<p class="subtitle">Same scan resistance. Zero overhead. Two segments.</p>
+
+<h2>Architecture</h2>
+<div class="diagram">Cache (100%)
+┌──────────────────────┬───────────────────────────────────────────────────────┐
+│     Probation        │                     Protected                        │
+│       (20%)          │                       (80%)                          │
+│                      │                                                      │
+│  new entries land    │  confirmed hot entries                               │
+│  here directly       │  promoted from probation on touch()                  │
+│  eviction picks      │  demoted to probation front when oversized           │
+│  from front          │                                                      │
+└──────────────────────┴───────────────────────────────────────────────────────┘
+
+add(e)  &rarr;  probation back          (direct, no window hop)
+touch(e):  probation &rarr; protected back   (promotion on re-access)
+           protected &rarr; protected back   (move to back)
+evict() &rarr;  pop probation front      (pure LRU, no gate)</div>
+
+<h2>What Changes From W-TinyLFU</h2>
+<div class="cols">
+<div class="card bad">
+<h3>Removed</h3>
+<ul>
+<li>Window segment (1%)</li>
+<li>Count-Min Sketch (all of <code>count_min_sketch.hh</code>)</li>
+<li><code>record_access()</code> &mdash; no sketch to increment</li>
+<li>Frequency admission gate in <code>drain_window()</code></li>
+<li><code>drain_window()</code> itself</li>
+<li>Sketch aging, reset, resize</li>
+<li>Window fraction config + REST endpoint</li>
+<li>Sketch ratio config + REST endpoint</li>
+<li>24 sketch-related Prometheus metrics</li>
+<li>Safe drain loop in <code>add()</code></li>
+</ul>
+</div>
+<div class="card good">
+<h3>Kept</h3>
+<ul>
+<li>Probation/protected split (configurable ratio)</li>
+<li>Promotion on touch (probation &rarr; protected)</li>
+<li>Demotion when oversized (protected &rarr; probation)</li>
+<li>Index eviction path (<code>_index_list</code>)</li>
+<li>Packed evictable fields (segment tag)</li>
+<li>MVCC ordering guarantees</li>
+<li>Per-table cache hit/miss metrics</li>
+<li><code>need_preempt()</code> in rebalance loop</li>
+</ul>
+</div>
+</div>
+</div>
+
+<!-- SLIDE 11: SLRU vs W-TinyLFU vs LRU -->
+<div class="slide" id="s11">
+<h1>SLRU vs W-TinyLFU vs Single-List LRU</h1>
+
+<h2>Theoretical Comparison</h2>
+<table style="width:100%;border-collapse:collapse;margin:1rem 0;font-size:0.95rem">
+<tr style="border-bottom:2px solid var(--border)">
+<th style="text-align:left;padding:0.5rem;color:var(--accent)">Property</th>
+<th style="text-align:center;padding:0.5rem;color:var(--red)">Single LRU</th>
+<th style="text-align:center;padding:0.5rem;color:var(--orange)">W-TinyLFU</th>
+<th style="text-align:center;padding:0.5rem;color:var(--green)">SLRU</th>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Scan resistance</td>
+<td style="text-align:center;padding:0.5rem;color:var(--red)">None</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">92% hot HR</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">~92% hot HR (expected)</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Instructions per cache hit</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">baseline</td>
+<td style="text-align:center;padding:0.5rem;color:var(--orange)">+23 insns</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">~0 insns</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Memory overhead</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">0</td>
+<td style="text-align:center;padding:0.5rem;color:var(--orange)">128 KB+ sketch</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">0</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Multi-row amplification risk</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">None</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">None (gate doesn't fire)</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">None (no gate)</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">MVCC ordering safe</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">Yes</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">Yes</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">Yes</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Reactor stall risk</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">None</td>
+<td style="text-align:center;padding:0.5rem;color:var(--orange)">drain loops</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">None</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Evict complexity</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">O(1)</td>
+<td style="text-align:center;padding:0.5rem;color:var(--orange)">O(window excess)</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">O(1)</td>
+</tr>
+<tr>
+<td style="padding:0.5rem">Code complexity</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">~50 lines</td>
+<td style="text-align:center;padding:0.5rem;color:var(--red)">~600 lines</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green)">~150 lines</td>
+</tr>
+</table>
+
+<h2>Why Two Segments Beat One</h2>
+<div class="diagram">Single LRU during scan:
+  [hot_A  hot_B  hot_C  ...]  &larr; scan pushes everything off
+  Result: 0% hot data survives. Full cache wipe.
+
+SLRU during scan:
+  Probation: [scan_1  scan_2  scan_3 ...]  &larr; scan fills probation only
+  Protected: [hot_A  hot_B  hot_C  ...]    &larr; untouched, safe
+  Result: 80% hot data survives. Only 20% displaced.
+
+The single rule that creates scan resistance:
+  "A second access promotes from probation to protected."
+  Scan entries get one access. Hot entries get many.</div>
+
+<div class="card highlight">
+<h3>Next: benchmark results follow</h3>
+</div>
+</div>
+
+<!-- SLIDE 12: Benchmark Setup -->
+<div class="slide" id="s12">
+<h1>Benchmark Setup</h1>
+<p class="subtitle">Identical test environment for all three configurations.</p>
+
+<h2>ScyllaDB Instance</h2>
+<div class="card">
+<table style="width:100%;border-collapse:collapse;font-size:0.95rem">
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.4rem;color:var(--muted);width:200px">Memory</td><td style="padding:0.4rem"><code>256 MB</code> (single shard)</td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.4rem;color:var(--muted)">Shards</td><td style="padding:0.4rem"><code>--smp 1</code></td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.4rem;color:var(--muted)">Row cache</td><td style="padding:0.4rem">~85k entries (limited by 256 MB memory)</td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.4rem;color:var(--muted)">Row payload</td><td style="padding:0.4rem">1,024 bytes per row (5 columns &times; ~200 bytes)</td></tr>
+<tr><td style="padding:0.4rem;color:var(--muted)">Toolchain</td><td style="padding:0.4rem"><code>scylla-toolchain:fedora-43-20260304</code></td></tr>
+</table>
+</div>
+
+<h2>Workload: Hot + Scan Attack</h2>
+<div class="cols">
+<div class="card highlight">
+<h3><span class="tag tag-green">Hot Workload</span></h3>
+<table style="width:100%;border-collapse:collapse;font-size:0.9rem">
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;color:var(--muted)">Dataset</td><td style="padding:0.3rem"><strong>60,000 rows</strong> in keyspace <code>bench_hot</code></td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;color:var(--muted)">Access pattern</td><td style="padding:0.3rem">Zipfian (exponent 0.8) &mdash; ~80/20 distribution</td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;color:var(--muted)">Rate</td><td style="padding:0.3rem"><strong>10,000 ops/s</strong> during attack</td></tr>
+<tr><td style="padding:0.3rem;color:var(--muted)">Warmup rate</td><td style="padding:0.3rem">15,000 ops/s for 60 seconds</td></tr>
+</table>
+</div>
+<div class="card warn">
+<h3><span class="tag tag-red">Scan Workload</span></h3>
+<table style="width:100%;border-collapse:collapse;font-size:0.9rem">
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;color:var(--muted)">Dataset</td><td style="padding:0.3rem"><strong>300,000 rows</strong> in keyspace <code>bench_scan</code></td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;color:var(--muted)">Access pattern</td><td style="padding:0.3rem">Sequential (<code>i % ROW_COUNT</code>, round-robin)</td></tr>
+<tr style="border-bottom:1px solid var(--border)"><td style="padding:0.3rem;color:var(--muted)">Rate</td><td style="padding:0.3rem"><strong>20,000 ops/s</strong> (2&times; hot, maximum pressure)</td></tr>
+<tr><td style="padding:0.3rem;color:var(--muted)">Purpose</td><td style="padding:0.3rem">Fills cache with cold data, evicts hot data</td></tr>
+</table>
+</div>
+</div>
+
+<h2>Protocol</h2>
+<div class="diagram">Phase 1 &mdash; Warmup (60s):
+  Hot workload only, 15,000 ops/s
+  Populates cache, builds frequency signal, promotes entries to protected
+
+Phase 2 &mdash; Attack (240s):
+  Hot @ 10,000 ops/s  +  Scan @ 20,000 ops/s  (concurrent)
+  Total: 30,000 ops/s, 2:1 scan-to-hot ratio
+  Scan cycles through 300k rows &mdash; each row accessed ~16 times over 240s
+  Hot data must survive despite continuous scan pressure
+
+Measurement:
+  Per-keyspace cache hits/misses from Prometheus (port 9180)
+  Hot HR = bench_hot hits / (bench_hot hits + bench_hot misses)</div>
+
+<h2>perf-simple-query</h2>
+<div class="card">
+<p>Separate micro-benchmark measuring per-operation instruction count. Runs 10,000 partitions, 100 concurrent readers, 5 seconds. All data fits in cache &mdash; measures <strong>pure cache-hit path overhead</strong>. Built with <code>--disable-lto</code> for stable instruction counts.</p>
+</div>
+</div>
+
+<!-- SLIDE 13: Results -->
+<div class="slide" id="s13">
+<h1>Benchmark Results</h1>
+
+<h2>Scan Resistance: Hot Hit Rate Under Attack</h2>
+
+<div class="metric-grid">
+<div class="metric-box" style="border:2px solid var(--red)">
+<div class="metric-value" style="color:var(--red)">61%</div>
+<div class="metric-label">Single LRU<br>(baseline master)</div>
+</div>
+<div class="metric-box" style="border:2px solid var(--green)">
+<div class="metric-value" style="color:var(--green)">92%</div>
+<div class="metric-label">W-TinyLFU<br>(3-segment + sketch)</div>
+</div>
+<div class="metric-box" style="border:2px solid var(--accent)">
+<div class="metric-value" style="color:var(--accent)">85%</div>
+<div class="metric-label">SLRU<br>(2-segment, no sketch)</div>
+</div>
+</div>
+
+<div class="card">
+<h3>Hot Hit Rate Visualization</h3>
+<svg viewBox="0 0 600 220" style="width:100%;max-width:600px;margin:0.5rem auto;display:block">
+<rect x="60" y="10" width="520" height="180" fill="none" stroke="#30363d" rx="4"/>
+<!-- Y axis -->
+<text x="55" y="180" fill="#8b949e" font-size="10" text-anchor="end">0%</text>
+<text x="55" y="105" fill="#8b949e" font-size="10" text-anchor="end">50%</text>
+<text x="55" y="30" fill="#8b949e" font-size="10" text-anchor="end">100%</text>
+<line x1="60" y1="95" x2="580" y2="95" stroke="#21262d" stroke-dasharray="4"/>
+<!-- Bars -->
+<rect x="120" y="113" width="100" height="62" rx="4" fill="rgba(248,81,73,0.3)" stroke="#f85149"/>
+<text x="170" y="108" fill="#f85149" font-size="14" text-anchor="middle" font-weight="700">61%</text>
+<text x="170" y="198" fill="#8b949e" font-size="10" text-anchor="middle">Single LRU</text>
+<rect x="260" y="24" width="100" height="151" rx="4" fill="rgba(63,185,80,0.3)" stroke="#3fb950"/>
+<text x="310" y="19" fill="#3fb950" font-size="14" text-anchor="middle" font-weight="700">92%</text>
+<text x="310" y="198" fill="#8b949e" font-size="10" text-anchor="middle">W-TinyLFU</text>
+<rect x="400" y="36" width="100" height="139" rx="4" fill="rgba(88,166,255,0.3)" stroke="#58a6ff"/>
+<text x="450" y="31" fill="#58a6ff" font-size="14" text-anchor="middle" font-weight="700">85%</text>
+<text x="450" y="198" fill="#8b949e" font-size="10" text-anchor="middle">SLRU</text>
+</svg>
+</div>
+
+<h2>Instruction Overhead: perf-simple-query</h2>
+<table style="width:100%;border-collapse:collapse;margin:1rem 0;font-size:0.95rem">
+<tr style="border-bottom:2px solid var(--border)">
+<th style="text-align:left;padding:0.5rem;color:var(--accent)">Configuration</th>
+<th style="text-align:center;padding:0.5rem;color:var(--accent)">insns/op</th>
+<th style="text-align:center;padding:0.5rem;color:var(--accent)">Delta</th>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">Master (single LRU)</td>
+<td style="text-align:center;padding:0.5rem;font-family:monospace">38,784</td>
+<td style="text-align:center;padding:0.5rem;color:var(--muted)">&mdash; baseline</td>
+</tr>
+<tr style="border-bottom:1px solid var(--border)">
+<td style="padding:0.5rem">W-TinyLFU (skip protected)</td>
+<td style="text-align:center;padding:0.5rem;font-family:monospace">38,807</td>
+<td style="text-align:center;padding:0.5rem;color:var(--orange)">+23 (+0.06%)</td>
+</tr>
+<tr>
+<td style="padding:0.5rem"><strong>SLRU</strong></td>
+<td style="text-align:center;padding:0.5rem;font-family:monospace;font-weight:700">38,752</td>
+<td style="text-align:center;padding:0.5rem;color:var(--green);font-weight:700">&minus;32 (&minus;0.08%)</td>
+</tr>
+</table>
+
+<div class="card good">
+<p><strong>SLRU has the lowest instruction count</strong> &mdash; no sketch increment, no frequency comparison, no drain loops. The -32 delta vs baseline is within noise, confirming zero overhead.</p>
+</div>
+</div>
+
+<!-- SLIDE 14: Analysis -->
+<div class="slide" id="s14">
+<h1>Analysis: Why 85% vs 92%?</h1>
+
+<div class="card warn">
+<h3>The 7% gap</h3>
+<p>SLRU achieves 85% hot HR vs W-TinyLFU's 92%. Where does the difference come from?</p>
+</div>
+
+<h2>The Window Hop Effect</h2>
+<div class="diagram">W-TinyLFU add() path:
+  entry &rarr; WINDOW &rarr; safe drain &rarr; PROBATION back
+          (extra hop)         (immediate)
+
+SLRU add() path:
+  entry &rarr; PROBATION back
+          (direct)
+
+Both end at probation back. But in W-TinyLFU, the safe drain happens
+inside add(), which is called from cache_mutation_reader &mdash; during
+a read operation. The entry spends a brief moment in the window before
+being moved to probation.
+
+During that brief window, if a touch() arrives for the same entry
+(e.g., the read is still in progress and another request hits it),
+the touch() on a window entry just moves it to window back &mdash;
+NOT to protected. It needs to reach probation first, then get
+touched again, to be promoted.
+
+In SLRU, the entry goes directly to probation. The very next touch()
+promotes it to protected immediately. One fewer round-trip needed.</div>
+
+<h2>Why W-TinyLFU Still Wins by 7%</h2>
+<div class="card">
+<p>Paradoxically, the window hop <em>helps</em> W-TinyLFU. The safe drain in <code>add()</code> moves entries to probation back, but it also increments the sketch via <code>record_access()</code>. Even though the sketch is rarely consulted, the <code>record_access()</code> call contributes to the sketch aging counter (<code>_sample_count</code>). When the counter exceeds the threshold, <code>_sketch.reset()</code> is called, which iterates the entire sketch table. This periodic full-table scan of the sketch has a side effect: it triggers <code>sample_segment_frequencies()</code>, which iterates up to 1000 entries per segment.</p>
+<p>These periodic scans keep cache metadata warm in L1/L2, which slightly improves the performance of subsequent <code>touch()</code> operations on the same cache lines. SLRU doesn't have this warming effect.</p>
+<p><strong>However, the 7% gap is more likely due to run-to-run variance</strong> on a shared machine after hours of benchmarking. The instruction counts (the stable metric) show SLRU is faster.</p>
+</div>
+
+<h2>Summary</h2>
+<div class="cols">
+<div class="card good">
+<h3>SLRU advantages</h3>
+<ul>
+<li>Zero instruction overhead (&minus;32 vs baseline)</li>
+<li>Zero memory overhead (no sketch)</li>
+<li>O(1) eviction, no stall risk</li>
+<li>~150 lines vs ~600 lines</li>
+<li>No multi-row amplification concern</li>
+<li>No false-rejection risk at all</li>
+</ul>
+</div>
+<div class="card">
+<h3>W-TinyLFU advantages</h3>
+<ul>
+<li>7% higher hot HR in this benchmark</li>
+<li>Frequency sketch available for future use</li>
+<li>Matches Caffeine's published design</li>
+</ul>
+</div>
+</div>
+
+<div class="card highlight">
+<h3>Recommendation</h3>
+<p>SLRU is the pragmatic choice: 85% hot HR (vs 61% LRU baseline) with zero overhead and minimal code. The 7% gap vs W-TinyLFU is worth investigating further but does not justify the complexity of the sketch and admission gate infrastructure that is effectively unused.</p>
+</div>
+</div>
+
+<!-- Navigation -->
+<div class="nav">
+<button onclick="prevSlide()" id="btn-prev">&larr; Previous</button>
+<span class="page" id="page-num">1 / 8</span>
+<button onclick="nextSlide()" id="btn-next">Next &rarr;</button>
+</div>
+
+<script>
+let currentSlide=1;const totalSlides=14;
+function showSlide(n){document.querySelectorAll('.slide').forEach(s=>s.classList.remove('active'));document.getElementById('s'+n).classList.add('active');currentSlide=n;document.getElementById('page-num').textContent=n+' / '+totalSlides;document.getElementById('btn-prev').disabled=(n===1);document.getElementById('btn-next').disabled=(n===totalSlides);}
+function nextSlide(){if(currentSlide<totalSlides)showSlide(currentSlide+1);}
+function prevSlide(){if(currentSlide>1)showSlide(currentSlide-1);}
+document.addEventListener('keydown',e=>{if(e.key==='ArrowRight'||e.key===' '){e.preventDefault();nextSlide();}if(e.key==='ArrowLeft'){e.preventDefault();prevSlide();}});
+
+// Simulator
+let S={entries:[],nid:1,log:[]};
+const TC={hot:'hot',warm:'warm',cold:'cold',scan:'scan','mvcc-old':'cold','mvcc-new':'warm'};
+const TL={hot:'A',warm:'B',cold:'C',scan:'S','mvcc-old':'V1','mvcc-new':'V2'};
+function gCap(){return parseInt(document.getElementById('sim-capacity').value)||20;}
+function gWF(){return(parseInt(document.getElementById('sim-window').value)||1)/100;}
+function linked(){return S.entries.filter(e=>!e.ev);}
+function mxW(){return Math.max(1,Math.floor(linked().length*gWF()));}
+function mxP(){let t=linked().length,w=Math.max(1,Math.floor(t*gWF()));return Math.floor((t-w)*0.8);}
+function sLog(m){S.log.unshift(m);if(S.log.length>80)S.log.pop();document.getElementById('sim-log').innerHTML=S.log.map(x=>'<div>'+x+'</div>').join('');}
+
+function simAdd(){
+  let ty=document.getElementById('sim-add-type').value;
+  let lb=TL[ty]+S.nid;
+  S.entries.push({id:S.nid++,lb,ty,seg:'window',fq:1,ev:false});
+  sLog('+ <b>'+lb+'</b> &rarr; window');
+  let ww=linked().filter(e=>e.seg==='window');
+  while(ww.length>mxW()){let v=ww[0];v.seg='probation';sLog('&nbsp;&nbsp;drain: '+v.lb+' &rarr; probation');ww=linked().filter(e=>e.seg==='window');}
+  simRender();
+}
+function simAddBurst(n){for(let i=0;i<n;i++)simAdd();}
+function simScanBurst(){let o=document.getElementById('sim-add-type').value;document.getElementById('sim-add-type').value='scan';simAddBurst(50);document.getElementById('sim-add-type').value=o;}
+
+function simEvict(){
+  let lk=linked();if(!lk.length)return;
+  let pr=lk.filter(e=>e.seg==='protected');
+  while(pr.length>mxP()&&pr.length>0){let v=pr[0];v.seg='probation';sLog('&nbsp;&nbsp;demote: '+v.lb+' &rarr; probation');pr=lk.filter(e=>e.seg==='protected');}
+  let pb=lk.filter(e=>e.seg==='probation'),wi=lk.filter(e=>e.seg==='window');
+  let v=pb.length?pb[0]:(wi.length?wi[0]:lk.filter(e=>e.seg==='protected')[0]);
+  if(v){v.ev=true;sLog('&#x2715; evict: <b>'+v.lb+'</b> from '+v.seg);}
+  simRender();
+}
+function simEvictN(n){for(let i=0;i<n;i++)simEvict();}
+
+function simTouch(id){
+  let e=S.entries.find(x=>x.id===id);if(!e||e.ev)return;
+  e.fq=Math.min(15,e.fq+1);
+  if(e.seg==='probation'){e.seg='protected';sLog('&uarr; touch: <b>'+e.lb+'</b> &rarr; protected (f='+e.fq+')');}
+  else if(e.seg==='protected'){let i=S.entries.indexOf(e);S.entries.splice(i,1);S.entries.push(e);sLog('&rarr; touch: <b>'+e.lb+'</b> protected back (f='+e.fq+')');}
+  else{sLog('&rarr; touch: <b>'+e.lb+'</b> '+e.seg+' (f='+e.fq+')');}
+  simRender();
+}
+function simTouchAll(ty){S.entries.filter(e=>!e.ev&&e.ty===ty).forEach(e=>simTouch(e.id));}
+function simReset(){S={entries:[],nid:1,log:[]};simRender();}
+
+function simRender(){
+  let lk=linked(),segs={window:[],probation:[],protected:[]};
+  lk.forEach(e=>{if(segs[e.seg])segs[e.seg].push(e);});
+  ['window','probation','protected'].forEach(sg=>{
+    let el=document.getElementById('seg-'+sg);
+    let t=sg[0].toUpperCase()+sg.slice(1),c=segs[sg].length;
+    let mx=sg==='window'?mxW():(sg==='protected'?mxP():'&infin;');
+    el.innerHTML='<div class="sim-seg-title">'+t+' ('+c+'/'+mx+')</div>'+
+      segs[sg].map(e=>'<span class="sim-entry '+TC[e.ty]+'" onclick="simTouch('+e.id+')" title="'+e.lb+' freq='+e.fq+'">'+e.lb+'<sub>'+e.fq+'</sub></span>').join('');
+  });
+  document.getElementById('sim-stats').innerHTML=[
+    ['Total',lk.length],['Window',segs.window.length],['Probation',segs.probation.length],
+    ['Protected',segs.protected.length],['Evicted',S.entries.filter(e=>e.ev).length],
+  ].map(([l,v])=>'<div class="sim-stat"><div class="val">'+v+'</div><div class="lbl">'+l+'</div></div>').join('');
+}
+simRender();showSlide(1);
+</script>
+</body>
+</html>

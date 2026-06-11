@@ -57,41 +57,22 @@ row_cache::create_underlying_reader(read_context& ctx, mutation_source& src, con
 
 static thread_local mutation_application_stats dummy_app_stats;
 static thread_local utils::updateable_value<double> dummy_index_cache_fraction(1.0);
-static thread_local utils::updateable_value<double> dummy_tinylfu_sketch_entries_per_mb(1024.0);
-static thread_local utils::updateable_value<double> dummy_tinylfu_initial_window_fraction(1.0);
 
 cache_tracker::cache_tracker()
-    : cache_tracker(dummy_index_cache_fraction, dummy_tinylfu_sketch_entries_per_mb,
-                    dummy_tinylfu_initial_window_fraction,
-                    dummy_app_stats, register_metrics::no)
+    : cache_tracker(dummy_index_cache_fraction, dummy_app_stats, register_metrics::no)
 {}
 
 cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb,
-                    dummy_tinylfu_initial_window_fraction,
-                    dummy_app_stats, with_metrics)
-{}
-
-cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats& app_stats, register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), dummy_tinylfu_sketch_entries_per_mb,
-                    dummy_tinylfu_initial_window_fraction,
-                    app_stats, with_metrics)
+    : cache_tracker(std::move(index_cache_fraction), dummy_app_stats, with_metrics)
 {}
 
 static thread_local cache_tracker* current_tracker;
 
-cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction,
-                             utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
-                             utils::updateable_value<double> tinylfu_initial_window_fraction,
-                             mutation_application_stats& app_stats, register_metrics with_metrics)
+cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction, mutation_application_stats& app_stats, register_metrics with_metrics)
     : _garbage(_region, this, app_stats)
     , _memtable_cleaner(_region, nullptr, app_stats)
     , _app_stats(app_stats)
     , _index_cache_fraction(std::move(index_cache_fraction))
-    , _tinylfu_sketch_entries_per_mb(std::move(tinylfu_sketch_entries_per_mb))
-    , _tinylfu_initial_window_fraction(std::move(tinylfu_initial_window_fraction))
-    , _sketch_ratio_observer(utils::dummy_observer<double>())
-    , _window_fraction_observer(utils::dummy_observer<double>())
 {
     if (with_metrics) {
         setup_metrics();
@@ -116,38 +97,7 @@ cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fractio
             return _lru.evict(should_evict_index);
         });
     });
-
-    // Observe ratio changes: resize the sketch whenever the config is updated.
-    _sketch_ratio_observer = _tinylfu_sketch_entries_per_mb.observe([this](const double&) noexcept {
-        try {
-            resize_sketch();
-        } catch (...) {
-            // Sketch resize is best-effort; the old sketch remains usable.
-        }
-    });
-
-    // Observe window percent changes.
-    _window_fraction_observer = _tinylfu_initial_window_fraction.observe([this](const double& v) noexcept {
-        _lru.set_window_fraction(v);
-    });
-
-    // Apply initial config values.
-    _lru.set_window_fraction(_tinylfu_initial_window_fraction.get());
-
-    // Set initial sketch size based on the current available memory.
-    // At construction time the LSA region is empty, so we use the total
-    // per-shard memory as a proxy for the eventual cache size.
-    resize_sketch();
 }
-
-cache_tracker::cache_tracker(utils::updateable_value<double> index_cache_fraction,
-                             utils::updateable_value<double> tinylfu_sketch_entries_per_mb,
-                             utils::updateable_value<double> tinylfu_initial_window_fraction,
-                             register_metrics with_metrics)
-    : cache_tracker(std::move(index_cache_fraction), std::move(tinylfu_sketch_entries_per_mb),
-                    std::move(tinylfu_initial_window_fraction),
-                    dummy_app_stats, with_metrics)
-{}
 
 cache_tracker::~cache_tracker() {
     clear();
@@ -160,21 +110,6 @@ memory::reclaiming_result cache_tracker::evict_from_lru_shallow() noexcept {
     });
 }
 
-void cache_tracker::resize_sketch() {
-    // Use total_space() if the region is already populated, otherwise fall
-    // back to the total per-shard memory (appropriate at construction time).
-    size_t cache_bytes = _region.occupancy().total_space();
-    if (cache_bytes == 0) {
-        cache_bytes = memory::stats().total_memory();
-    }
-    double entries_per_mb = _tinylfu_sketch_entries_per_mb.get();
-    size_t new_log2 = lru::compute_sketch_width_log2(cache_bytes, entries_per_mb);
-    _lru.resize_sketch(new_log2);
-}
-
-void cache_tracker::reset_sketch() noexcept {
-    _lru.reset_sketch();
-}
 
 void cache_tracker::set_compaction_scheduling_group(seastar::scheduling_group sg) {
     _memtable_cleaner.set_scheduling_group(sg);
@@ -232,37 +167,16 @@ cache_tracker::setup_metrics() {
             sm::description("total amount of attempts to compact expired rows during read")),
         sm::make_counter("rows_compacted_away", _stats.rows_compacted_away,
             sm::description("total amount of compacted and removed rows during read")),
-        // W-TinyLFU segment sizes
-        sm::make_gauge("tinylfu_window_size", sm::description("current entries in W-TinyLFU window segment"), [this] { return _lru.window_size(); }),
-        sm::make_gauge("tinylfu_probation_size", sm::description("current entries in W-TinyLFU probation segment"), [this] { return _lru.probation_size(); }),
-        sm::make_gauge("tinylfu_protected_size", sm::description("current entries in W-TinyLFU protected segment"), [this] { return _lru.protected_size(); }),
-        sm::make_gauge("tinylfu_max_window_size", sm::description("target window segment size"), [this] { return _lru.current_max_window_size(); }),
-        sm::make_gauge("tinylfu_max_protected_size", sm::description("target protected segment size"), [this] { return _lru.current_max_protected_size(); }),
-        // W-TinyLFU sampled frequency
-        sm::make_gauge("tinylfu_avg_freq_window", sm::description("sampled average sketch frequency in window segment"), [this] { return _lru.get_stats().sampled_avg_freq_window; }),
-        sm::make_gauge("tinylfu_avg_freq_probation", sm::description("sampled average sketch frequency in probation segment"), [this] { return _lru.get_stats().sampled_avg_freq_probation; }),
-        sm::make_gauge("tinylfu_avg_freq_protected", sm::description("sampled average sketch frequency in protected segment"), [this] { return _lru.get_stats().sampled_avg_freq_protected; }),
-        // W-TinyLFU sketch aging
-        sm::make_gauge("tinylfu_sample_count", sm::description("accesses since last sketch reset"), [this] { return _lru.sample_count(); }),
-        sm::make_gauge("tinylfu_sample_threshold", sm::description("accesses needed to trigger next sketch reset"), [this] { return _lru.sample_threshold(); }),
-        // W-TinyLFU admission gate
-        sm::make_counter("tinylfu_admissions", sm::description("entries admitted through TinyLFU frequency gate"), [this] { return _lru.get_stats().tinylfu_admissions; }),
-        sm::make_counter("tinylfu_rejections", sm::description("entries rejected by TinyLFU frequency gate"), [this] { return _lru.get_stats().tinylfu_rejections; }),
-        sm::make_counter("tinylfu_jitter_admissions", sm::description("admissions via hash-DoS jitter (freq >= 6, 1/128 chance)"), [this] { return _lru.get_stats().tinylfu_jitter_admissions; }),
-        sm::make_counter("tinylfu_direct_evictions", sm::description("evictions bypassing admission gate (path 2)"), [this] { return _lru.get_stats().direct_evictions; }),
-        // W-TinyLFU segment flow
-        sm::make_counter("tinylfu_protected_promotions", sm::description("entries promoted from probation to protected on hit"), [this] { return _lru.get_stats().protected_promotions; }),
-        sm::make_counter("tinylfu_protected_demotions", sm::description("entries demoted from protected to probation on overflow"), [this] { return _lru.get_stats().protected_demotions; }),
-        sm::make_counter("tinylfu_window_to_probation", sm::description("entries moved from window to probation"), [this] { return _lru.get_stats().window_to_probation; }),
-        sm::make_counter("tinylfu_sketch_resets", sm::description("number of sketch aging/reset cycles"), [this] { return _lru.get_stats().sketch_resets; }),
-        // W-TinyLFU admission frequency histogram
-        sm::make_counter("tinylfu_admission_freq_0_1", sm::description("admission decisions where entry frequency was 0-1"), [this] { return _lru.get_stats().admission_freq_bucket_0_1; }),
-        sm::make_counter("tinylfu_admission_freq_2_3", sm::description("admission decisions where entry frequency was 2-3"), [this] { return _lru.get_stats().admission_freq_bucket_2_3; }),
-        sm::make_counter("tinylfu_admission_freq_4_7", sm::description("admission decisions where entry frequency was 4-7"), [this] { return _lru.get_stats().admission_freq_bucket_4_7; }),
-        sm::make_counter("tinylfu_admission_freq_8_15", sm::description("admission decisions where entry frequency was 8-15"), [this] { return _lru.get_stats().admission_freq_bucket_8_15; }),
-        // LSA eviction tracking
-        sm::make_counter("tinylfu_eviction_calls", sm::description("total LSA-triggered eviction calls"), [this] { return _lru.get_stats().eviction_calls; }),
-        sm::make_counter("tinylfu_eviction_calls_empty", sm::description("eviction calls that found nothing to evict"), [this] { return _lru.get_stats().eviction_calls_empty; }),
+        // SLRU segment sizes
+        sm::make_gauge("slru_probation_size", sm::description("entries in SLRU probation segment"), [this] { return _lru.probation_size(); }),
+        sm::make_gauge("slru_protected_size", sm::description("entries in SLRU protected segment"), [this] { return _lru.protected_size(); }),
+        sm::make_gauge("slru_max_protected_size", sm::description("target protected segment size"), [this] { return _lru.current_max_protected_size(); }),
+        // SLRU segment flow
+        sm::make_counter("slru_direct_evictions", sm::description("direct evictions from probation front"), [this] { return _lru.get_stats().direct_evictions; }),
+        sm::make_counter("slru_protected_promotions", sm::description("entries promoted from probation to protected on hit"), [this] { return _lru.get_stats().protected_promotions; }),
+        sm::make_counter("slru_protected_demotions", sm::description("entries demoted from protected to probation on overflow"), [this] { return _lru.get_stats().protected_demotions; }),
+        sm::make_counter("slru_eviction_calls", sm::description("total LSA-triggered eviction calls"), [this] { return _lru.get_stats().eviction_calls; }),
+        sm::make_counter("slru_eviction_calls_empty", sm::description("eviction calls that found nothing to evict"), [this] { return _lru.get_stats().eviction_calls_empty; }),
     });
     sstables::register_index_page_cache_metrics(_metrics, _index_cached_file_stats);
     sstables::register_index_page_metrics(_metrics, _partition_index_cache_stats);
@@ -278,9 +192,6 @@ void cache_tracker::clear() {
         _memtable_cleaner.clear();
         current_tracker = this;
         _lru.evict_all();
-        // Reset the frequency sketch so stale history doesn't bias admission
-        // decisions after a full cache clear (e.g. truncate, schema change).
-        _lru.reset_sketch();
         // Eviction could have produced garbage.
         _garbage.clear();
         _memtable_cleaner.clear();
