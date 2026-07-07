@@ -124,6 +124,8 @@ struct cql_server_config {
     std::optional<uint16_t> shard_aware_transport_port;
     std::optional<uint16_t> shard_aware_transport_port_ssl;
     bool allow_shard_aware_drivers = true;
+    bool driver_update_enabled = false;
+    sstring driver_update_directory = "/var/lib/scylla/drivers";
     smp_service_group bounce_request_smp_service_group = default_smp_service_group();
     utils::updateable_value<uint32_t> max_concurrent_requests;
     utils::updateable_value<bool> cql_duplicate_bind_variable_names_refer_to_same_variable;
@@ -288,6 +290,11 @@ private:
         bool _ready = false;
         bool _authenticating = false;
         bool _tenant_switch = false;
+        // Driver update state
+        bool _driver_update_negotiated = false;
+        sstring _client_arch;
+        sstring _client_os;
+        sstring _client_driver_hash;
 
         enum class tracing_request_type : uint8_t {
             not_requested,
@@ -339,6 +346,8 @@ private:
         std::unique_ptr<cql_server::response> make_autheticate(int16_t, std::string_view, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_auth_success(int16_t, bytes, const tracing::trace_state_ptr& tr_state) const;
         std::unique_ptr<cql_server::response> make_auth_challenge(int16_t, bytes, const tracing::trace_state_ptr& tr_state) const;
+
+        future<std::unique_ptr<cql_server::response>> process_driver_download(uint16_t stream, request_reader in, service::client_state& client_state, tracing::trace_state_ptr trace_state);
 
         cql3::dialect get_dialect() const;
 

@@ -36,6 +36,8 @@
 #include <seastar/core/metrics.hh>
 #include <seastar/net/byteorder.hh>
 #include <seastar/net/tls.hh>
+#include <filesystem>
+#include <seastar/util/file.hh>
 #include <seastar/util/lazy.hh>
 #include <seastar/util/short_streams.hh>
 #include <seastar/core/execution_stage.hh>
@@ -1386,7 +1388,23 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_st
             cql_proto_exts.set(ext);
         }
     }
+    bool driver_update_requested = cql_proto_exts.contains(cql_protocol_extension::DRIVER_UPDATE);
     _client_state.set_protocol_extensions(std::move(cql_proto_exts));
+
+    // Extract driver update client metadata if the extension was negotiated
+    if (driver_update_requested && _server._config.driver_update_enabled) {
+        _driver_update_negotiated = true;
+        if (auto it = options.find("SCYLLA_CLIENT_ARCH"); it != options.end()) {
+            _client_arch = it->second;
+        }
+        if (auto it = options.find("SCYLLA_CLIENT_OS"); it != options.end()) {
+            _client_os = it->second;
+        }
+        if (auto it = options.find("SCYLLA_DRIVER_HASH"); it != options.end()) {
+            _client_driver_hash = it->second;
+        }
+    }
+
     std::unique_ptr<cql_server::response> res;
     if (auto& a = client_state.get_auth_service()->underlying_authenticator(); a.require_authentication()) {
         _authenticating = true;
@@ -1470,6 +1488,48 @@ future<std::unique_ptr<cql_server::response>> cql_server::connection::process_au
         });
     }
     return make_ready_future<std::unique_ptr<cql_server::response>>(make_auth_challenge(stream, std::move(challenge), trace_state));
+}
+
+future<std::unique_ptr<cql_server::response>> cql_server::connection::process_driver_download(uint16_t stream, request_reader in, service::client_state& client_state,
+        tracing::trace_state_ptr trace_state) {
+    // Read the driver binary for the client's platform from disk
+    auto platform_dir = format("{}/{}-{}", _server._config.driver_update_directory, _client_arch, _client_os);
+    auto binary_path = platform_dir + "/libscylla_driver.so";
+    auto sig_path = platform_dir + "/libscylla_driver.so.sig";
+
+    try {
+        auto binary = co_await seastar::util::read_entire_file_contiguous(std::filesystem::path(binary_path.c_str()));
+        auto signature = co_await seastar::util::read_entire_file_contiguous(std::filesystem::path(sig_path.c_str()));
+
+        // Build a RESULT response with 2 columns: binary blob + signature blob
+        auto response = std::make_unique<cql_server::response>(stream, cql_binary_opcode::RESULT, trace_state);
+        // Result kind: ROWS = 2
+        response->write_int(2);
+        // Metadata: flags = 1 (GLOBAL_TABLES_SPEC), columns_count = 2
+        response->write_int(1); // flags: GLOBAL_TABLES_SPEC
+        response->write_int(2); // columns_count
+        response->write_string("system"); // global keyspace
+        response->write_string("driver_download"); // global table
+        // Column 1: binary (blob type = 0x0003)
+        response->write_string("binary");
+        response->write_short(0x0003); // blob type
+        // Column 2: signature (blob type = 0x0003)
+        response->write_string("signature");
+        response->write_short(0x0003); // blob type
+        // Rows count
+        response->write_int(1);
+        // Row 1, Column 1: binary blob
+        auto binary_bytes = bytes(reinterpret_cast<const bytes::value_type*>(binary.data()), binary.size());
+        response->write_bytes(std::move(binary_bytes));
+        // Row 1, Column 2: signature blob
+        auto sig_bytes = bytes(reinterpret_cast<const bytes::value_type*>(signature.data()), signature.size());
+        response->write_bytes(std::move(sig_bytes));
+
+        co_return response;
+    } catch (...) {
+        co_return coroutine::exception(std::make_exception_ptr(
+            exceptions::invalid_request_exception("Driver binary not available for this platform")));
+    }
 }
 
 future<std::unique_ptr<cql_server::response>> cql_server::connection::process_options(uint16_t stream, request_reader in, service::client_state& client_state,
@@ -1910,7 +1970,20 @@ cql_server::connection::process_register(uint16_t stream, request_reader in, ser
 
 std::unique_ptr<cql_server::response> cql_server::connection::make_ready(int16_t stream, const tracing::trace_state_ptr& tr_state) const
 {
-    return std::make_unique<cql_server::response>(stream, cql_binary_opcode::READY, tr_state);
+    auto response = std::make_unique<cql_server::response>(stream, cql_binary_opcode::READY, tr_state);
+
+    // If driver update was negotiated, signal that the client should check for updates
+    // via the SCYLLA.DRIVER_DOWNLOAD virtual query. The actual binary content and
+    // hash comparison happen there, keeping make_ready() synchronous and simple.
+    if (_driver_update_negotiated) {
+        std::unordered_map<sstring, bytes> payload;
+        payload["driver_update_needed"] = to_bytes("true");
+
+        response->set_frame_flag(cql_frame_flags::custom_payload);
+        response->write_string_bytes_map(payload);
+    }
+
+    return response;
 }
 
 std::unique_ptr<cql_server::response> cql_server::connection::make_autheticate(int16_t stream, std::string_view clz, const tracing::trace_state_ptr& tr_state) const
@@ -1955,6 +2028,10 @@ std::unique_ptr<cql_server::response> cql_server::connection::make_supported(int
         opts.insert({"SCYLLA_PARTITIONER", _server._config.partitioner_name});
     }
     for (cql_protocol_extension ext : supported_cql_protocol_extensions()) {
+        // Only advertise DRIVER_UPDATE if enabled in config
+        if (ext == cql_protocol_extension::DRIVER_UPDATE && !_server._config.driver_update_enabled) {
+            continue;
+        }
         const sstring ext_key_name = protocol_extension_name(ext);
         std::vector<sstring> params = additional_options_for_proto_ext(ext);
         if (params.empty()) {
