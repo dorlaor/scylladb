@@ -211,6 +211,16 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
                 "Invalid value '{}' for '{}'; expected one of: sstable, parquet, hybrid",
                 sf, KW_STORAGE_FORMAT));
         }
+        // Setting a non-default format has to wait for every node to understand
+        // it. Until then a node that does not know the property would keep
+        // writing the native format while others did not, and the schema cell
+        // itself changes the digest -- see the PARQUET_SSTABLE_FORMAT gate in
+        // db/schema_tables.cc.
+        if (sf != "sstable" && !db.features().parquet_sstable_format) {
+            throw exceptions::configuration_exception(format(
+                "Cannot set '{}' to '{}': requires all nodes to support the "
+                "PARQUET_SSTABLE_FORMAT cluster feature", KW_STORAGE_FORMAT, sf));
+        }
     }
     if (has_property(KW_STORAGE_ENGINE)) {
         auto storage_engine = get_string(KW_STORAGE_ENGINE, "");

@@ -575,7 +575,11 @@ public:
         std::map<sstring, sstring> compaction_strategy_options;
         bool compaction_enabled = true;
         storage_engine_type storage_engine = storage_engine_type::normal;
-        storage_format_type storage_format = storage_format_type::sstable;
+        // Unset means the user never mentioned the property. That is distinct
+        // from explicitly choosing 'sstable', and the difference matters: a
+        // table that never opted in must not gain a schema cell, or every
+        // existing table's digest changes on upgrade. Mirrors tablet_options.
+        std::optional<storage_format_type> storage_format;
         ::caching_options caching_options;
         std::optional<std::map<sstring, sstring>> tablet_options;
 
@@ -793,11 +797,16 @@ public:
     }
 
     storage_format_type storage_format() const {
-        return _raw._props.storage_format;
+        return _raw._props.storage_format.value_or(storage_format_type::sstable);
+    }
+    // True only if the property was explicitly set, which is what decides whether
+    // a schema cell is written at all.
+    bool has_storage_format() const {
+        return _raw._props.storage_format.has_value();
     }
     // True when any SSTable of this table may be Parquet-encoded.
     bool uses_parquet_format() const {
-        return _raw._props.storage_format != storage_format_type::sstable;
+        return storage_format() != storage_format_type::sstable;
     }
     storage_engine_type storage_engine() const {
         return _raw._props.storage_engine;

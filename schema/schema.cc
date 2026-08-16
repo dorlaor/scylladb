@@ -899,7 +899,7 @@ auto fmt::formatter<schema>::format(const schema& s, fmt::format_context& ctx) c
     out = fmt::format_to(out, ",minIndexInterval={}", s._raw._props.min_index_interval);
     out = fmt::format_to(out, ",maxIndexInterval={}", s._raw._props.max_index_interval);
     out = fmt::format_to(out, ",speculativeRetry={}", s._raw._props.speculative_retry.to_sstring());
-    if (s.storage_format() != storage_format_type::sstable) {
+    if (s.has_storage_format() && s.storage_format() != storage_format_type::sstable) {
         out = fmt::format_to(out, ",storage_format={}", storage_format_type_to_sstring(s.storage_format()));
     }
     if (s.storage_engine() != storage_engine_type::normal) {
@@ -1249,7 +1249,7 @@ fragmented_ostringstream& schema::schema_properties(const schema_describe_helper
     os << "\n    AND memtable_flush_period_in_ms = " << fmt::to_string(memtable_flush_period());
     os << "\n    AND min_index_interval = " << fmt::to_string(min_index_interval());
     os << "\n    AND speculative_retry = '" << speculative_retry().to_sstring() << "'";
-    if (storage_format() != storage_format_type::sstable) {
+    if (has_storage_format() && storage_format() != storage_format_type::sstable) {
         os << "\n    AND storage_format = '" << storage_format_type_to_sstring(storage_format()) << "'";
     }
     if (storage_engine() != storage_engine_type::normal) {

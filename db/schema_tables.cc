@@ -1694,17 +1694,16 @@ mutation make_scylla_tables_mutation(schema_ptr table, api::timestamp_type times
     if (table->logstor_enabled()) {
         m.set_clustered_cell(ckey, "storage_engine", "logstor", timestamp);
     }
-    // Always written, including the default. Omitting the default looks tempting
-    // -- it keeps schema mutations smaller for tables that never opt in -- but it
-    // makes ALTER ... WITH storage_format = 'sstable' a no-op: the previous value
-    // survives because nothing overwrites it, and the table stays in the old
-    // format forever. Reverting has to work, so the cell is unconditional.
-    //
-    // This does mean every table gains a cell, which changes the schema digest.
-    // It must therefore be gated on the PARQUET_SSTABLE_FORMAT cluster feature
-    // before merge, or a mixed-version cluster will disagree on the digest.
-    m.set_clustered_cell(ckey, "storage_format",
-            storage_format_type_to_sstring(table->storage_format()), timestamp);
+    // Written whenever the property was explicitly set -- including when it was
+    // set back to 'sstable', so that reverting actually takes effect rather than
+    // leaving the previous value in place. A table that never mentioned the
+    // property writes no cell at all, so existing schemas keep their digest.
+    // Same shape as the `tablets` column above, and the property can only be set
+    // once PARQUET_SSTABLE_FORMAT is enabled (see cf_prop_defs::validate).
+    if (table->has_storage_format()) {
+        m.set_clustered_cell(ckey, "storage_format",
+                storage_format_type_to_sstring(table->storage_format()), timestamp);
+    }
     // Write the large_data_guardrails_enabled column only when enabled.
     // When disabled (the default), omit the cell entirely so that old nodes
     // that don't know this column can still read the SSTable during rolling
