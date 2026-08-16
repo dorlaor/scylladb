@@ -33,6 +33,7 @@ target_sources(sstables
     parquet/format/page_header.cc
     parquet/format/parquet_writer.cc
     parquet/schema_mapping.cc
+    parquet/writer_impl.cc
     writer.cc)
 target_include_directories(sstables
   PUBLIC
