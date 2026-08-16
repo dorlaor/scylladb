@@ -2545,6 +2545,7 @@ public:
             if (f == "verbatim")   { _cfg.level = sstables::parquet::folding_level::verbatim; }
             else if (f == "row")   { _cfg.level = sstables::parquet::folding_level::row_folded; }
             else if (f == "uniform") { _cfg.level = sstables::parquet::folding_level::uniform; }
+            else if (f == "logical") { _cfg.level = sstables::parquet::folding_level::logical; }
             else { throw std::invalid_argument(fmt::format("unknown folding level '{}'", f)); }
         }
         if (vm.count("compression-level")) {
@@ -2666,7 +2667,7 @@ With --stats-only no file is written and only the summary is printed.
             {
                     typed_option<sstring>("output-file", "write the Parquet file here"),
                     typed_option<>("stats-only", "report sizes without writing a file"),
-                    typed_option<std::string>("folding", "row", "metadata folding level, one of (verbatim, row, uniform)"),
+                    typed_option<std::string>("folding", "row", "metadata folding level, one of (verbatim, row, uniform, logical). 'logical' emits the plain CQL schema with no cell metadata -- lossy, for analytics export only"),
                     typed_option<int>("compression-level", 3, "zstd compression level"),
                     typed_option<uint64_t>("max-rows", "stop after this many rows; makes the run a cheap sampling estimate rather than a full re-encode"),
                     typed_option<>("merge", "merge all sstables into a single mutation fragment stream"),

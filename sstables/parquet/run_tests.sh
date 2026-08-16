@@ -52,7 +52,8 @@ echo; echo "### 6. folding round-trip (losslessness) ###";     /tmp/pq_shred_t r
 echo; echo "### 7. divergence cost curve ###";                 /tmp/pq_shred_t cost || FAIL=1
 echo; echo "### 8. hybrid tiering policy (C1-C7) ###";         /tmp/pq_tier_t || FAIL=1
 echo; echo "### 9. file round-trip: rows -> parquet -> rows ###"; /tmp/pq_shred_t filetrip || FAIL=1
-echo; echo "### 10. cross-read: parquet-cpp files, values vs pyarrow ###"
+echo; echo "### 10. L3 logical export (lossy, export-only) ###"; /tmp/pq_shred_t logical || FAIL=1
+echo; echo "### 11. cross-read: parquet-cpp files, values vs pyarrow ###"
 python3 $S/crossread.py /tmp/pq_xread_t $DATA/conf/v2page_*.parquet || FAIL=1
 
 echo; echo "==================================="

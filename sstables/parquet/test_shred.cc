@@ -261,6 +261,69 @@ int filetrip() {
     return fails ? 1 : 0;
 }
 
+// L3 is lossy by design, so the tests that matter are that it produces the plain
+// CQL schema and that every path which could silently lose data refuses it.
+int logical() {
+    size_t fails = 0;
+    auto cols = make_schema(6);
+    gen_opts o; o.rows = 2000; o.n_regular = 6; o.divergence_rate = 0.3;
+    o.null_rate = 0.2; o.ttl_rate = 0.2;
+    auto rows = generate(cols, o);
+
+    auto ms3 = map_schema(cols, folding_level::logical, rows);
+    // pk + ck + 6 regular, and nothing else: no __ts, no exceptions, no ttl.
+    if (ms3.leaf_count() != 8) {
+        ++fails;
+        std::printf("  FAIL L3 emitted %zu leaves, expected 8\n", ms3.leaf_count());
+    }
+    for (const auto& c : ms3.columns) {
+        if (c.name.rfind("__", 0) == 0) {
+            ++fails;
+            std::printf("  FAIL L3 emitted a metadata column: %s\n", c.name.c_str());
+        }
+    }
+    if (ms3.ts_index || ms3.tsx_mask_index) {
+        ++fails; std::printf("  FAIL L3 materialised a timestamp channel\n");
+    }
+
+    // It must still produce a valid, readable file.
+    auto img = write_rows(cols, rows, folding_level::logical);
+    try {
+        auto md = format::parse_footer(img);
+        if (md.num_rows != int64_t(rows.size())) {
+            ++fails; std::printf("  FAIL L3 file has %lld rows\n", (long long)md.num_rows);
+        }
+    } catch (const std::exception& e) {
+        ++fails; std::printf("  FAIL L3 file does not parse: %s\n", e.what());
+    }
+
+    // And reassemble must refuse it rather than invent write times.
+    bool refused = false;
+    try {
+        auto data = shred(ms3, cols, rows);
+        (void)reassemble(ms3, cols, data, rows.size());
+    } catch (const std::exception&) {
+        refused = true;
+    }
+    if (!refused) {
+        ++fails;
+        std::printf("  FAIL reassemble accepted L3 instead of refusing it\n");
+    }
+
+    if (folding_is_lossless(folding_level::logical)) {
+        ++fails; std::printf("  FAIL L3 reported as lossless\n");
+    }
+    for (auto l : {folding_level::verbatim, folding_level::row_folded, folding_level::uniform}) {
+        if (!folding_is_lossless(l)) {
+            ++fails; std::printf("  FAIL %s reported as lossy\n", to_string(l));
+        }
+    }
+
+    std::printf("logical/L3: %zu failures\n", fails);
+    std::printf("%s\n", fails ? "L3 FAIL" : "L3 PASS");
+    return fails ? 1 : 0;
+}
+
 int cost() {
     auto cols = make_schema(40);
     std::printf("divergence,variant,bytes,leaf_columns,vs_base\n");
@@ -287,12 +350,13 @@ int cost() {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|cost}\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|cost}\n", argv[0]); return 2; }
     try {
         std::string c = argv[1];
         if (c == "roundtrip") { return roundtrip(); }
         if (c == "cost")      { return cost(); }
         if (c == "filetrip")  { return filetrip(); }
+        if (c == "logical")   { return logical(); }
         std::fprintf(stderr, "unknown command\n"); return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what()); return 1;

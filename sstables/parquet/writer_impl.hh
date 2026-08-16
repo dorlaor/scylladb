@@ -65,7 +65,13 @@ public:
     void clear() { _rows.clear(); }
 
     // Schema + shred + encode the accumulated rows into a Parquet file image.
+    // Accepts any folding level, including the lossy export-only L3.
     std::vector<uint8_t> to_parquet(const pq_writer_config&) const;
+
+    // Same, but refuses a lossy folding level. Everything on the storage path
+    // must go through this: writing L3 into an sstable would silently discard
+    // write times, TTLs and deletions.
+    std::vector<uint8_t> to_parquet_for_storage(const pq_writer_config&) const;
 };
 
 class pq_writer_impl : public sstables::sstable_writer::writer_impl {

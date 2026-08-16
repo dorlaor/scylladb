@@ -145,6 +145,16 @@ std::vector<uint8_t> fragment_shredder::to_parquet(const pq_writer_config& cfg) 
     return write_rows(_cols, _rows, cfg.level, cfg.wopt, cfg.exc);
 }
 
+std::vector<uint8_t> fragment_shredder::to_parquet_for_storage(const pq_writer_config& cfg) const {
+    if (!folding_is_lossless(cfg.level)) {
+        throw std::invalid_argument(
+                std::string("folding level ") + to_string(cfg.level) +
+                " discards cell metadata and cannot be used as a storage format; "
+                "it is available for export only");
+    }
+    return to_parquet(cfg);
+}
+
 // ---------------------------------------------------------------- writer_impl
 pq_writer_impl::pq_writer_impl(sstables::sstable& sst, const ::schema& s,
                                const sstables::sstable_writer_config& cfg,
@@ -181,7 +191,7 @@ stop_iteration pq_writer_impl::consume_end_of_partition() {
 }
 
 void pq_writer_impl::consume_end_of_stream() {
-    auto img = _shredder.to_parquet(_pcfg);
+    auto img = _shredder.to_parquet_for_storage(_pcfg);
     _pos = img.size();
     if (_sink) { _sink(std::move(img)); }
 }

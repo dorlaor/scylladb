@@ -92,7 +92,16 @@ enum class folding_level {
                   //     side-channel for cells that disagree with their row.
     uniform,      // L2: as L1 but the whole row group shares one timestamp,
                   //     which then lives in the file's key/value metadata.
+    logical,      // L3: the user's CQL schema and nothing else -- no cell
+                  //     metadata at all. LOSSY: write times, TTLs and deletions
+                  //     are discarded, so this can never be a storage format.
+                  //     Export only; reassemble() refuses it.
 };
+
+// True for levels that can be read back into the rows they came from. L3 cannot.
+inline bool folding_is_lossless(folding_level l) {
+    return l != folding_level::logical;
+}
 
 // How L1 records cells whose timestamp differs from their row's.
 //

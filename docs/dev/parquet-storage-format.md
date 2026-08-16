@@ -444,8 +444,11 @@ and vanishes from the data entirely. The writer detects this and falls back to L
 if the precondition breaks mid-group.
 
 **Level 3 — logical / analytics.** Cell metadata dropped entirely; the file is exactly
-the user's CQL schema. **Lossy — export only, never a storage mode.** Used by the
-`EXPORT` path (§7.4).
+the user's CQL schema. **Lossy — export only, never a storage mode.** Implemented and
+reachable via `scylla sstable parquet-export --folding logical`. Enforced in three
+places: `reassemble()` throws, `folding_is_lossless()` reports it, and the storage path
+uses `to_parquet_for_storage()` which rejects any lossy level. Worth ~0 bytes versus L1
+(§10.3g) — it exists for interoperability, not size.
 
 Which columns were materialised is recorded explicitly, so the reader knows a missing
 column means "trivially absent" rather than "unknown". Omitted-column defaults live in
@@ -1363,6 +1366,28 @@ Same 50 000-row fixture, our writer, zstd-3 (`sstables/parquet/format/test_write
 DELTA_BINARY_PACKED on the folded timestamp column is worth ~10 % of the whole file on
 its own, which is the mechanism §3.1 predicted and the reason the folded `__ts` column is
 nearly free.
+
+### 10.3g L3 export: for interoperability, not for size
+
+Folding level L3 (§5.3) emits the user's CQL schema and nothing else — no `__ts`, no
+exception channel, no TTL or deletion columns. Measured on the same real table:
+
+| Level | Bytes | Leaves | Columns an analytics reader sees |
+|---|---:|---:|---|
+| L1 (storage) | 2 562 753 | 12 | the 11 CQL columns + `__ts` |
+| **L3 (export)** | **2 562 097** | **11** | the 11 CQL columns |
+
+**656 bytes smaller — 0.03 %.** L3 buys essentially nothing in size, because the folded
+`__ts` column already compresses to ~603 bytes for 200 000 rows (§10.3d). Its value is
+entirely that the file *is* the table: a Spark or Trino user sees the schema they expect
+with no Scylla-internal column to explain or filter out.
+
+That reframes L3. It is an interoperability feature, not a compression one, and it should
+be described that way — the §7.4 case for it stands, the implied size argument does not.
+
+L3 is lossy and can never be a storage format. `reassemble()` refuses it rather than
+inventing write times, `folding_is_lossless()` reports it, and the storage path goes
+through `to_parquet_for_storage()` which rejects any lossy level. All three are tested.
 
 ### 10.3f Type-based encoding rules do not work
 

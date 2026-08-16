@@ -19,6 +19,7 @@ const char* to_string(folding_level l) {
     case folding_level::verbatim:   return "L0";
     case folding_level::row_folded: return "L1";
     case folding_level::uniform:    return "L2";
+    case folding_level::logical:    return "L3";
     }
     return "?";
 }
@@ -165,6 +166,12 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
                                          converted_of(c.type), std::nullopt});
     }
 
+    if (ms.level == folding_level::logical) {
+        // Nothing beyond the user's own columns. Deliberately no __ts: the point
+        // of L3 is a file an analytics reader sees as the plain CQL table.
+        return ms;
+    }
+
     if (ms.level == folding_level::verbatim) {
         // Four metadata leaves per regular column, unconditionally. This is the
         // 2020 mapping and it is here to be measured against, not used.
@@ -308,6 +315,12 @@ std::vector<row> reassemble(const mapped_schema& ms,
                             const std::vector<cql_column>& cols,
                             const std::vector<column_data>& cd,
                             size_t nrows) {
+    if (ms.level == folding_level::logical) {
+        // Returning rows here would mean inventing write times, which is worse
+        // than failing: the caller would get data that looks reconstructed.
+        throw std::runtime_error("reassemble: folding level L3 is lossy by design; "
+                                 "cell metadata was discarded at write time");
+    }
     std::vector<size_t> key_idx, reg_idx;
     for (size_t i = 0; i < cols.size(); ++i) {
         (cols[i].kind == column_kind::regular ? reg_idx : key_idx).push_back(i);
