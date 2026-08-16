@@ -947,11 +947,20 @@ mapper and the row shredder/reassembler, implementing folding levels L0/L1/L2 wi
 automatic L2→L1 fallback when the uniform precondition breaks. Losslessness proven over
 540 generated cases (§10.3a), including divergent per-cell timestamps, TTLs and
 deletions.
-**Not done:** the shredder is expressed against a local `row`/`cell` model that mirrors
-the shape of Scylla's `clustering_row`/`atomic_cell` rather than the real types, so it is
-not yet wired to `sstable_writer::writer_impl`. Also outstanding: the `pq` version enum,
-`pq::make_reader`, index components pointing at `(row_group, row_index)`, TOC/component
-plumbing, and the mutation-source property suite.
+**Also done 2026-08-16:** `sstables/parquet/writer_impl.{hh,cc}` — `columns_of(schema)`,
+`fragment_shredder` (decorated_key / clustering_row / atomic_cell → rows) and
+`pq_writer_impl`, a real `sstable_writer::writer_impl`. Compiles in-tree; covered by
+`test/boost/parquet_writer_test` (3 cases, green) which drives 500 rows of real fragments
+through to a Parquet image and parses it back with our own footer reader.
+
+Contract discovered here and now asserted: regular columns arrive in **name order**,
+which is also the `column_id` order the shredder indexes cells by — not declaration
+order. The reader must use the same ordering to invert the mapping.
+
+**Not done:** the produced image goes to a caller-supplied sink, not into the Data
+component. Outstanding: component/TOC plumbing, the `pq` version enum, `pq::make_reader`,
+index components pointing at `(row_group, row_index)`, the mutation-source property
+suite, and — in the shredder — static rows, partition/range tombstones and collections.
 
 - `sstable_version_types::pq`; `writer_impl` subclass; `pq::make_reader`.
 - Component layout (§5.2); index components pointing at `(row_group, row_index)`.
@@ -1351,6 +1360,8 @@ nearly free.
 | 2026-08-16 | CQL `text` must carry the Parquet `UTF8` ConvertedType | Without it every downstream reader sees a blob, not a string — found by the writer↔pyarrow interop test, and it would have silently defeated the §7.4 interoperability case |
 | 2026-08-16 | Timestamp exceptions encoded as a two-leaf sparse side-channel, not per-column leaves | Leaf count becomes width-independent; worst-case divergence penalty 2.68× → 2.05×, and 23.5 % smaller at full divergence (§10.3c). Resolves open question 8 |
 | 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
+| 2026-08-16 | Fixed-width scalars are decoded straight from cell bytes (big-endian) rather than via `deserialize()` | Avoids a `data_value` round-trip per cell on the write path; unmapped types keep their serialised form as opaque `BYTE_ARRAY`, which is lossless but forgoes type-specific encoding |
+| 2026-08-16 | The Parquet image is handed to a sink, not written to the Data component yet | Keeps the whole fragment→Parquet path drivable from a unit test without constructing an sstable; component plumbing is a separate, smaller step |
 | 2026-08-16 | The writer emits V2 data pages only | Keeps definition levels outside the compressed body, so a reader can skip nulls and locate rows without invoking a codec — the property the level-decode test exercises |
 
 ---
