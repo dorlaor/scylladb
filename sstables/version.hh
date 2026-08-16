@@ -14,9 +14,18 @@
 
 namespace sstables {
 
-enum class sstable_version_types { ka, la, mc, md, me, ms, mt };
+// `pq` encodes the Data component as Parquet. Everything else about the sstable
+// -- the component set, the statistics layout, the index -- follows the `m`
+// family, because only the row encoding changes. See
+// docs/dev/parquet-storage-format.md section 5.2.
+enum class sstable_version_types { ka, la, mc, md, me, ms, mt, pq };
 enum class sstable_format_types { big };
 
+// NOTE: `pq` is intentionally absent from both arrays below. These mean "versions
+// the node can actually read / write", and until the Parquet writer and reader are
+// wired into the sstable layer that is not true of pq. Code can name the enum
+// value; nothing should yet claim the format is supported. Add it here in the
+// same change that lands the Data-component writer and pq::make_reader.
 constexpr std::array<sstable_version_types, 7> all_sstable_versions = {
     sstable_version_types::ka,
     sstable_version_types::la,

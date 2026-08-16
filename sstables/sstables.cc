@@ -270,6 +270,7 @@ const std::unordered_map<sstable_version_types, sstring, enum_hash<sstable_versi
     { sstable_version_types::me , "me" },
     { sstable_version_types::ms , "ms" },
     { sstable_version_types::mt , "mt" },
+    { sstable_version_types::pq , "pq" },
 };
 
 const std::unordered_map<sstable_format_types, sstring, enum_hash<sstable_format_types>> format_string = {
@@ -3000,6 +3001,7 @@ sstring sstable::component_basename(const sstring& ks, const sstring& cf, versio
     case sstable::version_types::me:
     case sstable::version_types::ms:
     case sstable::version_types::mt:
+    case sstable::version_types::pq:
         return v + "-" + g + "-" + f + "-" + component;
     }
     on_internal_error(sstlog, seastar::format("invalid version {} for sstable: table={}.{}, generation={}, format={}, component={}",
