@@ -52,8 +52,6 @@ class rle_decoder {
     uint64_t _rle_count = 0;      // values left in the current RLE run
     uint64_t _rle_value = 0;
     uint64_t _packed_count = 0;   // values left in the current bit-packed run
-    uint8_t  _buf[8]{};           // decoded group of 8
-    uint8_t  _buf_pos = 8;
     uint64_t _group[8]{};
     uint8_t  _group_len = 0;
     uint8_t  _group_pos = 0;

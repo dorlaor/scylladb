@@ -174,16 +174,18 @@ int roundtrip() {
             o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = tt; o.delete_rate = dl;
             auto rows = generate(cols, o);
             for (auto lvl : {folding_level::verbatim, folding_level::row_folded,
-                             folding_level::uniform}) {
+                             folding_level::uniform})
+            for (auto exc : {exception_encoding::sparse, exception_encoding::per_column}) {
                 ++cases;
-                auto ms = map_schema(cols, lvl, rows);
+                auto ms = map_schema(cols, lvl, rows, exc);
                 auto data = shred(ms, cols, rows);
                 auto back = reassemble(ms, cols, data, rows.size());
                 std::string why;
                 if (!compare(rows, back, ms.level, why)) {
                     ++fails;
-                    std::printf("  FAIL w=%zu div=%.2f null=%.2f ttl=%.2f del=%.2f %s(->%s): %s\n",
-                                w, d, nl, tt, dl, to_string(lvl), to_string(ms.level), why.c_str());
+                    std::printf("  FAIL w=%zu div=%.2f null=%.2f ttl=%.2f del=%.2f %s(->%s) exc=%s: %s\n",
+                                w, d, nl, tt, dl, to_string(lvl), to_string(ms.level),
+                                exc == exception_encoding::sparse ? "sparse" : "per-col", why.c_str());
                     if (fails > 8) { std::printf("  (stopping after 8)\n"); goto done; }
                 }
             }
@@ -197,17 +199,22 @@ done:
 
 int cost() {
     auto cols = make_schema(40);
-    std::printf("divergence,level,bytes,leaf_columns,vs_L1_at_0pct\n");
-    size_t l1_base = 0;
+    std::printf("divergence,variant,bytes,leaf_columns,vs_base\n");
+    size_t base = 0;
     for (double d : {0.0, 0.01, 0.05, 0.10, 0.25, 0.50, 1.00}) {
         gen_opts o; o.rows = 20000; o.n_regular = 40; o.divergence_rate = d; o.null_rate = 0.25;
         auto rows = generate(cols, o);
-        for (auto lvl : {folding_level::verbatim, folding_level::row_folded}) {
-            auto ms = map_schema(cols, lvl, rows);
-            auto img = write_rows(cols, rows, lvl);
-            if (d == 0.0 && lvl == folding_level::row_folded) { l1_base = img.size(); }
-            std::printf("%.2f,%s,%zu,%zu,%.2fx\n", d, to_string(ms.level), img.size(),
-                        ms.leaf_count(), l1_base ? double(img.size()) / double(l1_base) : 0.0);
+        struct { const char* name; folding_level lvl; exception_encoding exc; } variants[] = {
+            {"L0",         folding_level::verbatim,   exception_encoding::sparse},
+            {"L1-percol",  folding_level::row_folded, exception_encoding::per_column},
+            {"L1-sparse",  folding_level::row_folded, exception_encoding::sparse},
+        };
+        for (auto& v : variants) {
+            auto ms  = map_schema(cols, v.lvl, rows, v.exc);
+            auto img = write_rows(cols, rows, v.lvl, {}, v.exc);
+            if (d == 0.0 && std::string(v.name) == "L1-sparse") { base = img.size(); }
+            std::printf("%.2f,%s,%zu,%zu,%.2fx\n", d, v.name, img.size(),
+                        ms.leaf_count(), base ? double(img.size()) / double(base) : 0.0);
         }
     }
     return 0;

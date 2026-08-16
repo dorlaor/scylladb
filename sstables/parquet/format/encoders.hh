@@ -83,9 +83,7 @@ class delta_binary_packed_encoder {
     std::vector<uint8_t>& _out;
     std::vector<int64_t> _deltas;
     int64_t _prev = 0;
-    bool _first = true;
     size_t _count = 0;
-    size_t _header_at = 0;
 
     static void uvarint(std::vector<uint8_t>& o, uint64_t v) {
         while (v >= 0x80) { o.push_back(uint8_t(v) | 0x80); v >>= 7; }

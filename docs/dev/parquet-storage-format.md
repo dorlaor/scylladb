@@ -421,7 +421,8 @@ metadata and in `Scylla.db`:
 
 **Level 0 — verbatim.** The 2020 mapping. Always lossless, largest. Fallback only.
 
-**Level 1 — row-folded (default).**
+**Level 1 — row-folded (default).** *Amended 2026-08-16: exceptions use a sparse
+side-channel, not per-column leaves — see §10.3c.*
 - One `__ts` column per *row*, not per cell, holding the row's dominant (modal) cell
   timestamp; typically every cell of a row shares it, because the row came from one
   statement.
@@ -1256,6 +1257,9 @@ Two conclusions:
 2. **At realistic divergence (≤ 10 %) folding costs ≤ 24 %**, which is comfortably inside
    the margin measured in §10.1.
 
+**RESOLVED 2026-08-16 (see §10.3c).** The per-column design below was replaced by a
+sparse side-channel and re-measured. Original finding retained for the record:
+
 **Design finding — the exception leaves are too coarse.** Leaf count jumps 43 → 83 as
 soon as divergence is non-zero, and stays there: with 20 000 rows, "at least one row
 diverges in this column" is near-certain even at 1 %, so an exception leaf materialises
@@ -1264,6 +1268,36 @@ for *every* column while carrying almost no data. The per-column exception desig
 column plus a column-id column, or a (row, column, timestamp) triple set — so the cost
 scales with the number of divergent *cells* rather than the number of columns. Filed as
 open question 8.
+
+### 10.3c Sparse timestamp exceptions (resolves open question 8)
+
+The per-column exception leaves of §10.3a were replaced by a side-channel that is two
+leaves wide regardless of table width:
+
+- `__tsx_mask` — optional `BYTE_ARRAY`, a bitmap over the regular columns marking which
+  cells in this row diverge from the row's `__ts`.
+- `__tsx_vals` — optional `BYTE_ARRAY`, the corresponding timestamp deltas as
+  zigzag varints, in column order.
+
+Both are null for rows with no exception, which costs one definition-level bit each and
+compresses away. Same 20 000 rows × 40 regular columns, 25 % nulls:
+
+| Divergence | per-column bytes | leaves | **sparse bytes** | **leaves** | Saving |
+|---:|---:|---:|---:|---:|---:|
+| 0 % | 1 524 095 | 43 | 1 524 095 | 43 | — |
+| 1 % | 1 574 872 | 83 | **1 541 212** | **45** | 2.1 % |
+| 5 % | 1 725 241 | 83 | **1 610 139** | **45** | 6.7 % |
+| 10 % | 1 885 296 | 83 | **1 695 210** | **45** | 10.1 % |
+| 25 % | 2 247 308 | 83 | **1 930 428** | **45** | 14.1 % |
+| 50 % | 2 838 144 | 83 | **2 329 374** | **45** | 17.9 % |
+| 100 % | 4 087 661 | 83 | **3 128 426** | **45** | **23.5 %** |
+
+Leaf count is now 43 + 2 instead of 43 + 40, and it stays at +2 for a table of any
+width. The worst-case divergence penalty drops from 2.68× to **2.05×**.
+
+Losslessness re-proven over 1 080 cases (the §10.3a matrix × both exception encodings),
+0 failures. `exception_encoding::sparse` is the default; `per_column` is retained so the
+comparison stays reproducible.
 
 ### 10.3b Writer output — encoding effectiveness
 
@@ -1315,6 +1349,8 @@ nearly free.
 | 2026-08-16 | Threat-to-validity #1 (folding assumes uniform row timestamps) **retired** | Losslessness proven over 540 cases including 100 % per-cell divergence; cost curve measured at 1.03×–2.68× (§10.3a). L1 never loses to L0 |
 | 2026-08-16 | Per-column timestamp-exception leaves are the wrong shape; redesign to a sparse structure | At row-group scale they materialise for every column even at 1 % divergence while carrying nearly no data (§10.3a). Open question 8 |
 | 2026-08-16 | CQL `text` must carry the Parquet `UTF8` ConvertedType | Without it every downstream reader sees a blob, not a string — found by the writer↔pyarrow interop test, and it would have silently defeated the §7.4 interoperability case |
+| 2026-08-16 | Timestamp exceptions encoded as a two-leaf sparse side-channel, not per-column leaves | Leaf count becomes width-independent; worst-case divergence penalty 2.68× → 2.05×, and 23.5 % smaller at full divergence (§10.3c). Resolves open question 8 |
+| 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
 | 2026-08-16 | The writer emits V2 data pages only | Keeps definition levels outside the compressed body, so a reader can skip nulls and locate rows without invoking a codec — the property the level-decode test exercises |
 
 ---
@@ -1336,12 +1372,10 @@ nearly free.
    real write patterns may break it often enough to make it useless.
 7. **`zstd_with_dicts` inside Parquet** — worth the loss of external readability? §10.1
    should answer whether the marginal gain over plain zstd justifies it.
-8. **How should timestamp exceptions be encoded?** Per-column exception leaves (§5.3 as
-   written) materialise for every column as soon as divergence is non-zero, because at
-   row-group scale "some row diverges here" is near-certain — 43 → 83 leaves at 1 %
-   divergence, carrying almost nothing (§10.3a). A single sparse structure keyed by
-   (row, column) would scale with divergent *cells* instead. Needs designing and
-   re-measuring.
+8. ~~**How should timestamp exceptions be encoded?**~~ **Resolved 2026-08-16.** Replaced
+   the per-column leaves with a two-leaf sparse side-channel (`__tsx_mask` bitmap +
+   `__tsx_vals` zigzag-varint deltas). Leaf count is now width-independent and the
+   worst-case penalty fell from 2.68× to 2.05× — see §10.3c. §5.3 amended.
 
 ## 12. References
 

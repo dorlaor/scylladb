@@ -27,7 +27,10 @@ g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_shred_t schema_mapping.cc $S/parquet_writer.cc $S/parquet_metadata.cc test_shred.cc -lzstd || FAIL=1
 for f in $S/parquet_metadata.cc $S/page_header.cc $S/parquet_writer.cc schema_mapping.cc; do
-  clang++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -I. -c $f -o /tmp/clang_chk.o || FAIL=1
+  # -Werror + -Wunused-private-field mirrors the in-tree Scylla build, which is
+  # stricter than the gcc invocations above.
+  clang++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -Werror -Wunused-private-field \
+          -I. -c $f -o /tmp/clang_chk.o || FAIL=1
 done
 
 echo; echo "### 1. RLE/bit-packed round-trip ###";            /tmp/pq_lvl_t roundtrip || FAIL=1

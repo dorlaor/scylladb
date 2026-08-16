@@ -88,11 +88,24 @@ struct row {
 // ---------------------------------------------------------------- folding
 enum class folding_level {
     verbatim,     // L0: five leaves per regular column. The 2020 mapping.
-    row_folded,   // L1: one leaf per column, one __ts per row, exceptions only
-                  //     where a row's cells actually disagree.
+    row_folded,   // L1: one leaf per column, one __ts per row, plus a sparse
+                  //     side-channel for cells that disagree with their row.
     uniform,      // L2: as L1 but the whole row group shares one timestamp,
                   //     which then lives in the file's key/value metadata.
 };
+
+// How L1 records cells whose timestamp differs from their row's.
+//
+//   per_column -- one optional __tsx_<col> leaf per regular column. Simple, but
+//                 measured badly: at row-group scale "some row diverges in this
+//                 column" is near-certain, so every leaf materialises even at 1%
+//                 divergence while carrying almost nothing (43 -> 83 leaves; see
+//                 docs/dev/parquet-storage-format.md section 10.3a).
+//   sparse     -- two leaves total regardless of table width: a per-row bitmap of
+//                 which columns diverge, and a blob of zigzag-varint deltas from
+//                 the row timestamp. Both null for rows with no exception, which
+//                 costs a definition-level bit and compresses away.
+enum class exception_encoding { per_column, sparse };
 
 const char* to_string(folding_level);
 
@@ -105,8 +118,12 @@ struct mapped_schema {
     size_t                   n_regular = 0;
     // Index of the __ts column, if the level materialises one.
     std::optional<size_t>    ts_index;
-    // For L1: index of the per-column exception timestamp leaf, when present.
+    // L1/per_column: index of the exception leaf for each regular column.
     std::vector<std::optional<size_t>> ts_exc_index;
+    // L1/sparse: the two side-channel leaves.
+    exception_encoding    exc_encoding = exception_encoding::sparse;
+    std::optional<size_t> tsx_mask_index;
+    std::optional<size_t> tsx_vals_index;
     // For L0: index of the first of the four metadata leaves per column.
     std::vector<std::optional<size_t>> meta_base_index;
     // For L2: the single timestamp shared by every cell.
@@ -120,7 +137,8 @@ struct mapped_schema {
 // entire cost of the 2020 mapping, so this inspects the data first.
 mapped_schema map_schema(const std::vector<cql_column>& cols,
                          folding_level requested,
-                         const std::vector<row>& rows);
+                         const std::vector<row>& rows,
+                         exception_encoding = exception_encoding::sparse);
 
 // Shred rows into Parquet columns according to `ms`.
 std::vector<column_data> shred(const mapped_schema& ms,
@@ -138,6 +156,7 @@ std::vector<row> reassemble(const mapped_schema& ms,
 std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 const std::vector<row>& rows,
                                 folding_level level,
-                                writer_options opt = {});
+                                writer_options opt = {},
+                                exception_encoding = exception_encoding::sparse);
 
 } // namespace sstables::parquet
