@@ -1367,6 +1367,38 @@ DELTA_BINARY_PACKED on the folded timestamp column is worth ~10 % of the whole f
 its own, which is the mechanism §3.1 predicted and the reason the folded `__ts` column is
 nearly free.
 
+### 10.3i In-node estimator, and a trap in `data_size()`
+
+`GET /storage_service/estimate_parquet_ratios?keyspace=&cf=&rows=` samples rows from the
+largest SSTable of a table, runs them through the real shredder and writer, and reports a
+predicted ratio per folding level. This is criterion C6 in the form the policy needs it:
+in-node, cheap, and answered from the data.
+
+Measured against the known result for ClickBench (§10.3h full re-encode, ratio 0.479):
+
+| Folding level | Sampled | Parquet bytes | SSTable on disk | Ratio |
+|---|---:|---:|---:|---:|
+| L0 | 20 000 | 2 171 086 | 13 611 500 | 0.798 |
+| **L1** | 20 000 | 1 202 255 | 13 611 500 | **0.442** |
+| L2 | 20 000 | 1 202 255 | 13 611 500 | 0.442 |
+
+0.442 against 0.479 — comfortably good enough for a 15 % decision threshold, though less
+accurate than the 0.4 % seen in §10.3e because this samples the *first* 20 000 rows
+rather than uniformly.
+
+**The trap.** `sstable::data_size()` returns the **uncompressed** logical size, not the
+bytes on disk. The first working version of this endpoint used it and reported a ratio of
+**0.067** — Parquet looking 7× better than it is, because the SSTable side was being
+measured before compression. `ondisk_data_size()` is the correct accessor. It was caught
+only because 0.067 was implausible next to every other measurement in this document, and
+confirmed by `ls`-ing the actual Data.db: 13 611 500 bytes against the 89 496 640 that
+`data_size()` reported.
+
+That is the third baseline error in this project (after the untrained dictionary in
+§10.3h and the local-time timestamp digest in the cross-read harness). Every one produced
+a number that flattered Parquet, and every one was caught by comparison against an
+existing measurement rather than by review.
+
 ### 10.3h §10.1 re-measured through our own writer
 
 §10.1's Parquet column came from pyarrow. All three datasets have now been re-measured
