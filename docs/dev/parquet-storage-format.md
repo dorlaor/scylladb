@@ -1364,6 +1364,41 @@ DELTA_BINARY_PACKED on the folded timestamp column is worth ~10 % of the whole f
 its own, which is the mechanism §3.1 predicted and the reason the folded `__ts` column is
 nearly free.
 
+### 10.3f Type-based encoding rules do not work
+
+§3.1 lists `BYTE_STREAM_SPLIT` and `DELTA_BINARY_PACKED` as structural advantages of
+columnar storage. §10.3d then noted the double columns were still `PLAIN` and called
+enabling byte-stream-split "an easy remaining win". **It was tried and it lost.**
+
+Same 200 000-row real table as §10.3d, measured against the same SSTable:
+
+| Encoding rule | Bytes | vs. SSTable | Change |
+|---|---:|---:|---:|
+| PLAIN for regular columns (baseline) | 2 562 753 | 48.2 % | — |
+| + `BYTE_STREAM_SPLIT` on all doubles | 3 968 805 | 74.6 % | **+54.9 %** |
+| + `DELTA_BINARY_PACKED` on all bigints | 2 569 567 | 48.3 % | +0.3 % |
+
+The double regression is dramatic: `dist`/`fare`/`tip`/`total` went from 1 571 497 bytes
+combined to 2 970 733. The bigint regression isolates to one column — `payment_type`
+went 41 574 → 48 389, which is the entire delta.
+
+**Mechanism.** Both transforms destroy whole-value repetition. Money-shaped doubles
+(`0.0`, `12.50`, `2.00`) and low-cardinality integers (`payment_type` ∈ {1,2,3,4}) repeat
+*exactly*, and zstd compresses exact repeats far better than it compresses the residuals
+that byte-splitting or delta-ing leave behind. These encodings win on high-entropy
+continuous data — sensor readings, monotonic counters — and lose on categorical data
+that merely happens to be stored in a numeric type.
+
+**Consequence.** Type is the wrong signal. The physical type says nothing about whether a
+column's values repeat, and that is the property that decides the encoding. Regular
+columns therefore default to PLAIN.
+
+Delta *is* kept for the key columns and the folded `__ts`, where monotonicity is a
+property of construction rather than of the data: §10.3d measured `vendor` at 525 bytes
+and `__ts` at 603 bytes for 200 000 rows.
+
+This also revises §3.1: those encodings are *available* advantages, not automatic ones.
+
 ### 10.3e Sampling accuracy — the C6 estimator works
 
 Criterion C6 rests on being able to predict Parquet's size from a *sample*, cheaply,
@@ -1416,6 +1451,7 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
 | 2026-08-16 | CQL `text` must carry the Parquet `UTF8` ConvertedType | Without it every downstream reader sees a blob, not a string — found by the writer↔pyarrow interop test, and it would have silently defeated the §7.4 interoperability case |
 | 2026-08-16 | Timestamp exceptions encoded as a two-leaf sparse side-channel, not per-column leaves | Leaf count becomes width-independent; worst-case divergence penalty 2.68× → 2.05×, and 23.5 % smaller at full divergence (§10.3c). Resolves open question 8 |
 | 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
+| 2026-08-16 | Regular columns default to PLAIN; type-based encoding rules rejected | Measured, not assumed: byte-stream-split on doubles cost +54.9 % and delta on bigints +0.3 % on real data (§10.3f). Both destroy the exact-value repetition zstd was exploiting. Delta stays only where monotonicity is structural — key columns and `__ts` |
 | 2026-08-16 | V2 page decode honours the page's own `is_compressed` flag, not just the chunk codec | Found by first pointing our reader at parquet-cpp files: it clears the flag when compression does not pay, and decoding those pages with the chunk codec fails outright. Our own files never exercised it |
 | 2026-08-16 | Snappy added to the read path | Extremely common in third-party files, and Scylla already links snappy — the cost was a dozen lines |
 | 2026-08-16 | `sstable_version_types::pq` is defined but deliberately left out of `all_sstable_versions` and `writable_sstable_versions` | Those arrays mean "versions the node can read / write". Adding `pq` before the writer exists made `sstable_test` look for a `pq` fixture and fail — a useful signal that the arrays are a support claim, not a list of enum values. It goes in with the Data-component writer and `pq::make_reader` |
@@ -1448,6 +1484,12 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
    real write patterns may break it often enough to make it useless.
 7. **`zstd_with_dicts` inside Parquet** — worth the loss of external readability? §10.1
    should answer whether the marginal gain over plain zstd justifies it.
+9. **Per-column encoding selection.** §10.3f shows type-based rules lose. The encoding
+   has to be chosen from the data — trial-encode a sample of each column with PLAIN,
+   dictionary, delta and byte-stream-split and keep the smallest. The estimator already
+   samples and trial-encodes, so this is an extension of it rather than new machinery.
+   Until then, regular columns are PLAIN and only construction-monotonic columns use
+   delta.
 8. ~~**How should timestamp exceptions be encoded?**~~ **Resolved 2026-08-16.** Replaced
    the per-column leaves with a two-leaf sparse side-channel (`__tsx_mask` bitmap +
    `__tsx_vals` zigzag-varint deltas). Leaf count is now width-independent and the

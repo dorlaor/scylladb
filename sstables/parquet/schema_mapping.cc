@@ -147,6 +147,20 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
     // ---- regular columns
     for (size_t k = 0; k < reg_idx.size(); ++k) {
         const auto& c = cols[reg_idx[k]];
+        // Regular columns default to PLAIN and let zstd do the work.
+        //
+        // Both of the obvious type-based rules were tried on real data and both
+        // LOST (docs/dev/parquet-storage-format.md section 10.3f):
+        //   BYTE_STREAM_SPLIT on doubles      2 562 753 -> 3 968 805 bytes
+        //   DELTA_BINARY_PACKED on bigints    2 562 753 -> 2 569 567 bytes
+        // Transposing or delta-ing destroys the whole-value repetition that zstd
+        // was already exploiting -- money-shaped doubles and low-cardinality ids
+        // repeat exactly, and those repeats compress better than any residual.
+        //
+        // The key columns and __ts keep DELTA_BINARY_PACKED (set elsewhere)
+        // because they are monotonic by construction, where it demonstrably wins.
+        // Choosing per column from the data is the real answer; see open
+        // question 9.
         ms.columns.push_back(column_spec{c.name, phys_of(c.type), repetition::optional,
                                          converted_of(c.type), std::nullopt});
     }
