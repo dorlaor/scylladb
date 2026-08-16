@@ -20,6 +20,7 @@
 #include "sstables/storage.hh"
 #include "keys/keys.hh"
 #include "dht/i_partitioner.hh"
+#include "sstables/mx/writer.hh"
 
 #include <cstring>
 
@@ -168,10 +169,12 @@ std::vector<uint8_t> fragment_shredder::to_parquet_for_storage(const pq_writer_c
 pq_writer_impl::pq_writer_impl(sstables::sstable& sst, const ::schema& s,
                                uint64_t estimated_partitions,
                                const sstables::sstable_writer_config& cfg,
-                               pq_writer_config pcfg, shard_id shard, sink_type sink)
+                               pq_writer_config pcfg, encoding_stats enc_stats,
+                               shard_id shard, sink_type sink)
     : sstables::sstable_writer::writer_impl(sst, s, cfg)
     , _shredder(s)
     , _pcfg(std::move(pcfg))
+    , _enc_stats(enc_stats)
     , _sink(std::move(sink)) {
     if (_sink) {
         return;   // unit-test path: no sstable components at all
@@ -309,10 +312,17 @@ void pq_writer_impl::write_components() {
     }
     _sst.set_first_and_last_keys();
 
+    // The mc serialization header. Without it sstable::get_column_translation()
+    // is empty, and the index parser reads that as "not mc format" and decodes
+    // our vint entries as fixed-width big-endian -- every lookup then misses.
+    _sst._components->statistics.contents[metadata_type::Serialization] =
+            std::make_unique<serialization_header>(
+                    mc::make_serialization_header(_schema, _enc_stats, _cfg));
+
     sstables::seal_statistics(_sst.get_version(), _sst._components->statistics, _collector,
             _schema.get_partitioner().name(), _schema.bloom_filter_fp_chance(),
             _sst.get_schema(), _sst.get_first_decorated_key(), _sst.get_last_decorated_key(),
-            encoding_stats{});
+            _enc_stats);
 
     _sst.maybe_rebuild_filter_from_index(_num_partitions);
     _sst.write_summary();
@@ -330,10 +340,10 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
         const ::schema& s,
         uint64_t estimated_partitions,
         const sstables::sstable_writer_config& cfg,
-        encoding_stats /*enc_stats*/,
+        encoding_stats enc_stats,
         shard_id shard) {
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
-                                            pq_writer_config{}, shard, nullptr);
+                                            pq_writer_config{}, enc_stats, shard, nullptr);
 }
 
 } // namespace sstables::parquet

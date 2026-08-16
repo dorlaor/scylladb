@@ -976,7 +976,14 @@ void sstable::generate_toc() {
     if (_schema->bloom_filter_fp_chance() != 1.0) {
         _recognized_components.insert(component_type::Filter);
     }
-    if (!_schema->get_compressor_params().compression_enabled()) {
+    // pq never uses Scylla's block compression: a Parquet file compresses its
+    // own pages, and a second layer on top would defeat both the page index and
+    // external readability. It therefore always takes the CRC component set,
+    // whatever the table's compression settings say. Declaring CompressionInfo
+    // and not writing it makes data_size() zero, which silently reads as
+    // "end of file" everywhere -- including the index reader.
+    if (_version == sstable_version_types::pq
+            || !_schema->get_compressor_params().compression_enabled()) {
         _recognized_components.insert(component_type::CRC);
     } else {
         _recognized_components.insert(component_type::CompressionInfo);

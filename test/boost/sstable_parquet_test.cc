@@ -37,6 +37,7 @@
 #include "mutation/mutation.hh"
 
 #include <cstdio>
+#include <filesystem>
 #include <cstdlib>
 
 using namespace sstables;
@@ -148,6 +149,10 @@ SEASTAR_THREAD_TEST_CASE(test_pq_data_component_is_a_parquet_file) {
             BOOST_REQUIRE(f);
             BOOST_REQUIRE_EQUAL(std::fwrite(buf.get(), 1, buf.size(), f), buf.size());
             std::fclose(f);
+            auto idx = seastar::format("{}", sst->index_filename());
+            std::filesystem::copy_file(std::filesystem::path(idx.c_str()),
+                                       std::filesystem::path(std::string(dst) + ".index"),
+                                       std::filesystem::copy_options::overwrite_existing);
         }
     }).get();
 }

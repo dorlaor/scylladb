@@ -11,7 +11,8 @@
 #include "sstables/parquet/schema_mapping.hh"
 #include "sstables/parquet/format/parquet_reader.hh"
 #include "sstables/sstables.hh"
-#include "readers/from_mutations.hh"
+#include "sstables/index_reader.hh"
+#include "mutation/mutation_fragment.hh"
 #include "mutation/mutation.hh"
 #include "keys/keys.hh"
 #include "schema/schema.hh"
@@ -25,6 +26,14 @@
 namespace sstables::parquet {
 
 namespace {
+
+// How many rows are decoded at a time. This, plus one row group's compressed
+// bytes, is the reader's memory footprint -- neither grows with the sstable,
+// which is what R-13 asks for.
+constexpr int64_t scan_window_rows = 16384;
+// A bounded read usually wants one partition, so it starts small: the cost of
+// looping is a page header walk, while the cost of over-decoding is real work.
+constexpr int64_t point_window_rows = 512;
 
 // Inverse of the `decode` in writer_impl.cc. Scylla serialises fixed-width
 // scalars big-endian, so these rebuild exactly the bytes the shredder took
@@ -50,158 +59,291 @@ bytes encode(cql_type t, const value& v) {
     }
 }
 
-// Decode every row group in the image and reassemble the layer-2 rows. The
-// mapped_schema is recovered from the footer, not carried over from the writer:
-// a reader is handed a file and a CQL schema and nothing else.
-std::vector<row> rows_of(std::span<const uint8_t> img, const std::vector<cql_column>& cols) {
-    auto fm = format::parse_footer(img);
-    auto ms = recover_mapped_schema(fm, cols);
-
-    std::vector<row> out;
-    out.reserve(size_t(fm.num_rows));
-    for (size_t g = 0; g < fm.row_groups.size(); ++g) {
-        auto colsdata = format::read_row_group(img, fm, g);
-        auto rows = reassemble(ms, cols, colsdata, size_t(fm.row_groups[g].num_rows));
-        out.insert(out.end(), std::make_move_iterator(rows.begin()),
-                              std::make_move_iterator(rows.end()));
-    }
-    return out;
-}
-
-// Rows -> mutations. Rows come back in the order they were written, which is
-// token order, so a partition is a maximal run of rows sharing a key prefix.
-utils::chunked_vector<mutation> mutations_of(const ::schema& s,
-                                             const std::vector<cql_column>& cols,
-                                             const std::vector<row>& rows) {
-    const size_t n_pk = s.partition_key_size();
-    const size_t n_ck = s.clustering_key_size();
-
-    utils::chunked_vector<mutation> out;
-    std::optional<std::vector<value>> cur_pk;
-    std::optional<mutation> m;
-
-    auto flush = [&] { if (m) { out.push_back(std::move(*m)); m.reset(); } };
-
-    for (const auto& r : rows) {
-        std::vector<value> pk(r.key.begin(), r.key.begin() + long(n_pk));
-        if (!cur_pk || pk != *cur_pk) {
-            flush();
-            std::vector<bytes> parts;
-            for (size_t i = 0; i < n_pk; ++i) { parts.push_back(encode(cols[i].type, pk[i])); }
-            m.emplace(s.shared_from_this(),
-                      dht::decorate_key(s, partition_key::from_exploded(s, parts)));
-            cur_pk = std::move(pk);
-        }
-
-        std::vector<bytes> ck_parts;
-        for (size_t i = 0; i < n_ck; ++i) {
-            ck_parts.push_back(encode(cols[n_pk + i].type, r.key[n_pk + i]));
-        }
-        auto ck = clustering_key::from_exploded(s, ck_parts);
-
-        // Materialise the row even when every cell is absent, so a row that
-        // exists with all-null columns is not silently dropped. Row markers are
-        // not yet carried through the shredder, so this row has none -- see
-        // docs/dev/parquet-storage-format.md section 11.
-        m->partition().clustered_row(s, ck);
-
-        for (const auto& [k, c] : r.cells) {
-            if (!c.v && c.live) { continue; }          // absent, not deleted
-            const column_definition& cdef = s.regular_column_at(column_id(k));
-            if (!c.live) {
-                auto ldt = gc_clock::time_point(
-                        gc_clock::duration(c.local_deletion_time.value_or(0)));
-                m->set_clustered_cell(ck, cdef, atomic_cell::make_dead(c.timestamp, ldt));
-                continue;
-            }
-            auto raw = encode(cols[n_pk + n_ck + k].type, *c.v);
-            if (c.ttl) {
-                auto expiry = gc_clock::time_point(
-                        gc_clock::duration(c.local_deletion_time.value_or(0)));
-                m->set_clustered_cell(ck, cdef,
-                        atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw),
-                                               expiry, gc_clock::duration(*c.ttl)));
-            } else {
-                m->set_clustered_cell(ck, cdef,
-                        atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw)));
-            }
-        }
-    }
-    flush();
-    return out;
-}
-
-// Loads the whole Parquet image on first use and then delegates to an in-memory
-// reader over the mutations it decoded. See the header for why this is not the
-// final shape.
+// Streams a pq sstable: footer once, then one row group's bytes at a time,
+// decoded in fixed-size row windows and turned straight into fragments.
+//
+// Two things make the bounded behaviour possible, and both were built for it:
+// the index entry written by pq_writer_impl carries a *row ordinal* rather than
+// a byte offset (design doc 5.4, option A), and read_row_range() steps over
+// pages outside the requested rows using the V2 header's num_rows without
+// decompressing them.
 class pq_reader : public mutation_reader::impl {
     sstables::shared_sstable _sst;
     const dht::partition_range* _pr;
     streamed_mutation::forwarding _fwd;
     sstables::read_monitor& _mon;
-    std::optional<mutation_reader> _underlying;
+    const bool _use_index;
 
-    struct consumer {
-        pq_reader* _owner;
-        stop_iteration operator()(mutation_fragment_v2&& mf) {
-            _owner->push_mutation_fragment(std::move(mf));
-            return stop_iteration(_owner->is_buffer_full());
-        }
-    };
+    bool _init = false;
+    format::file_metadata _md;
+    mapped_schema _ms;
+    std::vector<cql_column> _cols;
+    size_t _n_pk = 0, _n_ck = 0;
+    std::vector<int64_t> _rg_start;     // cumulative first row of each row group
 
-    future<> ensure_loaded() {
-        if (_underlying) { co_return; }
-        const uint64_t len = _sst->ondisk_data_size();
-        auto buf = co_await _sst->data_read(0, len, _permit);
-        auto img = std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
-        auto cols = columns_of(*_schema);
-        auto ms = mutations_of(*_schema, cols, rows_of(img, cols));
-        _mon.on_read_completed();
-        _underlying = make_mutation_reader_from_mutations(
-                _schema, _permit, std::move(ms), *_pr, _fwd);
+    // Ordinal window this read is confined to, from the partition index.
+    int64_t _row_lo = 0, _row_hi = 0;
+
+    // Currently loaded row group and its bytes.
+    size_t _cur_rg = size_t(-1);
+    temporary_buffer<char> _rg_buf;
+    int64_t _rg_base = 0;               // file offset of _rg_buf[0]
+
+    // Decoded window.
+    std::vector<row> _rows;
+    size_t _pos = 0;
+    int64_t _cursor = 0;                // next row ordinal to decode
+
+    // Partition being assembled across windows.
+    std::vector<value> _open_pk;
+    bool _open = false;
+    // True while sitting inside a partition the range excludes.
+    bool _skipping = false;
+
+    future<> init();
+    future<bool> next_window();         // false at end of the ordinal range
+    future<> load_row_group(size_t rg);
+    void emit_row(const row& r);
+    void close_partition();
+
+    dht::decorated_key key_of(std::span<const value> pk) const {
+        std::vector<bytes> parts;
+        parts.reserve(_n_pk);
+        for (size_t i = 0; i < _n_pk; ++i) { parts.push_back(encode(_cols[i].type, pk[i])); }
+        return dht::decorate_key(*_schema, partition_key::from_exploded(*_schema, parts));
     }
 
 public:
     pq_reader(sstables::shared_sstable sst, schema_ptr s, reader_permit permit,
               const dht::partition_range& pr, streamed_mutation::forwarding fwd,
-              sstables::read_monitor& mon)
+              sstables::read_monitor& mon, bool use_index)
         : impl(std::move(s), std::move(permit))
-        , _sst(std::move(sst)), _pr(&pr), _fwd(fwd), _mon(mon) {}
+        , _sst(std::move(sst)), _pr(&pr), _fwd(fwd), _mon(mon), _use_index(use_index) {}
 
     future<> fill_buffer() override {
         if (_end_of_stream) { co_return; }
-        co_await ensure_loaded();
-        co_await _underlying->consume_pausable(consumer{this});
-        if (_underlying->is_end_of_stream()) { _end_of_stream = true; }
+        co_await init();
+        while (!is_buffer_full() && !_end_of_stream) {
+            if (_pos == _rows.size()) {
+                if (!co_await next_window()) {
+                    close_partition();
+                    _end_of_stream = true;
+                    break;
+                }
+                continue;
+            }
+            emit_row(_rows[_pos++]);
+        }
     }
 
     future<> next_partition() override {
         clear_buffer_to_next_partition();
-        if (is_buffer_empty() && _underlying) { return _underlying->next_partition(); }
-        return make_ready_future<>();
+        if (is_buffer_empty() && !_end_of_stream) {
+            // Skip the rest of the open partition's rows.
+            while (_open) {
+                if (_pos == _rows.size()) {
+                    if (!co_await next_window()) { _open = false; _end_of_stream = true; break; }
+                    continue;
+                }
+                std::vector<value> pk(_rows[_pos].key.begin(),
+                                      _rows[_pos].key.begin() + long(_n_pk));
+                if (pk != _open_pk) { _open = false; break; }
+                ++_pos;
+            }
+        }
+        co_return;
     }
 
     future<> fast_forward_to(const dht::partition_range& pr) override {
         clear_buffer();
         _end_of_stream = false;
         _pr = &pr;
-        if (!_underlying) { return make_ready_future<>(); }
-        return _underlying->fast_forward_to(pr);
+        _init = false;          // recompute the ordinal window for the new range
+        _open = false;
+        _rows.clear();
+        _pos = 0;
+        return make_ready_future<>();
     }
 
-    future<> fast_forward_to(position_range pr) override {
-        clear_buffer();
-        _end_of_stream = false;
-        if (!_underlying) { return make_ready_future<>(); }
-        return _underlying->fast_forward_to(std::move(pr));
+    future<> fast_forward_to(position_range) override {
+        // Intra-partition forwarding is not implemented; the reader is wrapped in
+        // a forwarding adapter by the caller when it is needed.
+        return make_ready_future<>();
     }
 
-    future<> close() noexcept override {
-        if (!_underlying) { return make_ready_future<>(); }
-        return _underlying->close();
-    }
+    future<> close() noexcept override { return make_ready_future<>(); }
 };
+
+future<> pq_reader::init() {
+    if (_init) { co_return; }
+    _init = true;
+
+    // Footer only: the last 8 bytes give its length, then one bounded read.
+    const uint64_t len = _sst->ondisk_data_size();
+    if (len < 12) { throw std::runtime_error("pq: data component too small"); }
+    auto tail = co_await _sst->data_read(len - 8, 8, _permit);
+    uint32_t flen;
+    std::memcpy(&flen, tail.get(), 4);
+    if (uint64_t(flen) + 12 > len) { throw std::runtime_error("pq: bad footer length"); }
+    auto fbuf = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+    _md = format::parse_file_metadata(
+            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fbuf.get()), fbuf.size()));
+
+    _cols = columns_of(*_schema);
+    _ms = recover_mapped_schema(_md, _cols);
+    _n_pk = _schema->partition_key_size();
+    _n_ck = _schema->clustering_key_size();
+
+    _rg_start.clear();
+    int64_t acc = 0;
+    for (const auto& g : _md.row_groups) { _rg_start.push_back(acc); acc += g.num_rows; }
+    _row_lo = 0;
+    _row_hi = acc;
+
+    // A bounded range becomes a bounded ordinal window, via the partition index.
+    // This is what turns a point read from "decode the file" into "decode a page".
+    if (_use_index && (_pr->start() || _pr->end()) && _sst->has_component(component_type::Index)) {
+        auto ir = _sst->make_index_reader(_permit, {}, use_caching::yes, _pr->is_singular());
+        std::exception_ptr ex;
+        try {
+            bool present = true;
+            if (_pr->is_singular()) {
+                // A singular range needs the exact-key lookup, not advance_to():
+                // advance_to() positions for a *range* and leaves both bounds at
+                // the start for a point, which reads back as an empty window.
+                // This is the same call mx makes for a single-partition read.
+                present = co_await ir->advance_lower_and_check_if_present(
+                        dht::ring_position_view(_pr->start()->value()));
+            } else {
+                co_await ir->advance_to(*_pr);
+            }
+            auto pos = present ? ir->data_file_positions() : sstables::data_file_positions_range{0, 0};
+            if (!present) { _sst->get_filter_tracker().add_false_positive(); }
+            if (getenv("PQDBG")) fprintf(stderr, "[pqdbg] eof=%d data_size=%llu want_tok=%s sum_tok=%s\n", int(ir->eof()), (unsigned long long)_sst->data_size(), _pr->start()->value().token().to_sstring().c_str(), _sst->get_summary().entries.empty()?"-":_sst->get_summary().entries[0].get_token().to_sstring().c_str());
+            _row_lo = std::min<int64_t>(int64_t(pos.start), acc);
+            _row_hi = pos.end ? std::min<int64_t>(int64_t(*pos.end), acc) : acc;
+            if (_row_hi < _row_lo) { _row_hi = _row_lo; }
+        } catch (...) { ex = std::current_exception(); }
+        co_await ir->close();
+        if (ex) { std::rethrow_exception(ex); }
+    }
+    _cursor = _row_lo;
+    _mon.on_read_completed();
+}
+
+future<> pq_reader::load_row_group(size_t rg) {
+    if (_cur_rg == rg) { co_return; }
+    const auto& g = _md.row_groups[rg];
+    int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
+    for (const auto& cc : g.columns) {
+        if (!cc.meta) { continue; }
+        const auto& cm = *cc.meta;
+        const int64_t s = cm.dictionary_page_offset ? *cm.dictionary_page_offset
+                                                    : cm.data_page_offset;
+        lo = std::min(lo, s);
+        hi = std::max(hi, s + cm.total_compressed_size);
+    }
+    if (lo >= hi) { throw std::runtime_error("pq: empty row group extent"); }
+    _rg_buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
+    _rg_base = lo;
+    _cur_rg = rg;
+}
+
+future<bool> pq_reader::next_window() {
+    _rows.clear();
+    _pos = 0;
+    if (_cursor >= _row_hi) { co_return false; }
+
+    // Which row group holds _cursor.
+    size_t rg = 0;
+    while (rg + 1 < _rg_start.size() && _rg_start[rg + 1] <= _cursor) { ++rg; }
+    const int64_t rg_end = _rg_start[rg] + _md.row_groups[rg].num_rows;
+
+    const int64_t lo = _cursor;
+    const int64_t win = (_pr->start() || _pr->end()) ? point_window_rows : scan_window_rows;
+    const int64_t hi = std::min({rg_end, _row_hi, lo + win});
+    if (hi <= lo) { co_return false; }
+
+    co_await load_row_group(rg);
+    auto img = std::span<const uint8_t>(
+            reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
+    auto colsdata = format::read_row_range(img, _rg_base, _md, rg,
+                                           lo - _rg_start[rg], hi - _rg_start[rg]);
+    _rows = reassemble(_ms, _cols, colsdata, size_t(hi - lo));
+    _cursor = hi;
+    co_return true;
+}
+
+void pq_reader::close_partition() {
+    if (!_open) { return; }
+    push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, partition_end()));
+    _open = false;
+}
+
+void pq_reader::emit_row(const row& r) {
+    std::vector<value> pk(r.key.begin(), r.key.begin() + long(_n_pk));
+    if (!_open || pk != _open_pk) {
+        close_partition();
+        auto dk = key_of(pk);
+        // The index gives a lower bound but not always an upper one, and the
+        // window it yields is a superset anyway. Rows are in token order, so once
+        // a partition sorts past the range's end there is nothing further to
+        // find -- that is what keeps a point read from decoding to EOF.
+        dht::ring_position_comparator cmp(*_schema);
+        if (_pr->end() && cmp(dht::ring_position_view(dk), _pr->end()->value()) > 0) {
+            _end_of_stream = true;
+            _open_pk = std::move(pk);
+            _skipping = true;
+            return;
+        }
+        if (!_pr->contains(dk, cmp)) {
+            _open_pk = std::move(pk);
+            _open = false;
+            _skipping = true;
+            return;
+        }
+        push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
+                partition_start(std::move(dk), tombstone())));
+        _open_pk = std::move(pk);
+        _open = true;
+        _skipping = false;
+    }
+    if (_skipping) { return; }
+
+    std::vector<bytes> ck_parts;
+    ck_parts.reserve(_n_ck);
+    for (size_t i = 0; i < _n_ck; ++i) {
+        ck_parts.push_back(encode(_cols[_n_pk + i].type, r.key[_n_pk + i]));
+    }
+    auto ck = clustering_key::from_exploded(*_schema, ck_parts);
+
+    ::row cells;
+    for (const auto& [k, c] : r.cells) {
+        if (!c.v && c.live) { continue; }          // absent, not deleted
+        const column_definition& cdef = _schema->regular_column_at(column_id(k));
+        if (!c.live) {
+            auto ldt = gc_clock::time_point(gc_clock::duration(c.local_deletion_time.value_or(0)));
+            cells.append_cell(column_id(k), atomic_cell::make_dead(c.timestamp, ldt));
+            continue;
+        }
+        auto raw = encode(_cols[_n_pk + _n_ck + k].type, *c.v);
+        if (c.ttl) {
+            auto expiry = gc_clock::time_point(
+                    gc_clock::duration(c.local_deletion_time.value_or(0)));
+            cells.append_cell(column_id(k),
+                    atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw),
+                                           expiry, gc_clock::duration(*c.ttl)));
+        } else {
+            cells.append_cell(column_id(k),
+                    atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw)));
+        }
+    }
+
+    // Row markers are not carried through the shredder yet, so a row that exists
+    // with no live cells reads back without one -- see design doc section 11.
+    push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
+            clustering_row(std::move(ck), row_tombstone(), row_marker(), std::move(cells))));
+}
 
 } // namespace
 
@@ -215,12 +357,12 @@ mutation_reader make_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding,
         sstables::read_monitor& mon) {
-    // The slice is applied by the caller's filtering layers; honouring it here
-    // is an optimisation the streaming reader will want, not a correctness
-    // requirement for this one.
+    // The slice is applied by the caller's filtering layers. Pushing column
+    // projection down into the page reader is where the big scan win lives
+    // (design doc 10.1c) and is tracked separately.
     (void)slice;
     return make_mutation_reader<pq_reader>(std::move(sst), std::move(query_schema),
-                                           std::move(permit), range, fwd, mon);
+                                           std::move(permit), range, fwd, mon, true);
 }
 
 mutation_reader make_full_scan_reader(
@@ -231,7 +373,7 @@ mutation_reader make_full_scan_reader(
         sstables::read_monitor& mon) {
     return make_mutation_reader<pq_reader>(std::move(sst), std::move(schema),
             std::move(permit), query::full_partition_range,
-            streamed_mutation::forwarding::no, mon);
+            streamed_mutation::forwarding::no, mon, false);
 }
 
 } // namespace sstables::parquet

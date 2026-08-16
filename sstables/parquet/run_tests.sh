@@ -25,6 +25,9 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined \
 g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
     -o /tmp/pq_write_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/test_writer.cc -lzstd || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
+    -o /tmp/pq_rowrange_t $S/test_row_range.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
+       $S/page_header.cc -lzstd -lsnappy || FAIL=1
+g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_shred_t schema_mapping.cc $S/parquet_writer.cc $S/parquet_metadata.cc \
        $S/page_header.cc $S/parquet_reader.cc test_shred.cc -lzstd -lsnappy || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I../.. \
@@ -59,6 +62,8 @@ echo; echo "### 10. OffsetIndex: row -> page lookup ###"
 /tmp/pq_oi_t $DATA/wout/*.parquet || FAIL=1
 echo; echo "### 11. L3 logical export (lossy, export-only) ###"; /tmp/pq_shred_t logical || FAIL=1
 echo; echo "### 13. schema recovery from the file alone ###"; /tmp/pq_shred_t recovery || FAIL=1
+echo; echo "### 14. read_row_range == read_row_group, sliced ###"
+/tmp/pq_rowrange_t "$DATA"/wout/*.parquet "$DATA"/conf/v2page_*.parquet || FAIL=1
 echo; echo "### 12. cross-read: parquet-cpp files, values vs pyarrow ###"
 python3 $S/crossread.py /tmp/pq_xread_t $DATA/conf/v2page_*.parquet || FAIL=1
 

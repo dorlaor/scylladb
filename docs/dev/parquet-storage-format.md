@@ -1303,21 +1303,121 @@ read whole rows.
 
 *Not yet measured — the estimator is not built. Deferred with the rest of C6.*
 
-### 10.1e Dictionary on the Parquet side — not yet measured
+### 10.1e Dictionary on the Parquet side — measured 2026-08-17
 
-The baseline uses a trained shared dictionary (§3.2). Parquet does not. Until this table
-is filled in, every ratio in §10 compares dictionary-compressed SSTables against
-*non*-dictionary Parquet, which understates Parquet by an unknown amount.
+The baseline uses a trained shared dictionary (§3.2); Parquet did not. That made every
+ratio in §10 a comparison of dictionary-compressed SSTables against *non*-dictionary
+Parquet — conservative, but it left open how much Parquet was giving away.
 
-| Dataset | Parquet zstd-3 | Parquet zstd-3 + trained dict | Gain | Externally readable? |
-|---|---:|---:|---:|---|
-| ClickBench | 13 099 368 | | | no — reader needs the dictionary |
-| Backblaze | 16 547 521 | | | no |
-| NYC TLC | 2 562 753 | | | no |
+**Answer: nothing worth having.** A trained zstd dictionary buys Parquet between −1.4 %
+and +7.1 %, and on data the dictionary has not seen it is consistently *negative*.
 
-Resolves open question 7. The dictionary should be the *same* one the table's SSTables use,
-obtained from the existing `sstable_compressor_factory`, so the comparison isolates the
-format rather than the dictionary.
+Measured by `sstables/parquet/format/bench_dict.cc`. A dictionary acts at the codec
+layer, below encoding, so the tool does not decode a single value: it walks the pages of
+a real Parquet file, decompresses each page body and recompresses it two ways. That is
+what makes it runnable over the 105- and 197-column datasets whose logical types our
+value decoders do not fully cover. Validity check: recompressing every page at zstd-3
+with no dictionary reproduces each file's real on-disk size to within 0.4 %, so the tool
+is measuring the same thing the writer produced.
+
+| Dataset | Pages | zstd-3 | + dict (self-trained) | Gain | + dict (held out) | Gain |
+|---|---:|---:|---:|---:|---:|---:|
+| ClickBench | 1 610 | 15 972 539 | 14 843 578 | **+7.07 %** | 4 727 107 | **−1.41 %** |
+| GitHub Archive | 287 | 23 998 275 | 23 263 216 | **+3.06 %** | 15 910 910 | +0.41 % |
+| HackerNews | 465 | 21 183 259 | 20 539 807 | **+3.04 %** | 8 704 304 | +0.80 % |
+| Backblaze | 3 191 | 16 827 649 | 16 655 506 | **+1.02 %** | 8 930 673 | **−0.25 %** |
+| NYC TLC | 623 | 8 593 353 | 8 611 399 | **−0.21 %** | 3 508 449 | **−1.18 %** |
+
+Five datasets, including the two most text-heavy schemas in the roster — free-text titles
+and URLs, and JSON event payloads — which are where a dictionary should shine. The best
+self-trained result is +7.1 % and the held-out results cluster around zero.
+
+Self-trained means the same bytes train the dictionary and are then compressed with it —
+optimistic, and also exactly what Scylla's `sstable_dict_autotrainer` does for a table's
+own SSTables, so it is the like-for-like column. Held out trains on the first half of the
+pages and measures the second, which is the honest answer for data the dictionary has not
+seen. Dictionary size 112 640 B, matching the ~110 KB dictionaries the baseline carries.
+
+**Why, and the control that shows it.** A dictionary pays when you compress many small
+*independent* blocks, because each one otherwise starts with a cold window. Scylla's
+SSTable chunks are 4–16 KB and row-oriented, so every chunk re-encounters the whole
+schema's worth of structure and a dictionary supplies it for free. Parquet pages are far
+larger and hold a single column, so zstd's own window has already captured that
+redundancy by the time a dictionary could contribute.
+
+To check that this is the mechanism rather than a property of these particular files, the
+same page bytes were re-cut into 4 KB blocks and compressed independently:
+
+| Dataset | Page-granular zstd-3 | 4 KB blocks, zstd-3 | 4 KB blocks + dict | Dict gain at 4 KB |
+|---|---:|---:|---:|---:|
+| GitHub Archive | 23 998 275 | 54 935 431 | 32 988 375 | **+39.95 %** |
+| ClickBench | 15 972 539 | 23 112 277 | 16 934 197 | **+26.73 %** |
+| HackerNews | 21 183 259 | 24 625 784 | 22 150 389 | **+10.05 %** |
+| Backblaze | 16 827 649 | 17 050 136 | 17 108 241 | −0.34 % |
+| NYC TLC | 8 593 353 | 8 845 544 | 9 616 586 | −8.72 % |
+
+This is the clearest statement of the mechanism. GitHub Archive is the extreme case: its
+JSON payloads carry enormous cross-row structure, so cutting the data into 4 KB blocks
+costs 2.3× in size and a dictionary then wins back 40 % of it — while at Parquet page
+granularity the same dictionary is worth 3 %. The dictionary is not finding something the
+page-granular encoder missed; it is repairing damage that small blocks caused.
+
+The two numeric datasets do not benefit even at 4 KB, so block size is *part* of the story
+and not all of it: where a column's values are individually incompressible, neither
+layout has redundancy left to exploit. Reported as measured rather than tidied.
+
+**Consequences.**
+
+1. **§10's ratios are fair, not conservative.** Parquet is not being handicapped by the
+   absence of a dictionary, so the 47.9–50.6 % figures stand as like-for-like.
+2. **Open question 7 is resolved: no.** A dictionary inside Parquet would cost external
+   readability — no other implementation could open the file without being handed the
+   dictionary out of band — in exchange for roughly zero, and for a loss on unseen data.
+   The format keeps `scylla.folding_level` as its only private metadata and stays
+   openable by pyarrow, which `test/boost/sstable_parquet_test.cc` asserts.
+
+### 10.1f Two more realistic schemas — and where the win is small
+
+The three original datasets are wide analytics and telemetry tables, which is the shape
+Parquet is known to suit. Two more were added on 2026-08-17 specifically to look for a
+case where it does *not* pay: a text-heavy table and a semi-structured event log. Both are
+public data, both realistic Scylla schemas, same method as §10.1 (realistic timestamp
+regime, token order, zstd-3, L1 folding).
+
+| Dataset | Rows | Cols | Shape | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
+|---|---:|---:|---|---:|---:|---:|---:|
+| D1 ClickBench | 200 000 | 105 | web analytics | 27 327 989 | 13 099 368 | **47.9 %** | 52.1 % |
+| D5 NYC TLC | 200 000 | 20 | numeric trips | 5 317 307 | 2 562 753 | **48.2 %** | 51.8 % |
+| D2 Backblaze | 300 000 | 197 | sparse telemetry | 32 671 140 | 16 547 521 | **50.6 %** | 49.4 % |
+| **D9 GitHub Archive** | 180 387 | 7 | event log + JSON payload | 34 006 460 | 24 575 665 | **72.3 %** | 27.7 % |
+| **D10 HackerNews** | 300 000 | 7 | free text (titles, URLs) | 23 136 733 | 21 244 885 | **91.8 %** | **8.2 %** |
+
+D9 and D10 are the pyarrow figures; §10.3h showed our own writer matches or beats pyarrow,
+so these are if anything pessimistic for Parquet.
+
+**The win is a function of schema shape, and on one realistic table it nearly vanishes.**
+HackerNews is seven columns of which two — `title` and `url` — are most of the bytes and
+are close to unique per row. Columnar grouping helps when a column's values repeat across
+rows; free text barely repeats, so there is little for the layout to exploit, while the
+row-oriented baseline's trained dictionary *does* capture common URL prefixes and English
+words. That is the one regime where a shared dictionary beats a better layout, and it
+shows up as 8.2 % instead of ~50 %.
+
+D9 sits in between for the same reason in the other direction: its JSON payloads are
+individually large but share heavy structure across rows, which columnar layout captures
+(and which, per §10.1e, is also why a dictionary is worth 40 % on 4 KB blocks of it and
+3 % on its pages).
+
+**This is the case for the design rather than against it.** §1 asked whether Parquet uses
+significantly less disk, and the answer is "on most schemas, roughly half — but you have
+to measure the table". A cluster-wide switch would be wrong. The design already assumes
+this: `storage_format` is a per-table property (§6), and criterion C6 refuses to convert
+anything until the sampling estimator has predicted the gain for that specific table
+(§10.3e validated it at 0.4 % error from 10 % of rows). A table like D10 would be measured
+at ~8 % and correctly left as SSTables.
+
+Threat to validity: D9 truncates each payload to 4 000 characters, and one hour of
+GitHub Archive is one hour of one traffic pattern.
 
 ### 10.2 Sensitivity to row group size
 
@@ -1615,16 +1715,65 @@ counts do, which is what makes a cheap estimator viable and therefore what makes
 enforceable rather than aspirational. Exposed as `--max-rows` on
 `scylla sstable parquet-export`.
 
-### 10.4 Throughput and latency vs. targets
+### 10.4 Throughput and latency vs. targets — measured 2026-08-17
 
-| Path | Native | Parquet | Δ | Target (§1.2) | Pass? |
-|---|---|---|---|---|---|
-| Write (flush) | | | | ≥ −10 % | |
-| Write (compaction) | | | | bounded | |
-| Full scan | | | | ≥ parity | |
-| Projected scan | | | | 1.5–5× | |
-| Point read p99 (cold) | | | | ≤ 1.2× | |
-| Point read (cache hit) | | | | no change | |
+First measurement of the real thing: `pq` and the default format written from the same
+mutations in the same process, by `test/boost/sstable_parquet_perf_test.cc`. 20 000
+partitions × 5 rows, 6 columns, values with realistic redundancy (a small vocabulary for
+the text columns) rather than random bytes, which would make every format look alike.
+
+| Path | Default (`me`) | `pq` | Δ | Target (§1.2) | Pass? |
+|---|---:|---:|---:|---|---|
+| Write | 584 ms | 572 ms | **0.98×** | ≥ −10 % | **yes** |
+| Full scan | 141 ms | 144 ms | **1.02×** | ≥ parity | **yes** (parity) |
+| Point read | 42.6 µs | 5 120 µs | **120×** | ≤ 1.2× | **no** |
+| Data size | 3 994 586 B | 1 311 344 B | **0.33×** | — | — |
+| Peak scan memory | 256 kB | 15 556 kB | 61× | bounded | **yes** — see below |
+
+**R-13 (bounded memory) holds.** Peak scan memory against sstable size, same schema:
+
+| Rows | Data bytes | Peak scan memory |
+|---:|---:|---:|
+| 20 000 | 251 556 | 13 708 kB |
+| 160 000 | 1 958 235 | 15 528 kB |
+
+8× the rows costs **1.13×** the memory. The absolute figure is higher than the row-format
+reader's because the unit of work is a row group's compressed bytes plus a 16 384-row
+decode window, but it does not grow with the file, which is what R-13 asks.
+
+**What this cost, and what the first attempt looked like.** The reader that made a pq
+sstable readable at all decoded the whole Parquet image before emitting a fragment. Its
+numbers are worth keeping because they show which problems are the format's and which
+were the implementation's:
+
+| Path | Whole-image reader | Streaming reader | Default |
+|---|---:|---:|---:|
+| Write | 1 357 ms | 572 ms | 584 ms |
+| Full scan | 232 ms | 144 ms | 141 ms |
+| Point read | 183 857 µs | 5 120 µs | 42.6 µs |
+| Memory growth, 8× rows | 8.13× | 1.13× | — |
+
+Nothing about the *format* was responsible for the first column. Write and scan reached
+parity and memory became bounded once the reader loaded the footer alone, seeked by the
+index entry's row ordinal (§5.4, option A), and decoded one row group at a time in fixed
+windows — using the V2 page header's `num_rows` to step over pages without decompressing
+them.
+
+**Point reads are the one target still missed, by 100×.** The cause is identified and
+narrow: `pq_reader::load_row_group` reads a whole row group's bytes from disk to serve a
+partition that occupies a few rows of it. With the default 1 M-row groups a small sstable
+is a single row group, so a point read still pays a whole-file read even though it now
+decodes only a page or so. The fix is to read per column chunk — the dictionary page plus
+only the pages the OffsetIndex says cover the wanted rows — which needs the page decoder
+to accept per-column byte spans instead of one contiguous image. Everything it depends on
+is already written and tested (`parse_offset_index`, `offset_index::page_for_row`,
+`read_row_range`). Until then the honest statement is that `pq` point reads cost about
+5 ms against 43 µs, and that §4's "≤ 1.2×" target is not met.
+
+Threats to validity: single shard, warm page cache, one synthetic schema. The size ratio
+here (0.33×) is better than the 0.48–0.51× measured on real datasets in §10.1 because the
+generated values repeat more than real data does; the *timing* ratios are the point of
+this table, not the size.
 
 ### 10.5 Decision log
 
@@ -1689,8 +1838,10 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
 5. **Counters.** Excluded in v1 — is there demand?
 6. **Does folding Level 2 survive real data?** It requires row-group-uniform timestamps;
    real write patterns may break it often enough to make it useless.
-7. **`zstd_with_dicts` inside Parquet** — worth the loss of external readability? §10.1
-   should answer whether the marginal gain over plain zstd justifies it.
+7. ~~**`zstd_with_dicts` inside Parquet**~~ — **Answered 2026-08-17: no.** A trained
+   dictionary is worth −1.4 % to +7.1 % on Parquet pages and is negative on held-out data,
+   because pages are large and single-column so zstd's window has already captured what a
+   dictionary would supply. Not worth losing external readability for. See §10.1e.
 9. **Per-column encoding selection.** §10.3f shows type-based rules lose. The encoding
    has to be chosen from the data — trial-encode a sample of each column with PLAIN,
    dictionary, delta and byte-stream-split and keep the smallest. The estimator already
@@ -1702,11 +1853,13 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
    `__tsx_vals` zigzag-varint deltas). Leaf count is now width-independent and the
    worst-case penalty fell from 2.68× to 2.05× — see §10.3c. §5.3 amended.
 
-10. **Streaming reader.** The `pq` reader materialises the whole Parquet image and every
-    mutation in it before emitting a fragment, which violates R-13 on large sstables. The
-    replacement decodes one row group at a time and seeks via the index entry's row
-    ordinal → OffsetIndex → page. Everything that needs it is already written; this is the
-    largest single piece of remaining work.
+10. ~~**Streaming reader.**~~ **Done 2026-08-17.** The reader loads the footer alone,
+    seeks by the index entry's row ordinal and decodes one row group at a time in 16 384-row
+    windows, stepping over pages via the V2 header's `num_rows`. R-13 holds: 8× the rows
+    costs 1.13× the peak scan memory (§10.4). What remains is narrower — a point read still
+    reads a whole row group's *bytes* from disk to serve a few rows, which is why point
+    reads are 120× native rather than the ≤1.2× §4 targeted. The fix is per-column-chunk
+    reads driven by the OffsetIndex; see §10.4.
 11. **Fragment kinds the shredder drops.** Static rows, partition tombstones, range
     tombstones, row markers, multi-cell collections and counters are not carried through
     `fragment_shredder`. This — not the reader or the writer — is why `pq` is absent from

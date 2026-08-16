@@ -29,6 +29,15 @@ std::vector<column_data> read_row_group(std::span<const uint8_t> image,
                                         const file_metadata&,
                                         size_t row_group_index);
 
+// Decode rows [row_lo, row_hi) of one row group. `base_offset` is the file
+// offset that image[0] maps to, so the caller can hand over just the bytes that
+// matter instead of the whole file. Pages outside the range are stepped over
+// using the V2 header's num_rows without being decompressed -- this is what
+// makes a point read cost one page rather than one file.
+std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
+                                        const file_metadata&, size_t row_group_index,
+                                        int64_t row_lo, int64_t row_hi);
+
 // Convenience: parse the footer and decode row group 0.
 std::vector<column_data> read_file(std::span<const uint8_t> image);
 

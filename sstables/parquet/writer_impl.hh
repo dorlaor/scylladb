@@ -84,6 +84,7 @@ public:
 private:
     fragment_shredder _shredder;
     pq_writer_config  _pcfg;
+    encoding_stats    _enc_stats;
     sink_type         _sink;
     uint64_t          _pos = 0;
 
@@ -109,7 +110,8 @@ public:
     pq_writer_impl(sstables::sstable& sst, const ::schema& s,
                    uint64_t estimated_partitions,
                    const sstables::sstable_writer_config& cfg,
-                   pq_writer_config pcfg, shard_id shard, sink_type sink);
+                   pq_writer_config pcfg, encoding_stats enc_stats,
+                   shard_id shard, sink_type sink);
 
     void consume_new_partition(const dht::decorated_key& dk) override;
     void consume(tombstone t) override;

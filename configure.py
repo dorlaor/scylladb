@@ -646,6 +646,7 @@ scylla_tests = set([
     'test/boost/parquet_writer_test',
     'test/boost/sstable_3_x_test',
     'test/boost/sstable_parquet_test',
+    'test/boost/sstable_parquet_perf_test',
     'test/boost/sstable_conforms_to_mutation_source_test',
     'test/boost/sstable_datafile_test',
     'test/boost/sstable_generation_test',

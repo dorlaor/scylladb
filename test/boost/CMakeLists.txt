@@ -30,6 +30,8 @@ add_scylla_test(bloom_filter_test
   KIND SEASTAR)
 add_scylla_test(sstable_parquet_test
   KIND SEASTAR)
+add_scylla_test(sstable_parquet_perf_test
+  KIND SEASTAR)
 add_scylla_test(bptree_test
   KIND SEASTAR
   LIBRARIES utils)
