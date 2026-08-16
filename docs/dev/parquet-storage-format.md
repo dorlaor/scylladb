@@ -963,10 +963,28 @@ suite, and — in the shredder — static rows, partition/range tombstones and c
 - Streaming, migration, split and merge must keep working across a mixed-format
   table; cluster-feature gating and tests.
 
-### Phase 4 — Hybrid tiering
-- Policy engine implementing C1–C7; compaction-strategy hook.
-- `estimate_parquet_ratios` API.
-- ICS and TWCS as first-class supported combinations.
+### Phase 4 — Hybrid tiering  <span>· **mostly delivered 2026-08-16**</span>
+**Done:** the policy engine. `evaluate_tiering()` in
+`sstables/parquet/tiering_policy.{hh,cc}` implements C1–C7 as a pure function
+over plain numbers — no compaction manager, no schema, no I/O — so every criterion
+is testable on its own, and each rejection carries a reason string. C6 treats
+"not measured" as a rejection rather than an optimistic guess.
+`tiering_context.{hh,cc}` is the only file that knows about sstables and schemas:
+it fills the inputs from a candidate compaction (size from the input sstables,
+age from their `max_timestamp`, eligibility from the schema) and checks the
+table's `storage_format` before anything else. 19 standalone cases plus in-tree
+schema-eligibility tests.
+
+**Estimator:** `scylla sstable parquet-export --max-rows` serves as the C6
+estimator today and its sampling accuracy is validated (§10.3e). The in-node
+`/storage_service/estimate_parquet_ratios` REST endpoint is **not** built — it
+needs to read rows from a live table's sstables, which is a bigger piece than the
+CLI path.
+
+**Not done:** wiring `decide_output_format()` into the compaction strategies so
+the verdict actually selects the writer. That is blocked on the Data-component
+integration — there is no point selecting a format the engine cannot yet emit.
+ICS and TWCS are supported by the policy's inputs but have no strategy-side hook.
 
 ### Phase 5 — Ecosystem and hardening
 - Backup/restore/scrub/tooling completion.
@@ -1398,6 +1416,8 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
 | 2026-08-16 | CQL `text` must carry the Parquet `UTF8` ConvertedType | Without it every downstream reader sees a blob, not a string — found by the writer↔pyarrow interop test, and it would have silently defeated the §7.4 interoperability case |
 | 2026-08-16 | Timestamp exceptions encoded as a two-leaf sparse side-channel, not per-column leaves | Leaf count becomes width-independent; worst-case divergence penalty 2.68× → 2.05×, and 23.5 % smaller at full divergence (§10.3c). Resolves open question 8 |
 | 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
+| 2026-08-16 | The tiering policy is a pure function; a separate `tiering_context` fills its inputs | Keeps every criterion unit-testable without a compaction manager or a schema, and forces each criterion to be expressible as a number the caller supplies — a criterion that cannot be does not belong in the policy |
+| 2026-08-16 | `decide_output_format` checks the table's `storage_format` before any criterion | Opting in is permission to convert, not an instruction: a table set to `parquet` still has to clear the size and gain gates, so a 4 KiB flush is never converted |
 | 2026-08-16 | The Parquet re-encoder ships as a `scylla sstable parquet-export` operation rather than a hook in the write path | It needs no access to sstable internals, produces the §10.3d measurements from our own writer, and is the natural home for the C6 estimator and the eventual export path. A temporary dual-write hook would have needed friend declarations for something that gets deleted later |
 | 2026-08-16 | **Format is a per-table schema property, not per-tablet.** Reverses the earlier per-tablet design | A tablet is an internal distribution unit, not something users reason about, and an SSTable's encoding has nothing to do with which tablet its data is in. Doing it at table level removes the `tablet_info` field, the `system.tablets` column and all the group0 plumbing — schema properties already replicate, so the mechanism exists. Mirrors how `compression` already works (§6.1) |
 | 2026-08-16 | Fixed-width scalars are decoded straight from cell bytes (big-endian) rather than via `deserialize()` | Avoids a `data_value` round-trip per cell on the write path; unmapped types keep their serialised form as opaque `BYTE_ARRAY`, which is lossless but forgoes type-specific encoding |

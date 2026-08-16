@@ -1,0 +1,88 @@
+/*
+ * Copyright (C) 2026-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#include "sstables/parquet/tiering_context.hh"
+#include "sstables/sstables.hh"
+#include "schema/schema.hh"
+
+#include <algorithm>
+
+namespace sstables::parquet {
+
+bool schema_is_parquet_eligible(const ::schema& s) {
+    if (s.is_counter()) {
+        return false;
+    }
+    for (const auto& c : s.all_columns()) {
+        // Non-frozen collections carry per-element cell metadata that the
+        // shredder does not model yet. Frozen ones are opaque blobs and fine.
+        if (!c.is_atomic()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t estimated_leaf_columns(const ::schema& s) {
+    // One leaf per column, plus the folded __ts, plus the two sparse exception
+    // leaves that appear as soon as any cell timestamp diverges.
+    return s.all_columns().size() + 3;
+}
+
+tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& inputs,
+                                   const ::schema& s,
+                                   const compaction_context& ctx) {
+    tiering_inputs in;
+    in.bottom_tier = ctx.bottom_tier;
+    in.garbage_fraction = ctx.estimated_droppable_tombstone_ratio;
+    in.predicted_gain = ctx.predicted_gain;
+    in.point_read_dominated = ctx.point_read_dominated;
+    in.schema_eligible = schema_is_parquet_eligible(s);
+    in.estimated_leaf_columns = estimated_leaf_columns(s);
+
+    // Sum of input sizes is an upper bound on the output: compaction only ever
+    // removes data. Overestimating here is the safe direction -- it can only let
+    // a marginal candidate through C2, and C6 still has to agree.
+    uint64_t bytes = 0;
+    int64_t newest = std::numeric_limits<int64_t>::min();
+    for (const auto& sst : inputs) {
+        bytes += sst->data_size();
+        newest = std::max(newest, sst->get_stats_metadata().max_timestamp);
+    }
+    in.estimated_output_bytes = bytes;
+
+    // Cell timestamps are microseconds since the epoch.
+    if (newest != std::numeric_limits<int64_t>::min()) {
+        const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        const auto age_us = now_us > newest ? now_us - newest : 0;
+        in.data_age = std::chrono::seconds{age_us / 1'000'000};
+    }
+    return in;
+}
+
+tiering_decision decide_output_format(const std::vector<sstables::shared_sstable>& inputs,
+                                      const ::schema& s,
+                                      const compaction_context& ctx,
+                                      const tiering_thresholds& th,
+                                      tiering_mode mode) {
+    // A table that has not opted in is never converted, whatever the numbers say.
+    switch (s.storage_format()) {
+    case storage_format_type::sstable:
+        return {tiering_verdict::use_native, "table storage_format is 'sstable'"};
+    case storage_format_type::parquet:
+        // Explicit opt-in: the eligibility gate still applies, because writing a
+        // 4 KiB flush as Parquet helps nobody.
+        break;
+    case storage_format_type::hybrid:
+        break;
+    }
+    return evaluate_tiering(make_tiering_inputs(inputs, s, ctx), th, mode);
+}
+
+} // namespace sstables::parquet

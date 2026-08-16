@@ -24,6 +24,7 @@
 
 #include "sstables/parquet/writer_impl.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
+#include "sstables/parquet/tiering_context.hh"
 
 #include "mutation/mutation.hh"
 #include "schema/schema_builder.hh"
@@ -161,4 +162,52 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_no_exception_leaves_when_uniform) {
         BOOST_REQUIRE(md.schema[i].name != "__tsx_mask");
         BOOST_REQUIRE(md.schema[i].name != "__tsx_vals");
     }
+}
+
+// ---------------------------------------------------------------- tiering
+// The policy itself is exhaustively tested standalone; what needs a real schema
+// is the eligibility gate and the storage_format check in front of it.
+
+SEASTAR_THREAD_TEST_CASE(test_parquet_schema_eligibility) {
+    BOOST_REQUIRE(pq::schema_is_parquet_eligible(*make_test_schema()));
+
+    // Non-frozen collections carry per-element cell metadata the shredder does
+    // not model, so they must be refused rather than silently mangled.
+    auto with_set = schema_builder(1u, "pqks", "withset")
+        .with_column("pk", long_type, ::column_kind::partition_key)
+        .with_column("s", set_type_impl::get_instance(utf8_type, true))
+        .build();
+    BOOST_REQUIRE(!pq::schema_is_parquet_eligible(*with_set));
+
+    // A frozen collection is an opaque blob and is fine.
+    auto with_frozen = schema_builder(1u, "pqks", "withfrozen")
+        .with_column("pk", long_type, ::column_kind::partition_key)
+        .with_column("s", set_type_impl::get_instance(utf8_type, false))
+        .build();
+    BOOST_REQUIRE(pq::schema_is_parquet_eligible(*with_frozen));
+
+    // pk + ck + 4 regular + __ts + 2 sparse exception leaves
+    BOOST_REQUIRE_EQUAL(pq::estimated_leaf_columns(*make_test_schema()), 9u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_parquet_storage_format_gates_conversion) {
+    pq::compaction_context ctx;
+    ctx.bottom_tier = true;
+    ctx.estimated_droppable_tombstone_ratio = 0.0;
+    ctx.predicted_gain = 0.9;                  // everything else says yes
+
+    // Default table: never converted, however good the numbers look.
+    auto plain = make_test_schema();
+    auto d = pq::decide_output_format({}, *plain, ctx);
+    BOOST_REQUIRE(!d.parquet());
+    BOOST_REQUIRE(d.reason.find("storage_format") != std::string::npos);
+
+    // Opted in, but with no input sstables the size criterion must still bite --
+    // opting in is permission to convert, not an instruction to convert anything.
+    auto opted = schema_builder(schema_ptr(make_test_schema()))
+        .set_storage_format(storage_format_type::hybrid)
+        .build();
+    auto d2 = pq::decide_output_format({}, *opted, ctx);
+    BOOST_REQUIRE(!d2.parquet());
+    BOOST_REQUIRE(d2.reason.find("below the") != std::string::npos);
 }
