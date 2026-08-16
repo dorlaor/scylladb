@@ -11,6 +11,10 @@
 #include "mutation/mutation_fragment.hh"
 #include "schema/schema.hh"
 #include "types/types.hh"
+#include "sstables/sstables.hh"
+#include "sstables/storage.hh"
+
+#include <seastar/core/fstream.hh>
 
 #include <cstring>
 
@@ -193,7 +197,27 @@ stop_iteration pq_writer_impl::consume_end_of_partition() {
 void pq_writer_impl::consume_end_of_stream() {
     auto img = _shredder.to_parquet_for_storage(_pcfg);
     _pos = img.size();
-    if (_sink) { _sink(std::move(img)); }
+
+    // A sink is the unit-test path: it lets the whole fragment -> Parquet route be
+    // driven without constructing an sstable.
+    if (_sink) {
+        _sink(std::move(img));
+        return;
+    }
+
+    // Otherwise the image becomes the Data component. consume_end_of_stream runs
+    // in a seastar thread (mx::writer relies on the same), so blocking here is
+    // allowed.
+    auto sink = _sst._storage->make_data_or_index_sink(_sst, component_type::Data).get();
+    auto out = output_stream<char>(std::move(sink));
+    out.write(reinterpret_cast<const char*>(img.data()), img.size()).get();
+    out.flush().get();
+    out.close().get();
+    _cfg.monitor->on_data_write_completed();
+
+    // NOTE: the remaining components -- index, summary, filter, statistics,
+    // digest, CRC, TOC -- are not written yet, so the sstable is not yet
+    // loadable. That is why `pq` is still absent from writable_sstable_versions.
 }
 
 } // namespace sstables::parquet

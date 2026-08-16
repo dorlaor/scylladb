@@ -68,6 +68,8 @@ class corrupt_data_handler;
 
 namespace sstables {
 
+namespace parquet { class pq_writer_impl; }
+
 template <typename ChecksumType, bool calculate_chunk_checksums>
 requires ChecksumUtils<ChecksumType>
 class checksummed_file_writer;
@@ -1222,6 +1224,7 @@ public:
     friend class test;
 
     friend class mc::writer;
+    friend class parquet::pq_writer_impl;
     friend class index_reader;
     friend class sstables_manager;
     template <typename DataConsumeRowsContext>
