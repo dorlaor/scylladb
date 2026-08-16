@@ -127,6 +127,7 @@ void file_writer::write_column_chunk(const column_spec& spec, const column_data&
     // and noted as a follow-up.
     const size_t page_sz = use_dict ? n : _opt.page_values;
     bool first_data_page = true;
+    int64_t rows_written = 0;   // first_row_index of the next page
 
     for (size_t off = 0; off < n || (n == 0 && off == 0); off += page_sz) {
         const size_t cnt = std::min(page_sz, n - off);
@@ -212,10 +213,18 @@ void file_writer::write_column_chunk(const column_spec& spec, const column_data&
                                   int32_t(cnt), page_nulls, int32_t(cnt),
                                   used, int32_t(def_bytes.size()), 0,
                                   _opt.compression != codec::uncompressed);
+        const int64_t page_start = int64_t(_buf.size());
         if (first_data_page) {
-            out_meta.cm.data_page_offset = int64_t(_buf.size());
+            out_meta.cm.data_page_offset = page_start;
             first_data_page = false;
         }
+        // PageLocation.offset points at the page header, and the size covers
+        // header + body -- that is what the spec means by "the page".
+        out_meta.pages.push_back(page_location{
+                page_start,
+                int32_t(hdr.size()) + compressed,
+                int64_t(rows_written)});
+        rows_written += int64_t(cnt);
         _buf.insert(_buf.end(), hdr.begin(), hdr.end());
         _buf.insert(_buf.end(), def_bytes.begin(), def_bytes.end());
         _buf.insert(_buf.end(), comp.begin(), comp.end());
@@ -258,6 +267,30 @@ void file_writer::add_row_group(std::span<const column_data> cols) {
     }
     _num_rows += rg.num_rows;
     _rgs.push_back(std::move(rg));
+}
+
+void file_writer::write_page_indexes() {
+    if (!_opt.write_page_index) { return; }
+    for (auto& rg : _rgs) {
+        for (auto& ch : rg.chunks) {
+            if (ch.pages.empty()) { continue; }
+            std::vector<uint8_t> blob;
+            {
+                compact_writer w(blob);
+                compact_writer::struct_scope oi(w);          // OffsetIndex
+                w.field_list(1, ctype::strct, ch.pages.size());
+                for (const auto& pl : ch.pages) {
+                    compact_writer::elem_scope e(w);          // PageLocation
+                    w.field_i64(1, pl.offset);
+                    w.field_i32(2, pl.compressed_page_size);
+                    w.field_i64(3, pl.first_row_index);
+                }
+            }
+            ch.offset_index_offset = int64_t(_buf.size());
+            ch.offset_index_length = int32_t(blob.size());
+            _buf.insert(_buf.end(), blob.begin(), blob.end());
+        }
+    }
 }
 
 void file_writer::write_footer() {
@@ -310,6 +343,10 @@ void file_writer::write_footer() {
                         w.field_i64(3, *m.stats->null_count);
                     }
                 }
+                // ColumnChunk.offset_index_offset / _length come after meta_data
+                // because Thrift field ids must be written in ascending order.
+                if (ch.offset_index_offset) { w.field_i64(4, *ch.offset_index_offset); }
+                if (ch.offset_index_length) { w.field_i32(5, *ch.offset_index_length); }
             }
             w.field_i64(2, rg.total_byte_size);
             w.field_i64(3, rg.num_rows);
@@ -333,6 +370,7 @@ void file_writer::write_footer() {
 }
 
 std::vector<uint8_t> file_writer::finish() {
+    write_page_indexes();
     write_footer();
     return std::move(_buf);
 }

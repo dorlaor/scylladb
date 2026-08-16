@@ -99,6 +99,31 @@ struct column_metadata {
     }
 };
 
+// parquet.thrift PageLocation. `first_row_index` is the row ordinal of the first
+// row in the page, relative to the start of the row group.
+struct page_loc {
+    int64_t offset = 0;
+    int32_t compressed_page_size = 0;
+    int64_t first_row_index = 0;
+};
+
+// The OffsetIndex of one column chunk: enough to turn a row ordinal into the
+// exact page that holds it, which is what row-ordinal lookup needs.
+struct offset_index {
+    std::vector<page_loc> pages;
+
+    // Index of the page containing `row` (relative to the row group), or
+    // pages.size() if the row is past the end.
+    size_t page_for_row(int64_t row) const {
+        size_t lo = 0, hi = pages.size();
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (pages[mid].first_row_index <= row) { lo = mid + 1; } else { hi = mid; }
+        }
+        return lo ? lo - 1 : pages.size();
+    }
+};
+
 struct column_chunk {
     std::optional<std::string>     file_path;
     int64_t                        file_offset = 0;
@@ -158,6 +183,11 @@ file_metadata parse_file_metadata(std::span<const uint8_t> thrift_blob, limits =
 // Validate the footer envelope of a whole file image and parse it. Checks the
 // leading and trailing "PAR1" magic and the footer length.
 file_metadata parse_footer(std::span<const uint8_t> file_image, limits = {});
+
+// Parse a chunk's OffsetIndex from the file image, using the offsets the footer
+// recorded. Returns nullopt when the chunk carries no page index.
+std::optional<offset_index> parse_offset_index(std::span<const uint8_t> file_image,
+                                               const column_chunk&, limits = {});
 
 // Byte offset and length of the metadata blob within a file image, without parsing.
 struct footer_span { size_t offset, length; };

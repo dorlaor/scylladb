@@ -273,6 +273,44 @@ file_metadata parse_file_metadata(std::span<const uint8_t> blob, limits lim, sem
     return m;
 }
 
+std::optional<offset_index> parse_offset_index(std::span<const uint8_t> img,
+                                               const column_chunk& cc, limits lim) {
+    if (!cc.offset_index_offset || !cc.offset_index_length) { return std::nullopt; }
+    const size_t off = size_t(*cc.offset_index_offset);
+    const size_t len = size_t(*cc.offset_index_length);
+    if (off + len > img.size()) { throw thrift_error("offset index extends past EOF"); }
+
+    compact_reader r(img.subspan(off, len), lim);
+    compact_reader::struct_scope sc(r);
+    offset_index oi;
+    for (;;) {
+        auto f = r.field_begin();
+        if (f.stop) { break; }
+        if (f.id == 1) {
+            auto h = r.list_begin();
+            oi.pages.reserve(h.size);
+            for (size_t i = 0; i < h.size; ++i) {
+                compact_reader::struct_scope ps(r);
+                page_loc pl;
+                for (;;) {
+                    auto pf = r.field_begin();
+                    if (pf.stop) { break; }
+                    switch (pf.id) {
+                    case 1: pl.offset = r.i64v(); break;
+                    case 2: pl.compressed_page_size = r.i32v(); break;
+                    case 3: pl.first_row_index = r.i64v(); break;
+                    default: r.skip(pf.type);
+                    }
+                }
+                oi.pages.push_back(pl);
+            }
+        } else {
+            r.skip(f.type);
+        }
+    }
+    return oi;
+}
+
 footer_span locate_footer(std::span<const uint8_t> img) {
     // Layout: "PAR1" <body> <FileMetaData> <u32 len> "PAR1"
     if (img.size() < 12) { throw thrift_error("file too small to be Parquet"); }

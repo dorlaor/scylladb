@@ -29,6 +29,16 @@
 
 namespace sstables::parquet::format {
 
+// One entry per data page, as parquet.thrift PageLocation. `first_row_index` is
+// what makes row-ordinal lookup work: given a row number, binary-searching these
+// yields the exact page to decode, which is the mechanism Scylla's index relies
+// on (design doc section 5.4, option A).
+struct page_location {
+    int64_t offset = 0;
+    int32_t compressed_page_size = 0;
+    int64_t first_row_index = 0;
+};
+
 struct writer_options {
     codec   compression = codec::zstd;
     int     zstd_level = 3;
@@ -36,6 +46,9 @@ struct writer_options {
     bool    use_dictionary = true;
     size_t  dictionary_max_bytes = 1u << 20;
     bool    write_statistics = true;
+    // Emit the OffsetIndex. Required for row-ordinal lookup, and it also
+    // lets scan-side readers skip pages.
+    bool    write_page_index = true;
 };
 
 // One leaf column of a row group. Exactly one value vector is populated; which
@@ -71,6 +84,11 @@ class file_writer {
     struct chunk_meta {
         column_metadata cm;
         int64_t         first_page_offset = 0;
+        std::vector<page_location> pages;      // for the OffsetIndex
+        // ColumnChunk.offset_index_offset / _length -- these live on the chunk,
+        // not on its meta_data.
+        std::optional<int64_t> offset_index_offset;
+        std::optional<int32_t> offset_index_length;
     };
     struct rg_meta {
         std::vector<chunk_meta> chunks;
@@ -86,6 +104,9 @@ class file_writer {
     std::vector<std::pair<std::string, std::string>> _kv;
 
     void write_column_chunk(const column_spec&, const column_data&, chunk_meta&);
+    // Emitted after all row groups and before the footer, which is where the
+    // spec puts it: the footer has to carry the offsets of these blobs.
+    void write_page_indexes();
     void write_footer();
 
 public:

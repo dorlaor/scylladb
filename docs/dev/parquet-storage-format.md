@@ -462,6 +462,38 @@ v1 (they already are, internally); non-frozen collections use Dremel `repeated` 
 
 ### 5.4 Ordering and random access
 
+**Index design — decided 2026-08-16.** Scylla's index has two jobs, and Parquet answers
+them very differently:
+
+1. **Partition lookup** (decorated key → position). Parquet has *no* key index, by design
+   — parquet-cpp and arrow-rs are scan engines, and Arrow still has an open issue for
+   fast random row-group reads. Nothing to copy; Scylla must supply this, which is why
+   §5.2 keeps our own index components.
+2. **Intra-partition seek.** Parquet's ColumnIndex gives this natively — see open
+   question 2.
+
+For job 1, `index_entry::position()` is a `uint64_t` that today means a byte offset into
+Data. Four options were considered; **option A was chosen**: store the **logical row
+ordinal**. Parquet's OffsetIndex records `first_row_index` per page, so a binary search
+turns an ordinal into the single page that must be decoded — one page decode per projected
+column, which is exactly the cost §4 assumed when it promised p99 ≤ 1.2× native.
+
+| | Stored value | Verdict |
+|---|---|---|
+| **A** | **Row ordinal** | **Chosen.** Uses Parquet's own mechanism; survives row-group resizing. Costs OffsetIndex emission, which §3.5 wanted anyway |
+| B | Packed `(row_group << 32 \| row)` | Rejected: without an OffsetIndex the reader decodes from the row-group start, strictly worse than A at 64 MiB groups |
+| C | Row group's byte offset | Fallback. Keeps the field a genuine byte offset, but a point read decodes from the group start |
+| D | No Scylla index; use row-group min/max | Rejected: viable because data is sorted, but gives up the O(1) partition lookup R-11 depends on, and needs a third branch in `generate_toc` |
+
+**Audit of the semantic change.** Repurposing `position()` was the risk. Grepping every
+consumer found the offset arithmetic confined to `mx/bsearch_clustered_cursor.hh`, which a
+`pq` reader never uses. Exactly one generic consumer does arithmetic —
+`sstable::estimated_keys_for_range` ratios `(end - start)` against `data_size()`. With row
+ordinals that becomes *simpler* (`end - start` is the row count), so it is a one-line
+version branch rather than a blocker.
+
+
+
 A Parquet file used as an SSTable **must be sorted by `(token, partition key,
 clustering key)`**, same as native. That is free — the mutation-fragment stream is
 already sorted. It buys:
@@ -1621,8 +1653,11 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
    from spanning row groups? It would simplify point lookup and split, but a single
    large partition would then force an oversized row group. Leaning: allow spanning,
    record the partition's row-group span in the index.
-2. **Promoted index equivalent.** Does the Parquet page index fully replace the
-   promoted index for intra-partition seeks, or do we still need our own?
+2. ~~**Promoted index equivalent.**~~ **Answered 2026-08-16: yes.** Because rows are
+   written sorted by `(token, pk, ck)`, the Parquet ColumnIndex's per-page min/max over
+   the clustering columns provides exactly what the promoted index provides —
+   intra-partition seeking — natively. Scylla needs to supply the *partition* index
+   (job 1 below); the intra-partition half comes free with the page index.
 3. **`sstable_run` semantics.** Does an ICS run mix formats mid-run during convergence,
    or is the run the atomic conversion unit? The latter is cleaner; cost unmeasured.
 4. **File streaming.** Is streaming a Parquet SSTable to a peer cheaper than re-encoding
