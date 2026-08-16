@@ -2531,13 +2531,15 @@ class parquet_export_consumer : public sstable_consumer {
     sstring _output;
     bool _stats_only;
     uint64_t _rows = 0;
+    uint64_t _max_rows = 0;    // 0 => no limit
 
 public:
     parquet_export_consumer(schema_ptr s, reader_permit, const bpo::variables_map& vm)
         : _schema(std::move(s))
         , _shredder(*_schema)
         , _output(vm.count("output-file") ? vm["output-file"].as<sstring>() : sstring())
-        , _stats_only(vm.count("stats-only")) {
+        , _stats_only(vm.count("stats-only"))
+        , _max_rows(vm.count("max-rows") ? vm["max-rows"].as<uint64_t>() : 0) {
         if (vm.count("folding")) {
             const auto f = vm["folding"].as<std::string>();
             if (f == "verbatim")   { _cfg.level = sstables::parquet::folding_level::verbatim; }
@@ -2563,6 +2565,13 @@ public:
         return make_ready_future<stop_iteration>(stop_iteration::no);
     }
     virtual future<stop_iteration> consume(clustering_row&& cr) override {
+        // Once the sample is full, keep draining but stop accumulating. Asking to
+        // stop here would make the framework seek to the next partition, and the
+        // full-scan reader does not support next_partition(); the legal early-out
+        // is at a partition boundary, below.
+        if (_max_rows && _rows >= _max_rows) {
+            return make_ready_future<stop_iteration>(stop_iteration::no);
+        }
         _shredder.add_clustering_row(cr);
         ++_rows;
         return make_ready_future<stop_iteration>(stop_iteration::no);
@@ -2571,7 +2580,11 @@ public:
         return make_ready_future<stop_iteration>(stop_iteration::no);
     }
     virtual future<stop_iteration> consume(partition_end&&) override {
-        return make_ready_future<stop_iteration>(stop_iteration::no);
+        // Sampling early-out, taken at a partition boundary where skipping the
+        // remaining partitions is supported.
+        const auto stop = (_max_rows && _rows >= _max_rows) ? stop_iteration::yes
+                                                            : stop_iteration::no;
+        return make_ready_future<stop_iteration>(stop);
     }
     virtual future<stop_iteration> consume_sstable_end() override {
         return make_ready_future<stop_iteration>(stop_iteration::no);
@@ -2655,6 +2668,7 @@ With --stats-only no file is written and only the summary is printed.
                     typed_option<>("stats-only", "report sizes without writing a file"),
                     typed_option<std::string>("folding", "row", "metadata folding level, one of (verbatim, row, uniform)"),
                     typed_option<int>("compression-level", 3, "zstd compression level"),
+                    typed_option<uint64_t>("max-rows", "stop after this many rows; makes the run a cheap sampling estimate rather than a full re-encode"),
                     typed_option<>("merge", "merge all sstables into a single mutation fragment stream"),
                     typed_option<>("no-skips", "don't use skips to skip to next partition"),
             }},

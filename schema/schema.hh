@@ -181,10 +181,9 @@ enum class storage_engine_type {
     logstor,
 };
 
-// Encoding of the SSTable Data component. Orthogonal to storage_engine_type:
-// that picks the storage engine (LSM vs logstor), this picks how an LSM
-// SSTable's rows are encoded. A property of the table, never of a tablet --
-// see docs/dev/parquet-storage-format.md section 6.1.
+// Encoding of the SSTable Data component: how a table's rows are laid out on
+// disk. A property of the table, never of a tablet -- see
+// docs/dev/parquet-storage-format.md section 6.1.
 enum class storage_format_type {
     sstable,    // the native row format (default)
     parquet,    // columnar, every SSTable

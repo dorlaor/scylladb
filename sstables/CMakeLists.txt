@@ -34,6 +34,7 @@ target_sources(sstables
     parquet/format/parquet_writer.cc
     parquet/schema_mapping.cc
     parquet/writer_impl.cc
+    parquet/tiering_policy.cc
     writer.cc)
 target_include_directories(sstables
   PUBLIC

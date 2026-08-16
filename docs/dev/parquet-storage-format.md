@@ -379,16 +379,16 @@ The extension points already exist and are clean:
   `pq::make_reader`.
 - **Version enum.** `sstable_version_types { ka, la, mc, md, me, ms, mt }`
   ([sstables/version.hh](sstables/version.hh:17)). Add `pq` (or better — see below).
-- **Storage engine precedent.** `storage_engine_type { normal, logstor }`
-  ([schema/schema.hh](schema/schema.hh:179)) with the `storage_engine` CQL property,
-  set at `CREATE TABLE`. Logstor is the in-tree proof that Scylla accepts an alternative
-  storage backend selected by a schema property.
+- **Schema-property precedent.** `compression` is the model to follow: a table-level
+  property that selects how SSTable bytes are encoded, changed with `ALTER TABLE`, with
+  existing files converted by a background rewrite. `storage_format` is the same shape
+  with a different encoder.
 
-**Design decision — version vs. storage engine.** Parquet is *not* a new
-`storage_engine` in the logstor sense: it keeps the LSM, the compaction manager, the
-sstable set, the index components, and the whole mutation-fragment pipeline. It only
-replaces the encoding of the Data component. Therefore it is modelled as a **new
-sstable version, `pq`**, added to `all_sstable_versions` and `writable_sstable_versions`.
+**Design decision — a new sstable version.** Parquet keeps the LSM, the compaction
+manager, the sstable set, the index components and the whole mutation-fragment pipeline;
+it only replaces the encoding of the Data component. It is therefore modelled as a **new
+sstable version, `pq`**, added to `all_sstable_versions` and `writable_sstable_versions`
+— not as a new storage engine, which would imply replacing far more than the encoding.
 This gives us TOC handling, component naming, backup/restore, streaming and the
 sstables registry for free.
 
@@ -640,7 +640,6 @@ which then selects the writer format.
 | **TTL / expiry** | Forces deletion columns to materialise | Supported; reduces the §5.3 folding win. Factored into the C6 estimate |
 | **Encryption at rest** | `file_io_extension::wrap_file` wraps components | Wrap `Data.parquet` transparently (§7.5) |
 | **Object storage** | S3/GS-backed SSTables | Strong synergy (§7.4) |
-| **Logstor** | Alternative storage engine, KV tables | Mutually exclusive; reject `storage_format='parquet'` on logstor tables |
 | **Downgrade** | Old nodes cannot read `pq` | Same procedure as dict compression: switch format, `nodetool upgradesstables -a`, wait for convergence, then downgrade. Document prominently |
 
 ### 7.2 Cluster feature and safety
@@ -1347,6 +1346,21 @@ DELTA_BINARY_PACKED on the folded timestamp column is worth ~10 % of the whole f
 its own, which is the mechanism §3.1 predicted and the reason the folded `__ts` column is
 nearly free.
 
+### 10.3e Sampling accuracy — the C6 estimator works
+
+Criterion C6 rests on being able to predict Parquet's size from a *sample*, cheaply,
+before rewriting anything. Measured on the 200 000-row table of §10.3d:
+
+| Run | Rows encoded | Bytes/row | Predicted ratio vs. SSTable |
+|---|---:|---:|---:|
+| Full re-encode | 200 000 | 12.81 | 0.482 |
+| **20 000-row sample** | 20 000 | 12.87 | **0.484** |
+
+**0.4 % error from 10 % of the data.** Compression ratios converge long before row
+counts do, which is what makes a cheap estimator viable and therefore what makes C6
+enforceable rather than aspirational. Exposed as `--max-rows` on
+`scylla sstable parquet-export`.
+
 ### 10.4 Throughput and latency vs. targets
 
 | Path | Native | Parquet | Δ | Target (§1.2) | Pass? |
@@ -1425,7 +1439,7 @@ nearly free.
 - [Compression in ScyllaDB, Part One](https://www.scylladb.com/2019/10/04/compression-in-scylla-part-one/) · [Part Two](https://www.scylladb.com/2019/10/07/compression-in-scylla-part-two/)
 - Melnik et al., *Dremel: Interactive Analysis of Web-Scale Datasets*, CACM 54 (2011)
 - [Apache Parquet format](https://parquet.apache.org/docs/) · [Encodings](https://github.com/apache/parquet-format/blob/master/Encodings.md)
-- In-tree: [docs/dev/logstor.md](docs/dev/logstor.md) · [docs/dev/object_storage.md](docs/dev/object_storage.md) · [docs/dev/compaction_controller.md](docs/dev/compaction_controller.md)
+- In-tree: [docs/dev/object_storage.md](docs/dev/object_storage.md) · [docs/dev/compaction_controller.md](docs/dev/compaction_controller.md)
 
 ### Validation datasets (§9.3)
 
