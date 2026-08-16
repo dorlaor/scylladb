@@ -53,6 +53,7 @@ target_link_libraries(sstables
     absl::headers
     libdeflate::libdeflate
     zstd::zstd_static
+    Snappy::snappy
     ZLIB::ZLIB)
 if (Scylla_USE_PRECOMPILED_HEADER_USE)
   target_precompile_headers(sstables REUSE_FROM scylla-precompiled-header)

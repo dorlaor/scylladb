@@ -26,9 +26,12 @@ g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
     -o /tmp/pq_write_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/test_writer.cc -lzstd || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_shred_t schema_mapping.cc $S/parquet_writer.cc $S/parquet_metadata.cc \
-       $S/page_header.cc $S/parquet_reader.cc test_shred.cc -lzstd || FAIL=1
+       $S/page_header.cc $S/parquet_reader.cc test_shred.cc -lzstd -lsnappy || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I../.. \
     -o /tmp/pq_tier_t tiering_policy.cc test_tiering.cc -lfmt || FAIL=1
+g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
+    -o /tmp/pq_xread_t $S/test_crossread.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
+       $S/page_header.cc -lzstd -lsnappy || FAIL=1
 for f in $S/parquet_metadata.cc $S/page_header.cc $S/parquet_writer.cc $S/parquet_reader.cc schema_mapping.cc tiering_policy.cc; do
   # -Werror + -Wunused-private-field mirrors the in-tree Scylla build, which is
   # stricter than the gcc invocations above.
@@ -49,6 +52,8 @@ echo; echo "### 6. folding round-trip (losslessness) ###";     /tmp/pq_shred_t r
 echo; echo "### 7. divergence cost curve ###";                 /tmp/pq_shred_t cost || FAIL=1
 echo; echo "### 8. hybrid tiering policy (C1-C7) ###";         /tmp/pq_tier_t || FAIL=1
 echo; echo "### 9. file round-trip: rows -> parquet -> rows ###"; /tmp/pq_shred_t filetrip || FAIL=1
+echo; echo "### 10. cross-read: parquet-cpp files, values vs pyarrow ###"
+python3 $S/crossread.py /tmp/pq_xread_t $DATA/conf/v2page_*.parquet || FAIL=1
 
 echo; echo "==================================="
 [ $FAIL -eq 0 ] && echo "PARQUET SUITE: ALL PASS" || echo "PARQUET SUITE: FAILURES"

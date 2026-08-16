@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include <cstring>
+#include <snappy.h>
 #include <zstd.h>
 
 namespace sstables::parquet::format {
@@ -20,15 +21,33 @@ namespace sstables::parquet::format {
 namespace {
 
 std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t expected) {
-    if (c == codec::uncompressed) { return {in.begin(), in.end()}; }
-    if (c != codec::zstd) {
-        throw decode_error("only zstd and uncompressed are supported on the read path");
+    switch (c) {
+    case codec::uncompressed:
+        return {in.begin(), in.end()};
+    case codec::zstd: {
+        std::vector<uint8_t> out(expected);
+        const size_t n = ZSTD_decompress(out.data(), out.size(), in.data(), in.size());
+        if (ZSTD_isError(n)) { throw decode_error(std::string("zstd: ") + ZSTD_getErrorName(n)); }
+        out.resize(n);
+        return out;
     }
-    std::vector<uint8_t> out(expected);
-    const size_t n = ZSTD_decompress(out.data(), out.size(), in.data(), in.size());
-    if (ZSTD_isError(n)) { throw decode_error(std::string("zstd: ") + ZSTD_getErrorName(n)); }
-    out.resize(n);
-    return out;
+    case codec::snappy: {
+        // Common in files written by other implementations; cheap to support
+        // since Scylla already links snappy.
+        size_t n = 0;
+        if (!snappy::GetUncompressedLength(reinterpret_cast<const char*>(in.data()), in.size(), &n)) {
+            throw decode_error("snappy: bad length header");
+        }
+        std::vector<uint8_t> out(n);
+        if (!snappy::RawUncompress(reinterpret_cast<const char*>(in.data()), in.size(),
+                                   reinterpret_cast<char*>(out.data()))) {
+            throw decode_error("snappy: corrupt input");
+        }
+        return out;
+    }
+    default:
+        throw decode_error(std::string("unsupported codec on the read path: ") + to_string(c));
+    }
 }
 
 // Append `n` decoded values of the chunk's physical type to `cd`.
@@ -182,10 +201,14 @@ std::vector<column_data> read_row_group(std::span<const uint8_t> image,
                     out[c].def_levels.insert(out[c].def_levels.end(), levels.begin(), levels.end());
                 }
 
-                // V2 keeps levels outside the compressed region.
+                // V2 keeps levels outside the compressed region. The page's own
+                // is_compressed flag wins over the chunk codec: parquet-cpp
+                // leaves a page raw when compression does not pay, and honouring
+                // only the chunk codec makes those pages fail to decode.
                 auto vbody = body.subspan(rl + dl);
                 const size_t uncompressed_values = size_t(ph.uncompressed_page_size) - rl - dl;
-                auto raw = decompress(vbody, cm.compression, uncompressed_values);
+                auto raw = decompress(vbody, h.is_compressed ? cm.compression : codec::uncompressed,
+                                      uncompressed_values);
 
                 const size_t present = optional
                         ? size_t(std::count(levels.begin(), levels.end(), uint64_t(1))) : n;
