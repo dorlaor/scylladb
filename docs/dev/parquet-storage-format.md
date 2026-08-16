@@ -54,8 +54,8 @@ Derived from the prompt. `R-n` identifiers are referenced throughout the design.
 | ID | Requirement |
 |----|-------------|
 | R-1 | Parquet is available as an alternative on-disk format for the SSTable **Data** component, alongside the native `mc`/`md`/`me`/`ms`/`mt` formats. |
-| R-2 | Format is selectable **per tablet**. A tablet is in `sstable` ("cql") mode or `parquet` mode; exactly one mode is authoritative at any instant. |
-| R-3 | The mode can be switched **dynamically** on a live tablet, without downtime and without blocking reads or writes. |
+| R-2 | Format is selectable **per table**, as a schema property. A table is in `sstable` ("cql") mode or `parquet` mode; exactly one is authoritative at any instant. Tablets are an internal distribution unit and play no part in this. |
+| R-3 | The mode can be switched **dynamically** on a live table, without downtime and without blocking reads or writes. |
 | R-4 | A **hybrid** mode: upper (small, hot) LSM tiers stay in native SSTable format; the bottom-most (large, cold) tiers are Parquet. |
 | R-5 | The Parquet format configuration (row group sizing, page sizing, encodings, compression) is user-controllable with sane defaults. |
 | R-6 | Round-trip must be **lossless**: cell timestamps, TTL/expiry, all tombstone kinds, static rows, collections, counters (or explicitly excluded — see §7.1). |
@@ -308,7 +308,7 @@ changes the story.
 
 Read this table as: **the Parquet case is strongest for append-mostly, dense,
 type-regular data, which is exactly the data that ends up in the bottom LSM tier of a
-large tablet.** That is the same conclusion the hybrid design (§6) reaches from the
+large table.** That is the same conclusion the hybrid design (§6) reaches from the
 write-amplification direction, which is a good sign.
 
 ### 3.5 "Novel Parquet compression" — the 2026 landscape
@@ -511,129 +511,115 @@ Reuse `sstable_compressor_factory` rather than introducing a second compression 
 
 ---
 
-## 6. Tablet-level format control and hybrid tiering
+## 6. Format control and hybrid tiering
+
+> **Design correction, 2026-08-16.** An earlier draft made the format selectable *per
+> tablet*, with a `tablet_storage_format` field in `tablet_info` and group0 plumbing to
+> match. That was wrong. A tablet is an internal unit of distribution and rebalancing;
+> it is not a thing users reason about, and the encoding of an SSTable has nothing to do
+> with which tablet its data belongs to. Coupling the two would have put a user-facing
+> knob at an internal abstraction, and would have allowed one table's data to exist in
+> two encodings for no reason a user could explain.
+>
+> **The storage format is a property of the table.** Everything below follows from that,
+> and the whole tablet-metadata subsystem the earlier draft required simply disappears.
 
 ### 6.1 Model
 
-Two orthogonal settings:
+One setting, on the table, in the schema:
 
-1. **Table-level default** — a schema property, the fallback for tablets that have no
-   override:
-   ```cql
-   CREATE TABLE ks.t (...) WITH storage_format = 'sstable';   -- default
-   ALTER  TABLE ks.t       WITH storage_format = 'hybrid';
-   ```
-   Values: `'sstable'` (a.k.a. "cql mode"), `'parquet'`, `'hybrid'`.
+```cql
+CREATE TABLE ks.t (...) WITH storage_format = 'sstable';   -- default
+ALTER  TABLE ks.t       WITH storage_format = 'hybrid';    -- sstable | parquet | hybrid | auto
+```
 
-2. **Per-tablet override** — a new field on `tablet_info`
-   ([locator/tablets.hh](locator/tablets.hh:315)), stored in `system.tablets` and
-   replicated through group0/Raft alongside `repair_task_info` and
-   `migration_task_info`:
-   ```
-   struct tablet_info {
-       ...
-       std::optional<tablet_storage_format> storage_format;  // nullopt => inherit table
-   };
-   enum class tablet_storage_format { sstable, parquet, hybrid };
-   ```
+That is the entire control surface. There is deliberately no per-tablet override, no new
+system table, and no group0 work: schema properties already replicate through the schema
+tables, so the mechanism exists and is well understood.
 
-### 6.2 "Only one at a time" — mode is a write-side policy
+**This is exactly how `compression` already behaves**, which is the precedent worth
+leaning on. Changing a table's compressor today is an `ALTER TABLE` followed by a
+background rewrite; changing its storage format is the same operation with a different
+output encoder. Nothing about that reasoning involves tablets.
 
-The prompt's constraint that only one format is active at a time is satisfied as
-follows, and the distinction matters:
+### 6.2 Switching is a write-side policy
 
-- **The mode determines what new SSTables are written as.** It is authoritative and
-  singular: at any instant a tablet is in exactly one mode, and every flush/compaction
-  output obeys it.
-- **Reads are always format-agnostic.** The sstable set merges readers regardless of
-  version; this already works (`mc` and `md` coexist today). During conversion both
-  formats are physically present — necessarily so, since conversion is not atomic over
-  terabytes.
-- A tablet is **converged** when no SSTable of a non-target format remains. Convergence
-  is observable (`system.tablets` column + `nodetool`), and is what an operator waits on.
+- **The setting decides what new SSTables are written as.** At any instant a table has
+  exactly one storage format, and every flush and compaction output obeys it.
+- **Reads are format-agnostic.** The SSTable set merges readers regardless of version;
+  `mc` and `md` already coexist today. During conversion both encodings are present —
+  necessarily, since conversion is not atomic over terabytes.
+- A table is **converged** when no SSTable of a non-target format remains.
 
-Switching is therefore:
+The sequence:
 
-1. Operator issues the change → group0 mutation on `system.tablets`. **Instant.**
-2. Replicas observe the new mode via `tablet_metadata_guard` and immediately begin
-   honouring it for new outputs.
-3. A background **format-convergence task** rewrites existing SSTables. It is a special
-   compaction (`compaction_type_options::rewrite_to_format`), scheduled at low priority,
-   resumable, abortable, and throttled by the compaction manager like any other.
-4. Convergence completes; the tablet reports converged.
+1. `ALTER TABLE` → schema change propagates. **Instant.**
+2. Every replica begins honouring it for new outputs.
+3. A background rewrite converts existing SSTables — a compaction variant
+   (`compaction_type_options::rewrite_to_format`), low priority, resumable, abortable,
+   throttled by the compaction manager like any other. This is the same shape as
+   `nodetool upgradesstables`.
+4. The table reports converged.
 
-Reverting is the same operation with the target reversed. No data is lost at any point,
-and an abort mid-flight simply leaves a mixed set that the next convergence run
-finishes.
+Reverting is the same operation with the target reversed. An abort mid-flight leaves a
+mixed set that the next run finishes. No data is at risk at any point.
 
-Reusing `tablet_transition_kind` for this was considered and **rejected**: the existing
-transition stages (`write_both_read_old` → `streaming` → `use_new` → `cleanup`) model
-*replica set* changes. Format conversion is node-local and needs no replica-set dance.
-Modelling it as a compaction variant is simpler and avoids perturbing migration
-correctness. A tablet undergoing migration and conversion simultaneously is serialised
-by the existing compaction/migration coordination.
+Compaction groups happen to be per-tablet, so the rewrite naturally proceeds
+tablet-by-tablet — but that is an artefact of where the LSM lives, not a design
+decision, and nothing in the format layer observes it.
 
-### 6.3 Hybrid: criteria for which LSM layers become Parquet
+### 6.3 Hybrid: which LSM layers become Parquet
 
-This is the prompt's central question. The criteria below are a conjunction — an
-SSTable-run is written as Parquet only if **all** hold. Every threshold is a config knob
-(§8).
+In `hybrid` mode the format is chosen per compaction output rather than per table. An
+output is written as Parquet only if **all** of the following hold. Every threshold is a
+per-table config knob (§8.3). None of them mention tablets.
 
 **C1 — Bottom tier / terminal position.** The output must be in the largest size tier
-(ICS/STCS: top size bucket; LCS: max level). The operational meaning is *expected
-remaining rewrites ≤ 1*. Converting data that will be re-compacted three more times
-pays the encode cost repeatedly for no benefit.
+(ICS/STCS: top size bucket; LCS: max level). Operationally: *expected remaining rewrites
+≤ 1*. Converting data that will be re-compacted three more times pays the encode cost
+repeatedly for no benefit.
 
-**C2 — Size.** Output ≥ `parquet_min_output_bytes`, default **256 MiB**. Rationale: at
-a 64 MiB row group, this is ≥ 4 row groups, which amortises the footer and per-chunk
-metadata. Below ~2 row groups Parquet's fixed costs win and the ratio inverts.
+**C2 — Size.** Output ≥ `parquet_min_output_bytes`, default **256 MiB** — at least four
+64 MiB row groups, enough to amortise the footer and per-chunk metadata.
 
-**C3 — Data age / write-coldness.** `max_timestamp` of the input older than
-`parquet_min_data_age`, default **24 h**. Prevents converting data that is still being
-overwritten.
+**C3 — Data age.** `max_timestamp` older than `parquet_min_data_age`, default **24 h**.
+Prevents converting data that is still being overwritten.
 
-**C4 — Low tombstone and shadowing density.** Estimated droppable-tombstone +
-shadowed-cell fraction ≤ `parquet_max_garbage_fraction`, default **10 %**. High garbage
-means an imminent GC rewrite, and tombstones map poorly (they force the deletion
-metadata columns to materialise, defeating §5.3 folding).
+**C4 — Low garbage.** Estimated droppable-tombstone plus shadowed-cell fraction ≤
+`parquet_max_garbage_fraction`, default **10 %**. High garbage means an imminent GC
+rewrite, and tombstones force the deletion metadata columns to materialise.
 
-**C5 — Schema eligibility.** No counters; no unsupported types; the predicted
-column-count after folding is within `parquet_max_leaf_columns` (default 2 000).
+**C5 — Schema eligibility.** No counters; no unsupported types; folded leaf count within
+`parquet_max_leaf_columns`.
 
 **C6 — Predicted gain.** A sampling estimator predicts ≥ `parquet_min_gain_ratio`
-(default **15 %**) saving versus what the table's current compressor would produce.
-**Do not guess — measure.** This reuses the dictionary autotrainer's proven sampling
-path (`do_sample_sstables`, ~4096 blocks, Hoeffding-bounded) and is exposed as
-`/storage_service/estimate_parquet_ratios?keyspace=&cf=`, mirroring
-`estimate_compression_ratios`.
+(default **15 %**) saving versus the table's current compressor. **Do not guess —
+measure.** Reuses the dictionary autotrainer's sampling path and is exposed as
+`/storage_service/estimate_parquet_ratios`.
 
-**C7 — Read-pattern gate (adaptive, optional).** If the table's reads are dominated by
-single-partition point queries and it is latency-classified, decline. Off by default;
-enabled by `storage_format = 'auto'`.
+**C7 — Read-pattern gate (optional).** Decline if the table is point-read dominated and
+latency-classified. Off unless `storage_format = 'auto'`.
 
-C6 is the one that makes this safe. It converts "will Parquet help this schema?" — the
-question §3.4 can only answer with a hypothesis — into a per-table measurement taken on
-the actual data, before any bytes are rewritten.
+C6 is what makes this safe: it turns "will Parquet help this schema?" — which §3.4 can
+only guess at — into a measurement on the actual data, before any bytes are rewritten.
 
 ### 6.4 Compaction strategy interaction
 
-Hybrid mode changes the cost of bottom-tier rewrites: merging L0 into a Parquet bottom
-run means re-encoding and re-compressing the whole run.
+Hybrid mode makes bottom-tier rewrites more expensive, since merging into a Parquet run
+means re-encoding and recompressing it.
 
-- **ICS is the recommended strategy for hybrid mode.** Its runs are fragmented into
-  bounded-size SSTables, so a merge rewrites only the overlapping fragments, not the
-  entire run. This bounds the write amplification that Parquet makes expensive.
-- **STCS** is workable but the top-bucket rewrite is a whole-tier re-encode — acceptable
-  only for genuinely cold data (C3 helps).
+- **ICS is recommended.** Its runs are fragmented into bounded SSTables, so a merge
+  rewrites only the overlapping fragments. That bounds exactly the write amplification
+  Parquet makes expensive.
+- **TWCS is an excellent fit** — old time windows are already immutable and cold, which
+  is C1 and C3 for free.
+- **STCS** works but a top-bucket rewrite re-encodes the whole tier; acceptable only for
+  genuinely cold data.
 - **LCS** works; max-level rewrites are already bounded per level.
-- **TWCS** is an excellent fit conceptually — old time windows are immutable and cold,
-  which is exactly C1+C3 — and should be a first-class supported combination.
 
-The compaction strategy needs one new input: for a candidate compaction, "will the
-output satisfy C1–C6?" This is a call into the policy engine at
-`compaction_descriptor` construction time, which then selects the writer format.
-
----
+The strategy needs one new input: for a candidate compaction, "will the output satisfy
+C1–C6?" That is a call into the policy engine when the `compaction_descriptor` is built,
+which then selects the writer format.
 
 ## 7. Other considerations
 
@@ -659,7 +645,7 @@ output satisfy C1–C6?" This is a call into the policy engine at
 
 ### 7.2 Cluster feature and safety
 
-A `PARQUET_SSTABLE_FORMAT` cluster feature must be enabled everywhere before any tablet
+A `PARQUET_SSTABLE_FORMAT` cluster feature must be enabled everywhere before any table
 may switch. Until then, DDL setting `storage_format` is rejected. This mirrors the
 `SSTABLE_COMPRESSION_DICTS` precedent, including the API-level guard.
 
@@ -708,7 +694,7 @@ are mutually exclusive.
 
 ### 7.6 Observability
 
-Per-format SSTable count and bytes; convergence progress per tablet; row-group size
+Per-format SSTable count and bytes; convergence progress per table; row-group size
 distribution; encode/decode CPU; compression ratio achieved vs. predicted (validates
 C6); page-index skip effectiveness; row-group buffer memory high-water mark;
 reactor-stall attribution.
@@ -869,13 +855,15 @@ ALTER TABLE ks.t WITH parquet_tiering = {
 };
 ```
 
-### 8.4 Per-tablet override
+### 8.4 Operational surface
 
 ```
-nodetool tablet set-storage-format --keyspace ks --table t --tablet <id> --format parquet
-nodetool tablet status --keyspace ks --table t     # mode + convergence %
+nodetool tablestats --format-status ks.t     # current format + convergence %
+nodetool upgradesstables -a ks t             # force convergence now
 ```
-plus the equivalent REST endpoints under `/storage_service/`.
+plus the equivalent REST endpoints under `/storage_service/`. There is no per-tablet
+command, by design (§6.1) — the format is a table property and tablets are not part of
+the user-facing model.
 
 ### 8.5 scylla.yaml
 
@@ -965,14 +953,16 @@ suite, and — in the shredder — static rows, partition/range tombstones and c
 - `sstable_version_types::pq`; `writer_impl` subclass; `pq::make_reader`.
 - Component layout (§5.2); index components pointing at `(row_group, row_index)`.
 - Metadata folding levels 0–2.
-- Table-level `storage_format` only; no tablets, no hybrid.
+- Table-level `storage_format`, single format per table; no hybrid tiering yet.
 - Round-trip property tests green; shadow-read verification available.
 
-### Phase 3 — Tablet-level control
-- `tablet_storage_format` in `tablet_info` + `system.tablets`; group0 plumbing.
-- `rewrite_to_format` compaction; convergence tracking; nodetool/REST.
+### Phase 3 — Format control and convergence
+- `storage_format` schema property, validated and plumbed through the schema tables
+  (no new system table, no group0 work — see §6.1).
+- `rewrite_to_format` compaction; per-table convergence tracking; nodetool/REST.
 - Cluster feature `PARQUET_SSTABLE_FORMAT`.
-- Streaming/migration/split/merge gating and tests.
+- Streaming, migration, split and merge must keep working across a mixed-format
+  table; cluster-feature gating and tests.
 
 ### Phase 4 — Hybrid tiering
 - Policy engine implementing C1–C7; compaction-strategy hook.
@@ -1360,6 +1350,7 @@ nearly free.
 | 2026-08-16 | CQL `text` must carry the Parquet `UTF8` ConvertedType | Without it every downstream reader sees a blob, not a string — found by the writer↔pyarrow interop test, and it would have silently defeated the §7.4 interoperability case |
 | 2026-08-16 | Timestamp exceptions encoded as a two-leaf sparse side-channel, not per-column leaves | Leaf count becomes width-independent; worst-case divergence penalty 2.68× → 2.05×, and 23.5 % smaller at full divergence (§10.3c). Resolves open question 8 |
 | 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
+| 2026-08-16 | **Format is a per-table schema property, not per-tablet.** Reverses the earlier per-tablet design | A tablet is an internal distribution unit, not something users reason about, and an SSTable's encoding has nothing to do with which tablet its data is in. Doing it at table level removes the `tablet_info` field, the `system.tablets` column and all the group0 plumbing — schema properties already replicate, so the mechanism exists. Mirrors how `compression` already works (§6.1) |
 | 2026-08-16 | Fixed-width scalars are decoded straight from cell bytes (big-endian) rather than via `deserialize()` | Avoids a `data_value` round-trip per cell on the write path; unmapped types keep their serialised form as opaque `BYTE_ARRAY`, which is lossless but forgoes type-specific encoding |
 | 2026-08-16 | The Parquet image is handed to a sink, not written to the Data component yet | Keeps the whole fragment→Parquet path drivable from a unit test without constructing an sstable; component plumbing is a separate, smaller step |
 | 2026-08-16 | The writer emits V2 data pages only | Keeps definition levels outside the compressed body, so a reader can skip nulls and locate rows without invoking a codec — the property the level-decode test exercises |
@@ -1376,8 +1367,10 @@ nearly free.
    promoted index for intra-partition seeks, or do we still need our own?
 3. **`sstable_run` semantics.** Does an ICS run mix formats mid-run during convergence,
    or is the run the atomic conversion unit? The latter is cleaner; cost unmeasured.
-4. **Tablet migration with file streaming.** Is streaming a Parquet file to a peer
-   cheaper than re-encoding? Probably yes; needs the receiver-side feature gate.
+4. **File streaming.** Is streaming a Parquet SSTable to a peer cheaper than re-encoding
+   it? Probably yes; needs the receiver-side feature gate. (This is where tablet
+   migration touches the format — but only as one caller of file streaming, not as a
+   design input.)
 5. **Counters.** Excluded in v1 — is there demand?
 6. **Does folding Level 2 survive real data?** It requires row-group-uniform timestamps;
    real write patterns may break it often enough to make it useless.
