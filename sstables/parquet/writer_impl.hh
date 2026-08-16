@@ -24,8 +24,11 @@
 
 #include "sstables/parquet/schema_mapping.hh"
 #include "sstables/writer_impl.hh"
+#include "sstables/writer.hh"
 
 #include <functional>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace sstables::parquet {
@@ -84,10 +87,29 @@ private:
     sink_type         _sink;
     uint64_t          _pos = 0;
 
+    // Partition index. Entries carry a *row ordinal*, not a byte offset -- see
+    // design doc 5.4 option A. The reader turns that ordinal into a page via the
+    // Parquet OffsetIndex.
+    // Held as the base type: the write() overload for keys takes file_writer&.
+    std::unique_ptr<file_writer> _index_writer;
+    // Opened up front, like mx does: create_data() hands the sstable's data and
+    // index files to the storage layer, and nothing can be written before it.
+    std::unique_ptr<crc32_checksummed_file_writer> _data_writer;
+    sstables::index_sampling_state _index_sampling_state;
+    std::optional<key> _first_key, _last_key;
+    uint64_t _num_partitions = 0;
+    // Ordinal of the first row of the partition currently being consumed.
+    uint64_t _partition_first_row = 0;
+    bool _in_partition = false;
+
+    void finish_open_partition();
+    void write_components();
+
 public:
     pq_writer_impl(sstables::sstable& sst, const ::schema& s,
+                   uint64_t estimated_partitions,
                    const sstables::sstable_writer_config& cfg,
-                   pq_writer_config pcfg, sink_type sink);
+                   pq_writer_config pcfg, shard_id shard, sink_type sink);
 
     void consume_new_partition(const dht::decorated_key& dk) override;
     void consume(tombstone t) override;
@@ -98,5 +120,20 @@ public:
     void consume_end_of_stream() override;
     uint64_t data_file_position_for_tests() const override { return _pos; }
 };
+
+// Factory used by sstable_writer when the sstable's version is `pq`. Mirrors
+// mc::make_writer so the dispatch in writer.cc stays a one-line choice.
+//
+// The pq_writer_config is defaulted here (L1, sparse exceptions). Deriving it
+// from the table's own storage-format properties -- rows per row group and so
+// on, per design doc section 6 -- is the next step; nothing about that changes
+// this signature.
+std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
+        sstables::sstable& sst,
+        const ::schema& s,
+        uint64_t estimated_partitions,
+        const sstables::sstable_writer_config& cfg,
+        encoding_stats enc_stats,
+        shard_id shard);
 
 } // namespace sstables::parquet

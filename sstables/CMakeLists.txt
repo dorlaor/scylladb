@@ -34,6 +34,7 @@ target_sources(sstables
     parquet/format/parquet_writer.cc
     parquet/schema_mapping.cc
     parquet/writer_impl.cc
+    parquet/reader.cc
     parquet/tiering_policy.cc
     parquet/tiering_context.cc
     parquet/format/parquet_reader.cc

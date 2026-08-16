@@ -78,6 +78,7 @@
 #include "tracing/traced_file.hh"
 #include "kl/reader.hh"
 #include "mx/reader.hh"
+#include "sstables/parquet/reader.hh"
 #include "utils/bit_cast.hh"
 #include "utils/cached_file.hh"
 #include "tombstone_gc.hh"
@@ -2701,7 +2702,10 @@ future<uint64_t> sstable::validate(reader_permit permit, abort_source& abort,
     }
     co_await utils::get_local_injector().inject("sstable_validate/pause", utils::wait_for_message(std::chrono::seconds(5)));
 
-    if (_version >= sstable_version_types::mc) {
+    // pq is excluded deliberately: mx::validate walks the mx data format, which a
+    // Parquet Data component is not. It falls through to the generic validator
+    // below, which goes through make_full_scan_reader and so through the pq reader.
+    if (implies_mx_generation(_version, sstable_version_types::mc)) {
         co_return co_await mx::validate(shared_from_this(), std::move(permit), abort, std::move(error_handler), monitor);
     }
 
@@ -3076,6 +3080,26 @@ sstable::make_reader(
 ) {
     const auto reversed = slice.is_reversed();
 
+    // pq must be dispatched before anything keyed off `>= mc`: it sorts after mc
+    // in the enum but is a different format entirely. Also before the index
+    // reader is built -- the Parquet reader does not consume one.
+    if (_version == version_types::pq) {
+        if (reversed) {
+            // No native reversed support yet; read forward and reverse, as kl does.
+            auto rd = make_reversing_reader(
+                    parquet::make_reader(shared_from_this(), query_schema->make_reversed(),
+                            permit, range, reverse_slice(*query_schema, slice),
+                            trace_state, streamed_mutation::forwarding::no, fwd_mr, mon),
+                    permit.max_result_size());
+            if (fwd) {
+                rd = make_forwardable(std::move(rd));
+            }
+            return rd;
+        }
+        return parquet::make_reader(shared_from_this(), std::move(query_schema),
+                std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr, mon);
+    }
+
     auto index_caching = use_caching(global_cache_index_pages && !slice.options.contains(query::partition_slice::option::bypass_cache));
     auto index_reader = make_index_reader(permit, trace_state, index_caching, range.is_singular());
 
@@ -3134,6 +3158,11 @@ sstable::make_full_scan_reader(
         tracing::trace_state_ptr trace_state,
         read_monitor& monitor,
         integrity_check integrity) {
+    // Before the `>= mc` test: pq sorts after mc but is not an mx file.
+    if (_version == version_types::pq) {
+        return parquet::make_full_scan_reader(shared_from_this(), std::move(schema),
+                std::move(permit), std::move(trace_state), monitor);
+    }
     if (_version >= version_types::mc) {
         return mx::make_full_scan_reader(shared_from_this(), std::move(schema), std::move(permit), std::move(trace_state), monitor, integrity);
     }
@@ -3145,7 +3174,7 @@ static std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> ma
     //   la-42-big-Data.db
     //   ka-42-big-Data.db
     //   me-3g8w_00qf_4pbog2i7h2c7am0uoe-big-Data.db
-    static boost::regex la_mx("(la|m[cdest])-([^-]+)-(\\w+)-(.*)");
+    static boost::regex la_mx("(la|m[cdest]|pq)-([^-]+)-(\\w+)-(.*)");
     static boost::regex ka("(\\w+)-(\\w+)-ka-(\\d+)-(.*)");
 
     // Use non-greedy match so that a snapshot tag that ressembles a name-<uuid> wouldn't match

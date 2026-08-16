@@ -16,6 +16,11 @@
 
 #include <seastar/core/fstream.hh>
 
+#include "sstables/writer.hh"
+#include "sstables/storage.hh"
+#include "keys/keys.hh"
+#include "dht/i_partitioner.hh"
+
 #include <cstring>
 
 namespace sstables::parquet {
@@ -161,15 +166,92 @@ std::vector<uint8_t> fragment_shredder::to_parquet_for_storage(const pq_writer_c
 
 // ---------------------------------------------------------------- writer_impl
 pq_writer_impl::pq_writer_impl(sstables::sstable& sst, const ::schema& s,
+                               uint64_t estimated_partitions,
                                const sstables::sstable_writer_config& cfg,
-                               pq_writer_config pcfg, sink_type sink)
+                               pq_writer_config pcfg, shard_id shard, sink_type sink)
     : sstables::sstable_writer::writer_impl(sst, s, cfg)
     , _shredder(s)
     , _pcfg(std::move(pcfg))
-    , _sink(std::move(sink)) {}
+    , _sink(std::move(sink)) {
+    if (_sink) {
+        return;   // unit-test path: no sstable components at all
+    }
+    // Zero is benign here but not further down; mx clamps for the same reason.
+    estimated_partitions = std::max(uint64_t(1), estimated_partitions);
+
+    // create_data() is what actually opens the Data and Index files. Until it
+    // runs, sst._data_file is null and make_data_or_index_sink dereferences it.
+    sst.open_sstable(cfg.origin);
+    sst.create_data().get();
+    sst._shards = { shard };
+
+    _index_sampling_state.summary_byte_cost = cfg.summary_byte_cost;
+    _index_sampling_state.max_partitions_per_page = cfg.summary_max_partitions_per_page;
+
+    {
+        auto out = sst._storage->make_data_or_index_sink(sst, component_type::Data).get();
+        _data_writer = std::make_unique<crc32_checksummed_file_writer>(
+                std::move(out), sst.sstable_buffer_size, sst.get_filename());
+    }
+    if (sst.has_component(component_type::Index)) {
+        auto out = sst._storage->make_data_or_index_sink(sst, component_type::Index).get();
+        _index_writer = std::make_unique<crc32_digest_file_writer>(
+                std::move(out), sst.sstable_buffer_size, sst.index_filename());
+        sstables::prepare_summary(sst._components->summary, estimated_partitions,
+                                  s.min_index_interval());
+    }
+
+    _cfg.monitor->on_write_started(_data_writer->offset_tracker());
+    if (sst.has_component(component_type::Filter)) {
+        sst._components->filter = utils::i_filter::get_filter(
+                estimated_partitions, s.bloom_filter_fp_chance(), utils::filter_format::m_format);
+    }
+}
+
+// The mc index entry is: key, then a vint position, then a vint promoted-index
+// size. For pq the position is the row ordinal, and the promoted index is always
+// absent because Parquet's ColumnIndex already provides intra-partition seeking
+// (design doc open question 2).
+void pq_writer_impl::finish_open_partition() {
+    if (!_in_partition || !_index_writer) {
+        _in_partition = false;
+        return;
+    }
+    write_vint(*_index_writer, uint64_t(0));   // no promoted index
+    _in_partition = false;
+}
 
 void pq_writer_impl::consume_new_partition(const dht::decorated_key& dk) {
+    finish_open_partition();
     _shredder.new_partition(dk);
+    _partition_first_row = _shredder.size();
+
+    if (_index_writer) {
+        auto pk = key::from_partition_key(_schema, dk.key());
+        // The filter and the min/max key statistics are fed per partition, as
+        // mx does. Without the filter every point read on this sstable misses.
+        if (_sst._components->filter) {
+            _sst._components->filter->add(utils::make_hashed_key(bytes_view(pk)));
+        }
+        _collector.add_key(bytes_view(pk));
+        sstables::maybe_add_summary_entry(_sst._components->summary, dk.token(),
+                bytes_view(pk), _index_writer->offset(), _index_writer->offset(),
+                _index_sampling_state);
+        // Same on-disk shape as mc: a uint16-prefixed key, then a vint. Only the
+        // meaning of the vint differs.
+        auto p_key = disk_string_view<uint16_t>();
+        p_key.value = bytes_view(pk);
+        write(_sst.get_version(), *_index_writer, p_key);
+        // Option A: the row ordinal of this partition's first row, not a byte
+        // offset. The reader maps it to a page through the OffsetIndex.
+        write_vint(*_index_writer, _partition_first_row);
+        _in_partition = true;
+
+        // After the write: p_key views into pk.
+        if (!_first_key) { _first_key = pk; }
+        _last_key = std::move(pk);
+    }
+    ++_num_partitions;
 }
 
 void pq_writer_impl::consume(tombstone) {
@@ -208,16 +290,50 @@ void pq_writer_impl::consume_end_of_stream() {
     // Otherwise the image becomes the Data component. consume_end_of_stream runs
     // in a seastar thread (mx::writer relies on the same), so blocking here is
     // allowed.
-    auto sink = _sst._storage->make_data_or_index_sink(_sst, component_type::Data).get();
-    auto out = output_stream<char>(std::move(sink));
-    out.write(reinterpret_cast<const char*>(img.data()), img.size()).get();
-    out.flush().get();
-    out.close().get();
+    finish_open_partition();
+    _data_writer->write(reinterpret_cast<const char*>(img.data()), img.size());
+    _data_writer->close();
+    _sst.write_digest(_data_writer->full_checksum());
+    _sst.write_crc(_data_writer->finalize_checksum());
+    _data_writer.reset();
     _cfg.monitor->on_data_write_completed();
+    write_components();
+}
 
-    // NOTE: the remaining components -- index, summary, filter, statistics,
-    // digest, CRC, TOC -- are not written yet, so the sstable is not yet
-    // loadable. That is why `pq` is still absent from writable_sstable_versions.
+void pq_writer_impl::write_components() {
+    if (_index_writer) {
+        sstables::seal_summary(_sst._components->summary, std::move(_first_key),
+                               std::move(_last_key), _index_sampling_state).get();
+        _index_writer->close();
+        _index_writer.reset();
+    }
+    _sst.set_first_and_last_keys();
+
+    sstables::seal_statistics(_sst.get_version(), _sst._components->statistics, _collector,
+            _schema.get_partitioner().name(), _schema.bloom_filter_fp_chance(),
+            _sst.get_schema(), _sst.get_first_decorated_key(), _sst.get_last_decorated_key(),
+            encoding_stats{});
+
+    _sst.maybe_rebuild_filter_from_index(_num_partitions);
+    _sst.write_summary();
+    _sst.write_filter();
+    _sst.write_statistics();
+    _sst.write_scylla_metadata(this_shard_id(), run_identifier{_cfg.run_identifier},
+                               std::nullopt, std::nullopt, std::nullopt);
+    if (!_cfg.leave_unsealed) {
+        _sst.seal_sstable(_cfg.backup).get();
+    }
+}
+
+std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
+        sstables::sstable& sst,
+        const ::schema& s,
+        uint64_t estimated_partitions,
+        const sstables::sstable_writer_config& cfg,
+        encoding_stats /*enc_stats*/,
+        shard_id shard) {
+    return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
+                                            pq_writer_config{}, shard, nullptr);
 }
 
 } // namespace sstables::parquet

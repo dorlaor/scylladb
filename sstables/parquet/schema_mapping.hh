@@ -144,10 +144,40 @@ struct mapped_schema {
 // Decides which optional metadata leaves are actually needed for this batch of
 // rows, then builds the schema. Materialising a leaf that is never used is the
 // entire cost of the 2020 mapping, so this inspects the data first.
+// What map_schema decides by looking at the data: which optional leaf groups a
+// batch of rows actually needs. Separated from the schema builder so a reader
+// can recover the same answers from a file it did not write.
+struct schema_flags {
+    bool any_ttl = false;
+    bool any_deletion = false;
+    bool all_same_ts = true;
+    std::vector<bool> col_diverges;      // per regular column
+    std::optional<int64_t> single_ts;
+};
+
+schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<row>& rows);
+
+// The single schema builder. Both map_schema (write side) and
+// recover_mapped_schema (read side) go through this, so there is exactly one
+// definition of the leaf layout.
+mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
+                                  folding_level requested,
+                                  const schema_flags&,
+                                  exception_encoding = exception_encoding::sparse);
+
 mapped_schema map_schema(const std::vector<cql_column>& cols,
                          folding_level requested,
                          const std::vector<row>& rows,
                          exception_encoding = exception_encoding::sparse);
+
+// Rebuild the mapped_schema of a file we did not write, from its footer. The
+// folding level comes from the scylla.folding_level key/value entry; which
+// optional leaf groups exist is read off the leaf names. Throws if the file was
+// not written by this mapping, or if the recovered layout does not match the
+// file's own leaves -- a mismatch means a silent misread, so it must not be
+// tolerated.
+mapped_schema recover_mapped_schema(const file_metadata&,
+                                    const std::vector<cql_column>& cols);
 
 // Shred rows into Parquet columns according to `ms`.
 std::vector<column_data> shred(const mapped_schema& ms,

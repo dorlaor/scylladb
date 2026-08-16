@@ -487,10 +487,32 @@ column, which is exactly the cost §4 assumed when it promised p99 ≤ 1.2× nat
 
 **Audit of the semantic change.** Repurposing `position()` was the risk. Grepping every
 consumer found the offset arithmetic confined to `mx/bsearch_clustered_cursor.hh`, which a
-`pq` reader never uses. Exactly one generic consumer does arithmetic —
-`sstable::estimated_keys_for_range` ratios `(end - start)` against `data_size()`. With row
-ordinals that becomes *simpler* (`end - start` is the row count), so it is a one-line
-version branch rather than a blocker.
+`pq` reader never uses. One generic consumer looked like it did arithmetic —
+`sstable::estimated_keys_for_range`.
+
+*Resolved on implementation (2026-08-16): no branch was needed.* That function has two
+paths, and the byte-offset one (`(end - start) / data_size()`) is reached only when the
+sstable has a BTI `Partitions.db` footer. `pq` writes a Summary and an Index, so it takes
+the other path, which ratios *summary page counts* and never touches `position()`. The
+predicted one-line version branch turned out to be zero lines — worth recording because
+the audit's conclusion was right (not a blocker) for a reason that was slightly wrong.
+
+**Implementation status (2026-08-16).** Option A is implemented and exercised end to end:
+
+- `pq_writer_impl::consume_new_partition` writes an mc-shaped index entry — a
+  `uint16`-length-prefixed key, then a vint — where the vint is the partition's first
+  **row ordinal**. The trailing promoted-index-size vint is always `0`, per open
+  question 2.
+- The writer emits Parquet's OffsetIndex (`write_page_indexes`), and
+  `offset_index::page_for_row()` binary-searches `first_row_index` to turn an ordinal
+  into a page.
+- Summary, Filter, Statistics, `Scylla.db` and the TOC are written, so a `pq` sstable is
+  loadable rather than merely parseable. `test/boost/sstable_parquet_test.cc` asserts each
+  component exists and that every written key is found by the filter.
+
+The reader shipped in this change does not yet *use* the ordinal: it decodes the whole
+image and serves from memory (§11, item 10). The index is written and verified so that the
+streaming reader is a drop-in replacement rather than a format change.
 
 
 
@@ -1679,6 +1701,21 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
    the per-column leaves with a two-leaf sparse side-channel (`__tsx_mask` bitmap +
    `__tsx_vals` zigzag-varint deltas). Leaf count is now width-independent and the
    worst-case penalty fell from 2.68× to 2.05× — see §10.3c. §5.3 amended.
+
+10. **Streaming reader.** The `pq` reader materialises the whole Parquet image and every
+    mutation in it before emitting a fragment, which violates R-13 on large sstables. The
+    replacement decodes one row group at a time and seeks via the index entry's row
+    ordinal → OffsetIndex → page. Everything that needs it is already written; this is the
+    largest single piece of remaining work.
+11. **Fragment kinds the shredder drops.** Static rows, partition tombstones, range
+    tombstones, row markers, multi-cell collections and counters are not carried through
+    `fragment_shredder`. This — not the reader or the writer — is why `pq` is absent from
+    `all_sstable_versions` and why `sstable_conforms_to_mutation_source_test` cannot yet
+    include it. A row that exists with all-null columns currently reads back without a
+    marker.
+12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
+    (L1, sparse exceptions). §6 specifies table-level control of folding level and row
+    group sizing; wiring the schema properties through to the writer is not done.
 
 ## 12. References
 

@@ -226,7 +226,7 @@ int filetrip() {
                 wo.page_values = 512;          // force multi-page chunks
                 auto ms   = map_schema(cols, lvl, rows);
                 auto data = shred(ms, cols, rows);
-                format::file_writer fw(ms.columns, wo);
+                format::parquet_file_writer fw(ms.columns, wo);
                 fw.add_row_group(data);
                 auto img = fw.finish();
 
@@ -349,14 +349,99 @@ int cost() {
 
 } // namespace
 
+// Recovering the mapped_schema from the file alone. This is what a reader
+// actually has to do: it is handed an image and a CQL schema, and nothing else.
+// The write-side mapped_schema is deliberately dropped before reassembling --
+// if recovery is wrong, the round trip breaks here and nowhere else.
+int recovery() {
+    size_t cases = 0, fails = 0;
+    const double divs[]  = {0.0, 0.05, 0.5};
+    const double nulls[] = {0.0, 0.3};
+    const size_t widths[] = {1, 6, 25};
+
+    for (size_t w : widths) {
+        auto cols = make_schema(w);
+        for (double d : divs) for (double nl : nulls)
+        for (auto exc : {exception_encoding::sparse, exception_encoding::per_column}) {
+            for (double ttl : {0.0, 0.2}) {
+                gen_opts o; o.rows = 800; o.n_regular = w;
+                o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = ttl;
+                auto rows = generate(cols, o);
+
+                for (auto lvl : {folding_level::verbatim, folding_level::row_folded,
+                                 folding_level::uniform}) {
+                    ++cases;
+                    format::writer_options wo;
+                    wo.page_values = 512;
+                    auto img = write_rows(cols, rows, lvl, wo, exc);
+
+                    // Everything below sees only the image and `cols`.
+                    try {
+                        auto fm = format::parse_footer(img);
+                        auto ms = recover_mapped_schema(fm, cols);
+                        auto back = format::read_file(img);
+                        auto rt = reassemble(ms, cols, back, size_t(fm.num_rows));
+                        std::string why;
+                        if (!compare(rows, rt, ms.level, why)) {
+                            ++fails;
+                            std::printf("  FAIL w=%zu div=%.2f null=%.1f ttl=%.1f %s %s: %s\n",
+                                        w, d, nl, ttl,
+                                        exc == exception_encoding::sparse ? "sparse" : "percol",
+                                        to_string(lvl), why.c_str());
+                            if (fails > 6) { std::printf("  (stopping)\n"); return 1; }
+                        }
+                    } catch (const std::exception& e) {
+                        ++fails;
+                        std::printf("  FAIL w=%zu div=%.2f %s %s: threw: %s\n", w, d,
+                                    exc == exception_encoding::sparse ? "sparse" : "percol",
+                                    to_string(lvl), e.what());
+                        if (fails > 6) { std::printf("  (stopping)\n"); return 1; }
+                    }
+                }
+            }
+        }
+    }
+
+    // A schema that does not match the file must be refused loudly rather than
+    // decoded into the wrong fields.
+    {
+        auto cols = make_schema(6);
+        auto rows = generate(cols, [] { gen_opts o; o.rows = 100; o.n_regular = 6; return o; }());
+        auto img = write_rows(cols, rows, folding_level::row_folded);
+        auto fm = format::parse_footer(img);
+        bool threw = false;
+        try { recover_mapped_schema(fm, make_schema(7)); }
+        catch (const std::exception&) { threw = true; }
+        ++cases;
+        if (!threw) { ++fails; std::printf("  FAIL: wrong-width schema was accepted\n"); }
+    }
+    // L3 is export-only: reading it back would invent cell metadata.
+    {
+        auto cols = make_schema(4);
+        auto rows = generate(cols, [] { gen_opts o; o.rows = 100; o.n_regular = 4; return o; }());
+        auto img = write_rows(cols, rows, folding_level::logical);
+        auto fm = format::parse_footer(img);
+        bool threw = false;
+        try { recover_mapped_schema(fm, cols); }
+        catch (const std::exception&) { threw = true; }
+        ++cases;
+        if (!threw) { ++fails; std::printf("  FAIL: L3 file was accepted for read-back\n"); }
+    }
+
+    std::printf("schema recovery: %zu cases, %zu failures\n", cases, fails);
+    std::printf("%s\n", fails ? "RECOVERY FAIL" : "RECOVERY PASS");
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|cost}\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|recovery|cost}\n", argv[0]); return 2; }
     try {
         std::string c = argv[1];
         if (c == "roundtrip") { return roundtrip(); }
         if (c == "cost")      { return cost(); }
         if (c == "filetrip")  { return filetrip(); }
         if (c == "logical")   { return logical(); }
+        if (c == "recovery")  { return recovery(); }
         std::fprintf(stderr, "unknown command\n"); return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what()); return 1;

@@ -73,7 +73,7 @@ void write_dictionary_page_header(std::vector<uint8_t>& out,
 
 } // namespace
 
-void file_writer::write_column_chunk(const column_spec& spec, const column_data& col,
+void parquet_file_writer::write_column_chunk(const column_spec& spec, const column_data& col,
                                      chunk_meta& out_meta) {
     const size_t n = col.num_values();
     const bool optional = spec.rep == repetition::optional;
@@ -250,7 +250,7 @@ void file_writer::write_column_chunk(const column_spec& spec, const column_data&
     }
 }
 
-void file_writer::add_row_group(std::span<const column_data> cols) {
+void parquet_file_writer::add_row_group(std::span<const column_data> cols) {
     if (cols.size() != _schema.size()) {
         throw std::runtime_error("writer: column count does not match schema");
     }
@@ -269,7 +269,7 @@ void file_writer::add_row_group(std::span<const column_data> cols) {
     _rgs.push_back(std::move(rg));
 }
 
-void file_writer::write_page_indexes() {
+void parquet_file_writer::write_page_indexes() {
     if (!_opt.write_page_index) { return; }
     for (auto& rg : _rgs) {
         for (auto& ch : rg.chunks) {
@@ -293,7 +293,7 @@ void file_writer::write_page_indexes() {
     }
 }
 
-void file_writer::write_footer() {
+void parquet_file_writer::write_footer() {
     std::vector<uint8_t> meta;
     compact_writer w(meta);
     {
@@ -369,7 +369,7 @@ void file_writer::write_footer() {
     _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
 }
 
-std::vector<uint8_t> file_writer::finish() {
+std::vector<uint8_t> parquet_file_writer::finish() {
     write_page_indexes();
     write_footer();
     return std::move(_buf);

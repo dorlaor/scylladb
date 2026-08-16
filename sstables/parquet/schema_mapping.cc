@@ -92,10 +92,38 @@ int64_t get_zigzag(const std::string& s, size_t& i) {
 
 } // namespace
 
-mapped_schema map_schema(const std::vector<cql_column>& cols,
-                         folding_level requested,
-                         const std::vector<row>& rows,
-                         exception_encoding exc) {
+// The layer decisions map_schema derives from the data. Split out so that the
+// reader can recover the same flags from a file's leaf names and rebuild an
+// identical mapped_schema through the one builder below -- two ways in, one
+// layout, so writer and reader cannot drift apart.
+schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<row>& rows) {
+    schema_flags f;
+    size_t n_regular = 0;
+    for (const auto& c : cols) { if (c.kind == column_kind::regular) { ++n_regular; } }
+    f.col_diverges.assign(n_regular, false);
+
+    for (const auto& r : rows) {
+        auto mt = modal_timestamp(r);
+        if (mt) {
+            if (!f.single_ts) { f.single_ts = mt; }
+            else if (*f.single_ts != *mt) { f.all_same_ts = false; }
+        }
+        for (const auto& [ci, c] : r.cells) {
+            if (c.ttl) { f.any_ttl = true; }
+            if (c.local_deletion_time || !c.live) { f.any_deletion = true; }
+            if (mt && c.timestamp != *mt) {
+                f.col_diverges[ci] = true;
+                f.all_same_ts = false;
+            }
+        }
+    }
+    return f;
+}
+
+mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
+                                  folding_level requested,
+                                  const schema_flags& flags,
+                                  exception_encoding exc) {
     mapped_schema ms;
     ms.level = requested;
     ms.exc_encoding = exc;
@@ -109,28 +137,12 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
     ms.ts_exc_index.assign(reg_idx.size(), std::nullopt);
     ms.meta_base_index.assign(reg_idx.size(), std::nullopt);
 
-    // ---- inspect the data before deciding what to materialise
-    bool any_ttl = false, any_deletion = false;
-    std::vector<bool> col_diverges(reg_idx.size(), false);
-    std::optional<int64_t> single_ts;
-    bool all_same_ts = true;
+    const bool any_ttl = flags.any_ttl, any_deletion = flags.any_deletion;
+    const std::vector<bool>& col_diverges = flags.col_diverges;
+    const std::optional<int64_t>& single_ts = flags.single_ts;
 
-    for (const auto& r : rows) {
-        auto mt = modal_timestamp(r);
-        if (mt) {
-            if (!single_ts) { single_ts = mt; }
-            else if (*single_ts != *mt) { all_same_ts = false; }
-        }
-        for (const auto& [ci, c] : r.cells) {
-            if (c.ttl) { any_ttl = true; }
-            if (c.local_deletion_time || !c.live) { any_deletion = true; }
-            if (mt && c.timestamp != *mt) {
-                col_diverges[ci] = true;
-                all_same_ts = false;
-            }
-        }
-    }
-    if (requested == folding_level::uniform && !(all_same_ts && !any_ttl && !any_deletion)) {
+    if (requested == folding_level::uniform &&
+        !(flags.all_same_ts && !any_ttl && !any_deletion)) {
         // Precondition broken -- fall back rather than lose information.
         ms.level = folding_level::row_folded;
     }
@@ -233,6 +245,99 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
         }
     } else {
         ms.uniform_ts = single_ts.value_or(0);
+    }
+    return ms;
+}
+
+mapped_schema map_schema(const std::vector<cql_column>& cols,
+                         folding_level requested,
+                         const std::vector<row>& rows,
+                         exception_encoding exc) {
+    return build_mapped_schema(cols, requested, scan_rows(cols, rows), exc);
+}
+
+mapped_schema recover_mapped_schema(const file_metadata& fm,
+                                    const std::vector<cql_column>& cols) {
+    // Leaf names as the file itself declares them.
+    std::vector<std::string> leaves;
+    for (size_t i = 1; i < fm.schema.size(); ++i) {
+        if (fm.schema[i].is_leaf()) { leaves.push_back(fm.schema[i].name); }
+    }
+    auto has = [&] (const std::string& n) {
+        return std::find(leaves.begin(), leaves.end(), n) != leaves.end();
+    };
+
+    const std::string* lvl = fm.kv("scylla.folding_level");
+    if (!lvl) {
+        throw std::runtime_error("parquet: file has no scylla.folding_level; "
+                                 "not written by this mapping");
+    }
+    folding_level level;
+    if      (*lvl == "L0") { level = folding_level::verbatim; }
+    else if (*lvl == "L1") { level = folding_level::row_folded; }
+    else if (*lvl == "L2") { level = folding_level::uniform; }
+    else if (*lvl == "L3") { level = folding_level::logical; }
+    else { throw std::runtime_error("parquet: unknown folding level '" + *lvl + "'"); }
+
+    if (level == folding_level::logical) {
+        // L3 discards write times, TTLs and deletions at write time. There is
+        // nothing to reassemble; refusing here rather than returning plausible
+        // rows with invented metadata.
+        throw std::runtime_error("parquet: L3 files are export-only and cannot be read back");
+    }
+
+    std::vector<size_t> reg_idx;
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (cols[i].kind == column_kind::regular) { reg_idx.push_back(i); }
+    }
+
+    schema_flags f;
+    f.col_diverges.assign(reg_idx.size(), false);
+    auto exc = exception_encoding::sparse;
+
+    if (level == folding_level::row_folded) {
+        if (has("__tsx_mask")) {
+            exc = exception_encoding::sparse;
+            // The sparse channel is two leaves for the whole table, so the file
+            // cannot say which columns diverge -- and does not need to: the
+            // per-row bitmap carries that. Any non-empty col_diverges makes the
+            // builder emit the pair, which is all that matters for the layout.
+            f.col_diverges.assign(reg_idx.size(), true);
+        } else {
+            bool any = false;
+            for (size_t k = 0; k < reg_idx.size(); ++k) {
+                if (has("__tsx_" + cols[reg_idx[k]].name)) { f.col_diverges[k] = true; any = true; }
+            }
+            if (any) { exc = exception_encoding::per_column; }
+        }
+        // The __ttl_/__ldt_ groups are all-or-nothing: the builder emits one
+        // leaf per regular column or none at all, so testing the first is
+        // enough, and the leaf-count check below catches any disagreement.
+        if (!reg_idx.empty()) {
+            f.any_ttl      = has("__ttl_" + cols[reg_idx[0]].name);
+            f.any_deletion = has("__ldt_" + cols[reg_idx[0]].name);
+        }
+    } else if (level == folding_level::uniform) {
+        f.all_same_ts = true;
+        const std::string* u = fm.kv("scylla.uniform_timestamp");
+        if (!u) { throw std::runtime_error("parquet: L2 file without scylla.uniform_timestamp"); }
+        f.single_ts = int64_t(std::stoll(*u));
+    }
+
+    auto ms = build_mapped_schema(cols, level, f, exc);
+
+    // The recovered layout must reproduce the file exactly. If it does not, the
+    // schema we were handed is not the schema this file was written with, and
+    // decoding would silently read the wrong column into the wrong field.
+    if (ms.columns.size() != leaves.size()) {
+        throw std::runtime_error("parquet: recovered " + std::to_string(ms.columns.size()) +
+                                 " leaves but file has " + std::to_string(leaves.size()));
+    }
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        if (ms.columns[i].name != leaves[i]) {
+            throw std::runtime_error("parquet: leaf " + std::to_string(i) + " is '" + leaves[i] +
+                                     "' but the schema says '" + ms.columns[i].name + "'");
+        }
     }
     return ms;
 }
@@ -397,7 +502,7 @@ std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 exception_encoding exc) {
     auto ms = map_schema(cols, level, rows, exc);
     auto data = shred(ms, cols, rows);
-    file_writer w(ms.columns, opt);
+    parquet_file_writer w(ms.columns, opt);
     w.add_key_value("scylla.folding_level", to_string(ms.level));
     if (ms.uniform_ts) {
         w.add_key_value("scylla.uniform_timestamp", std::to_string(*ms.uniform_ts));

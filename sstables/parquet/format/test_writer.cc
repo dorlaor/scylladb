@@ -35,6 +35,10 @@ struct fixture {
     size_t rows;
     bool with_nulls;
     bool delta_ts;
+    // Distinct values in the `status` column. One is the interesting case: the
+    // dictionary then needs zero bits to address, which parquet-cpp rejects
+    // unless the writer clamps the width. Regression cover for that.
+    size_t status_card = 5;
 };
 
 void jstr(std::ostream& o, const std::string& s) {
@@ -56,6 +60,8 @@ int emit(const std::string& dir) {
         {"w_uncompressed",  {codec::uncompressed, 0, 8192, true, 1u<<20, true}, 20000, true, true},
         {"w_multipage",     {codec::zstd, 3, 1000,  false, 1u<<20, true}, 20000, true,  false},
         {"w_tiny",          {codec::zstd, 3, 20000, true,  1u<<20, true}, 7,     true,  false},
+        {"w_dict_single",   {codec::zstd, 3, 20000, true,  1u<<20, true}, 30000, true,  false, 1},
+        {"w_dict_two",      {codec::zstd, 3, 20000, true,  1u<<20, true}, 30000, true,  false, 2},
     };
 
     std::ofstream man(dir + "/manifest.json");
@@ -105,7 +111,7 @@ int emit(const std::string& dir) {
             cols[2].f64.push_back(p2 ? av : 0.0);
 
             const bool p3 = !f.with_nulls || (rng() % 4) != 0;
-            const std::string sv = STATUS[rng() % 5];
+            const std::string sv = STATUS[rng() % f.status_card];
             cols[3].def_levels.push_back(p3 ? 1 : 0);
             cols[3].str.push_back(p3 ? sv : std::string());
 
@@ -113,7 +119,7 @@ int emit(const std::string& dir) {
             cols[4].i64.push_back(ts);
         }
 
-        file_writer w(schema, f.opt);
+        parquet_file_writer w(schema, f.opt);
         w.add_key_value("scylla.folding_level", "L1");
         w.add_key_value("scylla.table", "pqlab.demo");
         w.add_row_group(cols);
@@ -142,6 +148,7 @@ int emit(const std::string& dir) {
             << ", \"page_values\": " << f.opt.page_values
             << ", \"delta_ts\": " << (f.delta_ts ? "true" : "false")
             << ", \"nulls\": " << (f.with_nulls ? "true" : "false")
+            << ", \"status_card\": " << f.status_card
             << ", \"seed\": 1234}";
         std::printf("  wrote %-16s %8zu rows  %9zu B  (%s%s%s)\n", f.name.c_str(), n, img.size(),
                     to_string(f.opt.compression),

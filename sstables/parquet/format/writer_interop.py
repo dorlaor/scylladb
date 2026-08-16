@@ -50,7 +50,7 @@ class MT64:
         return x & 0xFFFFFFFFFFFFFFFF
 
 
-def expected(rows, with_nulls, seed=1234):
+def expected(rows, with_nulls, seed=1234, status_card=5):
     rng = MT64(seed)
     ids, grade, amount, status, ts = [], [], [], [], []
     t = 1700000000000000
@@ -64,7 +64,7 @@ def expected(rows, with_nulls, seed=1234):
         av = (rng() % 1000000) / 100.0
         amount.append(av if p2 else None)
         p3 = (not with_nulls) or (rng() % 4) != 0
-        sv = STATUS[rng() % 5]
+        sv = STATUS[rng() % status_card]
         status.append(sv if p3 else None)
         t += rng() % 1000
         ts.append(t)
@@ -75,7 +75,8 @@ def check(entry):
     path = entry["path"]
     tbl = pq.read_table(path)
     got = {c: tbl.column(c).to_pylist() for c in tbl.column_names}
-    want = expected(entry["rows"], entry["nulls"], entry["seed"])
+    want = expected(entry["rows"], entry["nulls"], entry["seed"],
+                    entry.get("status_card", 5))
     problems = []
     if set(got) != set(want):
         return ["column set: got %s want %s" % (sorted(got), sorted(want))]

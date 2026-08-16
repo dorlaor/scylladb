@@ -80,7 +80,7 @@ struct column_spec {
     std::optional<encoding> preferred;
 };
 
-class file_writer {
+class parquet_file_writer {
     struct chunk_meta {
         column_metadata cm;
         int64_t         first_page_offset = 0;
@@ -110,7 +110,7 @@ class file_writer {
     void write_footer();
 
 public:
-    file_writer(std::vector<column_spec> schema, writer_options opt = {})
+    parquet_file_writer(std::vector<column_spec> schema, writer_options opt = {})
         : _schema(std::move(schema)), _opt(opt) {
         _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
     }

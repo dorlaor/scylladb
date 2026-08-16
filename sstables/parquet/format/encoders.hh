@@ -186,6 +186,12 @@ inline dict_result encode_dictionary_byte_array(std::span<const std::string> val
         r.dictionary_page.insert(r.dictionary_page.end(), s->begin(), s->end());
     }
     uint8_t bw = bit_width_for(r.num_distinct ? r.num_distinct - 1 : 0);
+    // A single-entry dictionary needs zero bits to address, and a zero bit width
+    // is what the arithmetic produces. Our own decoder copes, but parquet-cpp
+    // rejects the resulting index stream ("Invalid number of indices: 0"), so
+    // the file would not be externally readable -- which is the whole point of
+    // the format. Cost is one bit per value in a case that compresses away.
+    if (bw == 0) { bw = 1; }
     r.index_page.push_back(bw);
     rle_encoder enc(bw);
     enc.encode(idx);

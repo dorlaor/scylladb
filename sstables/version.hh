@@ -22,10 +22,17 @@ enum class sstable_version_types { ka, la, mc, md, me, ms, mt, pq };
 enum class sstable_format_types { big };
 
 // NOTE: `pq` is intentionally absent from both arrays below. These mean "versions
-// the node can actually read / write", and until the Parquet writer and reader are
-// wired into the sstable layer that is not true of pq. Code can name the enum
-// value; nothing should yet claim the format is supported. Add it here in the
-// same change that lands the Data-component writer and pq::make_reader.
+// the node can actually read / write", and pq is not there yet.
+//
+// As of 2026-08-16 the writer and reader ARE wired in: a pq sstable is written
+// with a full component set, reads back through sstable::make_reader, and its
+// Data component opens in pyarrow (test/boost/sstable_parquet_test.cc). What
+// still blocks membership is coverage, not plumbing -- the shredder drops static
+// rows, partition and range tombstones, row markers, multi-cell collections and
+// counters. Adding pq here would enrol it in the generic suites, including
+// sstable_conforms_to_mutation_source_test, which exercise all of those.
+// Add it in the change that closes those gaps; see
+// docs/dev/parquet-storage-format.md section 11, item 11.
 constexpr std::array<sstable_version_types, 7> all_sstable_versions = {
     sstable_version_types::ka,
     sstable_version_types::la,
@@ -52,6 +59,17 @@ inline auto get_highest_sstable_version() {
 
 sstable_version_types version_from_string(std::string_view s);
 sstable_format_types format_from_string(std::string_view s);
+
+// `pq` sorts after every mx version, but it is a different format rather than a
+// newer generation of the same one. Comparisons of the form "v >= mc" are fine
+// where they ask a structural question pq also answers yes to (index shape,
+// filter format, serialization header). They are NOT fine where the code infers
+// "we already have an sstable at version X, so the cluster must support X" --
+// pq's ordinal position implies nothing about mt or ms support. Use this for
+// those.
+constexpr bool implies_mx_generation(sstable_version_types v, sstable_version_types at_least) {
+    return v != sstable_version_types::pq && v >= at_least;
+}
 
 bool has_summary_and_index(sstable_version_types v);
 bool uses_legacy_dk_order(sstable_version_types v);

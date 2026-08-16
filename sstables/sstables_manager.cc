@@ -264,7 +264,8 @@ sstables::sstable::version_types sstables_manager::get_preferred_sstable_version
 
 sstables::sstable::version_types sstables_manager::get_safe_sstable_version_for_rewrites(sstable_version_types existing_version) const {
     auto preferred_format = sstables::version_from_string(_config.format());
-    auto mt_supported = bool(_features.mt_sstable) || existing_version >= sstable_version_types::mt;
+    auto mt_supported = bool(_features.mt_sstable) ||
+            implies_mx_generation(existing_version, sstable_version_types::mt);
     if (mt_supported && preferred_format == sstable_version_types::mt) {
         return sstable_version_types::mt;
     }
@@ -274,7 +275,8 @@ sstables::sstable::version_types sstables_manager::get_safe_sstable_version_for_
     if (mt_supported && preferred_format == sstable_version_types::ms) {
         return sstable_version_types::mt;
     }
-    auto ms_supported = bool(_features.ms_sstable) || existing_version >= sstable_version_types::ms;
+    auto ms_supported = bool(_features.ms_sstable) ||
+            implies_mx_generation(existing_version, sstable_version_types::ms);
     if (ms_supported && preferred_format == sstable_version_types::ms) {
         return sstable_version_types::ms;
     }
