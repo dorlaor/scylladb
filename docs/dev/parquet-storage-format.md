@@ -1006,6 +1006,18 @@ orders · wide sparse (100 cols, 20 % filled) · large blob · collection-heavy.
 **Parquet variants:** row group ∈ {16, 64, 256} MiB × compression ∈ {zstd-3, zstd-9,
 lz4, zstd_with_dicts} × folding ∈ {verbatim, row, uniform}.
 
+**Both sides of the dictionary question must be measured**, and only one has been so far:
+
+- *Baseline side (done).* SSTables compressed with a trained shared dictionary — the
+  §3.2 bar. See Trap 4 for why this has to be verified rather than assumed.
+- *Parquet side (**not yet measured**).* §5.6 proposes priming each page's zstd frame
+  with the same trained dictionary. This is the symmetric experiment and it is the one
+  configuration that competes hardest with `ZstdWithDictsCompressor`, because it gives
+  Parquet the same cross-chunk redundancy the baseline already has. Open question 7 asks
+  whether the gain justifies forfeiting external readability — that cannot be answered
+  until it is measured. Required numbers: plain zstd-3 vs. zstd-3-with-dict, per dataset,
+  at the same folding level, with the dictionary trained on that table's own data.
+
 **Metrics per cell:** on-disk bytes · write CPU · full-scan throughput · projected-scan
 throughput · point-read p50/p99 (cold) · peak writer memory · reactor-stall count.
 
@@ -1045,6 +1057,38 @@ Pick the dataset roster and the pass/fail thresholds **before** measuring, publi
 cell including the regressions, and report distributions rather than means. §3.4 already
 predicts a regression on wide-sparse schemas; a validation run that does not reproduce
 one is more likely to be missing the case than to have disproved it.
+
+**Trap 4 — The untrained-dictionary baseline (overstates, and it has already happened
+twice).**
+
+§3.2 says every size claim is measured against `ZstdWithDictsCompressor`. Setting that
+property does **not** make a table's SSTables dictionary-compressed. The dictionary has to
+be trained and the files rewritten; until then the data is plain-Zstd and the baseline is
+roughly **2× too large**, which flatters Parquet by the same factor.
+
+This is not hypothetical. It has bitten twice in one day:
+
+| Incident | Reported | Actual | Cause |
+|---|---:|---:|---|
+| §10.3h first run, ClickBench | 25.1 % | 47.9 % | table created with the dict compressor, dictionary never trained |
+| §10.3i first working estimator | 6.7 % | 44.2 % | `data_size()` is the *uncompressed* size; the SSTable side was measured before compression |
+
+**Required protocol for any size comparison.** Every one of these, every time:
+
+1. `POST /storage_service/retrain_dict?keyspace=&cf=`
+2. `GET /storage_service/keyspace_upgrade_sstables/<ks>?cf=&exclude_current_version=false`
+3. Major-compact, then **verify** the baseline moved — if the byte count is unchanged after
+   step 2, the dictionary did not apply and the number is not a dict baseline.
+4. Measure the SSTable with `ondisk_data_size()` or `ls`, never `data_size()`.
+5. Sanity-check the result against an existing measurement in §10 before believing it.
+
+`harness.py` does 1–3. The ad-hoc loader used for §10.3h did not, which is how the first
+error got in. **Any new measurement path must do the same or explicitly state that its
+baseline is plain Zstd.**
+
+*Follow-up (not yet built):* `estimate_parquet_ratios` should report whether the sampled
+SSTable is actually dictionary-compressed, so the endpoint cannot silently return a
+plain-Zstd comparison. It has the SSTable in hand and can check its compression options.
 
 ### 9.3 Public dataset roster
 
@@ -1204,6 +1248,22 @@ read whole rows.
 ### 10.1d Estimator accuracy (validates C6)
 
 *Not yet measured — the estimator is not built. Deferred with the rest of C6.*
+
+### 10.1e Dictionary on the Parquet side — not yet measured
+
+The baseline uses a trained shared dictionary (§3.2). Parquet does not. Until this table
+is filled in, every ratio in §10 compares dictionary-compressed SSTables against
+*non*-dictionary Parquet, which understates Parquet by an unknown amount.
+
+| Dataset | Parquet zstd-3 | Parquet zstd-3 + trained dict | Gain | Externally readable? |
+|---|---:|---:|---:|---|
+| ClickBench | 13 099 368 | | | no — reader needs the dictionary |
+| Backblaze | 16 547 521 | | | no |
+| NYC TLC | 2 562 753 | | | no |
+
+Resolves open question 7. The dictionary should be the *same* one the table's SSTables use,
+obtained from the existing `sstable_compressor_factory`, so the comparison isolates the
+format rather than the dictionary.
 
 ### 10.2 Sensitivity to row group size
 
@@ -1540,6 +1600,7 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
 | 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
 | 2026-08-16 | `storage_format` is `std::optional` in the schema: "never set" is distinct from "set to sstable" | The earlier unconditional cell made revert work but gave *every* table a new schema cell, changing the digest on upgrade. `tablet_options` already solves this with `has_tablet_options()`; mirroring it means a table that never mentioned the property writes no cell, while an explicit revert to `'sstable'` still writes one and takes effect |
 | 2026-08-16 | Setting a non-default `storage_format` requires the `PARQUET_SSTABLE_FORMAT` cluster feature | Until every node understands the property, a node that does not would keep writing the native format while others did not. Validated in `cf_prop_defs`, so the error arrives at DDL time with a clear message |
+| 2026-08-16 | Verifying the dictionary baseline is a required step of the measurement protocol, not an assumption | Setting `ZstdWithDictsCompressor` does not make files dictionary-compressed; two separate measurements were ~2× and ~7× wrong before this was noticed (Trap 4). Every comparison must retrain, rewrite, confirm the baseline moved, use `ondisk_data_size()`, and cross-check against an existing §10 number |
 | 2026-08-16 | Regular columns default to PLAIN; type-based encoding rules rejected | Measured, not assumed: byte-stream-split on doubles cost +54.9 % and delta on bigints +0.3 % on real data (§10.3f). Both destroy the exact-value repetition zstd was exploiting. Delta stays only where monotonicity is structural — key columns and `__ts` |
 | 2026-08-16 | V2 page decode honours the page's own `is_compressed` flag, not just the chunk codec | Found by first pointing our reader at parquet-cpp files: it clears the flag when compression does not pay, and decoding those pages with the chunk codec fails outright. Our own files never exercised it |
 | 2026-08-16 | Snappy added to the read path | Extremely common in third-party files, and Scylla already links snappy — the cost was a dozen lines |
