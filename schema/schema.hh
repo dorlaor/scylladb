@@ -181,6 +181,33 @@ enum class storage_engine_type {
     logstor,
 };
 
+// Encoding of the SSTable Data component. Orthogonal to storage_engine_type:
+// that picks the storage engine (LSM vs logstor), this picks how an LSM
+// SSTable's rows are encoded. A property of the table, never of a tablet --
+// see docs/dev/parquet-storage-format.md section 6.1.
+enum class storage_format_type {
+    sstable,    // the native row format (default)
+    parquet,    // columnar, every SSTable
+    hybrid,     // native in the upper LSM tiers, columnar in the bottom tier
+};
+
+inline sstring storage_format_type_to_sstring(storage_format_type t) {
+    switch (t) {
+    case storage_format_type::sstable: return "sstable";
+    case storage_format_type::parquet: return "parquet";
+    case storage_format_type::hybrid:  return "hybrid";
+    }
+    throw std::invalid_argument(format("unknown storage format type: {:d}\n", uint8_t(t)));
+}
+
+inline storage_format_type sstring_to_storage_format_type(std::string_view s) {
+    if (s == "sstable") { return storage_format_type::sstable; }
+    if (s == "parquet") { return storage_format_type::parquet; }
+    if (s == "hybrid")  { return storage_format_type::hybrid; }
+    throw std::invalid_argument(format("unknown storage format '{}' "
+        "(expected one of: sstable, parquet, hybrid)", s));
+}
+
 inline sstring storage_engine_type_to_sstring(storage_engine_type t) {
     switch (t) {
     case storage_engine_type::normal:
@@ -549,6 +576,7 @@ public:
         std::map<sstring, sstring> compaction_strategy_options;
         bool compaction_enabled = true;
         storage_engine_type storage_engine = storage_engine_type::normal;
+        storage_format_type storage_format = storage_format_type::sstable;
         ::caching_options caching_options;
         std::optional<std::map<sstring, sstring>> tablet_options;
 
@@ -765,6 +793,13 @@ public:
         return _raw._props.compaction_enabled;
     }
 
+    storage_format_type storage_format() const {
+        return _raw._props.storage_format;
+    }
+    // True when any SSTable of this table may be Parquet-encoded.
+    bool uses_parquet_format() const {
+        return _raw._props.storage_format != storage_format_type::sstable;
+    }
     storage_engine_type storage_engine() const {
         return _raw._props.storage_engine;
     }

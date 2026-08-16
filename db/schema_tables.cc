@@ -322,6 +322,7 @@ schema_ptr scylla_tables(schema_features features) {
         sb.with_column("tablets", map_type_impl::get_instance(utf8_type, utf8_type, false));
 
         sb.with_column("storage_engine", utf8_type);
+        sb.with_column("storage_format", utf8_type);
         sb.with_column("large_data_guardrails_enabled", boolean_type);
 
         sb.with_hash_version();
@@ -1693,6 +1694,17 @@ mutation make_scylla_tables_mutation(schema_ptr table, api::timestamp_type times
     if (table->logstor_enabled()) {
         m.set_clustered_cell(ckey, "storage_engine", "logstor", timestamp);
     }
+    // Always written, including the default. Omitting the default looks tempting
+    // -- it keeps schema mutations smaller for tables that never opt in -- but it
+    // makes ALTER ... WITH storage_format = 'sstable' a no-op: the previous value
+    // survives because nothing overwrites it, and the table stays in the old
+    // format forever. Reverting has to work, so the cell is unconditional.
+    //
+    // This does mean every table gains a cell, which changes the schema digest.
+    // It must therefore be gated on the PARQUET_SSTABLE_FORMAT cluster feature
+    // before merge, or a mixed-version cluster will disagree on the digest.
+    m.set_clustered_cell(ckey, "storage_format",
+            storage_format_type_to_sstring(table->storage_format()), timestamp);
     // Write the large_data_guardrails_enabled column only when enabled.
     // When disabled (the default), omit the cell entirely so that old nodes
     // that don't know this column can still read the SSTable during rolling
@@ -2211,6 +2223,9 @@ static void prepare_builder_from_scylla_tables_row(const schema_ctxt& ctxt, sche
     if (auto opt_map = get_map<sstring, sstring>(table_row, "tablets")) {
         auto tablet_options = db::tablet_options(*opt_map);
         builder.set_tablet_options(tablet_options.to_map());
+    }
+    if (auto storage_format = table_row.get<sstring>("storage_format")) {
+        builder.set_storage_format(sstring_to_storage_format_type(*storage_format));
     }
     if (auto storage_engine = table_row.get<sstring>("storage_engine")) {
         if (*storage_engine == "logstor") {

@@ -600,6 +600,7 @@ bool operator==(const schema::user_properties& lhs, const schema::user_propertie
         && lhs.compaction_strategy_options == rhs.compaction_strategy_options
         && lhs.compaction_enabled == rhs.compaction_enabled
         && lhs.storage_engine == rhs.storage_engine
+        && lhs.storage_format == rhs.storage_format
         && lhs.caching_options == rhs.caching_options
         && lhs.tablet_options == rhs.tablet_options
         && lhs.get_paxos_grace_seconds() == rhs.get_paxos_grace_seconds()
@@ -707,6 +708,7 @@ table_schema_version schema::calculate_digest(const schema::raw_schema& r) {
     feed_hash(h, r._indices_by_name);
     feed_hash(h, r._is_counter);
     feed_hash(h, r._props.storage_engine);
+    feed_hash(h, r._props.storage_format);
 
     for (auto&& [name, ext] : r._props.extensions) {
         feed_hash(h, name);
@@ -897,6 +899,9 @@ auto fmt::formatter<schema>::format(const schema& s, fmt::format_context& ctx) c
     out = fmt::format_to(out, ",minIndexInterval={}", s._raw._props.min_index_interval);
     out = fmt::format_to(out, ",maxIndexInterval={}", s._raw._props.max_index_interval);
     out = fmt::format_to(out, ",speculativeRetry={}", s._raw._props.speculative_retry.to_sstring());
+    if (s.storage_format() != storage_format_type::sstable) {
+        out = fmt::format_to(out, ",storage_format={}", storage_format_type_to_sstring(s.storage_format()));
+    }
     if (s.storage_engine() != storage_engine_type::normal) {
         out = fmt::format_to(out, ",storage_engine={}", storage_engine_type_to_sstring(s.storage_engine()));
     }
@@ -1244,6 +1249,9 @@ fragmented_ostringstream& schema::schema_properties(const schema_describe_helper
     os << "\n    AND memtable_flush_period_in_ms = " << fmt::to_string(memtable_flush_period());
     os << "\n    AND min_index_interval = " << fmt::to_string(min_index_interval());
     os << "\n    AND speculative_retry = '" << speculative_retry().to_sstring() << "'";
+    if (storage_format() != storage_format_type::sstable) {
+        os << "\n    AND storage_format = '" << storage_format_type_to_sstring(storage_format()) << "'";
+    }
     if (storage_engine() != storage_engine_type::normal) {
         os << "\n    AND storage_engine = '" << storage_engine_type_to_sstring(storage_engine()) << "'";
     }
