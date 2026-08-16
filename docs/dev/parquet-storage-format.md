@@ -1298,6 +1298,40 @@ Losslessness re-proven over 1 080 cases (the §10.3a matrix × both exception en
 0 failures. `exception_encoding::sparse` is the default; `per_column` is retained so the
 comparison stays reproducible.
 
+### 10.3d End-to-end through our own writer (retires threat #2)
+
+**Measured 2026-08-16.** Real ScyllaDB table → real SSTable → `scylla sstable
+parquet-export` → Parquet, with the shredder reading the actual mutation-fragment
+stream. Previous size numbers came from pyarrow; these come from our writer.
+
+200 000 NYC-taxi rows, 11 columns, `ZstdWithDictsCompressor`, one tablet, realistic
+timestamps:
+
+| | Bytes |
+|---|---:|
+| SSTable `Data.db` (Zstd + dicts) | 5 317 307 |
+| **Parquet, our writer, L1 folding, zstd-3** | **2 562 753** |
+| **Ratio** | **48.2 % — 51.8 % saved** |
+
+The per-column breakdown is the interesting part:
+
+| Column | Uncompressed | Compressed | Note |
+|---|---:|---:|---|
+| `vendor` (partition key, 3 distinct) | 800 280 | **525** | delta-packed to nothing |
+| `__ts` (the folded timestamp) | 8 428 | **603** | §3.1's biggest claimed win, confirmed: ~0.003 bytes/row |
+| `flag` (low-cardinality text) | 2 974 | 1 528 | RLE_DICTIONARY |
+| `pay` | 1 600 330 | 41 574 | delta-packed |
+| `rid` (unique sequential) | 341 339 | 341 439 | already minimal after delta; zstd adds 100 bytes of frame |
+| `dist`/`fare`/`tip`/`total` (doubles) | 1 600 340 ea. | 332 k–453 k ea. | **not yet using BYTE_STREAM_SPLIT** — an easy remaining win |
+
+The output file is read back correctly by pyarrow (200 000 rows × 12 columns, values
+verified), so the interop property holds for files produced from real Scylla data and
+not just from synthetic fixtures.
+
+Two follow-ups this exposes: enable `BYTE_STREAM_SPLIT` for `double` columns by default
+(the encoder exists but is not selected), and note that `__ts` at 603 bytes for 200 000
+rows means the folding overhead is effectively zero on `INSERT`-shaped data.
+
 ### 10.3b Writer output — encoding effectiveness
 
 Same 50 000-row fixture, our writer, zstd-3 (`sstables/parquet/format/test_writer.cc`):
@@ -1350,6 +1384,7 @@ nearly free.
 | 2026-08-16 | CQL `text` must carry the Parquet `UTF8` ConvertedType | Without it every downstream reader sees a blob, not a string — found by the writer↔pyarrow interop test, and it would have silently defeated the §7.4 interoperability case |
 | 2026-08-16 | Timestamp exceptions encoded as a two-leaf sparse side-channel, not per-column leaves | Leaf count becomes width-independent; worst-case divergence penalty 2.68× → 2.05×, and 23.5 % smaller at full divergence (§10.3c). Resolves open question 8 |
 | 2026-08-16 | Build unblocked by disabling `Seastar_LTTNG` | `lttng-ust-devel` is absent and there is no sudo on this host. The option only gates IO tracing tracepoints, so a dev build is unaffected — but a production build should install the package instead |
+| 2026-08-16 | The Parquet re-encoder ships as a `scylla sstable parquet-export` operation rather than a hook in the write path | It needs no access to sstable internals, produces the §10.3d measurements from our own writer, and is the natural home for the C6 estimator and the eventual export path. A temporary dual-write hook would have needed friend declarations for something that gets deleted later |
 | 2026-08-16 | **Format is a per-table schema property, not per-tablet.** Reverses the earlier per-tablet design | A tablet is an internal distribution unit, not something users reason about, and an SSTable's encoding has nothing to do with which tablet its data is in. Doing it at table level removes the `tablet_info` field, the `system.tablets` column and all the group0 plumbing — schema properties already replicate, so the mechanism exists. Mirrors how `compression` already works (§6.1) |
 | 2026-08-16 | Fixed-width scalars are decoded straight from cell bytes (big-endian) rather than via `deserialize()` | Avoids a `data_value` round-trip per cell on the write path; unmapped types keep their serialised form as opaque `BYTE_ARRAY`, which is lossless but forgoes type-specific encoding |
 | 2026-08-16 | The Parquet image is handed to a sink, not written to the Data component yet | Keeps the whole fragment→Parquet path drivable from a unit test without constructing an sstable; component plumbing is a separate, smaller step |
