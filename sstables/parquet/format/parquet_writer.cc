@@ -97,8 +97,14 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         }
         dict = encode_dictionary_byte_array(present);
         // Dictionary only pays if it is small relative to the data.
+        // Cardinality has to be well below the row count, not merely below it.
+        // A dictionary is decompressed in full before a single value can be
+        // decoded, so a near-unique dictionary is pure cost on the read path --
+        // it dominated point-read latency at the old 2x threshold (design doc
+        // 10.4) while saving almost nothing, because zstd already finds those
+        // repeats. 8x keeps the low-cardinality columns a dictionary is for.
         if (dict.dictionary_page.size() <= _opt.dictionary_max_bytes &&
-            dict.num_distinct * 2 < present.size()) {
+            dict.num_distinct * _opt.dictionary_min_repeat < present.size()) {
             use_dict = true;
         }
     }

@@ -1717,63 +1717,103 @@ enforceable rather than aspirational. Exposed as `--max-rows` on
 
 ### 10.4 Throughput and latency vs. targets — measured 2026-08-17
 
-First measurement of the real thing: `pq` and the default format written from the same
-mutations in the same process, by `test/boost/sstable_parquet_perf_test.cc`. 20 000
-partitions × 5 rows, 6 columns, values with realistic redundancy (a small vocabulary for
-the text columns) rather than random bytes, which would make every format look alike.
+`pq` and the default format written from the same mutations in the same process, by
+`test/boost/sstable_parquet_perf_test.cc`. 20 000 partitions × 5 rows, 6 columns, values
+with realistic redundancy (a small vocabulary for the text columns) rather than random
+bytes, which would make every format look alike.
 
 | Path | Default (`me`) | `pq` | Δ | Target (§1.2) | Pass? |
 |---|---:|---:|---:|---|---|
-| Write | 584 ms | 572 ms | **0.98×** | ≥ −10 % | **yes** |
-| Full scan | 141 ms | 144 ms | **1.02×** | ≥ parity | **yes** (parity) |
-| Point read | 42.6 µs | 5 120 µs | **120×** | ≤ 1.2× | **no** |
-| Data size | 3 994 586 B | 1 311 344 B | **0.33×** | — | — |
-| Peak scan memory | 256 kB | 15 556 kB | 61× | bounded | **yes** — see below |
+| Write | 580 ms | 609 ms | **1.05×** | ≥ −10 % | **yes** |
+| Full scan | 143 ms | 136 ms | **0.95×** | ≥ parity | **yes** — faster |
+| Point read | 38.8 µs | 2 421 µs | **62×** | ≤ 1.2× | **no** |
+| Data size | 3 994 586 B | 1 275 614 B | **0.32×** | — | — |
+| Peak scan memory | 256 kB | 15 552 kB | 61× | bounded | **yes** — see below |
 
 **R-13 (bounded memory) holds.** Peak scan memory against sstable size, same schema:
 
-| Rows | Data bytes | Peak scan memory |
-|---:|---:|---:|
-| 20 000 | 251 556 | 13 708 kB |
-| 160 000 | 1 958 235 | 15 528 kB |
+| Rows | Data bytes | Peak scan memory | Point read |
+|---:|---:|---:|---:|
+| 20 000 | 248 619 | 13 712 kB | 1 026 µs |
+| 160 000 | 1 994 243 | 15 532 kB | 3 055 µs |
 
 8× the rows costs **1.13×** the memory. The absolute figure is higher than the row-format
-reader's because the unit of work is a row group's compressed bytes plus a 16 384-row
-decode window, but it does not grow with the file, which is what R-13 asks.
+reader's because the unit of work is a decode window plus the pages behind it, but it does
+not grow with the file, which is what R-13 asks.
 
-**What this cost, and what the first attempt looked like.** The reader that made a pq
-sstable readable at all decoded the whole Parquet image before emitting a fragment. Its
-numbers are worth keeping because they show which problems are the format's and which
-were the implementation's:
+#### How it got here, and what each step was worth
 
-| Path | Whole-image reader | Streaming reader | Default |
+The first reader that made a pq sstable readable decoded the whole Parquet image before
+emitting a fragment. Keeping the intermediate numbers is worth more than the final ones,
+because they separate the format's costs from the implementation's:
+
+| | Whole image | + streaming | + paged reads, dictionary fix, page sizing |
 |---|---:|---:|---:|
-| Write | 1 357 ms | 572 ms | 584 ms |
-| Full scan | 232 ms | 144 ms | 141 ms |
-| Point read | 183 857 µs | 5 120 µs | 42.6 µs |
-| Memory growth, 8× rows | 8.13× | 1.13× | — |
+| Write | 1 357 ms | 572 ms | 609 ms |
+| Full scan | 232 ms | 144 ms | 136 ms |
+| Point read | 183 857 µs | 5 120 µs | **2 421 µs** |
+| Memory growth at 8× rows | 8.13× | 1.13× | 1.13× |
 
-Nothing about the *format* was responsible for the first column. Write and scan reached
-parity and memory became bounded once the reader loaded the footer alone, seeked by the
-index entry's row ordinal (§5.4, option A), and decoded one row group at a time in fixed
-windows — using the V2 page header's `num_rows` to step over pages without decompressing
-them.
+*Streaming.* Load the footer alone, turn the partition range into a row-ordinal window via
+the index entry (§5.4 option A), decode one row group at a time in fixed windows, and use
+the V2 page header's `num_rows` to step over pages without decompressing them. This is
+what bought write and scan parity and bounded memory.
 
-**Point reads are the one target still missed, by 100×.** The cause is identified and
-narrow: `pq_reader::load_row_group` reads a whole row group's bytes from disk to serve a
-partition that occupies a few rows of it. With the default 1 M-row groups a small sstable
-is a single row group, so a point read still pays a whole-file read even though it now
-decodes only a page or so. The fix is to read per column chunk — the dictionary page plus
-only the pages the OffsetIndex says cover the wanted rows — which needs the page decoder
-to accept per-column byte spans instead of one contiguous image. Everything it depends on
-is already written and tested (`parse_offset_index`, `offset_index::page_for_row`,
-`read_row_range`). Until then the honest statement is that `pq` point reads cost about
-5 ms against 43 µs, and that §4's "≤ 1.2×" target is not met.
+*Paged reads.* For a bounded range, fetch two extents per column chunk — the dictionary
+page and the contiguous run of data pages the OffsetIndex says covers the wanted rows —
+instead of the whole row group. Worth little on its own here, because the cost had already
+moved elsewhere; it matters at scale, where a row group is far larger than a partition.
 
-Threats to validity: single shard, warm page cache, one synthetic schema. The size ratio
-here (0.33×) is better than the 0.48–0.51× measured on real datasets in §10.1 because the
-generated values repeat more than real data does; the *timing* ratios are the point of
-this table, not the size.
+*The dictionary was the real cost, and profiling was the only way to find it.* Three
+plausible explanations were each measured and rejected before the right one turned up: the
+summary being too sparse (no change), the page size (5 291 → 4 928 µs for a 20× reduction),
+and per-string allocation when materialising the dictionary (no change). Phase timing then
+showed 235 ms of 250 ms sitting in `decode_columns`, and disabling dictionaries entirely
+dropped it to 13 ms. The cause is structural: **a point read must decompress a column
+chunk's entire dictionary page before it can decode a single value**, so a
+near-unique dictionary is paid for in full on every read. The writer's heuristic admitted
+any column with under 50 % distinct values; requiring 8× repeats instead
+
+| Dictionary threshold | Point read | Data bytes |
+|---|---:|---:|
+| `num_distinct × 2 < rows` (old) | 5 001 µs | 1 355 705 |
+| `num_distinct × 8 < rows` (new) | 1 771 µs | 1 312 381 |
+
+— made point reads 2.8× faster *and* the file slightly smaller, because zstd was already
+finding those repeats and the dictionary page was mostly overhead.
+
+*Page sizing.* A point read decodes whole pages, so page size trades bytes for latency:
+
+| `page_values` | Data bytes | Point read |
+|---:|---:|---:|
+| 1 024 | 1 349 499 | 1 728 µs |
+| 2 048 | 1 312 381 | 1 791 µs |
+| **8 192** | **1 275 614** | **2 151 µs** |
+| 20 000 | 1 252 083 | 2 836 µs |
+
+8 192 is the default: +1.9 % size over the largest page for 24 % lower latency. Like
+`row_group_rows` (§8.2), it stays tunable, because the right point on that curve depends
+on whether a table is scanned or probed.
+
+#### The target still missed
+
+Point reads are 62× native against a ≤1.2× target. What remains is inherent to columnar
+layout rather than to this implementation: a point read touches *k* column chunks, and for
+each one it pays a page decode and, where a dictionary is used, a dictionary-page
+decompress — against a row format that reads one contiguous row. Closing the rest of the
+gap means caching decoded dictionary and page state across reads, which is what
+parquet-cpp and arrow-rs do and what Scylla's cache tracker exists for; that is a caching
+change, not a format change. Until then the honest statement is 2.4 ms against 39 µs, and
+§4's promise of p99 ≤ 1.2× does not hold for cold point reads.
+
+This is also the strongest argument for the hybrid design in §5.6: point-read-heavy tables
+stay on SSTables, and criterion C7 already refuses conversion when a table is
+point-read-dominated.
+
+Threats to validity: single shard, warm page cache, one synthetic schema, and the 0.32×
+size ratio is better than the 0.48–0.92× measured on real datasets (§10.1, §10.1f) because
+generated values repeat more than real ones. The *timing* ratios are the point of this
+table, not the size.
 
 ### 10.5 Decision log
 

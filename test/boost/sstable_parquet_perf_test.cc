@@ -187,7 +187,7 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_scan_memory_scaling) {
     sstables::test_env::do_with_async([] (sstables::test_env& env) {
         auto s = perf_schema();
         std::printf("\n=== R-13: scan memory vs sstable size (pq) ===\n");
-        std::printf("  %10s  %12s  %12s\n", "rows", "data bytes", "scan peak kB");
+        std::printf("  %10s  %12s  %12s  %10s\n", "rows", "data bytes", "scan peak kB", "point us");
 
         int64_t small_peak = 0, large_peak = 0;
         for (int n_part : {4'000, 32'000}) {
@@ -208,8 +208,27 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_scan_memory_scaling) {
                 }
             }
             BOOST_REQUIRE_EQUAL(n, size_t(n_part));
-            std::printf("  %10d  %12llu  %12lld\n", n_part * 5,
-                        (unsigned long long)sst->ondisk_data_size(), (long long)(peak / 1024));
+
+            // Point-read cost at each size. If it tracks the file rather than the
+            // partition, the reader is I/O bound on the row-group read and the
+            // OffsetIndex-driven per-page read is the fix; if it is flat, it is not.
+            auto muts2 = gen(s, n_part, 5);
+            double pt = 0;
+            {
+                auto t0 = clk::now();
+                const int probes = 20;
+                for (int i = 0; i < probes; ++i) {
+                    auto pr = dht::partition_range::make_singular(
+                            muts2[size_t(i) * (muts2.size() / probes)].decorated_key());
+                    auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+                    auto close = deferred_close(rd);
+                    auto m = read_mutation_from_mutation_reader(rd).get();
+                    if (!m) { BOOST_FAIL("point read missed"); }
+                }
+                pt = duration<double, std::micro>(clk::now() - t0).count() / probes;
+            }
+            std::printf("  %10d  %12llu  %12lld  %10.1f\n", n_part * 5,
+                        (unsigned long long)sst->ondisk_data_size(), (long long)(peak / 1024), pt);
             (n_part == 4'000 ? small_peak : large_peak) = peak;
         }
         if (small_peak > 0) {

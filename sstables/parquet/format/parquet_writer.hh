@@ -42,9 +42,15 @@ struct page_location {
 struct writer_options {
     codec   compression = codec::zstd;
     int     zstd_level = 3;
-    size_t  page_values = 20000;      // values per data page
+    // Values per data page. Measured trade-off (design doc 10.4): a point read
+    // decodes whole pages, so smaller pages cost size and buy latency --
+    // 1024 -> +7.8 % bytes / 1728 us, 8192 -> +1.9 % / 2151 us, 20000 -> base /
+    // 2836 us. 8192 keeps almost all of the compression for most of the speed.
+    size_t  page_values = 8192;
     bool    use_dictionary = true;
     size_t  dictionary_max_bytes = 1u << 20;
+    // Minimum average repeats per distinct value before a dictionary is used.
+    size_t  dictionary_min_repeat = 8;
     bool    write_statistics = true;
     // Emit the OffsetIndex. Required for row-ordinal lookup, and it also
     // lets scan-side readers skip pages.

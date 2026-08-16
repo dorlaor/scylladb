@@ -273,14 +273,8 @@ file_metadata parse_file_metadata(std::span<const uint8_t> blob, limits lim, sem
     return m;
 }
 
-std::optional<offset_index> parse_offset_index(std::span<const uint8_t> img,
-                                               const column_chunk& cc, limits lim) {
-    if (!cc.offset_index_offset || !cc.offset_index_length) { return std::nullopt; }
-    const size_t off = size_t(*cc.offset_index_offset);
-    const size_t len = size_t(*cc.offset_index_length);
-    if (off + len > img.size()) { throw thrift_error("offset index extends past EOF"); }
-
-    compact_reader r(img.subspan(off, len), lim);
+offset_index parse_offset_index_blob(std::span<const uint8_t> blob, limits lim) {
+    compact_reader r(blob, lim);
     compact_reader::struct_scope sc(r);
     offset_index oi;
     for (;;) {
@@ -309,6 +303,15 @@ std::optional<offset_index> parse_offset_index(std::span<const uint8_t> img,
         }
     }
     return oi;
+}
+
+std::optional<offset_index> parse_offset_index(std::span<const uint8_t> img,
+                                               const column_chunk& cc, limits lim) {
+    if (!cc.offset_index_offset || !cc.offset_index_length) { return std::nullopt; }
+    const size_t off = size_t(*cc.offset_index_offset);
+    const size_t len = size_t(*cc.offset_index_length);
+    if (off + len > img.size()) { throw thrift_error("offset index extends past EOF"); }
+    return parse_offset_index_blob(img.subspan(off, len), lim);
 }
 
 footer_span locate_footer(std::span<const uint8_t> img) {

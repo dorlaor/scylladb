@@ -84,10 +84,14 @@ class pq_reader : public mutation_reader::impl {
     // Ordinal window this read is confined to, from the partition index.
     int64_t _row_lo = 0, _row_hi = 0;
 
-    // Currently loaded row group and its bytes.
+    // Currently loaded row group and its bytes. A scan holds the whole row group
+    // (sequential reads are what a scan wants); a bounded read instead holds two
+    // small extents per column and never touches the pages in between.
     size_t _cur_rg = size_t(-1);
     temporary_buffer<char> _rg_buf;
     int64_t _rg_base = 0;               // file offset of _rg_buf[0]
+    size_t _oi_rg = size_t(-1);
+    std::vector<std::optional<format::offset_index>> _oi;
 
     // Decoded window.
     std::vector<row> _rows;
@@ -103,6 +107,10 @@ class pq_reader : public mutation_reader::impl {
     future<> init();
     future<bool> next_window();         // false at end of the ordinal range
     future<> load_row_group(size_t rg);
+    future<> load_offset_indexes(size_t rg);
+    // Reads only the pages covering [lo, hi). Falls back to the whole row group
+    // when the file carries no OffsetIndex.
+    future<std::vector<format::column_data>> decode_paged(size_t rg, int64_t lo, int64_t hi);
     void emit_row(const row& r);
     void close_partition();
 
@@ -260,18 +268,102 @@ future<bool> pq_reader::next_window() {
     const int64_t rg_end = _rg_start[rg] + _md.row_groups[rg].num_rows;
 
     const int64_t lo = _cursor;
-    const int64_t win = (_pr->start() || _pr->end()) ? point_window_rows : scan_window_rows;
+    const bool bounded = _pr->start() || _pr->end();
+    const int64_t win = bounded ? point_window_rows : scan_window_rows;
     const int64_t hi = std::min({rg_end, _row_hi, lo + win});
     if (hi <= lo) { co_return false; }
 
-    co_await load_row_group(rg);
-    auto img = std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
-    auto colsdata = format::read_row_range(img, _rg_base, _md, rg,
-                                           lo - _rg_start[rg], hi - _rg_start[rg]);
+    std::vector<format::column_data> colsdata;
+    if (bounded) {
+        colsdata = co_await decode_paged(rg, lo - _rg_start[rg], hi - _rg_start[rg]);
+    } else {
+        co_await load_row_group(rg);
+        auto img = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
+        colsdata = format::read_row_range(img, _rg_base, _md, rg,
+                                          lo - _rg_start[rg], hi - _rg_start[rg]);
+    }
     _rows = reassemble(_ms, _cols, colsdata, size_t(hi - lo));
     _cursor = hi;
     co_return true;
+}
+
+future<> pq_reader::load_offset_indexes(size_t rg) {
+    if (_oi_rg == rg) { co_return; }
+    _oi.assign(_md.row_groups[rg].columns.size(), std::nullopt);
+    _oi_rg = rg;
+
+    // The per-column OffsetIndex blobs sit together near the end of the file, so
+    // one read covers all of them.
+    int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
+    for (const auto& cc : _md.row_groups[rg].columns) {
+        if (!cc.offset_index_offset || !cc.offset_index_length) { continue; }
+        lo = std::min(lo, *cc.offset_index_offset);
+        hi = std::max(hi, *cc.offset_index_offset + *cc.offset_index_length);
+    }
+    if (lo >= hi) { co_return; }        // file has no page index; caller falls back
+    auto buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
+    auto img = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
+    for (size_t c = 0; c < _oi.size(); ++c) {
+        const auto& cc = _md.row_groups[rg].columns[c];
+        if (!cc.offset_index_offset || !cc.offset_index_length) { continue; }
+        try {
+            _oi[c] = format::parse_offset_index_blob(
+                    img.subspan(size_t(*cc.offset_index_offset - lo), size_t(*cc.offset_index_length)));
+        } catch (...) { _oi[c] = std::nullopt; }
+    }
+}
+
+future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int64_t lo, int64_t hi) {
+    co_await load_offset_indexes(rg);
+    const auto& g = _md.row_groups[rg];
+
+    bool all = true;
+    for (const auto& o : _oi) { if (!o || o->pages.empty()) { all = false; break; } }
+    if (!all) {
+        // No page index: nothing to seek with, so read the row group whole.
+        co_await load_row_group(rg);
+        auto img = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
+        co_return format::read_row_range(img, _rg_base, _md, rg, lo, hi);
+    }
+
+    // Two extents per column: the dictionary page at the head of the chunk, and
+    // the contiguous run of data pages covering the wanted rows. Everything else
+    // in the chunk is never read.
+    std::vector<temporary_buffer<char>> held;
+    held.reserve(g.columns.size() * 2);
+    std::vector<format::column_input> in(g.columns.size());
+
+    for (size_t c = 0; c < g.columns.size(); ++c) {
+        const auto& cm = *g.columns[c].meta;
+        const auto& pages = _oi[c]->pages;
+        const size_t i0 = _oi[c]->page_for_row(lo);
+        const size_t i1 = _oi[c]->page_for_row(hi > lo ? hi - 1 : lo);
+        if (i0 >= pages.size() || i1 >= pages.size() || i1 < i0) {
+            throw std::runtime_error("pq: OffsetIndex does not cover the requested rows");
+        }
+
+        if (cm.dictionary_page_offset) {
+            const int64_t d0 = *cm.dictionary_page_offset;
+            const int64_t d1 = pages.front().offset;    // first data page
+            if (d1 > d0) {
+                auto b = co_await _sst->data_read(uint64_t(d0), size_t(d1 - d0), _permit);
+                in[c].dict = std::span<const uint8_t>(
+                        reinterpret_cast<const uint8_t*>(b.get()), b.size());
+                held.push_back(std::move(b));
+            }
+        }
+        const int64_t p0 = pages[i0].offset;
+        const int64_t p1 = pages[i1].offset + pages[i1].compressed_page_size;
+        auto b = co_await _sst->data_read(uint64_t(p0), size_t(p1 - p0), _permit);
+        in[c].pages = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(b.get()), b.size());
+        in[c].first_row = pages[i0].first_row_index;
+        held.push_back(std::move(b));
+    }
+
+    co_return format::decode_columns(in, _md, rg, lo, hi);
 }
 
 void pq_reader::close_partition() {

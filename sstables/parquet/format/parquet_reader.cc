@@ -53,7 +53,7 @@ std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t exp
 // Append `n` decoded values of the chunk's physical type to `cd`.
 void append_values(column_data& cd, phys_type pt, encoding enc,
                    std::span<const uint8_t> body, size_t n,
-                   const std::vector<std::string>& dict_ba,
+                   std::span<const std::string_view> dict_ba,
                    const std::vector<int32_t>& dict_i32,
                    const std::vector<int64_t>& dict_i64,
                    const std::vector<double>& dict_f64) {
@@ -91,7 +91,7 @@ void append_values(column_data& cd, phys_type pt, encoding enc,
     }
     case phys_type::byte_array: {
         auto v = (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary)
-               ? decode_rle_dictionary<std::string>(body, dict_ba, n)
+               ? decode_rle_dictionary_views(body, dict_ba, n)
                : decode_plain_byte_array(body, n);
         cd.str.insert(cd.str.end(), v.begin(), v.end());
         break;
@@ -147,7 +147,7 @@ void expand_nulls(column_data& cd, phys_type pt, size_t first, size_t count,
 // image[0] corresponds to, so a caller can pass a slice of the file rather than
 // the whole thing -- which is the entire point: this is what lets a point read
 // touch one page instead of one file.
-std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
+std::vector<column_data> decode_columns(std::span<const column_input> in,
                                         const file_metadata& md, size_t rg_index,
                                         int64_t row_lo, int64_t row_hi) {
     if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
@@ -175,19 +175,49 @@ std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t 
         const bool optional = leaves[c]->repetition_type &&
                               *leaves[c]->repetition_type == repetition::optional;
 
-        std::vector<std::string> dict_ba;
+        // The dictionary page stays as raw bytes with a view table over it; see
+        // index_plain_byte_array() for why materialising it was the single
+        // largest cost in a point read.
+        std::vector<uint8_t> dict_raw;
+        std::vector<std::string_view> dict_ba;
         std::vector<int32_t> dict_i32;
         std::vector<int64_t> dict_i64;
         std::vector<double>  dict_f64;
 
-        int64_t off = (cm.dictionary_page_offset ? *cm.dictionary_page_offset
-                                                 : cm.data_page_offset) - base_offset;
-        const int64_t end = off + cm.total_compressed_size;
-        if (off < 0 || size_t(end) > image.size()) { throw decode_error("chunk extends past EOF"); }
+        if (c >= in.size()) { throw decode_error("missing column input"); }
+        const auto& ci = in[c];
+
+        // The dictionary page, when it is supplied separately. A caller that
+        // hands over the whole chunk leaves `dict` empty and lets the page walk
+        // below find it, which is the same bytes either way.
+        if (!ci.dict.empty()) {
+            size_t dconsumed = 0;
+            auto dph = parse_page_header(ci.dict, dconsumed);
+            if (dph.type != page_type::dictionary_page || !dph.dict) {
+                throw decode_error("dictionary span does not start with a dictionary page");
+            }
+            auto dbody = ci.dict.subspan(dconsumed, size_t(dph.compressed_page_size));
+            auto raw = decompress(dbody, cm.compression, size_t(dph.uncompressed_page_size));
+            const size_t n = size_t(dph.dict->num_values);
+            switch (cm.type) {
+            case phys_type::int32:      dict_i32 = decode_plain<int32_t>(raw, n); break;
+            case phys_type::int64:      dict_i64 = decode_plain<int64_t>(raw, n); break;
+            case phys_type::dbl:        dict_f64 = decode_plain<double>(raw, n); break;
+            case phys_type::byte_array:
+                dict_raw = std::move(raw);
+                dict_ba = index_plain_byte_array(dict_raw, n);
+                break;
+            default: throw decode_error("unsupported dictionary type");
+            }
+        }
+
+        const std::span<const uint8_t> image = ci.pages;
+        int64_t off = 0;
+        const int64_t end = int64_t(image.size());
 
         // Row cursor within this row group, advanced by every data page whether
-        // or not it is decoded.
-        int64_t row_at = 0;
+        // or not it is decoded. It starts wherever the supplied page run starts.
+        int64_t row_at = ci.first_row;
         int64_t produced = 0;
         while (off < end && row_at < row_hi) {
             size_t consumed = 0;
@@ -208,7 +238,10 @@ std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t 
                 case phys_type::int32:      dict_i32 = decode_plain<int32_t>(raw, n); break;
                 case phys_type::int64:      dict_i64 = decode_plain<int64_t>(raw, n); break;
                 case phys_type::dbl:        dict_f64 = decode_plain<double>(raw, n); break;
-                case phys_type::byte_array: dict_ba  = decode_plain_byte_array(raw, n); break;
+                case phys_type::byte_array:
+                    dict_raw = std::move(raw);
+                    dict_ba = index_plain_byte_array(dict_raw, n);
+                    break;
                 default: throw decode_error("unsupported dictionary type");
                 }
             } else if (ph.type == page_type::data_page_v2 && ph.v2) {
@@ -282,6 +315,27 @@ std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t 
         trim(out[c], drop, keep);
     }
     return out;
+}
+
+std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
+                                        const file_metadata& md, size_t rg_index,
+                                        int64_t row_lo, int64_t row_hi) {
+    if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
+    const auto& rg = md.row_groups[rg_index];
+    std::vector<column_input> in(rg.columns.size());
+    for (size_t c = 0; c < rg.columns.size(); ++c) {
+        const auto& cc = rg.columns[c];
+        if (!cc.meta) { throw decode_error("column chunk without metadata"); }
+        const auto& cm = *cc.meta;
+        const int64_t start = (cm.dictionary_page_offset ? *cm.dictionary_page_offset
+                                                         : cm.data_page_offset) - base_offset;
+        const int64_t end = start + cm.total_compressed_size;
+        if (start < 0 || size_t(end) > image.size()) { throw decode_error("chunk extends past EOF"); }
+        // Whole chunk in one span: the page walk finds the dictionary itself.
+        in[c].pages = image.subspan(size_t(start), size_t(end - start));
+        in[c].first_row = 0;
+    }
+    return decode_columns(in, md, rg_index, row_lo, row_hi);
 }
 
 std::vector<column_data> read_row_group(std::span<const uint8_t> image,

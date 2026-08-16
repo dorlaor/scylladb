@@ -26,6 +26,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace sstables::parquet::format {
@@ -74,6 +75,48 @@ inline std::vector<T> decode_byte_stream_split(std::span<const uint8_t> in, size
         uint8_t buf[K];
         for (size_t b = 0; b < K; ++b) { buf[b] = in[b * count + i]; }
         std::memcpy(&out[i], buf, K);
+    }
+    return out;
+}
+
+// A BYTE_ARRAY dictionary page as a table of views into the page's own bytes.
+//
+// Materialising it as std::string cost more than everything else in a point read
+// put together: a column with a near-unique dictionary made every reader allocate
+// one string per distinct value before it could decode a single row. Views make
+// the table one allocation and copy only the values actually referenced.
+// The caller must keep the decompressed page alive for as long as the views.
+inline std::vector<std::string_view> index_plain_byte_array(std::span<const uint8_t> in,
+                                                            size_t count) {
+    std::vector<std::string_view> out;
+    out.reserve(count);
+    size_t p = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (p + 4 > in.size()) { throw decode_error("truncated BYTE_ARRAY length"); }
+        uint32_t n;
+        std::memcpy(&n, in.data() + p, 4);
+        p += 4;
+        if (p + n > in.size()) { throw decode_error("truncated BYTE_ARRAY value"); }
+        out.emplace_back(reinterpret_cast<const char*>(in.data() + p), n);
+        p += n;
+    }
+    return out;
+}
+
+// RLE_DICTIONARY over a view table: only referenced entries become strings.
+inline std::vector<std::string> decode_rle_dictionary_views(std::span<const uint8_t> page,
+                                                            std::span<const std::string_view> dict,
+                                                            size_t count) {
+    if (page.empty()) { throw decode_error("empty dictionary index page"); }
+    const uint8_t bw = page[0];
+    rle_decoder dec(page.subspan(1), bw);
+    auto idx = dec.decode_all(count);
+    if (idx.size() != count) { throw decode_error("short dictionary index stream"); }
+    std::vector<std::string> out;
+    out.reserve(count);
+    for (uint64_t i : idx) {
+        if (i >= dict.size()) { throw decode_error("dictionary index out of range"); }
+        out.emplace_back(dict[size_t(i)]);
     }
     return out;
 }

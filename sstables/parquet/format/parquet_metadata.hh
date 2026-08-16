@@ -186,6 +186,10 @@ file_metadata parse_footer(std::span<const uint8_t> file_image, limits = {});
 
 // Parse a chunk's OffsetIndex from the file image, using the offsets the footer
 // recorded. Returns nullopt when the chunk carries no page index.
+// Parse a bare OffsetIndex blob (i.e. the bytes the footer points at, already
+// extracted). Lets a reader fetch just those bytes instead of holding the file.
+offset_index parse_offset_index_blob(std::span<const uint8_t> blob, limits = {});
+
 std::optional<offset_index> parse_offset_index(std::span<const uint8_t> file_image,
                                                const column_chunk&, limits = {});
 
