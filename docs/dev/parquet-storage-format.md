@@ -1367,6 +1367,36 @@ DELTA_BINARY_PACKED on the folded timestamp column is worth ~10 % of the whole f
 its own, which is the mechanism §3.1 predicted and the reason the folded `__ts` column is
 nearly free.
 
+### 10.3h §10.1 re-measured through our own writer
+
+§10.1's Parquet column came from pyarrow. All three datasets have now been re-measured
+with `scylla sstable parquet-export`, i.e. the real shredder, encoders and file writer,
+reading the real SSTables.
+
+| Dataset | Rows | SSTable (Zstd+dicts) | **Parquet, our writer** | **Ratio** | pyarrow (§10.1) | pyarrow ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| ClickBench | 200 000 | 27 327 989 | **13 099 368** | **47.9 %** | 16 177 362 | 59.3 % |
+| Backblaze | 300 000 | 32 671 140 | **16 547 521** | **50.6 %** | 17 055 064 | 52.5 % |
+| NYC TLC (§10.3d schema) | 200 000 | 5 317 307 | **2 562 753** | **48.2 %** | — | — |
+
+**Our writer is not worse than pyarrow, and on ClickBench it is materially better** —
+47.9 % against 59.3 %. The headline claim of §10.1 therefore holds when measured with the
+implementation rather than a reference encoder. The threat-to-validity "sizes come from
+pyarrow" is fully retired.
+
+The ClickBench margin is not yet explained and should not be over-claimed: the two runs
+differ in dictionary thresholds and in page splitting (our dictionary-encoded chunks are
+currently a single page), and either could account for it.
+
+**A near-miss worth recording.** The first attempt at this measurement reported 25.1 %
+for ClickBench. That baseline was wrong: creating a table with
+`ZstdWithDictsCompressor` does *not* mean its SSTables are dictionary-compressed — the
+dictionary has to be trained and the files rewritten. The untrained baseline was
+52 103 621 bytes, which is the plain-Zstd figure, and it flattered Parquet by roughly 2×.
+It was caught only because that number exactly matched the plain-Zstd column of §10.1.
+Any future measurement must `retrain_dict` and `upgrade_sstables` before comparing —
+`harness.py` already does; the ad-hoc loader did not.
+
 ### 10.3g L3 export: for interoperability, not for size
 
 Folding level L3 (§5.3) emits the user's CQL schema and nothing else — no `__ts`, no
