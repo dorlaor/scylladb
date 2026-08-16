@@ -26,6 +26,7 @@
 
 #include "schema_mapping.hh"
 #include "format/parquet_metadata.hh"
+#include "format/parquet_reader.hh"
 
 #include <cstdio>
 #include <random>
@@ -197,6 +198,69 @@ done:
     return fails ? 1 : 0;
 }
 
+// The real end-to-end: rows -> Parquet file -> rows, through the actual encoders,
+// compressor and page layout rather than just the in-memory shred/reassemble pair.
+// Until the reader existed, nothing the writer produced could be checked this way.
+int filetrip() {
+    size_t cases = 0, fails = 0;
+    const double divs[] = {0.0, 0.1, 1.0};
+    const double nulls[] = {0.0, 0.3, 0.7};
+    const size_t widths[] = {1, 6, 25};
+    const struct { const char* name; format::codec c; int lvl; } comps[] = {
+        {"zstd3", format::codec::zstd, 3},
+        {"none",  format::codec::uncompressed, 0},
+    };
+
+    for (size_t w : widths) {
+        auto cols = make_schema(w);
+        for (double d : divs) for (double nl : nulls) for (auto& cp : comps) {
+            gen_opts o; o.rows = 1500; o.n_regular = w;
+            o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = 0.2;
+            auto rows = generate(cols, o);
+
+            for (auto lvl : {folding_level::verbatim, folding_level::row_folded}) {
+                ++cases;
+                format::writer_options wo;
+                wo.compression = cp.c;
+                wo.zstd_level = cp.lvl;
+                wo.page_values = 512;          // force multi-page chunks
+                auto ms   = map_schema(cols, lvl, rows);
+                auto data = shred(ms, cols, rows);
+                format::file_writer fw(ms.columns, wo);
+                fw.add_row_group(data);
+                auto img = fw.finish();
+
+                std::vector<format::column_data> back;
+                try {
+                    back = format::read_file(img);
+                } catch (const std::exception& e) {
+                    ++fails;
+                    std::printf("  FAIL w=%zu div=%.1f null=%.1f %s %s: read threw: %s\n",
+                                w, d, nl, cp.name, to_string(lvl), e.what());
+                    continue;
+                }
+                if (back.size() != ms.columns.size()) {
+                    ++fails;
+                    std::printf("  FAIL w=%zu %s: got %zu columns, expected %zu\n",
+                                w, to_string(lvl), back.size(), ms.columns.size());
+                    continue;
+                }
+                auto rt = reassemble(ms, cols, back, rows.size());
+                std::string why;
+                if (!compare(rows, rt, ms.level, why)) {
+                    ++fails;
+                    std::printf("  FAIL w=%zu div=%.1f null=%.1f %s %s: %s\n",
+                                w, d, nl, cp.name, to_string(lvl), why.c_str());
+                    if (fails > 6) { std::printf("  (stopping)\n"); return 1; }
+                }
+            }
+        }
+    }
+    std::printf("file round-trip: %zu cases, %zu failures\n", cases, fails);
+    std::printf("%s\n", fails ? "FILE ROUNDTRIP FAIL" : "FILE ROUNDTRIP PASS");
+    return fails ? 1 : 0;
+}
+
 int cost() {
     auto cols = make_schema(40);
     std::printf("divergence,variant,bytes,leaf_columns,vs_base\n");
@@ -223,11 +287,12 @@ int cost() {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|cost}\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|cost}\n", argv[0]); return 2; }
     try {
         std::string c = argv[1];
         if (c == "roundtrip") { return roundtrip(); }
         if (c == "cost")      { return cost(); }
+        if (c == "filetrip")  { return filetrip(); }
         std::fprintf(stderr, "unknown command\n"); return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what()); return 1;
