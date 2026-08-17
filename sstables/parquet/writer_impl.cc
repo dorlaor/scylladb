@@ -93,6 +93,14 @@ std::vector<cql_column> columns_of(const ::schema& s) {
     for (const auto& c : s.regular_columns()) {
         cols.push_back({c.name_as_text(), cql_type_of(*c.type), column_kind::regular});
     }
+    // Static columns ride along as ordinary value columns, appended after the
+    // regular ones. That gets them the whole cell machinery -- timestamps, TTLs,
+    // the divergence channel -- for free, and costs nothing on disk because a
+    // static value is constant within its partition and so compresses away.
+    // The reader splits them back out by index; see static_base().
+    for (const auto& c : s.static_columns()) {
+        cols.push_back({"__s_" + c.name_as_text(), cql_type_of(*c.type), column_kind::regular});
+    }
     return cols;
 }
 
@@ -101,6 +109,7 @@ fragment_shredder::fragment_shredder(const ::schema& s)
     : _schema(s), _cols(columns_of(s)) {
     _n_pk = s.partition_key_size();
     _n_ck = s.clustering_key_size();
+    _static_base = static_base(s);
 }
 
 void fragment_shredder::set_partition_tombstone(tombstone t) {
@@ -111,6 +120,8 @@ void fragment_shredder::set_partition_tombstone(tombstone t) {
 void fragment_shredder::new_partition(const dht::decorated_key& dk) {
     _pk.clear();
     _part_del.reset();
+    _static_cells.clear();
+    _saw_clustering_row = false;
     std::vector<cql_type> types;
     for (const auto& c : _schema.partition_key_columns()) { types.push_back(cql_type_of(*c.type)); }
     std::vector<bytes> parts;
@@ -144,6 +155,9 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
                                   int32_t(t.deletion_time.time_since_epoch().count())};
     }
     r.part_del = _part_del;
+    _saw_clustering_row = true;
+    // Static cells ride on every row of the partition.
+    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
 
     // Regular cells. column_id indexes the regular columns, which is exactly the
     // index space schema_mapping uses for cells.
@@ -171,8 +185,51 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
     _rows.push_back(std::move(r));
 }
 
-void fragment_shredder::add_static_row(const static_row&) {
-    // Static rows need their own row-group section; not part of this step.
+void fragment_shredder::add_static_row(const static_row& sr) {
+    // Held, not emitted: static cells are replayed onto every clustering row of
+    // the partition, where they cost nothing because they are constant and
+    // compress away. A partition with no clustering rows gets a placeholder from
+    // end_partition().
+    sr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
+        const column_definition& cdef = _schema.static_column_at(id);
+        if (!cdef.is_atomic()) { return; }
+        auto av = acoc.as_atomic_cell(cdef);
+        cell c;
+        c.timestamp = av.timestamp();
+        c.live = av.is_live();
+        if (c.live) {
+            auto lv = av.value().linearize();
+            c.v = decode(cql_type_of(*cdef.type), bytes_view(lv));
+            if (av.is_live_and_has_ttl()) {
+                c.ttl = int32_t(av.ttl().count());
+                c.local_deletion_time = int32_t(av.expiry().time_since_epoch().count());
+            }
+        } else {
+            c.local_deletion_time = int32_t(av.deletion_time().time_since_epoch().count());
+        }
+        _static_cells.emplace(_static_base + size_t(id), std::move(c));
+    });
+}
+
+void fragment_shredder::end_partition() {
+    if (_saw_clustering_row || _pk.empty()) {
+        _saw_clustering_row = false;
+        return;
+    }
+    if (_static_cells.empty() && !_part_del) {
+        return;                       // nothing to record
+    }
+    // Static-only (or tombstone-only) partition: one placeholder row, whose
+    // clustering values are meaningless and are flagged as such.
+    row r;
+    r.key = _pk;
+    for (size_t i = 0; i < _n_ck; ++i) {
+        r.key.push_back(decode(_cols[_n_pk + i].type, bytes_view()));
+    }
+    r.no_ck = true;
+    r.part_del = _part_del;
+    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
+    _rows.push_back(std::move(r));
 }
 
 std::vector<uint8_t> fragment_shredder::to_parquet(const pq_writer_config& cfg) const {
@@ -298,9 +355,7 @@ void pq_writer_impl::consume(tombstone t) {
 }
 
 stop_iteration pq_writer_impl::consume(static_row&& sr) {
-    if (!sr.empty()) {
-        unrepresentable("static rows");
-    }
+    _shredder.add_static_row(sr);
     return stop_iteration::no;
 }
 
@@ -319,6 +374,7 @@ stop_iteration pq_writer_impl::consume(range_tombstone_change&& rtc) {
 }
 
 stop_iteration pq_writer_impl::consume_end_of_partition() {
+    _shredder.end_partition();
     return stop_iteration::no;
 }
 

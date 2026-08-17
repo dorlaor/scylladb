@@ -107,6 +107,11 @@ struct row {
     // absent entirely compresses away -- and it keeps a row self-describing,
     // which is what lets the reader work a window at a time.
     std::optional<deletion_info> part_del;
+    // True for a placeholder row standing in for a partition that has no
+    // clustering rows -- a static row or a bare partition tombstone. Its
+    // clustering-key values are meaningless. Marking the row is cheaper than
+    // making every clustering-key column nullable for every table.
+    bool no_ck = false;
 };
 
 // ---------------------------------------------------------------- folding
@@ -164,6 +169,7 @@ struct mapped_schema {
     std::optional<size_t> rm_index, rm_ttl_index, rm_ldt_index;
     std::optional<size_t> rt_ts_index, rt_ldt_index;
     std::optional<size_t> pt_ts_index, pt_ldt_index;
+    std::optional<size_t> no_ck_index;
     // For L2: the single timestamp shared by every cell.
     std::optional<int64_t>   uniform_ts;
 
@@ -184,6 +190,7 @@ struct schema_flags {
     bool any_marker_ttl = false;
     bool any_row_del = false;
     bool any_part_del = false;
+    bool any_no_ck = false;
     std::vector<bool> col_diverges;      // per regular column
     std::optional<int64_t> single_ts;
 };

@@ -78,7 +78,7 @@ class pq_reader : public mutation_reader::impl {
     format::file_metadata _md;
     mapped_schema _ms;
     std::vector<cql_column> _cols;
-    size_t _n_pk = 0, _n_ck = 0;
+    size_t _n_pk = 0, _n_ck = 0, _static_base = 0;
     std::vector<int64_t> _rg_start;     // cumulative first row of each row group
 
     // Ordinal window this read is confined to, from the partition index.
@@ -201,6 +201,7 @@ future<> pq_reader::init() {
     _ms = recover_mapped_schema(_md, _cols);
     _n_pk = _schema->partition_key_size();
     _n_ck = _schema->clustering_key_size();
+    _static_base = static_base(*_schema);
 
     _rg_start.clear();
     int64_t acc = 0;
@@ -373,6 +374,7 @@ void pq_reader::close_partition() {
 }
 
 void pq_reader::emit_row(const row& r) {
+    bool just_opened = false;
     std::vector<value> pk(r.key.begin(), r.key.begin() + long(_n_pk));
     if (!_open || pk != _open_pk) {
         close_partition();
@@ -406,8 +408,46 @@ void pq_reader::emit_row(const row& r) {
         _open_pk = std::move(pk);
         _open = true;
         _skipping = false;
+        just_opened = true;
     }
     if (_skipping) { return; }
+
+    // Static cells were replayed onto every row of the partition; they belong to
+    // the partition, not the row, so they come back out as a static_row emitted
+    // once, immediately after the partition_start.
+    if (just_opened) {
+        ::row st;
+        for (const auto& [k, c] : r.cells) {
+            if (k < _static_base) { continue; }
+            const column_definition& cdef = _schema->static_column_at(column_id(k - _static_base));
+            if (!c.v && c.live) { continue; }
+            if (!c.live) {
+                auto ldt = gc_clock::time_point(gc_clock::duration(c.local_deletion_time.value_or(0)));
+                st.append_cell(column_id(k - _static_base),
+                               atomic_cell::make_dead(c.timestamp, ldt));
+                continue;
+            }
+            auto raw = encode(_cols[_n_pk + _n_ck + k].type, *c.v);
+            if (c.ttl) {
+                auto expiry = gc_clock::time_point(
+                        gc_clock::duration(c.local_deletion_time.value_or(0)));
+                st.append_cell(column_id(k - _static_base),
+                        atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw),
+                                               expiry, gc_clock::duration(*c.ttl)));
+            } else {
+                st.append_cell(column_id(k - _static_base),
+                        atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw)));
+            }
+        }
+        if (!st.empty()) {
+            push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
+                    static_row(std::move(st))));
+        }
+    }
+
+    // A placeholder row exists only to carry the static row or the partition
+    // tombstone; it has no clustering row of its own.
+    if (r.no_ck) { return; }
 
     std::vector<bytes> ck_parts;
     ck_parts.reserve(_n_ck);
@@ -418,6 +458,7 @@ void pq_reader::emit_row(const row& r) {
 
     ::row cells;
     for (const auto& [k, c] : r.cells) {
+        if (k >= _static_base) { continue; }       // static: already emitted above
         if (!c.v && c.live) { continue; }          // absent, not deleted
         const column_definition& cdef = _schema->regular_column_at(column_id(k));
         if (!c.live) {

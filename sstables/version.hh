@@ -30,9 +30,10 @@ enum class sstable_format_types { big };
 // (test/boost/sstable_parquet_test.cc). Row markers, row tombstones and
 // partition tombstones round-trip as of 2026-08-17.
 //
-// What still blocks membership is coverage, not plumbing: static rows, range
-// tombstones, multi-cell collections and counters cannot be represented, and
-// the writer throws on them rather than dropping them. Adding pq here would
+// Row markers, row and partition tombstones, and static rows all round-trip.
+// What still blocks membership is coverage, not plumbing: range tombstones,
+// multi-cell collections and counters cannot be represented, and the writer
+// throws on them rather than dropping them. Adding pq here would
 // enrol it in the generic suites -- including
 // sstable_conforms_to_mutation_source_test -- which exercise all of those.
 // Add it in the change that closes those gaps; see

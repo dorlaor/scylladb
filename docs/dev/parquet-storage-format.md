@@ -1932,16 +1932,25 @@ table, not the size.
     The marker is stored as a delta against the row's own timestamp, which is zero for an
     ordinary INSERT and costs nothing after zstd.
 
-    Still unrepresentable: **static rows, range tombstones, multi-cell collections and
-    counters**. These now make the writer *throw* rather than drop the fragment. That
+    **Static rows** landed the same day. They ride as ordinary value columns appended
+    after the regular ones, which gets them the whole cell machinery — timestamps, TTLs,
+    the divergence channel — for free, and costs almost nothing on disk because a static
+    value is constant within its partition and compresses away. The awkward case is a
+    partition whose only content is a static row: there is no clustering row to attach it
+    to, so the writer emits one placeholder row marked with a `__no_ck` leaf, which is
+    cheaper than making every clustering-key column nullable for every table.
+
+    Still unrepresentable: **range tombstones, multi-cell collections and counters**.
+    These now make the writer *throw* rather than drop the fragment. That
     distinction matters more than the missing support: before, a partition tombstone was
     silently discarded, which produced a perfectly valid Parquet file that resurrected
     deleted rows. Refusing is recoverable; silence is not.
 
     Range tombstones are the remaining blocker for `all_sstable_versions` and for
     `sstable_conforms_to_mutation_source_test`, because they are fragments *between* rows
-    rather than attributes of one, and so need a representation of their own — most likely
-    a side list in the file's key/value metadata, ordered by clustering position.
+    rather than attributes of one. The likely design reuses the `__no_ck` idea: interleave
+    them as marked rows carrying the bound's clustering prefix, a bound weight, and how
+    many clustering components the bound actually sets.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.

@@ -46,6 +46,10 @@ struct pq_writer_config {
 // the reader will need exactly the same mapping to invert it.
 std::vector<cql_column> columns_of(const ::schema& s);
 
+// Index, within the value columns produced by columns_of(), of the first static
+// column. Everything at or after it is static; everything before is regular.
+inline size_t static_base(const ::schema& s) { return s.regular_columns_count(); }
+
 // Converts a mutation-fragment stream into rows. Split out from the
 // writer_impl so it can be unit-tested without constructing an sstable.
 class fragment_shredder {
@@ -54,6 +58,9 @@ class fragment_shredder {
     std::vector<row> _rows;
     std::vector<value> _pk;      // current partition's key components
     std::optional<deletion_info> _part_del;
+    std::map<size_t, cell> _static_cells;     // indexed as value columns
+    size_t _static_base = 0;
+    bool _saw_clustering_row = false;
     size_t _n_pk = 0, _n_ck = 0;
 
 public:
@@ -62,6 +69,10 @@ public:
     void new_partition(const dht::decorated_key& dk);
     // Applies to every row of the current partition until the next one.
     void set_partition_tombstone(tombstone);
+    // Closes the open partition. A partition whose only content is a static row
+    // has no clustering row to attach it to, so one placeholder row is emitted
+    // and marked with __no_ck.
+    void end_partition();
     void add_clustering_row(const clustering_row& cr);
     void add_static_row(const static_row& sr);
 

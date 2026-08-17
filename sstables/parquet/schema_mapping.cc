@@ -114,6 +114,7 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
         }
         if (r.row_del)  { f.any_row_del = true; }
         if (r.part_del) { f.any_part_del = true; }
+        if (r.no_ck)    { f.any_no_ck = true; }
         for (const auto& [ci, c] : r.cells) {
             if (c.ttl) { f.any_ttl = true; }
             if (c.local_deletion_time || !c.live) { f.any_deletion = true; }
@@ -149,7 +150,8 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
 
     if (requested == folding_level::uniform &&
         !(flags.all_same_ts && !any_ttl && !any_deletion &&
-          !flags.any_marker && !flags.any_row_del && !flags.any_part_del)) {
+          !flags.any_marker && !flags.any_row_del && !flags.any_part_del &&
+          !flags.any_no_ck)) {
         // Precondition broken -- fall back rather than lose information.
         ms.level = folding_level::row_folded;
     }
@@ -269,6 +271,11 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
             ms.columns.push_back({"__rt_ldt", phys_type::int32, repetition::optional,
                                   std::nullopt, std::nullopt});
         }
+        if (flags.any_no_ck) {
+            ms.no_ck_index = ms.columns.size();
+            ms.columns.push_back({"__no_ck", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+        }
         if (flags.any_part_del) {
             ms.pt_ts_index = ms.columns.size();
             ms.columns.push_back({"__pt_ts", phys_type::int64, repetition::optional,
@@ -362,6 +369,7 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
         f.any_marker_ttl = has("__rm_ttl");
         f.any_row_del    = has("__rt_ts");
         f.any_part_del   = has("__pt_ts");
+        f.any_no_ck      = has("__no_ck");
     } else if (level == folding_level::uniform) {
         f.all_same_ts = true;
         const std::string* u = fm.kv("scylla.uniform_timestamp");
@@ -479,6 +487,7 @@ std::vector<column_data> shred(const mapped_schema& ms,
         opt_i64(ms.rt_ts_index, r.row_del.has_value(), r.row_del ? r.row_del->timestamp : 0);
         opt_i32(ms.rt_ldt_index, r.row_del.has_value(),
                 r.row_del ? r.row_del->local_deletion_time : 0);
+        opt_i32(ms.no_ck_index, r.no_ck, 1);
         opt_i64(ms.pt_ts_index, r.part_del.has_value(), r.part_del ? r.part_del->timestamp : 0);
         opt_i32(ms.pt_ldt_index, r.part_del.has_value(),
                 r.part_del ? r.part_del->local_deletion_time : 0);
@@ -577,6 +586,7 @@ std::vector<row> reassemble(const mapped_schema& ms,
             r.row_del = deletion_info{cd[*ms.rt_ts_index].i64[i],
                                       present(ms.rt_ldt_index) ? cd[*ms.rt_ldt_index].i32[i] : 0};
         }
+        if (present(ms.no_ck_index)) { r.no_ck = true; }
         if (present(ms.pt_ts_index)) {
             r.part_del = deletion_info{cd[*ms.pt_ts_index].i64[i],
                                        present(ms.pt_ldt_index) ? cd[*ms.pt_ldt_index].i32[i] : 0};

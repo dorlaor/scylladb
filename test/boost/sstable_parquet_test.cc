@@ -287,21 +287,79 @@ SEASTAR_THREAD_TEST_CASE(test_pq_markers_and_tombstones_round_trip) {
     }).get();
 }
 
-// What the shredder cannot represent must stop the write rather than produce a
-// valid Parquet file that is quietly missing data.
-SEASTAR_THREAD_TEST_CASE(test_pq_refuses_what_it_cannot_represent) {
+// Static rows: held by the shredder and replayed onto every row of the
+// partition, then split back out on read. The interesting cases are a partition
+// with a static row and no clustering rows at all, which has no row to attach it
+// to, and a static-only partition that is also deleted.
+SEASTAR_THREAD_TEST_CASE(test_pq_static_rows_round_trip) {
     sstables::test_env::do_with_async([] (sstables::test_env& env) {
         auto s = schema_builder(1, "ks", "pq_static")
             .with_column("pk", utf8_type, column_kind::partition_key)
             .with_column("ck", int32_type, column_kind::clustering_key)
             .with_column("st", int32_type, column_kind::static_column)
+            .with_column("st2", utf8_type, column_kind::static_column)
             .with_column("v", int32_type)
             .build();
 
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 20; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("k{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 500 + p;
+
+            if (p % 4 != 3) {
+                m.set_static_cell(*s->get_column_definition(to_bytes("st")),
+                        atomic_cell::make_live(*int32_type, ts, int32_type->decompose(p)));
+                m.set_static_cell(*s->get_column_definition(to_bytes("st2")),
+                        atomic_cell::make_live(*utf8_type, ts,
+                                utf8_type->decompose(sstring(format("s{}", p % 5)))));
+            }
+            // p % 4 == 1 is static-only: no clustering rows at all.
+            if (p % 4 != 1) {
+                for (int r = 0; r < 3; ++r) {
+                    auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                    m.set_clustered_cell(ck, *s->get_column_definition(to_bytes("v")),
+                            atomic_cell::make_live(*int32_type, ts, int32_type->decompose(r * 3)));
+                }
+            }
+            // p % 4 == 3 has neither statics nor rows; skip it entirely.
+            if (p % 4 != 3) {
+                muts.push_back(std::move(m));
+            }
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+        auto expected = muts;
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+        auto got = read_all(sst, s, env.make_reader_permit());
+
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+    }).get();
+}
+
+// What the shredder still cannot represent must stop the write rather than
+// produce a valid Parquet file that is quietly missing data.
+SEASTAR_THREAD_TEST_CASE(test_pq_refuses_range_tombstones) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
         auto pk = partition_key::from_single_value(*s, utf8_type->decompose(sstring("k")));
         mutation m(s, pk);
-        m.set_static_cell(*s->get_column_definition(to_bytes("st")),
-                          atomic_cell::make_live(*int32_type, 100, int32_type->decompose(7)));
+        auto start = clustering_key_prefix::from_single_value(*s, int32_type->decompose(1));
+        auto end   = clustering_key_prefix::from_single_value(*s, int32_type->decompose(9));
+        // Spell the bound kinds out: passing bare prefixes picks the
+        // position_in_partition_view overload, which asserts on a bound weight
+        // of `equal`.
+        m.partition().apply_delete(*s, range_tombstone(
+                std::move(start), bound_kind::incl_start,
+                std::move(end), bound_kind::incl_end,
+                tombstone(100, gc_clock::time_point(gc_clock::duration(1)))));
 
         BOOST_REQUIRE_THROW(
                 make_sstable_containing(env.make_sstable(s, sstable_version_types::pq),
