@@ -1326,9 +1326,10 @@ is measuring the same thing the writer produced.
 | GitHub Archive | 287 | 23 998 275 | 23 263 216 | **+3.06 %** | 15 910 910 | +0.41 % |
 | HackerNews | 465 | 21 183 259 | 20 539 807 | **+3.04 %** | 8 704 304 | +0.80 % |
 | Backblaze | 3 191 | 16 827 649 | 16 655 506 | **+1.02 %** | 8 930 673 | **−0.25 %** |
+| Wikipedia pageviews | 94 | 2 380 194 | 2 296 371 | **+3.52 %** | 1 002 337 | −0.10 % |
 | NYC TLC | 623 | 8 593 353 | 8 611 399 | **−0.21 %** | 3 508 449 | **−1.18 %** |
 
-Five datasets, including the two most text-heavy schemas in the roster — free-text titles
+Six datasets, including the three most text-heavy schemas in the roster — free-text titles
 and URLs, and JSON event payloads — which are where a dictionary should shine. The best
 self-trained result is +7.1 % and the held-out results cluster around zero.
 
@@ -1376,13 +1377,12 @@ layout has redundancy left to exploit. Reported as measured rather than tidied.
    The format keeps `scylla.folding_level` as its only private metadata and stays
    openable by pyarrow, which `test/boost/sstable_parquet_test.cc` asserts.
 
-### 10.1f Two more realistic schemas — and where the win is small
+### 10.1f Where the win is small — three datasets added to look for it
 
 The three original datasets are wide analytics and telemetry tables, which is the shape
-Parquet is known to suit. Two more were added on 2026-08-17 specifically to look for a
-case where it does *not* pay: a text-heavy table and a semi-structured event log. Both are
-public data, both realistic Scylla schemas, same method as §10.1 (realistic timestamp
-regime, token order, zstd-3, L1 folding).
+Parquet is known to suit. Three more were added on 2026-08-17 specifically to look for a
+case where it does *not* pay. Two were found. Same method as §10.1 (realistic timestamp
+regime, token order, zstd-3, L1 folding); all public data, all realistic Scylla schemas.
 
 | Dataset | Rows | Cols | Shape | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
 |---|---:|---:|---|---:|---:|---:|---:|
@@ -1390,34 +1390,41 @@ regime, token order, zstd-3, L1 folding).
 | D5 NYC TLC | 200 000 | 20 | numeric trips | 5 317 307 | 2 562 753 | **48.2 %** | 51.8 % |
 | D2 Backblaze | 300 000 | 197 | sparse telemetry | 32 671 140 | 16 547 521 | **50.6 %** | 49.4 % |
 | **D9 GitHub Archive** | 180 387 | 7 | event log + JSON payload | 34 006 460 | 24 575 665 | **72.3 %** | 27.7 % |
-| **D10 HackerNews** | 300 000 | 7 | free text (titles, URLs) | 23 136 733 | 21 244 885 | **91.8 %** | **8.2 %** |
+| **D10 HackerNews** | 300 000 | 7 | free text: titles, URLs | 23 136 733 | 21 244 885 | **91.8 %** | 8.2 % |
+| **D11 Wikipedia pageviews** | 176 082 | 5 | hourly metrics per page | 2 566 689 | 2 387 826 | **93.0 %** | 7.0 % |
 
-D9 and D10 are the pyarrow figures; §10.3h showed our own writer matches or beats pyarrow,
-so these are if anything pessimistic for Parquet.
+D9–D11 are pyarrow figures; §10.3h showed our own writer matches or beats pyarrow, so they
+are if anything pessimistic for Parquet.
 
-**The win is a function of schema shape, and on one realistic table it nearly vanishes.**
-HackerNews is seven columns of which two — `title` and `url` — are most of the bytes and
-are close to unique per row. Columnar grouping helps when a column's values repeat across
-rows; free text barely repeats, so there is little for the layout to exploit, while the
-row-oriented baseline's trained dictionary *does* capture common URL prefixes and English
-words. That is the one regime where a shared dictionary beats a better layout, and it
-shows up as 8.2 % instead of ~50 %.
+**Half the disk is not a property of the format. It is a property of wide tables.**
+The three that win have 20–197 columns. The two that barely win have five and seven, and
+in both the bytes are dominated by a **high-cardinality text column that is, or is part
+of, the partition key** — HackerNews `title`/`url`, pageviews `page`. Columnar grouping
+pays when a column's values repeat across rows; near-unique text barely repeats, so there
+is little for the layout to exploit, while the row-oriented baseline's trained dictionary
+still captures common substrings. D9 sits in between: its JSON payloads are individually
+large but share heavy structure across rows, which the layout does capture.
 
-D9 sits in between for the same reason in the other direction: its JSON payloads are
-individually large but share heavy structure across rows, which columnar layout captures
-(and which, per §10.1e, is also why a dictionary is worth 40 % on 4 KB blocks of it and
-3 % on its pages).
+**A narrow row also cannot amortise its per-row metadata.** D11 is the clearest case: at
+13.6 bytes per row in L1, the one mandatory `__ts` leaf is **37.5 %** of the file, and
+folding it away with L2 takes D11 from 93.0 % to **58.1 %** of the baseline. The same
+folding is worth 13.3 % on D2 and under 3 % on the wide tables. So metadata folding matters
+most precisely where the format is otherwise weakest — which makes L2, and better
+timestamp encoding generally, a bigger lever for narrow tables than any layout change.
+(Read that comparison only where L2 actually applied: on D5 and D1 the uniform-timestamp
+precondition failed and L2 silently fell back to L1, so their near-zero deltas mean
+"not measured", not "no cost".)
 
-**This is the case for the design rather than against it.** §1 asked whether Parquet uses
-significantly less disk, and the answer is "on most schemas, roughly half — but you have
-to measure the table". A cluster-wide switch would be wrong. The design already assumes
-this: `storage_format` is a per-table property (§6), and criterion C6 refuses to convert
-anything until the sampling estimator has predicted the gain for that specific table
-(§10.3e validated it at 0.4 % error from 10 % of rows). A table like D10 would be measured
-at ~8 % and correctly left as SSTables.
+**This is the case for the design as specified, not against it.** §1 asked whether Parquet
+uses significantly less disk. The honest answer is *"on wide tables, roughly half; on
+narrow text-keyed tables, under 10 % — measure the table"*. A cluster-wide switch would be
+wrong. The design already assumes this: `storage_format` is a per-table property (§6), and
+criterion C6 refuses to convert anything until the sampling estimator has predicted the
+gain for that specific table (§10.3e validated it at 0.4 % error from 10 % of rows). D10
+and D11 would both be measured at 7–8 % and correctly left as SSTables.
 
-Threat to validity: D9 truncates each payload to 4 000 characters, and one hour of
-GitHub Archive is one hour of one traffic pattern.
+Threats to validity: D9 truncates each payload to 4 000 characters; one hour of GitHub
+Archive and three hours of pageviews are each one traffic pattern.
 
 ### 10.2 Sensitivity to row group size
 
