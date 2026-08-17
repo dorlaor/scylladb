@@ -533,6 +533,76 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
     return ms;
 }
 
+// One row's worth of a collection column: five leaves under a repeated group, so
+// a variable number of slots rather than one per row. The definition levels are
+// per leaf, because `key` and `__ts` are required inside the group (max_def 2)
+// while `value`, `__ttl` and `__ldt` are optional (max_def 3):
+//
+//   0  the whole collection is absent from this row
+//   1  present but with no elements
+//   2  an element exists; for an optional leaf, its own value is null
+//   3  an optional leaf's value is present
+static void shred_collection(std::vector<column_data>& out, const mapped_schema& ms,
+                             size_t k, size_t vcol, const row& r) {
+    auto& l_key = out[vcol];
+    auto& l_val = out[vcol + 1];
+    auto& l_ts  = out[vcol + 2];
+    auto& l_ttl = out[vcol + 3];
+    auto& l_ldt = out[vcol + 4];
+
+    auto slot = [] (column_data& cd, uint64_t rep, uint64_t def) {
+        cd.rep_levels.push_back(rep);
+        cd.def_levels.push_back(def);
+    };
+
+    auto it = r.collections.find(k);
+    const collection_cell* cc = it == r.collections.end() ? nullptr : &it->second;
+
+    if (!cc || cc->elements.empty()) {
+        // Absent or empty: one slot on every leaf, carrying no value.
+        const uint64_t d = cc ? 1 : 0;
+        slot(l_key, 0, d);
+        slot(l_val, 0, d);
+        slot(l_ts,  0, d);
+        slot(l_ttl, 0, d);
+        slot(l_ldt, 0, d);
+    } else {
+        for (size_t i = 0; i < cc->elements.size(); ++i) {
+            const auto& e = cc->elements[i];
+            const uint64_t rep = i ? 1 : 0;
+
+            slot(l_key, rep, 2);
+            l_key.str.push_back(e.key);
+
+            const bool has_val = e.value.has_value();
+            slot(l_val, rep, has_val ? 3 : 2);
+            if (has_val) { l_val.str.push_back(*e.value); }
+
+            slot(l_ts, rep, 2);
+            l_ts.i64.push_back(e.timestamp);
+
+            slot(l_ttl, rep, e.ttl ? 3 : 2);
+            if (e.ttl) { l_ttl.i32.push_back(*e.ttl); }
+
+            slot(l_ldt, rep, e.local_deletion_time ? 3 : 2);
+            if (e.local_deletion_time) { l_ldt.i32.push_back(*e.local_deletion_time); }
+        }
+    }
+
+    // The collection-wide tombstone is a row-level pair, not part of the group.
+    const bool has_tomb = cc && cc->tomb.has_value();
+    if (ms.ct_ts_index[k]) {
+        auto& cd = out[*ms.ct_ts_index[k]];
+        cd.def_levels.push_back(has_tomb ? 1 : 0);
+        cd.i64.push_back(has_tomb ? cc->tomb->timestamp : 0);
+    }
+    if (ms.ct_ldt_index[k]) {
+        auto& cd = out[*ms.ct_ldt_index[k]];
+        cd.def_levels.push_back(has_tomb ? 1 : 0);
+        cd.i32.push_back(has_tomb ? cc->tomb->local_deletion_time : 0);
+    }
+}
+
 std::vector<column_data> shred(const mapped_schema& ms,
                                const std::vector<cql_column>& cols,
                                const std::vector<row>& rows) {
@@ -555,6 +625,12 @@ std::vector<column_data> shred(const mapped_schema& ms,
             // Recorded, not computed: a collection column contributes five leaves
             // rather than one, so leaf positions no longer follow from k.
             const size_t vcol = ms.value_leaf[k];
+
+            if (ms.value_is_collection[k]) {
+                shred_collection(out, ms, k, vcol, r);
+                continue;
+            }
+
             auto it = r.cells.find(k);
             const bool present = it != r.cells.end() && it->second.v.has_value();
             out[vcol].def_levels.push_back(present ? 1 : 0);
@@ -642,6 +718,69 @@ std::vector<column_data> shred(const mapped_schema& ms,
     return out;
 }
 
+// Where the next row starts in a collection column's leaves. Slot counts match
+// across the five leaves; value counts do not, because each leaf stores only its
+// present values.
+struct collection_cursor {
+    size_t slot = 0;
+    size_t v_key = 0, v_val = 0, v_ts = 0, v_ttl = 0, v_ldt = 0;
+};
+
+// Inverse of shred_collection(). Consumes exactly one row's slots and advances
+// the cursor. Returns nullopt when the collection is absent from this row, which
+// is distinct from present-and-empty.
+static std::optional<collection_cell> read_collection(
+        const std::vector<column_data>& cd, const mapped_schema& ms,
+        size_t k, size_t vcol, size_t row_i, collection_cursor& cur) {
+    const auto& l_key = cd[vcol];
+    const auto& l_val = cd[vcol + 1];
+    const auto& l_ts  = cd[vcol + 2];
+    const auto& l_ttl = cd[vcol + 3];
+    const auto& l_ldt = cd[vcol + 4];
+
+    const size_t start = cur.slot;
+    if (start >= l_key.def_levels.size()) { return std::nullopt; }
+
+    // This row's slots run to the next rep==0, which is the next row's start.
+    size_t end = start + 1;
+    while (end < l_key.rep_levels.size() && l_key.rep_levels[end] != 0) { ++end; }
+    cur.slot = end;
+
+    const uint64_t d0 = l_key.def_levels[start];
+    if (d0 == 0) { return std::nullopt; }            // absent
+
+    collection_cell out;
+    // The tombstone leaves are row-level -- one slot per row -- so they are
+    // indexed by the row, not by the slot. Read it before the empty-collection
+    // return, because a deleted collection is usually deleted *and* empty.
+    if (ms.ct_ts_index[k]) {
+        const auto& ts_leaf = cd[*ms.ct_ts_index[k]];
+        if (row_i < ts_leaf.def_levels.size() && ts_leaf.def_levels[row_i] != 0) {
+            int32_t ldt = 0;
+            if (ms.ct_ldt_index[k]) {
+                const auto& ldt_leaf = cd[*ms.ct_ldt_index[k]];
+                if (row_i < ldt_leaf.def_levels.size() && ldt_leaf.def_levels[row_i] != 0) {
+                    ldt = ldt_leaf.i32[row_i];
+                }
+            }
+            out.tomb = deletion_info{ts_leaf.i64[row_i], ldt};
+        }
+    }
+
+    if (d0 == 1) { return out; }                     // present but empty
+
+    for (size_t sl = start; sl < end; ++sl) {
+        collection_element e;
+        e.key = l_key.str[cur.v_key++];
+        if (l_val.def_levels[sl] == 3) { e.value = l_val.str[cur.v_val++]; }
+        e.timestamp = l_ts.i64[cur.v_ts++];
+        if (l_ttl.def_levels[sl] == 3) { e.ttl = l_ttl.i32[cur.v_ttl++]; }
+        if (l_ldt.def_levels[sl] == 3) { e.local_deletion_time = l_ldt.i32[cur.v_ldt++]; }
+        out.elements.push_back(std::move(e));
+    }
+    return out;
+}
+
 std::vector<row> reassemble(const mapped_schema& ms,
                             const std::vector<cql_column>& cols,
                             const std::vector<column_data>& cd,
@@ -660,6 +799,11 @@ std::vector<row> reassemble(const mapped_schema& ms,
                                !ms.meta_base_index.empty() && ms.meta_base_index[0].has_value();
 
     std::vector<row> out(nrows);
+    // Per collection column, where the next row's slots and values begin. A
+    // repeated column has a variable number of slots per row, so its position
+    // cannot be derived from the row index.
+    std::vector<collection_cursor> coll_cur(reg_idx.size());
+
     for (size_t i = 0; i < nrows; ++i) {
         row& r = out[i];
         for (size_t k = 0; k < key_idx.size(); ++k) {
@@ -685,6 +829,13 @@ std::vector<row> reassemble(const mapped_schema& ms,
             // Recorded, not computed: a collection column contributes five leaves
             // rather than one, so leaf positions no longer follow from k.
             const size_t vcol = ms.value_leaf[k];
+
+            if (ms.value_is_collection[k]) {
+                auto cc = read_collection(cd, ms, k, vcol, i, coll_cur[k]);
+                if (cc) { r.collections.emplace(k, std::move(*cc)); }
+                continue;
+            }
+
             const bool present = cd[vcol].def_levels[i] != 0;
 
             if (ms.level == folding_level::verbatim) {

@@ -70,6 +70,8 @@ echo; echo "### 10. OffsetIndex: row -> page lookup ###"
 /tmp/pq_oi_t $DATA/wout/*.parquet || FAIL=1
 echo; echo "### 11. L3 logical export (lossy, export-only) ###"; /tmp/pq_shred_t logical || FAIL=1
 echo; echo "### 13. schema recovery from the file alone ###"; /tmp/pq_shred_t recovery || FAIL=1
+echo; echo "### 18. non-frozen collections, in memory and through a file ###"
+/tmp/pq_shred_t collections || FAIL=1
 echo; echo "### 15. Dremel levels from the schema tree, vs pyarrow ###"
 if [ -f "$DATA"/nested/nested.parquet ]; then
   /tmp/pq_levels_tree_t "$DATA"/nested/nested.parquet "$DATA"/nested/nested.levels.json || FAIL=1

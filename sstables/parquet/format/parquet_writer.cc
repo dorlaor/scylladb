@@ -140,10 +140,16 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     dict_result dict;
     if (_opt.use_dictionary && spec.type == phys_type::byte_array && !col.str.empty()) {
         // Only the present values go into the dictionary.
+        // Values are dense per slot only when the column does not repeat; a
+        // repeated one supplies present values only, so walk a value cursor
+        // rather than indexing by slot.
         std::vector<std::string> present;
         present.reserve(n);
+        size_t vi = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (!has_def || col.def_levels[i] == max_def) { present.push_back(col.str[i]); }
+            const bool p = !has_def || col.def_levels[i] == max_def;
+            if (p) { present.push_back(col.str[vi]); }
+            if (p || max_rep == 0) { ++vi; }
         }
         dict = encode_dictionary_byte_array(present);
         // Dictionary only pays if it is small relative to the data.

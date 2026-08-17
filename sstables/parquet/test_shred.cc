@@ -476,8 +476,174 @@ int recovery() {
     return fails ? 1 : 0;
 }
 
+// ---------------------------------------------------------------- collections
+// Non-frozen collections are the one thing in the mutation stream that needs
+// Dremel nesting rather than another leaf, so they get their own suite: the
+// interesting states are absent, present-but-empty, populated, populated with a
+// dead element, and deleted-and-empty. Absent and present-but-empty are the pair
+// most easily conflated, and conflating them resurrects a cleared collection.
+std::vector<cql_column> make_collection_schema(size_t n_scalar, size_t n_coll) {
+    auto c = make_schema(n_scalar);
+    for (size_t i = 0; i < n_coll; ++i) {
+        cql_column col{"m" + std::to_string(i), cql_type::blob, column_kind::regular};
+        col.multi_cell = true;
+        c.push_back(col);
+    }
+    return c;
+}
+
+std::vector<row> generate_with_collections(const std::vector<cql_column>& cols,
+                                          size_t nrows, size_t n_scalar, size_t n_coll,
+                                          uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    auto unit = [&] { return double(rng() % 1000000) / 1000000.0; };
+    const int64_t base_ts = 1700000000000000LL;
+    std::vector<row> rows;
+
+    for (size_t i = 0; i < nrows; ++i) {
+        row r;
+        r.key.push_back(int64_t(i) * 13 + 1);
+        r.key.push_back(base_ts + int64_t(i) * 1000);
+        const int64_t row_ts = base_ts + int64_t(rng() % 1000000);
+
+        for (size_t k = 0; k < n_scalar; ++k) {
+            if (unit() < 0.3) { continue; }
+            cell c;
+            c.live = true;
+            c.timestamp = row_ts;
+            switch (cols[2 + k].type) {
+            case cql_type::bigint: c.v = int64_t(rng() % 100000); break;
+            case cql_type::int32:  c.v = int32_t(rng() % 1000); break;
+            case cql_type::dbl:    c.v = double(rng() % 10000) / 100.0; break;
+            default:               c.v = std::string("s") + std::to_string(rng() % 20); break;
+            }
+            r.cells.emplace(k, std::move(c));
+        }
+
+        for (size_t j = 0; j < n_coll; ++j) {
+            const size_t k = n_scalar + j;
+            const size_t kind = (i + j) % 6;
+            if (kind == 0) { continue; }                       // absent
+            collection_cell cc;
+            if (kind == 1) {
+                // present but empty
+            } else if (kind == 5) {
+                // deleted, and empty with it
+                cc.tomb = deletion_info{row_ts - 1, int32_t(i % 1000)};
+            } else {
+                const size_t n = 1 + (rng() % 4);
+                for (size_t e = 0; e < n; ++e) {
+                    collection_element el;
+                    el.key = "k" + std::to_string((i + e) % 11);
+                    if (!(kind == 3 && e == 0)) {
+                        el.value = "v" + std::to_string(rng() % 50);
+                    }                                          // else: dead element
+                    el.timestamp = row_ts + int64_t(e);
+                    if (kind == 4 && e == 1) {
+                        el.ttl = int32_t(3600 + e);
+                        el.local_deletion_time = int32_t(i + e);
+                    }
+                    cc.elements.push_back(std::move(el));
+                }
+                if (kind == 2 && (i % 5) == 0) {
+                    cc.tomb = deletion_info{row_ts - 2, int32_t(i % 500)};
+                }
+            }
+            r.collections.emplace(k, std::move(cc));
+        }
+        rows.push_back(std::move(r));
+    }
+    return rows;
+}
+
+bool compare_collections(const std::vector<row>& in, const std::vector<row>& out,
+                         std::string& why) {
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i].collections.size() != out[i].collections.size()) {
+            why = "row " + std::to_string(i) + ": collection count " +
+                  std::to_string(out[i].collections.size()) + " != " +
+                  std::to_string(in[i].collections.size());
+            return false;
+        }
+        for (const auto& [k, want] : in[i].collections) {
+            auto it = out[i].collections.find(k);
+            if (it == out[i].collections.end()) {
+                why = "row " + std::to_string(i) + " col " + std::to_string(k) + ": lost";
+                return false;
+            }
+            if (!(it->second == want)) {
+                why = "row " + std::to_string(i) + " col " + std::to_string(k) + ": differs (" +
+                      std::to_string(want.elements.size()) + " elements in, " +
+                      std::to_string(it->second.elements.size()) + " out, tomb " +
+                      (want.tomb ? "set" : "unset") + "/" +
+                      (it->second.tomb ? "set" : "unset") + ")";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+int collections() {
+    size_t cases = 0, fails = 0;
+    for (size_t n_scalar : {0u, 2u, 5u}) {
+        for (size_t n_coll : {1u, 3u}) {
+            for (size_t nrows : {1u, 7u, 900u}) {
+                auto cols = make_collection_schema(n_scalar, n_coll);
+                auto rows = generate_with_collections(cols, nrows, n_scalar, n_coll, 5 + nrows);
+
+                // In-memory: shred then reassemble.
+                for (auto lvl : {folding_level::row_folded, folding_level::verbatim}) {
+                    ++cases;
+                    auto ms = map_schema(cols, lvl, rows);
+                    auto data = shred(ms, cols, rows);
+                    auto back = reassemble(ms, cols, data, rows.size());
+                    std::string why;
+                    if (back.size() != rows.size()) {
+                        ++fails;
+                        std::printf("  FAIL sc=%zu coll=%zu rows=%zu %s: %zu rows back\n",
+                                    n_scalar, n_coll, nrows, to_string(lvl), back.size());
+                        continue;
+                    }
+                    if (!compare_collections(rows, back, why)) {
+                        ++fails;
+                        std::printf("  FAIL sc=%zu coll=%zu rows=%zu %s: %s\n",
+                                    n_scalar, n_coll, nrows, to_string(lvl), why.c_str());
+                        if (fails > 5) { return 1; }
+                    }
+                }
+
+                // Through a real file, which is what exercises the nesting.
+                ++cases;
+                try {
+                    format::writer_options wo;
+                    wo.page_values = 128;              // several pages per chunk
+                    auto img = write_rows(cols, rows, folding_level::row_folded, wo);
+                    auto fm = format::parse_footer(img);
+                    auto ms2 = recover_mapped_schema(fm, cols);
+                    auto cd = format::read_row_group(img, fm, 0);
+                    auto back = reassemble(ms2, cols, cd, size_t(fm.num_rows));
+                    std::string why;
+                    if (!compare_collections(rows, back, why)) {
+                        ++fails;
+                        std::printf("  FAIL file sc=%zu coll=%zu rows=%zu: %s\n",
+                                    n_scalar, n_coll, nrows, why.c_str());
+                    }
+                } catch (const std::exception& e) {
+                    ++fails;
+                    std::printf("  FAIL file sc=%zu coll=%zu rows=%zu threw: %s\n",
+                                n_scalar, n_coll, nrows, e.what());
+                }
+            }
+        }
+    }
+    std::printf("collections: %zu cases, %zu failures\n", cases, fails);
+    std::printf("%s\n", fails ? "COLLECTIONS FAIL" : "COLLECTIONS PASS");
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|recovery|cost}\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|recovery|collections|cost}\n", argv[0]); return 2; }
     try {
         std::string c = argv[1];
         if (c == "roundtrip") { return roundtrip(); }
@@ -485,6 +651,7 @@ int main(int argc, char** argv) {
         if (c == "filetrip")  { return filetrip(); }
         if (c == "logical")   { return logical(); }
         if (c == "recovery")  { return recovery(); }
+        if (c == "collections") { return collections(); }
         std::fprintf(stderr, "unknown command\n"); return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what()); return 1;
