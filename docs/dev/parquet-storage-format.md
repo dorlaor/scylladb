@@ -1994,14 +1994,30 @@ table, not the size.
          `sstable::make_reader` builds its slice with `reverse_slice()` — a temporary. The
          bug was invisible while the slice was never dereferenced. The reader now holds the
          slice **by value**.
-       - It filters rather than seeks. Range tombstone changes are *not* yet clipped to the
-         slice, so a sliced read can still carry a change for a range whose rows it does
-         not return. That is harmless for query results but not canonical, and it is the
-         remaining half of this item.
+       - Filtering rows is not enough on its own: a range tombstone that spans into the
+         slice has to be **re-opened at the slice boundary**. Rather than hand-roll that,
+         the reader now drives `mutation_fragment_filter`, the same helper mx uses, which
+         owns the `clustering_ranges_walker` and returns the clipped changes to emit.
 
-    So the order of work is: clip range tombstone changes to the slice, then multi-cell
-    collections (which need Dremel repetition levels — the encoder emits definition levels
-    only, so nesting is not expressible at all today). Counters are excluded by design.
+    **Re-running the enrolment experiment after that fix**, `pq` gets through ten of the
+    conformance suite's sub-tests, including all of the ones this work was aimed at:
+
+    ```
+    run_mutation_reader_tests_basic
+    test_range_tombstones_v2
+    test_time_window_clustering_slicing
+    test_clustering_slices
+    test_streamed_mutation_forwarding_across_range_tombstones
+    test_streamed_mutation_forwarding_guarantees
+    test_streamed_mutation_slicing_returns_only_relevant_tombstones
+    test_streamed_mutation_forwarding_is_consistent_with_slicing
+    ```
+
+    It then stops on `pq: cannot represent multi-cell static collections yet` — the
+    writer's own guard, firing exactly where it should. **Collections are now the only
+    thing left**, and that is measured rather than assumed. They need Dremel repetition
+    levels: the encoder emits definition levels only, so nesting is not expressible at all
+    today. Counters are excluded by design (open question 5).
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.

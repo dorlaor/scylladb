@@ -12,6 +12,7 @@
 #include "sstables/parquet/format/parquet_reader.hh"
 #include "sstables/sstables.hh"
 #include "sstables/index_reader.hh"
+#include "sstables/mutation_fragment_filter.hh"
 #include "readers/forwardable.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/mutation.hh"
@@ -105,6 +106,10 @@ class pq_reader : public mutation_reader::impl {
     // Partition being assembled across windows.
     std::vector<value> _open_pk;
     std::optional<dht::decorated_key> _open_dk;
+    // Applies the clustering slice, and -- the part that cannot be done by
+    // filtering rows alone -- clips range tombstone changes to the slice's
+    // boundaries, re-opening a range at the start of each range it spans.
+    std::optional<mutation_fragment_filter> _filter;
     bool _open = false;
     // True while sitting inside a partition the range excludes.
     bool _skipping = false;
@@ -380,6 +385,12 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
 
 void pq_reader::close_partition() {
     if (!_open) { return; }
+    if (_filter && _filter->current_tombstone()) {
+        auto res = _filter->apply(position_in_partition_view::after_all_clustered_rows(), {});
+        for (auto&& rt : res.rts) {
+            push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, std::move(rt)));
+        }
+    }
     push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, partition_end()));
     _open = false;
 }
@@ -415,6 +426,9 @@ void pq_reader::emit_row(const row& r) {
                            gc_clock::time_point(gc_clock::duration(r.part_del->local_deletion_time)));
         }
         _open_dk = dk;
+        _filter.emplace(*_schema,
+                query::clustering_key_filter_ranges::get_ranges(*_schema, _slice, dk.key()),
+                streamed_mutation::forwarding::no);
         push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
                 partition_start(std::move(dk), pt)));
         _open_pk = std::move(pk);
@@ -477,8 +491,13 @@ void pq_reader::emit_row(const row& r) {
             t = tombstone(r.rtc->tomb->timestamp,
                           gc_clock::time_point(gc_clock::duration(r.rtc->tomb->local_deletion_time)));
         }
-        push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
-                range_tombstone_change(std::move(pos), t)));
+        // The filter decides what actually goes out: a change outside the slice
+        // is swallowed, and one that opens a range spanning into the slice is
+        // re-emitted at the slice boundary instead.
+        auto res = _filter->apply(pos, t);
+        for (auto&& rt : res.rts) {
+            push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, std::move(rt)));
+        }
         return;
     }
 
@@ -493,19 +512,15 @@ void pq_reader::emit_row(const row& r) {
     }
     auto ck = clustering_key::from_exploded(*_schema, ck_parts);
 
-    // Honour the query's clustering slice. The reader does not *seek* to the
-    // slice -- the ColumnIndex's per-page clustering bounds would let a later
-    // version do that -- but it must not emit rows outside it. Returning extra
-    // rows is what the mutation-source conformance suite trips on.
-    if (_open_dk) {
-        const auto& ranges = _slice.row_ranges(*_schema, _open_dk->key());
-        clustering_key_prefix::tri_compare cmp(*_schema);
-        bool in = ranges.empty();
-        for (const auto& r : ranges) {
-            if (r.contains(ck, cmp)) { in = true; break; }
-        }
-        if (!in) { return; }
+    // Honour the query's clustering slice. The reader does not *seek* to it --
+    // the ColumnIndex's per-page clustering bounds would let a later version do
+    // that -- but it must not emit rows outside it, and any range tombstone the
+    // slice boundary cuts has to be re-opened there.
+    auto row_res = _filter->apply(position_in_partition_view::for_key(ck));
+    for (auto&& rt : row_res.rts) {
+        push_mutation_fragment(mutation_fragment_v2(*_schema, _permit, std::move(rt)));
     }
+    if (row_res.action != mutation_fragment_filter::result::emit) { return; }
 
     ::row cells;
     for (const auto& [k, c] : r.cells) {
