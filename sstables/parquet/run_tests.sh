@@ -24,6 +24,9 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined \
     -o /tmp/pq_lvl_t  $S/parquet_metadata.cc $S/page_header.cc $S/test_levels.cc || FAIL=1
 g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
     -o /tmp/pq_write_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/test_writer.cc -lzstd || FAIL=1
+g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -I. \
+    -o /tmp/pq_nested_write_t $S/test_nested_write.cc $S/parquet_writer.cc \
+       $S/parquet_metadata.cc -lzstd || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_nested_read_t $S/test_nested_read.cc $S/parquet_reader.cc \
        $S/parquet_metadata.cc $S/page_header.cc -lzstd -lsnappy || FAIL=1
@@ -74,7 +77,18 @@ if [ -f "$DATA"/nested/nested.parquet ]; then
   /tmp/pq_nested_read_t "$DATA"/nested/nested.parquet "$DATA"/nested/nested.tags.txt \
       tags.list.element || FAIL=1
 else
-  echo "  (no nested fixture; generate with sstables/parquet/format/gen_nested.py)"
+  echo "  (no nested fixture; generate with $S/gen_nested.py)"
+fi
+
+echo; echo "### 17. write a nested list column, vs pyarrow ###"
+mkdir -p "$DATA"/wnest
+if /tmp/pq_nested_write_t "$DATA"/wnest; then
+  python3 $S/writer_nested_interop.py "$DATA"/wnest || FAIL=1
+  # and our own reader must agree with what pyarrow saw
+  /tmp/pq_nested_read_t "$DATA"/wnest/w_nested.parquet "$DATA"/wnest/w_nested.tags.txt \
+      tags.list.element || FAIL=1
+else
+  FAIL=1
 fi
 echo; echo "### 14. read_row_range == read_row_group, sliced ###"
 /tmp/pq_rowrange_t "$DATA"/wout/*.parquet "$DATA"/conf/v2page_*.parquet || FAIL=1

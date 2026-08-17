@@ -73,9 +73,55 @@ void write_dictionary_page_header(std::vector<uint8_t>& out,
 
 } // namespace
 
+parquet_file_writer::parquet_file_writer(std::vector<column_spec> schema, writer_options opt)
+        : _schema(std::move(schema)), _opt(opt) {
+    _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
+    // Synthesise the tree a flat schema implies, so footer emission has one path.
+    schema_element root;
+    root.name = "schema";
+    root.num_children = int32_t(_schema.size());
+    _tree.push_back(root);
+    for (const auto& c : _schema) {
+        schema_element e;
+        e.type = c.type;
+        e.repetition_type = c.rep;
+        e.name = c.name;
+        e.converted_type = c.converted_type;
+        _tree.push_back(e);
+    }
+}
+
+parquet_file_writer::parquet_file_writer(nested_schema ns, writer_options opt)
+        : _tree(std::move(ns.tree)), _opt(opt) {
+    _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
+    if (_tree.empty()) { throw std::runtime_error("writer: nested schema has no root"); }
+
+    // Derive the leaves and their levels with the same walker the reader uses, so
+    // the two cannot disagree about what a level means.
+    file_metadata probe;
+    probe.schema = _tree;
+    for (const auto& li : walk_leaves(probe)) {
+        const auto& el = _tree[li.index];
+        if (!el.type) { throw std::runtime_error("writer: leaf without a physical type"); }
+        column_spec c;
+        c.name = el.name;
+        c.type = *el.type;
+        c.rep = el.repetition_type.value_or(repetition::required);
+        c.converted_type = el.converted_type;
+        c.max_def = li.max_def;
+        c.max_rep = li.max_rep;
+        c.path = li.path;
+        _schema.push_back(std::move(c));
+    }
+}
+
 void parquet_file_writer::write_column_chunk(const column_spec& spec, const column_data& col,
                                      chunk_meta& out_meta) {
-    const size_t n = col.num_values();
+    // Slots, not values. Parquet's ColumnMetaData.num_values counts level
+    // entries, and for a repeated column there are more of those than values --
+    // reporting the value count makes readers stop early with no error.
+    const size_t n = !col.def_levels.empty() ? col.def_levels.size()
+                   : (!col.rep_levels.empty() ? col.rep_levels.size() : col.num_values());
     // A leaf inside a repeated group states its levels explicitly, because the
     // schema tree they come from is not visible here. A flat leaf derives them.
     const uint8_t max_rep = spec.max_rep;
@@ -137,7 +183,8 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     // and noted as a follow-up.
     const size_t page_sz = use_dict ? n : _opt.page_values;
     bool first_data_page = true;
-    int64_t rows_written = 0;   // first_row_index of the next page
+    int64_t rows_written = 0;
+    size_t val_cursor = 0;   // next present value, for repeated columns   // first_row_index of the next page
 
     // A page must never split a row, so with repetition the cut points are the
     // rep_level==0 positions rather than every `page_values`-th value.
@@ -174,7 +221,15 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         }
         null_count += page_nulls;
 
-        // values (present only)
+        // Where this page's values start. A flat column supplies one value per
+        // slot, so the slot index doubles as the value index; a repeated one
+        // supplies present values only, so they have to be counted.
+        const size_t vbase = max_rep == 0 ? off : val_cursor;
+        size_t page_present = 0;
+        for (size_t i = 0; i < cnt; ++i) {
+            if (!has_def || col.def_levels[off + i] == max_def) { ++page_present; }
+        }
+
         std::vector<uint8_t> body;
         encoding used = encoding::plain;
         if (use_dict) {
@@ -185,18 +240,26 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             case phys_type::int32: {
                 std::vector<int32_t> present;
                 present.reserve(cnt);
-                for (size_t i = 0; i < cnt; ++i) {
-                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.i32[off + i]); }
-                }
+                size_t vi = vbase;
+                    for (size_t i = 0; i < cnt; ++i) {
+                        if (!has_def || col.def_levels[off + i] == max_def) {
+                            present.push_back(col.i32[vi]);
+                        }
+                        if (max_rep == 0 || !has_def || col.def_levels[off + i] == max_def) { ++vi; }
+                    }
                 encode_plain<int32_t>(body, present);
                 break;
             }
             case phys_type::int64: {
                 std::vector<int64_t> present;
                 present.reserve(cnt);
-                for (size_t i = 0; i < cnt; ++i) {
-                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.i64[off + i]); }
-                }
+                size_t vi = vbase;
+                    for (size_t i = 0; i < cnt; ++i) {
+                        if (!has_def || col.def_levels[off + i] == max_def) {
+                            present.push_back(col.i64[vi]);
+                        }
+                        if (max_rep == 0 || !has_def || col.def_levels[off + i] == max_def) { ++vi; }
+                    }
                 if (spec.preferred && *spec.preferred == encoding::delta_binary_packed) {
                     encode_delta_binary_packed(body, present);
                     used = encoding::delta_binary_packed;
@@ -208,9 +271,13 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             case phys_type::dbl: {
                 std::vector<double> present;
                 present.reserve(cnt);
-                for (size_t i = 0; i < cnt; ++i) {
-                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.f64[off + i]); }
-                }
+                size_t vi = vbase;
+                    for (size_t i = 0; i < cnt; ++i) {
+                        if (!has_def || col.def_levels[off + i] == max_def) {
+                            present.push_back(col.f64[vi]);
+                        }
+                        if (max_rep == 0 || !has_def || col.def_levels[off + i] == max_def) { ++vi; }
+                    }
                 if (spec.preferred && *spec.preferred == encoding::byte_stream_split) {
                     encode_byte_stream_split<double>(body, present);
                     used = encoding::byte_stream_split;
@@ -222,9 +289,13 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             case phys_type::byte_array: {
                 std::vector<std::string> present;
                 present.reserve(cnt);
-                for (size_t i = 0; i < cnt; ++i) {
-                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.str[off + i]); }
-                }
+                size_t vi = vbase;
+                    for (size_t i = 0; i < cnt; ++i) {
+                        if (!has_def || col.def_levels[off + i] == max_def) {
+                            present.push_back(col.str[vi]);
+                        }
+                        if (max_rep == 0 || !has_def || col.def_levels[off + i] == max_def) { ++vi; }
+                    }
                 encode_plain_byte_array(body, present);
                 break;
             }
@@ -280,6 +351,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             == out_meta.cm.encodings.end()) {
             out_meta.cm.encodings.push_back(used);
         }
+        val_cursor += page_present;
         off = stop;
     }
 
@@ -349,18 +421,16 @@ void parquet_file_writer::write_footer() {
         compact_writer::struct_scope s(w);
         w.field_i32(1, 2);                          // version
         // --- schema: flat, root first
-        w.field_list(2, ctype::strct, _schema.size() + 1);
-        {
-            compact_writer::elem_scope root(w);
-            w.field_binary(4, "schema");
-            w.field_i32(5, int32_t(_schema.size()));   // num_children
-        }
-        for (const auto& c : _schema) {
+        w.field_list(2, ctype::strct, _tree.size());
+        // Straight out of _tree, so a nested schema needs no special case: a group
+        // has num_children and no physical type, a leaf the other way round.
+        for (const auto& el : _tree) {
             compact_writer::elem_scope e(w);
-            w.field_i32(1, int32_t(c.type));
-            w.field_i32(3, int32_t(c.rep));
-            w.field_binary(4, c.name);
-            if (c.converted_type) { w.field_i32(6, *c.converted_type); }
+            if (el.type)            { w.field_i32(1, int32_t(*el.type)); }
+            if (el.repetition_type) { w.field_i32(3, int32_t(*el.repetition_type)); }
+            w.field_binary(4, el.name);
+            if (el.num_children)    { w.field_i32(5, *el.num_children); }
+            if (el.converted_type)  { w.field_i32(6, *el.converted_type); }
         }
         w.field_i64(3, _num_rows);
         // --- row groups

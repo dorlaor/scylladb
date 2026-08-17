@@ -131,7 +131,11 @@ class parquet_file_writer {
     };
 
     std::vector<uint8_t>     _buf;      // whole file image
-    std::vector<column_spec> _schema;
+    // The schema tree exactly as Parquet stores it: flat, depth-first, root at
+    // index 0. A flat schema is just a root with one leaf per column; a nested
+    // one is supplied by the caller.
+    std::vector<schema_element> _tree;
+    std::vector<column_spec> _schema;   // leaves, in column order
     writer_options           _opt;
     std::vector<rg_meta>     _rgs;
     int64_t                  _num_rows = 0;
@@ -144,10 +148,18 @@ class parquet_file_writer {
     void write_footer();
 
 public:
-    parquet_file_writer(std::vector<column_spec> schema, writer_options opt = {})
-        : _schema(std::move(schema)), _opt(opt) {
-        _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
-    }
+    // Flat schema: one leaf per column, no nesting.
+    parquet_file_writer(std::vector<column_spec> schema, writer_options opt = {});
+
+    // Nested schema. `tree` is depth-first with the root at index 0, which is how
+    // the footer stores it; the leaf specs and their Dremel levels are derived
+    // from it by walk_leaves(), so writer and reader agree by construction.
+    struct nested_schema { std::vector<schema_element> tree; };
+    parquet_file_writer(nested_schema tree, writer_options opt = {});
+
+    // The leaves the tree produced, in column order. add_row_group() wants one
+    // column_data per entry.
+    const std::vector<column_spec>& leaves() const { return _schema; }
 
     // Scylla-private metadata (folding level, source table, dictionary id, ...).
     // External readers ignore it; ours uses it to know what was omitted.
