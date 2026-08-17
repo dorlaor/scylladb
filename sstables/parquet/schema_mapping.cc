@@ -26,6 +26,21 @@ const char* to_string(folding_level l) {
 
 namespace {
 
+// Timestamp deltas, computed so they cannot overflow.
+//
+// Cell timestamps legitimately span the whole int64 range -- the conformance
+// corpus deliberately uses values next to both ends -- and `a - b` on two of
+// those is signed overflow, which is undefined behaviour rather than a large
+// number. Doing the arithmetic unsigned makes the wraparound defined, and adding
+// it back the same way recovers the original exactly. mx relies on the same trick
+// for its own delta encoding.
+inline int64_t ts_delta(int64_t a, int64_t b) {
+    return int64_t(uint64_t(a) - uint64_t(b));
+}
+inline int64_t ts_undelta(int64_t base, int64_t delta) {
+    return int64_t(uint64_t(base) + uint64_t(delta));
+}
+
 // The timestamp a row folds to: the one most of its live cells agree on.
 // Choosing the mode (rather than, say, the max) minimises how many cells need
 // an exception entry.
@@ -683,7 +698,7 @@ std::vector<column_data> shred(const mapped_schema& ms,
                 auto it = r.cells.find(k);
                 if (it == r.cells.end() || !mt || it->second.timestamp == *mt) { continue; }
                 mask[k / 8] = char(uint8_t(mask[k / 8]) | uint8_t(1u << (k % 8)));
-                put_zigzag(vals, it->second.timestamp - *mt);
+                put_zigzag(vals, ts_delta(it->second.timestamp, *mt));
                 any = true;
             }
             out[*ms.tsx_mask_index].def_levels.push_back(any ? 1 : 0);
@@ -706,7 +721,7 @@ std::vector<column_data> shred(const mapped_schema& ms,
             out[*idx].i32.push_back(present ? v : 0);
         };
         opt_i64(ms.rm_index, r.marker.has_value(),
-                r.marker ? r.marker->timestamp - mt.value_or(0) : 0);
+                r.marker ? ts_delta(r.marker->timestamp, mt.value_or(0)) : 0);
         opt_i32(ms.rm_ttl_index, bool(r.marker && r.marker->ttl),
                 r.marker && r.marker->ttl ? *r.marker->ttl : 0);
         opt_i32(ms.rm_ldt_index, bool(r.marker && r.marker->expiry),
@@ -829,7 +844,7 @@ std::vector<row> reassemble(const mapped_schema& ms,
             size_t pos = 0;
             for (size_t k = 0; k < reg_idx.size(); ++k) {
                 if (k / 8 < mask.size() && (uint8_t(mask[k / 8]) & (1u << (k % 8)))) {
-                    exc.emplace(k, row_ts + get_zigzag(vals, pos));
+                    exc.emplace(k, ts_undelta(row_ts, get_zigzag(vals, pos)));
                 }
             }
         }
@@ -890,7 +905,7 @@ std::vector<row> reassemble(const mapped_schema& ms,
         };
         if (present(ms.rm_index)) {
             marker_info m;
-            m.timestamp = row_ts + cd[*ms.rm_index].i64[i];
+            m.timestamp = ts_undelta(row_ts, cd[*ms.rm_index].i64[i]);
             if (present(ms.rm_ttl_index)) { m.ttl = cd[*ms.rm_ttl_index].i32[i]; }
             if (present(ms.rm_ldt_index)) { m.expiry = cd[*ms.rm_ldt_index].i32[i]; }
             r.marker = m;

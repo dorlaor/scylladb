@@ -29,6 +29,7 @@
 #include "format/parquet_reader.hh"
 
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -62,6 +63,11 @@ struct gen_opts {
     double marker_ttl_rate = 0.0;
     double row_del_rate = 0.0;
     double part_del_rate = 0.0;
+    // Draw timestamps from the extremes of int64 rather than a narrow band. The
+    // folding scheme stores per-cell and marker timestamps as deltas against the
+    // row's, and those subtractions overflow once the span approaches 2^63 -- which
+    // the conformance corpus does deliberately.
+    double extreme_ts_rate = 0.0;
     uint64_t seed = 7;
 };
 
@@ -78,7 +84,15 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
         row r;
         r.key.push_back(int64_t(i) * 13 + 1);
         r.key.push_back(base_ts + int64_t(i) * 1000);
-        const int64_t row_ts = base_ts + int64_t(rng() % 2000000000);
+        int64_t row_ts = base_ts + int64_t(rng() % 2000000000);
+        if (unit() < o.extreme_ts_rate) {
+            static const int64_t extremes[] = {
+                std::numeric_limits<int64_t>::min() + 64,
+                std::numeric_limits<int64_t>::max() - 64,
+                -9223372036854775737LL,
+            };
+            row_ts = extremes[rng() % 3];
+        }
         const bool diverge = unit() < o.divergence_rate;
 
         for (size_t k = 0; k < nreg; ++k) {
@@ -87,7 +101,22 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
             c.live = true;
             // A diverging row gives each cell its own write time, as repeated
             // UPDATEs to different columns would.
-            c.timestamp = diverge ? row_ts + int64_t(rng() % 100000) : row_ts;
+            if (diverge && unit() < o.extreme_ts_rate) {
+                static const int64_t far[] = {
+                    std::numeric_limits<int64_t>::max() - 32,
+                    std::numeric_limits<int64_t>::min() + 32,
+                };
+                c.timestamp = far[rng() % 2];
+            } else {
+                // Saturating, so the generator itself does not overflow when the
+                // row timestamp is already near the top of the range.
+                const int64_t bump = int64_t(rng() % 100000);
+                c.timestamp = diverge
+                        ? (row_ts > std::numeric_limits<int64_t>::max() - bump
+                                ? std::numeric_limits<int64_t>::max()
+                                : row_ts + bump)
+                        : row_ts;
+            }
             switch (cols[2 + k].type) {
             case cql_type::bigint: c.v = int64_t(rng() % 1000000); break;
             case cql_type::int32:  c.v = int32_t(rng() % 1000); break;
@@ -103,7 +132,9 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
             marker_info m;
             // Usually the row's own timestamp, occasionally not -- the delta
             // encoding has to survive both.
-            m.timestamp = (unit() < 0.8) ? row_ts : row_ts + int64_t(rng() % 5000);
+            const int64_t mb = int64_t(rng() % 5000);
+            m.timestamp = (unit() < 0.8 || row_ts > std::numeric_limits<int64_t>::max() - mb)
+                    ? row_ts : row_ts + mb;
             if (unit() < o.marker_ttl_rate) {
                 m.ttl = int32_t(rng() % 86400);
                 m.expiry = int32_t(rng() % 100000);
@@ -111,7 +142,10 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
             r.marker = m;
         }
         if (unit() < o.row_del_rate) {
-            r.row_del = deletion_info{row_ts - int64_t(rng() % 1000), int32_t(rng() % 100000)};
+            const int64_t rb = int64_t(rng() % 1000);
+            r.row_del = deletion_info{
+                    row_ts < std::numeric_limits<int64_t>::min() + rb ? row_ts : row_ts - rb,
+                    int32_t(rng() % 100000)};
         }
         if (unit() < o.part_del_rate) {
             // Constant within a run of rows, as a real partition tombstone is.
@@ -212,6 +246,7 @@ int roundtrip() {
             gen_opts o; o.rows = 800; o.n_regular = w;
             o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = tt; o.delete_rate = dl;
             o.marker_rate = 0.9; o.marker_ttl_rate = tt; o.row_del_rate = dl; o.part_del_rate = 0.1;
+            o.extreme_ts_rate = 0.3;
             auto rows = generate(cols, o);
             for (auto lvl : {folding_level::verbatim, folding_level::row_folded,
                              folding_level::uniform})
@@ -413,6 +448,7 @@ int recovery() {
                 o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = ttl;
                 o.marker_rate = 0.9; o.marker_ttl_rate = ttl > 0 ? 0.2 : 0.0;
                 o.row_del_rate = 0.05; o.part_del_rate = 0.1;
+                o.extreme_ts_rate = 0.3;
                 auto rows = generate(cols, o);
 
                 for (auto lvl : {folding_level::verbatim, folding_level::row_folded,

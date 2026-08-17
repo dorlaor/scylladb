@@ -667,7 +667,10 @@ SEASTAR_THREAD_TEST_CASE(test_pq_corpus_shaped_schema) {
             .with_column("pk", bytes_type, column_kind::partition_key)
             .with_column("ck1", bytes_type, column_kind::clustering_key)
             .with_column("ck2", bytes_type, column_kind::clustering_key);
-        for (int i = 0; i < 4; ++i) {
+        // Match the corpus more closely: it is 64 + 64 columns with 33 rows and
+        // range tombstones, and it was the range tombstones that this test was
+        // missing.
+        for (int i = 0; i < 12; ++i) {
             sb.with_column(to_bytes(format("v{}", i)),
                            i % 2 ? data_type(list_b) : bytes_type);
             sb.with_column(to_bytes(format("s{}", i)),
@@ -693,21 +696,42 @@ SEASTAR_THREAD_TEST_CASE(test_pq_corpus_shaped_schema) {
         for (int p = 0; p < 6; ++p) {
             auto pk = partition_key::from_single_value(*s, blob(p));
             mutation m(s, pk);
-            const api::timestamp_type ts = 7000 + p;
-            for (int i = 0; i < 4; ++i) {
+            // The corpus uses timestamps near the extremes of int64 -- values like
+            // -9223372036854775737 appear in its output. The folding scheme stores
+            // per-cell and row-marker timestamps as *deltas* against the row's
+            // timestamp, and those subtractions overflow for spans that wide.
+            static const api::timestamp_type extremes[] = {
+                std::numeric_limits<api::timestamp_type>::min() + 70,
+                std::numeric_limits<api::timestamp_type>::max() - 70,
+                -9223372036854775737LL,
+                7000,
+            };
+            const api::timestamp_type ts = extremes[p % 4] + p;
+            for (int i = 0; i < 12; ++i) {
                 const auto& cdef = *s->get_column_definition(to_bytes(format("s{}", i)));
                 if (i % 2) { m.set_static_cell(cdef, make_list(ts, 2)); }
                 else       { m.set_static_cell(cdef, atomic_cell::make_live(
                                      *bytes_type, ts, bytes_view(blob(i)))); }
             }
-            for (int r = 0; r < 4; ++r) {
+            for (int r = 0; r < 9; ++r) {
                 auto ck = clustering_key::from_exploded(*s, {blob(r), blob(r + 1)});
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < 12; ++i) {
                     const auto& cdef = *s->get_column_definition(to_bytes(format("v{}", i)));
                     if (i % 2) { m.set_clustered_cell(ck, cdef, make_list(ts, 1 + r % 2)); }
                     else       { m.set_clustered_cell(ck, cdef, atomic_cell::make_live(
                                         *bytes_type, ts, bytes_view(blob(r + i)))); }
                 }
+            }
+            // Two range tombstones per partition, which is what the corpus has and
+            // what this test was missing.
+            for (int t = 0; t < 2; ++t) {
+                auto lo = clustering_key_prefix::from_exploded(*s, {blob(1 + t * 3)});
+                auto hi = clustering_key_prefix::from_exploded(*s, {blob(3 + t * 3)});
+                m.partition().apply_delete(*s, range_tombstone(
+                        std::move(lo), t ? bound_kind::incl_start : bound_kind::excl_start,
+                        std::move(hi), t ? bound_kind::excl_end : bound_kind::incl_end,
+                        tombstone(ts + 1 + t,
+                                  gc_clock::time_point(gc_clock::duration(p + t + 1)))));
             }
             muts.push_back(std::move(m));
         }
