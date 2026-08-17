@@ -71,6 +71,10 @@ bytes encode(cql_type t, const value& v) {
 class pq_reader : public mutation_reader::impl {
     sstables::shared_sstable _sst;
     const dht::partition_range* _pr;
+    // Held by value. The caller's slice can be a temporary -- the reversed path
+    // in sstable::make_reader builds one with reverse_slice() -- and a reader
+    // outlives the call that made it.
+    query::partition_slice _slice;
     sstables::read_monitor& _mon;
     const bool _use_index;
 
@@ -100,6 +104,7 @@ class pq_reader : public mutation_reader::impl {
 
     // Partition being assembled across windows.
     std::vector<value> _open_pk;
+    std::optional<dht::decorated_key> _open_dk;
     bool _open = false;
     // True while sitting inside a partition the range excludes.
     bool _skipping = false;
@@ -128,9 +133,10 @@ public:
     // the interface while ignoring the position range would silently return rows
     // the caller did not ask for.
     pq_reader(sstables::shared_sstable sst, schema_ptr s, reader_permit permit,
-              const dht::partition_range& pr, sstables::read_monitor& mon, bool use_index)
+              const dht::partition_range& pr, const query::partition_slice& slice,
+              sstables::read_monitor& mon, bool use_index)
         : impl(std::move(s), std::move(permit))
-        , _sst(std::move(sst)), _pr(&pr), _mon(mon), _use_index(use_index) {}
+        , _sst(std::move(sst)), _pr(&pr), _slice(slice), _mon(mon), _use_index(use_index) {}
 
     future<> fill_buffer() override {
         if (_end_of_stream) { co_return; }
@@ -408,6 +414,7 @@ void pq_reader::emit_row(const row& r) {
             pt = tombstone(r.part_del->timestamp,
                            gc_clock::time_point(gc_clock::duration(r.part_del->local_deletion_time)));
         }
+        _open_dk = dk;
         push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
                 partition_start(std::move(dk), pt)));
         _open_pk = std::move(pk);
@@ -486,6 +493,20 @@ void pq_reader::emit_row(const row& r) {
     }
     auto ck = clustering_key::from_exploded(*_schema, ck_parts);
 
+    // Honour the query's clustering slice. The reader does not *seek* to the
+    // slice -- the ColumnIndex's per-page clustering bounds would let a later
+    // version do that -- but it must not emit rows outside it. Returning extra
+    // rows is what the mutation-source conformance suite trips on.
+    if (_open_dk) {
+        const auto& ranges = _slice.row_ranges(*_schema, _open_dk->key());
+        clustering_key_prefix::tri_compare cmp(*_schema);
+        bool in = ranges.empty();
+        for (const auto& r : ranges) {
+            if (r.contains(ck, cmp)) { in = true; break; }
+        }
+        if (!in) { return; }
+    }
+
     ::row cells;
     for (const auto& [k, c] : r.cells) {
         if (k >= _static_base) { continue; }       // static: already emitted above
@@ -538,12 +559,11 @@ mutation_reader make_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding,
         sstables::read_monitor& mon) {
-    // The slice is applied by the caller's filtering layers. Pushing column
-    // projection down into the page reader is where the big scan win lives
-    // (design doc 10.1c) and is tracked separately.
-    (void)slice;
+    // Column projection is not pushed down yet -- that is where the big scan win
+    // lives (design doc 10.1c) and is tracked separately. The *row* slice is
+    // honoured, in pq_reader::emit_row.
     auto rd = make_mutation_reader<pq_reader>(std::move(sst), std::move(query_schema),
-                                              std::move(permit), range, mon, true);
+                                              std::move(permit), range, slice, mon, true);
     if (fwd) {
         rd = make_forwardable(std::move(rd));
     }
@@ -556,8 +576,10 @@ mutation_reader make_full_scan_reader(
         reader_permit permit,
         tracing::trace_state_ptr,
         sstables::read_monitor& mon) {
-    return make_mutation_reader<pq_reader>(std::move(sst), std::move(schema),
-            std::move(permit), query::full_partition_range, mon, false);
+    // A full scan wants everything, so the schema's full slice is the right one.
+    auto& s_ref = *schema;
+    return make_mutation_reader<pq_reader>(std::move(sst), schema,
+            std::move(permit), query::full_partition_range, s_ref.full_slice(), mon, false);
 }
 
 } // namespace sstables::parquet

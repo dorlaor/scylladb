@@ -35,6 +35,7 @@
 #include "readers/from_mutations.hh"
 #include "readers/combined.hh"
 #include "sstables/sstables.hh"
+#include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
 
 #include <cstdio>
@@ -509,5 +510,42 @@ SEASTAR_THREAD_TEST_CASE(test_pq_forwarding_reader_honours_position_range) {
             .fast_forward_to(ck(8), ck(9))
             .produces_row_with_key(ck(8))
             .produces_end_of_stream();
+    }).get();
+}
+
+// A read with a clustering slice must not return rows outside it. The reader
+// used to take the slice and drop it, which the mutation-source conformance
+// suite catches in test_range_tombstones_v2 -- and which also left a dangling
+// reference, because the reversed path builds its slice with reverse_slice()
+// and a reader outlives the call that made it.
+SEASTAR_THREAD_TEST_CASE(test_pq_read_honours_clustering_slice) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 8, 12);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto ck = [&] (int i) {
+            return clustering_key::from_single_value(*s, int32_type->decompose(i));
+        };
+        auto slice = partition_slice_builder(*s)
+                .with_range(query::clustering_range::make(ck(4), ck(7)))
+                .build();
+
+        const auto& want = expected[0];
+        auto pr = dht::partition_range::make_singular(want.decorated_key());
+        auto rd = sst->make_reader(s, env.make_reader_permit(), pr, slice);
+        auto close = deferred_close(rd);
+        auto got = read_mutation_from_mutation_reader(rd).get();
+        BOOST_REQUIRE(got);
+
+        sstring keys;
+        for (const auto& re : got->partition().clustered_rows()) {
+            keys += format("{}{}", keys.empty() ? "" : ",",
+                           value_cast<int32_t>(int32_type->deserialize(
+                                   re.key().explode(*s)[0])));
+        }
+        BOOST_REQUIRE_EQUAL(keys, sstring("4,5,6,7"));
     }).get();
 }

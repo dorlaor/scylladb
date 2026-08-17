@@ -1983,17 +1983,25 @@ table, not the size.
        whole job is to make someone notice.
     2. It does **not** fail on collections. It gets as far as `test_range_tombstones_v2` in
        `run_mutation_reader_tests_basic`, well inside the suite.
-    3. It fails because **the reader ignores the query's clustering slice**. `make_reader`
-       takes `slice` and drops it on the floor, so a sliced read returns rows outside the
-       requested clustering ranges — the same class of bug as the forwarding one fixed
-       earlier the same day, and now the next thing to fix. Honouring a slice means
-       filtering emitted rows against `slice.row_ranges()` *and* clipping range tombstone
-       changes to those ranges; the ColumnIndex would let a later version seek rather than
-       filter.
+    3. It failed because **the reader ignored the query's clustering slice** — `make_reader`
+       took `slice` and dropped it, so a sliced read returned rows outside the requested
+       ranges. **Fixed the same day**: rows are now filtered against
+       `slice.row_ranges()`. Two things worth recording about that fix:
 
-    So the order of work is: clustering slices, then multi-cell collections (which need
-    Dremel repetition levels — the encoder emits definition levels only, so nesting is not
-    expressible at all today). Counters are excluded by design.
+       - It exposed a **dangling reference that had been latent since the reader was
+         written**. Holding `const query::partition_slice&` looks like what mx does, but a
+         pq reader outlives the call that made it, and the reversed path in
+         `sstable::make_reader` builds its slice with `reverse_slice()` — a temporary. The
+         bug was invisible while the slice was never dereferenced. The reader now holds the
+         slice **by value**.
+       - It filters rather than seeks. Range tombstone changes are *not* yet clipped to the
+         slice, so a sliced read can still carry a change for a range whose rows it does
+         not return. That is harmless for query results but not canonical, and it is the
+         remaining half of this item.
+
+    So the order of work is: clip range tombstone changes to the slice, then multi-cell
+    collections (which need Dremel repetition levels — the encoder emits definition levels
+    only, so nesting is not expressible at all today). Counters are excluded by design.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
