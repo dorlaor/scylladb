@@ -96,6 +96,16 @@ class delta_binary_packed_encoder {
         uint8_t w = 0; while (max) { ++w; max >>= 1; } return w;
     }
 
+    // Every step of the delta arithmetic here is done in unsigned space, and
+    // deliberately so: the values can span the whole int64 range -- timestamps at
+    // both ends of it are a real case, and the losslessness suite generates them --
+    // and a signed difference then overflows, which is undefined behaviour rather
+    // than the wrap-around the format relies on. Modulo 2**64 throughout round-trips
+    // exactly, and the decoder undoes it the same way.
+    //
+    // If deltas do wrap, `min_delta` stops being a meaningful minimum and the width
+    // comes out at 64, so such a block simply does not compress. That is the correct
+    // outcome: correctness first, and the case is pathological.
     void flush_block() {
         if (_deltas.empty()) { return; }
         // Pad the block out to BLOCK values so miniblock arithmetic is uniform.
@@ -110,7 +120,7 @@ class delta_binary_packed_encoder {
         for (size_t m = 0; m < MINIS; ++m) {
             uint64_t maxv = 0;
             for (size_t i = 0; i < MINI; ++i) {
-                maxv = std::max(maxv, uint64_t(_deltas[m * MINI + i] - min_delta));
+                maxv = std::max(maxv, uint64_t(_deltas[m * MINI + i]) - uint64_t(min_delta));
             }
             uint8_t w = width_of(maxv);
             _out[width_at + m] = w;
@@ -118,7 +128,7 @@ class delta_binary_packed_encoder {
             // Miniblock bodies are plain bit-packed (no RLE hybrid header).
             uint64_t acc = 0; int bits = 0;
             for (size_t i = 0; i < MINI; ++i) {
-                uint64_t v = uint64_t(_deltas[m * MINI + i] - min_delta);
+                uint64_t v = uint64_t(_deltas[m * MINI + i]) - uint64_t(min_delta);
                 acc |= (w == 64 ? v : (v & ((1ull << w) - 1))) << bits;
                 bits += w;
                 while (bits >= 8) { _out.push_back(uint8_t(acc)); acc >>= 8; bits -= 8; }
@@ -140,7 +150,7 @@ public:
         zigzag(_out, vals[0]);
         _prev = vals[0];
         for (size_t i = 1; i < vals.size(); ++i) {
-            _deltas.push_back(vals[i] - _prev);
+            _deltas.push_back(int64_t(uint64_t(vals[i]) - uint64_t(_prev)));
             _prev = vals[i];
             if (_deltas.size() == BLOCK) { flush_block(); }
         }
@@ -192,6 +202,46 @@ inline dict_result encode_dictionary_byte_array(std::span<const std::string> val
     // the file would not be externally readable -- which is the whole point of
     // the format. Cost is one bit per value in a case that compresses away.
     if (bw == 0) { bw = 1; }
+    r.index_page.push_back(bw);
+    rle_encoder enc(bw);
+    enc.encode(idx);
+    r.index_page.insert(r.index_page.end(), enc.bytes().begin(), enc.bytes().end());
+    return r;
+}
+
+// The same, for fixed-width values. A PLAIN dictionary page for a fixed-width type
+// is just the distinct values back to back, and the index stream is identical.
+//
+// Distinctness is decided on the **bit pattern**, not on `==`. For integers the two
+// agree; for doubles the bit pattern is the stricter one, which is what a lossless
+// format needs -- it keeps -0.0 apart from 0.0 and one NaN apart from another, where
+// `==` would fold the first pair together and call the second pair unequal to itself.
+template <typename T>
+requires (sizeof(T) == 4 || sizeof(T) == 8)
+inline dict_result encode_dictionary_fixed(std::span<const T> vals) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    dict_result r;
+    std::unordered_map<uint64_t, uint32_t> seen;
+    std::vector<T> distinct;
+    std::vector<uint64_t> idx;
+    idx.reserve(vals.size());
+    for (const T& v : vals) {
+        uint64_t key = 0;
+        std::memcpy(&key, &v, sizeof(T));
+        auto it = seen.find(key);
+        if (it == seen.end()) {
+            uint32_t id = uint32_t(distinct.size());
+            distinct.push_back(v);
+            seen.emplace(key, id);
+            idx.push_back(id);
+        } else {
+            idx.push_back(it->second);
+        }
+    }
+    r.num_distinct = distinct.size();
+    for (const T& v : distinct) { put_le(r.dictionary_page, &v, sizeof(T)); }
+    uint8_t bw = bit_width_for(r.num_distinct ? r.num_distinct - 1 : 0);
+    if (bw == 0) { bw = 1; }        // see encode_dictionary_byte_array
     r.index_page.push_back(bw);
     rle_encoder enc(bw);
     enc.encode(idx);

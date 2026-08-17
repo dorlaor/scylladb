@@ -23,6 +23,9 @@
 // That also lets the whole path be driven from a unit test without an sstable.
 
 #include "sstables/parquet/schema_mapping.hh"
+#include <map>
+#include <seastar/core/sstring.hh>
+#include "sstables/metadata_collector.hh"
 #include "sstables/writer_impl.hh"
 #include "sstables/writer.hh"
 
@@ -37,9 +40,63 @@ struct pq_writer_config {
     folding_level      level = folding_level::row_folded;
     exception_encoding exc   = exception_encoding::sparse;
     format::writer_options wopt{};
-    // Rows buffered before a row group is cut. The real writer will bound this
-    // by bytes as well -- see design doc section 5.5 on the memory budget.
-    size_t row_group_rows = 1'000'000;
+    // A row group is cut when either limit trips.
+    //
+    // `row_group_buffer_bytes` is **buffered shredder memory**, not encoded output, and
+    // the two differ by about 343x -- 1 887 B/row held in memory against 5.2 B/row
+    // written. It is named for what it measures because the obvious name invites a 343x
+    // misconfiguration: someone setting "64 MiB" expecting 64 MiB of Parquet gets about
+    // 35 600 rows, which is roughly 185 kB of actual output on a narrow table. Its job is
+    // to stop a shard running out of memory (R-13), so it is charged against
+    // fragment_shredder::buffered_bytes(), which errs ~4% high on purpose.
+    //
+    // `row_group_rows` is the read-granularity knob and currently a backstop, because at
+    // ~1.9 kB/row the byte budget fires roughly 28x sooner. The two serve different
+    // people: bytes protects the shard, rows tunes point-read and scan cost. Both are
+    // exposed for that reason -- see design doc 5.5a and 8.2.
+    size_t row_group_rows         = 1'000'000;
+    size_t row_group_buffer_bytes = 64u << 20;
+};
+
+// The user-facing `parquet = {...}` table property (design doc 8.2), parsed and
+// validated into a pq_writer_config.
+//
+// Mirrors how `compression = {...}` becomes compression_parameters: a map of strings
+// from CQL, validated once at ALTER/CREATE time so a bad value is a configuration
+// error rather than a broken sstable discovered later.
+//
+// Only the knobs that are actually implemented are accepted. Silently ignoring a
+// recognised-looking option is worse than rejecting it -- a user who sets
+// `compression: 'gzip'` and gets zstd has been lied to -- so anything the writer
+// cannot honour is an error with the supported set named.
+class parquet_parameters {
+public:
+    static constexpr const char* ROW_GROUP_ROWS         = "row_group_rows";
+    static constexpr const char* ROW_GROUP_BUFFER_BYTES = "row_group_buffer_bytes";
+    static constexpr const char* PAGE_ROWS              = "page_rows";
+    static constexpr const char* COMPRESSION            = "compression";
+    static constexpr const char* COMPRESSION_LEVEL      = "compression_level";
+    static constexpr const char* METADATA_FOLDING       = "metadata_folding";
+
+    // Guard rails. The lower bound on rows is not arbitrary: below ~1 000 rows the
+    // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --
+    // at 100 rows on a 20-leaf table it is 45 B/row against a 5.2 B/row total, so the
+    // file grows about ninefold (design doc 10.4c).
+    static constexpr size_t min_row_group_rows = 1'000;
+    static constexpr size_t max_row_group_rows = 100'000'000;
+    static constexpr size_t min_buffer_bytes   = 1u << 20;    // 1 MiB
+    static constexpr size_t max_buffer_bytes   = 1024ull << 20; // 1 GiB
+
+    parquet_parameters() = default;
+    explicit parquet_parameters(const std::map<sstring, sstring>& opts);
+
+    // Only entries that differ from the defaults, so DESCRIBE stays terse.
+    std::map<sstring, sstring> to_map() const;
+
+    const pq_writer_config& config() const { return _cfg; }
+
+private:
+    pq_writer_config _cfg;
 };
 
 // Builds the layer-2 column description for a Scylla schema. Exposed because
@@ -56,6 +113,7 @@ class fragment_shredder {
     const ::schema& _schema;
     std::vector<cql_column> _cols;
     std::vector<row> _rows;
+    size_t _buffered_bytes = 0;
     std::vector<value> _pk;      // current partition's key components
     std::optional<deletion_info> _part_del;
     std::map<size_t, cell> _static_cells;     // indexed as value columns
@@ -81,7 +139,13 @@ public:
     const std::vector<cql_column>& columns() const { return _cols; }
     const std::vector<row>& rows() const { return _rows; }
     size_t size() const { return _rows.size(); }
-    void clear() { _rows.clear(); }
+    void clear() { _rows.clear(); _buffered_bytes = 0; }
+
+    // Estimated heap held by the buffered rows, for the write-side memory budget
+    // (R-13, design doc 5.5a). Errs high on purpose -- see heap_bytes(). Accumulated
+    // as rows are appended rather than walked on demand, because the writer needs to
+    // consult it after every row.
+    size_t buffered_bytes() const { return _buffered_bytes; }
 
     // Schema + shred + encode the accumulated rows into a Parquet file image.
     // Accepts any folding level, including the lossy export-only L3.
@@ -91,6 +155,19 @@ public:
     // must go through this: writing L3 into an sstable would silently discard
     // write times, TTLs and deletions.
     std::vector<uint8_t> to_parquet_for_storage(const pq_writer_config&) const;
+
+private:
+    // Static content rides on every row of the partition, because the reader
+    // rebuilds the static row from whichever row it sees first -- and that may be
+    // a range tombstone change or a placeholder, not a clustering row. Both the
+    // atomic cells and the collections have to go on, together: replaying only
+    // the cells drops every static collection in any partition whose first row is
+    // not a clustering row.
+    void replay_statics(row& r) const;
+
+    // The one place a row enters the buffer, so the memory accounting cannot drift
+    // away from the buffer the way the static-cell replay once did.
+    void push_row(row&& r);
 };
 
 class pq_writer_impl : public sstables::sstable_writer::writer_impl {
@@ -119,6 +196,37 @@ private:
     uint64_t _partition_first_row = 0;
     bool _in_partition = false;
 
+    // Statistics metadata, collected with the same semantics as mx -- see
+    // sstables/mx/writer.cc write_cell() and write_liveness_info().
+    //
+    // This is correctness, not reporting. The min/max timestamps, the
+    // local-deletion-time range and the tombstone drop-time histogram are what
+    // compaction and tombstone garbage collection read; an sstable that
+    // under-reports them can have a tombstone dropped while data it shadows is
+    // still live. Before this existed the pq writer fed its metadata_collector
+    // only add_key().
+    sstables::column_stats _c_stats;
+
+    void collect_atomic_cell(const atomic_cell_view& cell);
+    void collect_cell(const column_definition& cdef, const atomic_cell_or_collection& acoc);
+    void collect_cells(const ::row& cells, ::column_kind kind);
+    void collect_marker(const row_marker& marker);
+
+    // Streaming row groups. Both stay empty for an sstable that fits inside the
+    // budget, which then takes the single-shot path in consume_end_of_stream() and is
+    // byte-for-byte what it was before -- so every size measured in design doc 10 is
+    // unaffected.
+    //
+    // Once a cut happens the leaf set has to be fixed, and it cannot be derived from
+    // rows not yet seen, so it becomes the conservative one (design doc 5.5a).
+    std::optional<mapped_schema> _ms;
+    std::unique_ptr<format::parquet_file_writer> _pq;
+    // Rows already flushed into earlier row groups. The index entry is a file-global
+    // row ordinal (option A), so it cannot come from the shredder's own size once the
+    // shredder is being cleared at each cut.
+    uint64_t _rows_flushed = 0;
+
+    void cut_row_group();
     void finish_open_partition();
     void write_components();
 

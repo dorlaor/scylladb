@@ -182,17 +182,21 @@ bool compare(const std::vector<row>& in, const std::vector<row>& out,
                 why = "row " + std::to_string(i) + ": partition tombstone differs"; return false;
             }
         }
+        // Every cell must survive every lossless level, dead ones included.
+        //
+        // This check used to require the opposite: outside L0 a dead cell was
+        // expected to be *absent* from the output, and preserving one was reported as
+        // "dead cell resurrected". That had the concept backwards. Dropping a dead
+        // cell is what resurrects data -- the deletion stops shadowing whatever it was
+        // hiding, so the old value reappears on the next merge. The expectation was
+        // written to match what the reassembler did (it bailed on a missing value
+        // before consulting `__ldt_`), which made a real data-loss bug look correct
+        // for 540 cases.
+        //
+        // Only L3 may discard cell metadata, and it is export-only --
+        // to_parquet_for_storage() refuses it outright.
         for (const auto& [k, c] : in[i].cells) {
-            const bool keeps = (lvl == folding_level::verbatim) || (c.live && c.v);
             auto it = out[i].cells.find(k);
-            if (!keeps) {
-                if (it != out[i].cells.end()) {
-                    why = "row " + std::to_string(i) + " col " + std::to_string(k) +
-                          ": dead cell resurrected";
-                    return false;
-                }
-                continue;
-            }
             if (it == out[i].cells.end()) {
                 why = "row " + std::to_string(i) + " col " + std::to_string(k) + ": cell lost";
                 return false;
@@ -217,12 +221,20 @@ bool compare(const std::vector<row>& in, const std::vector<row>& out,
                     why = "row " + std::to_string(i) + " col " + std::to_string(k) + ": ttl differs";
                     return false;
                 }
+                if (c.live != it->second.live) {
+                    why = "row " + std::to_string(i) + " col " + std::to_string(k) +
+                          ": liveness differs";
+                    return false;
+                }
+                if (c.local_deletion_time != it->second.local_deletion_time) {
+                    why = "row " + std::to_string(i) + " col " + std::to_string(k) +
+                          ": local deletion time differs";
+                    return false;
+                }
             }
         }
-        size_t expect = 0;
-        for (const auto& [k, c] : in[i].cells) {
-            if (lvl == folding_level::verbatim || (c.live && c.v)) { ++expect; }
-        }
+        // No level may invent cells either, so the counts must match exactly.
+        const size_t expect = in[i].cells.size();
         if (out[i].cells.size() != expect) {
             why = "row " + std::to_string(i) + ": cell count " +
                   std::to_string(out[i].cells.size()) + " != " + std::to_string(expect);
@@ -233,7 +245,7 @@ bool compare(const std::vector<row>& in, const std::vector<row>& out,
 }
 
 int roundtrip() {
-    size_t cases = 0, fails = 0;
+    size_t cases = 0, fails = 0, wider = 0, derived_leaves = 0;
     const double divs[] = {0.0, 0.05, 0.25, 0.5, 1.0};
     const double nulls[] = {0.0, 0.25, 0.6};
     const double ttls[] = {0.0, 0.3};
@@ -250,24 +262,50 @@ int roundtrip() {
             auto rows = generate(cols, o);
             for (auto lvl : {folding_level::verbatim, folding_level::row_folded,
                              folding_level::uniform})
-            for (auto exc : {exception_encoding::sparse, exception_encoding::per_column}) {
+            for (auto exc : {exception_encoding::sparse, exception_encoding::per_column})
+            // Both leaf sets, over the same cases. `conservative` is what an incremental
+            // row-group writer must use, because Parquet fixes one leaf set per file
+            // before the first row group and the flags are otherwise derived from every
+            // row. It emits metadata leaves the data does not need, so it exercises a
+            // different reassembly path -- every optional leaf present but null -- and
+            // losslessness has to hold there too or cutting row groups is unsafe.
+            for (auto ls : {leaf_set::derived, leaf_set::conservative}) {
                 ++cases;
-                auto ms = map_schema(cols, lvl, rows, exc);
+                auto ms = map_schema(cols, lvl, rows, exc, ls);
+                // Guard against the new dimension being a no-op: if `conservative` were
+                // ignored, every case above would still pass and prove nothing. The
+                // conservative set must never be smaller, and must sometimes be larger.
+                if (ls == leaf_set::derived) {
+                    derived_leaves = ms.columns.size();
+                } else {
+                    if (ms.columns.size() < derived_leaves) {
+                        ++fails;
+                        std::printf("  FAIL conservative leaf set (%zu) smaller than derived (%zu)\n",
+                                    ms.columns.size(), derived_leaves);
+                    }
+                    if (ms.columns.size() > derived_leaves) { ++wider; }
+                }
                 auto data = shred(ms, cols, rows);
                 auto back = reassemble(ms, cols, data, rows.size());
                 std::string why;
                 if (!compare(rows, back, ms.level, why)) {
                     ++fails;
-                    std::printf("  FAIL w=%zu div=%.2f null=%.2f ttl=%.2f del=%.2f %s(->%s) exc=%s: %s\n",
+                    std::printf("  FAIL w=%zu div=%.2f null=%.2f ttl=%.2f del=%.2f %s(->%s) exc=%s leaves=%s: %s\n",
                                 w, d, nl, tt, dl, to_string(lvl), to_string(ms.level),
-                                exc == exception_encoding::sparse ? "sparse" : "per-col", why.c_str());
+                                exc == exception_encoding::sparse ? "sparse" : "per-col",
+                                ls == leaf_set::derived ? "derived" : "conservative", why.c_str());
                     if (fails > 8) { std::printf("  (stopping after 8)\n"); goto done; }
                 }
             }
         }
     }
 done:
-    std::printf("round-trip: %zu cases, %zu failures\n", cases, fails);
+    std::printf("round-trip: %zu cases, %zu failures (%zu with a wider conservative leaf set)\n",
+                cases, fails, wider);
+    if (!wider) {
+        std::printf("  FAIL conservative leaf set was never wider -- the flag is a no-op\n");
+        ++fails;
+    }
     std::printf("%s\n", fails ? "SHRED ROUNDTRIP FAIL" : "SHRED ROUNDTRIP PASS");
     return fails ? 1 : 0;
 }

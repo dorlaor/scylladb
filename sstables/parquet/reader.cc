@@ -15,6 +15,7 @@
 #include "sstables/mutation_fragment_filter.hh"
 #include "readers/forwardable.hh"
 #include "mutation/collection_mutation.hh"
+#include "mutation/counters.hh"
 #include "types/collection.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/mutation.hh"
@@ -61,6 +62,36 @@ bytes encode(cql_type t, const value& v) {
         return bytes(reinterpret_cast<const int8_t*>(s.data()), s.size());
     }
     }
+}
+
+// The inverse of read_counter_cell(): rebuild a counter cell from the elements
+// standing in for its shards. An element-less collection carrying a tombstone is
+// a dead counter cell; anything else is live, and every element's timestamp is
+// the cell's own so the first one serves.
+//
+// Shards go back through add_maybe_unsorted_shard() rather than add_shard():
+// counter_cell_view requires them sorted by id, and while our writer emits them
+// in the order the source cell held them -- already sorted -- relying on that
+// would make the reader depend on an invariant it does not enforce.
+static atomic_cell_or_collection build_counter(const collection_cell& cc) {
+    if (cc.elements.empty()) {
+        const auto ts = cc.tomb ? cc.tomb->timestamp : api::missing_timestamp;
+        const auto ldt = gc_clock::time_point(
+                gc_clock::duration(cc.tomb ? cc.tomb->local_deletion_time : 0));
+        return atomic_cell_or_collection(atomic_cell::make_dead(ts, ldt));
+    }
+    counter_cell_builder b(cc.elements.size());
+    for (const auto& e : cc.elements) {
+        int64_t msb = 0, lsb = 0, value = 0, clock = 0;
+        if (!unpack_i64_pair(e.key, msb, lsb) ||
+            !e.value || !unpack_i64_pair(*e.value, value, clock)) {
+            throw std::runtime_error("pq: malformed counter shard");
+        }
+        b.add_maybe_unsorted_shard(counter_shard(
+                counter_id(utils::UUID(msb, lsb)), value, clock));
+    }
+    b.sort_and_remove_duplicates();
+    return atomic_cell_or_collection(b.build(cc.elements.front().timestamp));
 }
 
 // Rebuild a collection cell from the mapping's element list. Keys and values are
@@ -507,7 +538,8 @@ void pq_reader::emit_row(const row& r) {
             if (k < _static_base) { continue; }
             const column_definition& cdef =
                     _schema->static_column_at(column_id(k - _static_base));
-            st.append_cell(column_id(k - _static_base), build_collection(cdef, cc));
+            st.append_cell(column_id(k - _static_base),
+                    cdef.is_counter() ? build_counter(cc) : build_collection(cdef, cc));
         }
         if (!st.empty()) {
             // The filter has to be told about the static row even though the slice
@@ -527,17 +559,21 @@ void pq_reader::emit_row(const row& r) {
     // weight and region, and emit it in place. Everything past prefix_len in the
     // clustering columns is padding the writer put there.
     if (r.rtc) {
-        std::optional<clustering_key_prefix> prefix;
-        if (r.rtc->prefix_len > 0) {
-            std::vector<bytes> parts;
-            parts.reserve(size_t(r.rtc->prefix_len));
-            for (int32_t i = 0; i < r.rtc->prefix_len && size_t(i) < _n_ck; ++i) {
-                parts.push_back(encode(_cols[_n_pk + size_t(i)].type, r.key[_n_pk + size_t(i)]));
-            }
-            prefix = clustering_key_prefix::from_exploded(*_schema, std::move(parts));
+        // The prefix must always be present, even when it is empty: the bounds
+        // that cover a whole partition -- before_all_clustered_rows and
+        // after_all_clustered_rows -- are an *empty* clustering prefix carrying
+        // weight -1 or +1, not an absent one. A position with no key at all is
+        // not a valid clustered position, and comparing one against those bounds
+        // silently yields nonsense rather than failing, which sends the
+        // clustering_ranges_walker past every range and drops the whole partition.
+        std::vector<bytes> parts;
+        parts.reserve(size_t(std::max<int32_t>(r.rtc->prefix_len, 0)));
+        for (int32_t i = 0; i < r.rtc->prefix_len && size_t(i) < _n_ck; ++i) {
+            parts.push_back(encode(_cols[_n_pk + size_t(i)].type, r.key[_n_pk + size_t(i)]));
         }
         auto pos = position_in_partition(partition_region(r.rtc->region),
-                                         bound_weight(r.rtc->weight), std::move(prefix));
+                                         bound_weight(r.rtc->weight),
+                                         clustering_key_prefix::from_exploded(*_schema, std::move(parts)));
         tombstone t;
         if (r.rtc->tomb) {
             t = tombstone(r.rtc->tomb->timestamp,
@@ -601,7 +637,8 @@ void pq_reader::emit_row(const row& r) {
     for (const auto& [k, cc] : r.collections) {
         if (k >= _static_base) { continue; }
         const column_definition& cdef = _schema->regular_column_at(column_id(k));
-        cells.append_cell(column_id(k), build_collection(cdef, cc));
+        cells.append_cell(column_id(k),
+                cdef.is_counter() ? build_counter(cc) : build_collection(cdef, cc));
     }
 
     row_marker rm;

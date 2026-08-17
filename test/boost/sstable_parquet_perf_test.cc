@@ -25,6 +25,8 @@
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/memory.hh>
 
+#include <algorithm>
+#include <cstdlib>
 #include "test/lib/sstable_test_env.hh"
 #include "test/lib/sstable_utils.hh"
 
@@ -94,7 +96,9 @@ struct result {
     sstring   label;
     double    write_ms = 0;
     double    scan_ms = 0;
-    double    point_us = 0;      // per point read
+    double    point_us = 0;      // mean per point read
+    double    point_p50 = 0, point_p95 = 0, point_p99 = 0;
+    size_t    point_n = 0;
     uint64_t  bytes = 0;
     int64_t   scan_peak_kb = 0;  // live-memory high-water during the scan
     size_t    rows = 0;
@@ -130,15 +134,34 @@ result measure(sstables::test_env& env, schema_ptr s,
     r.scan_peak_kb = peak / 1024;
 
     // Point reads, each on a fresh reader so nothing is carried over.
-    t0 = clk::now();
+    //
+    // Timed individually rather than as one bulk average. A mean over a handful of reads
+    // hides the distribution, and the distribution is the interesting part of a point-read
+    // number: the cost here is dominated by per-read setup -- opening a row group and
+    // decompressing a dictionary page -- so a few cheap reads can flatter the mean badly.
+    std::vector<double> samples;
+    samples.reserve(point_idx.size());
     for (size_t i : point_idx) {
         auto pr = dht::partition_range::make_singular(muts[i].decorated_key());
+        auto t1 = clk::now();
         auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
         auto close = deferred_close(rd);
         auto m = read_mutation_from_mutation_reader(rd).get();
+        samples.push_back(duration<double, std::micro>(clk::now() - t1).count());
         if (!m) { BOOST_FAIL("point read returned nothing"); }
     }
-    r.point_us = duration<double, std::micro>(clk::now() - t0).count() / double(point_idx.size());
+    double sum = 0;
+    for (double v : samples) { sum += v; }
+    r.point_us = sum / double(samples.size());
+    r.point_n = samples.size();
+    std::sort(samples.begin(), samples.end());
+    auto pct = [&] (double q) {
+        return samples[std::min(samples.size() - 1,
+                                size_t(q * double(samples.size())))];
+    };
+    r.point_p50 = pct(0.50);
+    r.point_p95 = pct(0.95);
+    r.point_p99 = pct(0.99);
 
     return r;
 }
@@ -154,8 +177,24 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         auto muts = gen(s, n_part, n_rows);
 
         // A fixed spread of partitions, same set for both formats.
-        std::vector<size_t> point_idx;
-        for (int i = 0; i < 50; ++i) { point_idx.push_back(size_t(i) * (muts.size() / 50)); }
+        // Uniformly random distinct partitions, not a stride.
+        //
+        // This used to be 50 evenly-spaced indices, which is both too small a sample to
+        // say anything about a latency distribution and too friendly an access pattern:
+        // a stride walks the partition index and summary in order, so it gets locality
+        // that a real point-read workload does not have. Both formats get the identical
+        // key list, so the comparison stays fair either way -- but the absolute numbers
+        // were optimistic for both.
+        const size_t n_points = [] {
+            if (const char* e = std::getenv("PQ_PERF_POINTS")) {
+                return size_t(std::max(1L, std::atol(e)));
+            }
+            return size_t(10000);
+        }();
+        std::vector<size_t> point_idx(muts.size());
+        for (size_t i = 0; i < muts.size(); ++i) { point_idx[i] = i; }
+        std::shuffle(point_idx.begin(), point_idx.end(), std::mt19937_64(12345));
+        if (point_idx.size() > n_points) { point_idx.resize(n_points); }
 
         auto def = measure(env, s, muts, sstables::get_highest_sstable_version(), "default (me)", point_idx);
         auto pq  = measure(env, s, muts, sstable_version_types::pq, "pq (parquet)", point_idx);
@@ -174,6 +213,17 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
                     "format", "write ms", "scan ms", "point us", "data bytes", "scan kB");
         line(def);
         line(pq);
+        std::printf("\n  point-read distribution over %zu uniformly random partitions:\n",
+                    def.point_n);
+        std::printf("  %-14s  %10s  %10s  %10s  %10s\n",
+                    "format", "mean us", "p50 us", "p95 us", "p99 us");
+        for (const auto& r : {def, pq}) {
+            std::printf("  %-14s  %10.1f  %10.1f  %10.1f  %10.1f\n",
+                        r.label.c_str(), r.point_us, r.point_p50, r.point_p95, r.point_p99);
+        }
+        std::printf("  point ratios: mean %.1fx  p50 %.1fx  p95 %.1fx  p99 %.1fx\n",
+                    pq.point_us / def.point_us, pq.point_p50 / def.point_p50,
+                    pq.point_p95 / def.point_p95, pq.point_p99 / def.point_p99);
         std::printf("  ratios (pq/default): write %.2fx  scan %.2fx  point %.2fx  size %.3fx\n\n",
                     pq.write_ms / def.write_ms, pq.scan_ms / def.scan_ms,
                     pq.point_us / def.point_us, double(pq.bytes) / double(def.bytes));

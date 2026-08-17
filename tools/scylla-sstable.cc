@@ -2604,6 +2604,9 @@ public:
         fmt::print("{{\n");
         fmt::print("  \"rows\": {},\n", _rows);
         fmt::print("  \"parquet_bytes\": {},\n", img.size());
+        // The write-side memory budget's own estimate, so it can be checked against
+        // measured RSS rather than trusted (R-13, design doc 5.5a).
+        fmt::print("  \"buffered_bytes_estimate\": {},\n", _shredder.buffered_bytes());
         fmt::print("  \"row_groups\": {},\n", md.row_groups.size());
         fmt::print("  \"leaf_columns\": {},\n", md.leaf_count());
         fmt::print("  \"folding_level\": \"{}\",\n",

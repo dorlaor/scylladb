@@ -476,10 +476,14 @@ static shared_sstable sstable_for_overlapping_test(test_env& env, const schema_p
     return sst;
 }
 
+static bool has_reference_fixture(sstables::sstable::version_types v) {
+    return v != sstables::sstable::version_types::pq;
+}
+
 SEASTAR_TEST_CASE(check_read_indexes) {
     return test_env::do_with_async([] (test_env& env) {
         for_each_sstable_version([&env] (const sstables::sstable::version_types version) {
-            if (!has_summary_and_index(version)) {
+            if (!has_summary_and_index(version) || !has_reference_fixture(version)) {
                 // read_indexes isn't implemented for BTI indexes
                 return make_ready_future<>();
             }
@@ -516,6 +520,9 @@ SEASTAR_TEST_CASE(check_multi_schema) {
     //);
     return test_env::do_with_async([] (test_env& env) {
         for_each_sstable_version([&env] (const sstables::sstable::version_types version) {
+            if (!has_reference_fixture(version)) {
+                return make_ready_future<>();
+            }
             return seastar::async([&env, version] {
                 auto set_of_ints_type = set_type_impl::get_instance(int32_type, true);
                 auto builder = schema_builder(this_smp_shard_count(), "test", "test_multi_schema")
@@ -613,6 +620,7 @@ SEASTAR_TEST_CASE(test_sliced_mutation_reads) {
     // insert into sliced_mutation_reads_test (pk, ck, v1) values (1, 5, 1);
     return test_env::do_with_async([] (test_env& env) {
       for (auto version : all_sstable_versions) {
+          if (!has_reference_fixture(version)) { continue; }
         auto set_of_ints_type = set_type_impl::get_instance(int32_type, true);
         auto builder = schema_builder(this_smp_shard_count(), "ks", "sliced_mutation_reads_test")
             .with_column("pk", int32_type, column_kind::partition_key)
@@ -704,6 +712,7 @@ SEASTAR_TEST_CASE(test_wrong_range_tombstone_order) {
 
     return test_env::do_with_async([] (test_env& env) {
       for (const auto version : all_sstable_versions) {
+          if (!has_reference_fixture(version)) { continue; }
         auto s = schema_builder(this_smp_shard_count(), "ks", "wrong_range_tombstone_order")
             .with(schema_builder::compact_storage::yes)
             .with_column("p", int32_type, column_kind::partition_key)
@@ -773,6 +782,7 @@ SEASTAR_TEST_CASE(test_counter_read) {
 
         return test_env::do_with_async([] (test_env& env) {
           for (const auto version : all_sstable_versions) {
+              if (!has_reference_fixture(version)) { continue; }
             auto s = schema_builder(this_smp_shard_count(), "ks", "counter_test")
                     .with_column("pk", int32_type, column_kind::partition_key)
                     .with_column("ck", int32_type, column_kind::clustering_key)
@@ -898,6 +908,7 @@ SEASTAR_TEST_CASE(test_promoted_index_read) {
 
     return test_env::do_with_async([] (test_env& env) {
       for (const auto version : all_sstable_versions) {
+          if (!has_reference_fixture(version)) { continue; }
         auto s = schema_builder(this_smp_shard_count(), "ks", "promoted_index_read")
                 .with_column("pk", int32_type, column_kind::partition_key)
                 .with_column("ck1", int32_type, column_kind::clustering_key)
@@ -1575,6 +1586,7 @@ SEASTAR_TEST_CASE(sstable_composite_reverse_tombstone_metadata_check) {
 SEASTAR_TEST_CASE(test_partition_skipping) {
     return test_env::do_with_async([] (test_env& env) {
       for (const auto version : all_sstable_versions) {
+          if (!has_reference_fixture(version)) { continue; }
         auto s = schema_builder(this_smp_shard_count(), "ks", "test_skipping_partitions")
                 .with_column("pk", int32_type, column_kind::partition_key)
                 .with_column("v", int32_type)
@@ -2139,6 +2151,7 @@ SEASTAR_TEST_CASE(test_wrong_counter_shard_order) {
         // on a three-node Scylla 1.7.4 cluster.
         return test_env::do_with_async([] (test_env& env) {
           for (const auto version : all_sstable_versions) {
+              if (!has_reference_fixture(version)) { continue; }
             auto s = schema_builder(this_smp_shard_count(), "scylla_bench", "test_counters")
                     .with_column("pk", long_type, column_kind::partition_key)
                     .with_column("ck", long_type, column_kind::clustering_key)
@@ -2218,6 +2231,7 @@ SEASTAR_TEST_CASE(test_broken_promoted_index_is_skipped) {
     return test_env::do_with_async([] (test_env& env) {
       sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
       for (const auto version : all_sstable_versions) {
+          if (!has_reference_fixture(version)) { continue; }
         if (!has_summary_and_index(version)) {
             // This is an old test for some workaround for
             // incorrectly-generated promoted indexes.
@@ -2257,6 +2271,7 @@ SEASTAR_TEST_CASE(test_old_format_non_compound_range_tombstone_is_read) {
     // delete from ks.test where pk = 1 and ck = 2;
     return test_env::do_with_async([] (test_env& env) {
         for (const auto version : all_sstable_versions) {
+            if (!has_reference_fixture(version)) { continue; }
             if (version < sstable_version_types::mc) { // Applies only to formats older than 'm'
                 auto s = schema_builder(this_smp_shard_count(), "ks", "test")
                     .with_column("pk", int32_type, column_kind::partition_key)

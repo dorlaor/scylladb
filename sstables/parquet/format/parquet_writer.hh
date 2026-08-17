@@ -154,7 +154,23 @@ public:
     // Nested schema. `tree` is depth-first with the root at index 0, which is how
     // the footer stores it; the leaf specs and their Dremel levels are derived
     // from it by walk_leaves(), so writer and reader agree by construction.
-    struct nested_schema { std::vector<schema_element> tree; };
+    // A schema given as a tree, for anything with repeated groups in it.
+    //
+    // `preferred` carries the per-leaf encoding hints, in leaf order -- the order
+    // walk_leaves() returns, which is also the order the mapping builds its leaves
+    // in. Empty means no hints, which is what a test that only has a tree passes.
+    //
+    // They cannot travel inside the tree: `schema_element` mirrors the Parquet
+    // Thrift SchemaElement, where an encoding is a property of a column chunk, not
+    // of the schema. So structure comes from the tree and encoding comes from here,
+    // and the two stay separate on purpose. Before this field existed the hints
+    // were silently dropped on the nested path and every column was written PLAIN
+    // -- including monotonic clustering keys the mapping had explicitly asked to be
+    // DELTA_BINARY_PACKED. See docs/dev/parquet-storage-format.md section 10.1g.
+    struct nested_schema {
+        std::vector<schema_element> tree;
+        std::vector<std::optional<encoding>> preferred;
+    };
     parquet_file_writer(nested_schema tree, writer_options opt = {});
 
     // The leaves the tree produced, in column order. add_row_group() wants one

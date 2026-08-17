@@ -16,10 +16,12 @@
 // components a loadable sstable needs are written, and that the round trip
 // survives the real read path rather than a test harness.
 //
-// Deliberately limited to what the shredder currently handles: no static rows,
-// no partition or range tombstones, no collections, no counters, no row
-// markers. Those are tracked in docs/dev/parquet-storage-format.md section 11,
-// and are the reason `pq` is not yet in all_sstable_versions.
+// The whole mutation model is covered here: row markers, row and partition
+// tombstones, static rows, range tombstones, non-frozen collections and counters.
+// sstable_conforms_to_mutation_source_test holds pq to the same contract as every
+// other writable version and is the broader net; these cases are the targeted
+// ones, each aimed at a specific way the encoding can go wrong, and they exist
+// because iterating on the conformance suite means a three-minute build per guess.
 
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
@@ -36,9 +38,11 @@
 #include "readers/combined.hh"
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "sstables/sstables.hh"
+#include "sstables/parquet/format/parquet_metadata.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
 #include "mutation/collection_mutation.hh"
+#include "mutation/counters.hh"
 #include "types/map.hh"
 #include "types/set.hh"
 #include "types/list.hh"
@@ -651,6 +655,436 @@ SEASTAR_THREAD_TEST_CASE(test_pq_collections_round_trip) {
         BOOST_REQUIRE_EQUAL(got.size(), want.size());
         for (size_t i = 0; i < got.size(); ++i) {
             assert_that(got[i]).is_equal_to(want[i]);
+        }
+    }).get();
+}
+
+// A deleted cell must not come back as a cell that was never written.
+//
+// L0 folding stores a per-column `__live_` flag, so it can tell "dead" from "absent".
+// L1 and L2 -- and L1 is the default -- do not: they carry the value, a `__ttl_` and a
+// `__ldt_`. Deadness therefore has to be read off `__ldt_`, and the reassembler used to
+// bail on a missing value before looking at it:
+//
+//     if (!present) { continue; }
+//
+// so every dead cell in an L1 file was silently dropped on the way back. That is the
+// worst shape of bug this format can have: the file is valid, the read succeeds, and a
+// cell the user deleted returns as though the delete never happened -- resurrecting
+// whatever it shadowed on merge. It was invisible to a round-trip test that only wrote
+// live cells, and it is why this case gets its own test.
+SEASTAR_THREAD_TEST_CASE(test_pq_dead_cells_are_not_lost) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = schema_builder(1, "ks", "pq_dead")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("a", int32_type)
+            .with_column("b", int32_type)
+            .with_column("c", utf8_type)
+            .build();
+        const auto& adef = *s->get_column_definition(to_bytes("a"));
+        const auto& bdef = *s->get_column_definition(to_bytes("b"));
+        const auto& cdef = *s->get_column_definition(to_bytes("c"));
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 12; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 5000 + p;
+            for (int r = 0; r < 5; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                const auto ldt = gc_clock::time_point(gc_clock::duration(3600 + r));
+                switch ((p + r) % 5) {
+                case 0:
+                    // The case that was lost: the row's *only* content is a dead cell.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_dead(ts, ldt));
+                    break;
+                case 1:
+                    // Dead beside live, so the row survives either way and only the
+                    // deletion itself goes missing.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_dead(ts, ldt));
+                    m.set_clustered_cell(ck, bdef, atomic_cell::make_live(
+                            *int32_type, ts, int32_type->decompose(r)));
+                    break;
+                case 2:
+                    // Every column dead.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_dead(ts, ldt));
+                    m.set_clustered_cell(ck, bdef, atomic_cell::make_dead(ts, ldt));
+                    m.set_clustered_cell(ck, cdef, atomic_cell::make_dead(ts, ldt));
+                    break;
+                case 3:
+                    // A live cell with a TTL also carries an ldt (its expiry), so it
+                    // must still read back as live -- the discriminator is the value,
+                    // not the presence of an ldt.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_live(
+                            *int32_type, ts, int32_type->decompose(r),
+                            gc_clock::time_point(gc_clock::duration(9000 + r)),
+                            gc_clock::duration(600)));
+                    m.set_clustered_cell(ck, bdef, atomic_cell::make_dead(ts, ldt));
+                    break;
+                default:
+                    // Absent must stay absent: `b` and `c` are never written here.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_live(
+                            *int32_type, ts, int32_type->decompose(r)));
+                    break;
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
+
+        // Count the dead cells explicitly, so this cannot pass by both sides being
+        // equally empty -- which is exactly how the bug hid.
+        auto count_dead = [&] (const utils::chunked_vector<mutation>& ms) {
+            size_t n = 0;
+            for (const auto& m : ms) {
+                for (const rows_entry& re : m.partition().clustered_rows()) {
+                    re.row().cells().for_each_cell([&] (column_id id,
+                                                       const atomic_cell_or_collection& acoc) {
+                        const auto& def = s->regular_column_at(id);
+                        if (def.is_atomic() && !acoc.as_atomic_cell(def).is_live()) { ++n; }
+                    });
+                }
+            }
+            return n;
+        };
+        const size_t dead_ref = count_dead(want), dead_pq = count_dead(got);
+        BOOST_REQUIRE_GT(dead_ref, 0u);
+        BOOST_REQUIRE_EQUAL(dead_pq, dead_ref);
+    }).get();
+}
+
+// Row groups are cut when the write buffer exceeds its budget, and the result still
+// round-trips.
+//
+// Until this existed the writer emitted exactly one row group per sstable, so
+// `fragment_shredder` buffered every row before encoding anything -- about 1.8 kB per row,
+// which is 17 GiB at ten million rows (R-13, design doc 5.5a). It also meant the reader's
+// multi-row-group path, which has existed all along, was never once exercised through the
+// sstable layer. Turning on code that has never run is exactly how the delta-encoding
+// bug got in, so this test drives the real thing rather than a unit of it.
+//
+// It uses the *shipping* budget rather than a test-only override, so the row count has to
+// be large enough to trip it: 64 MiB at ~1.9 kB/row is about 35 600 rows.
+SEASTAR_THREAD_TEST_CASE(test_pq_row_groups_are_cut_by_the_memory_budget) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        // Eight value columns rather than two: the budget is on *buffered bytes*, and a
+        // wider row reaches it with far fewer rows, which keeps the test's runtime down.
+        // A row here costs roughly 1.7 kB buffered (a std::map entry plus a cell per
+        // column), so ~40 000 rows is one cut.
+        auto sb = schema_builder(1, "ks", "pq_rg")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("v_txt", utf8_type);
+        for (int i = 0; i < 7; ++i) {
+            sb.with_column(to_bytes(format("v{}", i)), int32_type);
+        }
+        auto s = sb.build();
+        const auto& vt = *s->get_column_definition(to_bytes("v_txt"));
+
+        constexpr int PARTS = 2500, ROWS = 24;      // 60 000 rows -> at least two cuts
+        utils::chunked_vector<mutation> muts;
+        muts.reserve(PARTS);
+        for (int p = 0; p < PARTS; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:06d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 1000 + p;
+            for (int r = 0; r < ROWS; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.set_clustered_cell(ck, vt, atomic_cell::make_live(
+                        *utf8_type, ts, utf8_type->decompose(sstring(format("v{}", r % 40)))));
+                for (int i = 0; i < 7; ++i) {
+                    m.set_clustered_cell(ck, *s->get_column_definition(to_bytes(format("v{}", i))),
+                            atomic_cell::make_live(*int32_type, ts,
+                                                   int32_type->decompose(r * 3 + i)));
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+        auto expected = muts;
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        // The point of the test: more than one row group actually happened. Without this
+        // the round-trip below would pass on a single-row-group file and prove nothing.
+        const uint64_t len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+        std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+        auto md = sstables::parquet::format::parse_footer(img);
+        BOOST_TEST_MESSAGE(fmt::format("row groups: {}, rows: {}",
+                                       md.row_groups.size(), md.num_rows));
+        BOOST_REQUIRE_GT(md.row_groups.size(), 1u);
+        BOOST_REQUIRE_EQUAL(md.num_rows, int64_t(PARTS) * ROWS);
+
+        // Row-group row counts must sum to the total, or the reader's cumulative
+        // ordinal table would point at the wrong group.
+        int64_t sum = 0;
+        for (const auto& g : md.row_groups) {
+            BOOST_REQUIRE_GT(g.num_rows, 0);
+            sum += g.num_rows;
+        }
+        BOOST_REQUIRE_EQUAL(sum, md.num_rows);
+
+        auto got = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+
+        // And a single-partition read, which is the path that turns an index row ordinal
+        // into a page and is where a row group boundary is most likely to be mishandled.
+        for (int p : {0, PARTS / 2, PARTS - 1}) {
+            auto& want = expected[size_t(p)];
+            auto pr = dht::partition_range::make_singular(want.decorated_key());
+            auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+            auto close = deferred_close(rd);
+            auto m = read_mutation_from_mutation_reader(rd).get();
+            BOOST_REQUIRE(m);
+            assert_that(*m).is_equal_to(want);
+        }
+    }).get();
+}
+
+// Counter cells, which are atomic but not scalar: their value is a set of
+// per-replica shards, and merging two counter cells means merging shards by id
+// rather than taking the newer value. Stored as an opaque blob they would still
+// read back byte-identical from a single sstable while being wrong the moment
+// anything merged them, so this checks the shards individually as well as
+// comparing whole mutations against the reference format.
+SEASTAR_THREAD_TEST_CASE(test_pq_counters_round_trip) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = schema_builder(1, "ks", "pq_counters")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("c", counter_type)
+            .with_column("c2", counter_type)
+            .with_column("sc", counter_type, column_kind::static_column)
+            .build();
+
+        const auto& cdef   = *s->get_column_definition(to_bytes("c"));
+        const auto& c2def  = *s->get_column_definition(to_bytes("c2"));
+        const auto& scdef  = *s->get_column_definition(to_bytes("sc"));
+        BOOST_REQUIRE(cdef.is_counter());
+
+        // Deterministic shard ids, so the fixture is reproducible.
+        auto shard_id = [] (int n) {
+            return counter_id(utils::UUID(0x1000000000000000LL + n, 0x2000000000000000LL + n * 7));
+        };
+        auto make_counter = [&] (api::timestamp_type ts, int nshards, int salt) {
+            counter_cell_builder b{size_t(nshards)};
+            for (int i = 0; i < nshards; ++i) {
+                b.add_maybe_unsorted_shard(counter_shard(
+                        shard_id(i), int64_t(salt) * 1000 + i, int64_t(i) + 1));
+            }
+            b.sort_and_remove_duplicates();
+            return b.build(ts);
+        };
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 14; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 9000 + p;
+            if (p % 5 != 4) {
+                m.set_static_cell(scdef, make_counter(ts, 1 + p % 3, p + 50));
+            }
+            for (int r = 0; r < 4; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                const int kind = (p + r) % 4;
+                if (kind == 0) {
+                    m.set_clustered_cell(ck, cdef, make_counter(ts, 1, p));
+                } else if (kind == 1) {
+                    // Several shards: the case an opaque blob would fail to merge.
+                    m.set_clustered_cell(ck, cdef, make_counter(ts, 5, p));
+                } else if (kind == 2) {
+                    // A deleted counter cell, which has no shards at all.
+                    m.set_clustered_cell(ck, cdef, atomic_cell::make_dead(
+                            ts, gc_clock::time_point(gc_clock::duration(p + 3))));
+                } else {
+                    m.set_clustered_cell(ck, cdef, make_counter(ts, 2, p));
+                    m.set_clustered_cell(ck, c2def, make_counter(ts, 3, p + 20));
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
+
+        // Shard-level check, so this cannot pass on blobs that merely compare
+        // equal: every live counter cell must come back with its shard ids,
+        // values and logical clocks intact, and multi-shard cells must exist.
+        size_t live_cells = 0, multi_shard_cells = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            for (const rows_entry& re : got[i].partition().clustered_rows()) {
+                const auto* cell = re.row().cells().find_cell(cdef.id);
+                if (!cell) { continue; }
+                auto av = cell->as_atomic_cell(cdef);
+                if (!av.is_live()) { continue; }
+                ++live_cells;
+                counter_cell_view ccv(av);
+                size_t n = 0;
+                for (auto&& cs : ccv.shards()) {
+                    BOOST_REQUIRE_EQUAL(cs.id(), shard_id(int(n)));
+                    BOOST_REQUIRE_EQUAL(cs.logical_clock(), int64_t(n) + 1);
+                    ++n;
+                }
+                BOOST_REQUIRE_GT(n, 0u);
+                if (n > 1) { ++multi_shard_cells; }
+            }
+        }
+        BOOST_REQUIRE_GT(live_cells, 0u);
+        BOOST_REQUIRE_GT(multi_shard_cells, 0u);
+    }).get();
+}
+
+// Static content when the partition's *first* row is not a clustering row.
+//
+// The writer replays static cells onto every row of the partition and the reader
+// rebuilds the static row from whichever row it sees first. That makes the first
+// row's identity load-bearing, and two shapes make it something other than a
+// clustering row: a range tombstone change that opens before all rows, and the
+// placeholder emitted for a partition that has no rows at all. Both used to
+// replay only the atomic static cells, so every static collection was silently
+// dropped -- and only in those shapes, which is why the ordinary collections
+// round-trip test never saw it.
+//
+// The partition-wide range tombstone matters for a second reason: its bounds are
+// before/after_all_clustered_rows, whose clustering prefix is *empty but present*.
+// Rebuilding those as an absent prefix yields a position that compares as
+// nonsense rather than failing, which sent the walker past every range and
+// dropped the partition's rows wholesale.
+SEASTAR_THREAD_TEST_CASE(test_pq_statics_survive_a_leading_range_tombstone) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto map_si = map_type_impl::get_instance(utf8_type, int32_type, true);
+        auto s = schema_builder(1, "ks", "pq_static_rtc")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("v", int32_type)
+            .with_column("sa", int32_type, column_kind::static_column)
+            .with_column("sm", map_si, column_kind::static_column)
+            .with_column("sm2", map_si, column_kind::static_column)
+            .build();
+
+        const auto& sadef  = *s->get_column_definition(to_bytes("sa"));
+        const auto& smdef  = *s->get_column_definition(to_bytes("sm"));
+        const auto& sm2def = *s->get_column_definition(to_bytes("sm2"));
+
+        auto make_map = [&] (api::timestamp_type ts, int n, int salt) {
+            collection_mutation_writer w{tombstone{}};
+            for (int i = 0; i < n; ++i) {
+                auto k = utf8_type->decompose(sstring(format("k{}_{}", salt, i)));
+                auto kb = managed_bytes(reinterpret_cast<const int8_t*>(k.data()), k.size());
+                w.push_back(managed_bytes_view(kb), atomic_cell::make_live(
+                        *int32_type, ts, int32_type->decompose(i * 10 + salt)));
+            }
+            return atomic_cell_or_collection(std::move(w).finish());
+        };
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 16; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 7000 + p;
+
+            // Every partition carries an atomic static cell and two static
+            // collections. The atomic one is the control: it survived the bug, so
+            // if only it comes back the collections were dropped.
+            m.set_static_cell(sadef, atomic_cell::make_live(
+                    *int32_type, ts, int32_type->decompose(p)));
+            m.set_static_cell(smdef, make_map(ts, 3, p));
+            if (p % 4 != 3) {
+                m.set_static_cell(sm2def, make_map(ts, 2, p + 100));
+            }
+
+            const int shape = p % 4;
+            if (shape != 2) {                       // shape 2: no rows at all
+                for (int r = 0; r < 6; ++r) {
+                    auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                    m.set_clustered_cell(ck, *s->get_column_definition(to_bytes("v")),
+                            atomic_cell::make_live(*int32_type, ts, int32_type->decompose(r)));
+                }
+            }
+
+            if (shape == 0) {
+                // Covers the whole partition: both bounds are an empty prefix.
+                m.partition().apply_delete(*s, range_tombstone(
+                        bound_view::bottom(), bound_view::top(),
+                        tombstone(ts - 1, gc_clock::time_point(gc_clock::duration(p + 1)))));
+            } else if (shape == 1) {
+                // Opens before every row and closes in the middle, so the first
+                // fragment after the static row is still a range tombstone change
+                // but the partition keeps some live rows.
+                auto hi = clustering_key_prefix::from_single_value(*s, int32_type->decompose(3));
+                m.partition().apply_delete(*s, range_tombstone(
+                        bound_view::bottom(),
+                        bound_view(hi, bound_kind::incl_end),
+                        tombstone(ts - 1, gc_clock::time_point(gc_clock::duration(p + 1)))));
+            }
+            // shape 3: ordinary partition, and sm2 absent -- the control case.
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        // Assert the static collections are actually there, so this cannot pass by
+        // both sides being equally empty.
+        size_t with_static_collection = 0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+            const auto& sr = got[i].partition().static_row().get();
+            if (sr.find_cell(smdef.id)) { ++with_static_collection; }
+        }
+        BOOST_REQUIRE_EQUAL(with_static_collection, got.size());
+
+        auto fw = fragments_of(ref, s, env.make_reader_permit());
+        auto fg = fragments_of(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(fg.size(), fw.size());
+        for (size_t i = 0; i < fg.size(); ++i) {
+            BOOST_REQUIRE_EQUAL(fg[i], fw[i]);
         }
     }).get();
 }

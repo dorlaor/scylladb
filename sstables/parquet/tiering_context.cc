@@ -14,17 +14,17 @@
 
 namespace sstables::parquet {
 
-bool schema_is_parquet_eligible(const ::schema& s) {
-    if (s.is_counter()) {
-        return false;
-    }
-    for (const auto& c : s.all_columns()) {
-        // Non-frozen collections carry per-element cell metadata that the
-        // shredder does not model yet. Frozen ones are opaque blobs and fine.
-        if (!c.is_atomic()) {
-            return false;
-        }
-    }
+// C5 of the tiering decision. Nothing in the mutation model is out of reach any
+// more: non-frozen collections became a repeated group, counters became one
+// element per shard, and every remaining type falls back to an opaque blob
+// column, which round-trips because the bytes are what Scylla stores anyway. So
+// no schema is currently ineligible.
+//
+// The gate stays because it is where a future encoding gap belongs -- refusing a
+// schema is how the tiering policy avoids silently mangling one -- and because C5
+// is part of the documented decision function. Returning a constant is the honest
+// answer today, not an oversight.
+bool schema_is_parquet_eligible(const ::schema&) {
     return true;
 }
 

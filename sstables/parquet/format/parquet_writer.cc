@@ -100,7 +100,17 @@ parquet_file_writer::parquet_file_writer(nested_schema ns, writer_options opt)
     // the two cannot disagree about what a level means.
     file_metadata probe;
     probe.schema = _tree;
-    for (const auto& li : walk_leaves(probe)) {
+    const auto leaves = walk_leaves(probe);
+    // A hint list, if given, must line up with the leaves one for one. Silently
+    // taking the shorter of the two is how the hints came to be dropped in the
+    // first place, so a mismatch is an error rather than a partial application.
+    if (!ns.preferred.empty() && ns.preferred.size() != leaves.size()) {
+        throw std::runtime_error("writer: " + std::to_string(ns.preferred.size()) +
+                                 " encoding hints for " + std::to_string(leaves.size()) +
+                                 " leaves");
+    }
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        const auto& li = leaves[i];
         const auto& el = _tree[li.index];
         if (!el.type) { throw std::runtime_error("writer: leaf without a physical type"); }
         column_spec c;
@@ -111,6 +121,7 @@ parquet_file_writer::parquet_file_writer(nested_schema ns, writer_options opt)
         c.max_def = li.max_def;
         c.max_rep = li.max_rep;
         c.path = li.path;
+        if (!ns.preferred.empty()) { c.preferred = ns.preferred[i]; }
         _schema.push_back(std::move(c));
     }
 }
@@ -138,7 +149,12 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     // ---- decide encoding
     bool use_dict = false;
     dict_result dict;
-    if (_opt.use_dictionary && spec.type == phys_type::byte_array && !col.str.empty()) {
+    // An explicit encoding hint wins outright. Otherwise a monotonic key column would
+    // qualify for a dictionary on cardinality alone and lose its delta encoding: on a
+    // time-series table that is the difference between 37 kB and 528 kB for the
+    // clustering key.
+    const bool hinted = spec.preferred.has_value();
+    if (_opt.use_dictionary && !hinted && spec.type == phys_type::byte_array && !col.str.empty()) {
         // Only the present values go into the dictionary.
         // Values are dense per slot only when the column does not repeat; a
         // repeated one supplies present values only, so walk a value cursor
@@ -162,6 +178,53 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         if (dict.dictionary_page.size() <= _opt.dictionary_max_bytes &&
             dict.num_distinct * _opt.dictionary_min_repeat < present.size()) {
             use_dict = true;
+        }
+    } else if (_opt.use_dictionary && !hinted && spec.type != phys_type::byte_array) {
+        // Numerics get a dictionary too, on the same terms.
+        //
+        // Measured on a time-series table (design doc 10.1g): leaving these on PLAIN
+        // costs about 10% of the file. It is not uniform -- PLAIN plus zstd beats a
+        // dictionary on the higher-cardinality columns (`temp`, 992 distinct, 353 kB
+        // against 359 kB) and loses badly on the low-cardinality ones (`precip_6h`,
+        // 135 distinct, 26 kB against 11 kB). The distinct-count threshold below is
+        // what separates them, and it is the same one the byte_array path uses.
+        auto build = [&] (const auto& values) {
+            using V = typename std::decay_t<decltype(values)>::value_type;
+            dict = encode_dictionary_fixed(std::span<const V>(values));
+            if (dict.dictionary_page.size() <= _opt.dictionary_max_bytes &&
+                dict.num_distinct * _opt.dictionary_min_repeat < values.size()) {
+                use_dict = true;
+            }
+        };
+        // Present values only, and dense per slot only when the column does not
+        // repeat -- same cursor discipline as the byte_array path above.
+        auto gather = [&] (const auto& src, auto& dst) {
+            dst.reserve(n);
+            size_t vi = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const bool pr = !has_def || col.def_levels[i] == max_def;
+                if (pr) { dst.push_back(src[vi]); }
+                if (pr || max_rep == 0) { ++vi; }
+            }
+        };
+        switch (spec.type) {
+        case phys_type::int32: {
+            if (col.i32.empty()) { break; }
+            std::vector<int32_t> v; gather(col.i32, v); build(v);
+            break;
+        }
+        case phys_type::int64: {
+            if (col.i64.empty()) { break; }
+            std::vector<int64_t> v; gather(col.i64, v); build(v);
+            break;
+        }
+        case phys_type::dbl: {
+            if (col.f64.empty()) { break; }
+            std::vector<double> v; gather(col.f64, v); build(v);
+            break;
+        }
+        default:
+            break;
         }
     }
 

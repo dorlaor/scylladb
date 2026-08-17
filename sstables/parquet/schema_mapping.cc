@@ -111,7 +111,8 @@ int64_t get_zigzag(const std::string& s, size_t& i) {
 // reader can recover the same flags from a file's leaf names and rebuild an
 // identical mapped_schema through the one builder below -- two ways in, one
 // layout, so writer and reader cannot drift apart.
-schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<row>& rows) {
+schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<row>& rows,
+                       leaf_set ls) {
     schema_flags f;
     size_t n_regular = 0;
     for (const auto& c : cols) { if (c.kind == column_kind::regular) { ++n_regular; } }
@@ -140,6 +141,20 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
             }
         }
     }
+    if (ls == leaf_set::conservative) {
+        // Every optional metadata leaf, whether the rows need it or not. An incremental
+        // writer has to fix the leaf set before its first row group, and by then it has
+        // seen only a prefix of the rows -- so anything a later row might need has to
+        // exist already. Unused leaves are all-null and cost a fixed ~225 B each.
+        f.any_ttl = f.any_deletion = true;
+        f.any_marker = f.any_marker_ttl = true;
+        f.any_row_del = f.any_part_del = f.any_rtc = true;
+        // Forces the divergence channel on: without it a later row whose cell timestamp
+        // differs from its row timestamp would have nowhere to record the difference.
+        f.all_same_ts = false;
+        for (size_t k = 0; k < f.col_diverges.size(); ++k) { f.col_diverges[k] = true; }
+    }
+
     return f;
 }
 
@@ -217,6 +232,16 @@ static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
                                  " leaves but the mapping has " + std::to_string(ms.columns.size()));
     }
     for (size_t i = 0; i < leaves.size(); ++i) {
+        // Position is the only correspondence between the mapping's leaf list and
+        // the tree's, and everything downstream relies on it: the levels below, and
+        // the per-leaf encoding hints write_rows() hands the writer. A count match
+        // does not prove an order match, so check the names too -- a silent
+        // mismatch would attach one column's levels and encoding to another.
+        if (!leaves[i].path.empty() && leaves[i].path.back() != ms.columns[i].name) {
+            throw std::runtime_error("leaf " + std::to_string(i) + " is '" +
+                                     leaves[i].path.back() + "' but the mapping calls it '" +
+                                     ms.columns[i].name + "'");
+        }
         ms.columns[i].max_def = leaves[i].max_def;
         ms.columns[i].max_rep = leaves[i].max_rep;
         ms.columns[i].path    = leaves[i].path;
@@ -341,8 +366,24 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
         }
     } else if (ms.level == folding_level::row_folded) {
         ms.ts_index = ms.columns.size();
+        // PLAIN, deliberately, even though a folded row timestamp is exactly the
+        // monotonic-ish shape DELTA_BINARY_PACKED is for.
+        //
+        // Asking for delta here makes test_pq_corpus_shaped_schema fail: cell write
+        // timestamps near int64's minimum come back with the top bit relocated
+        // (-2**63 + 74 reads back as 2**57 + 74), so the low bits survive and the
+        // high ones do not. That is *not* the codec -- it round-trips int64 extremes
+        // exactly and UBSan-clean, single values and 200-value runs alike, and the
+        // mapping's leaf order is now asserted against the tree's -- so something in
+        // the interaction is still unaccounted for. Enabling it would trade a real
+        // correctness failure for about 4 KB.
+        //
+        // The measured win from encoding hints is elsewhere and unaffected: on a
+        // time-series table the *clustering key* goes from 912 882 to 37 445 bytes,
+        // 25 % of the whole file, where this column is 3 772. See
+        // docs/dev/parquet-storage-format.md section 10.1g and open question 13.
         ms.columns.push_back({"__ts", phys_type::int64, repetition::required, std::nullopt,
-                              encoding::delta_binary_packed});
+                              std::nullopt});
         bool any_divergence = false;
         for (bool b : col_diverges) { any_divergence = any_divergence || b; }
         if (any_divergence) {
@@ -459,8 +500,9 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
 mapped_schema map_schema(const std::vector<cql_column>& cols,
                          folding_level requested,
                          const std::vector<row>& rows,
-                         exception_encoding exc) {
-    return build_mapped_schema(cols, requested, scan_rows(cols, rows), exc);
+                         exception_encoding exc,
+                         leaf_set ls) {
+    return build_mapped_schema(cols, requested, scan_rows(cols, rows, ls), exc);
 }
 
 mapped_schema recover_mapped_schema(const file_metadata& fm,
@@ -888,10 +930,26 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 if (cd[b + 3].def_levels[i]) { c.local_deletion_time = cd[b + 3].i32[i]; }
                 r.cells.emplace(k, std::move(c));
             } else {
-                if (!present) { continue; }
+                // L1 and L2 have no per-column live flag -- that is L0's `__live_`
+                // leaf -- so deadness has to be read off `__ldt_`:
+                //
+                //   value present                -> live (ldt, if any, is the expiry)
+                //   no value, ldt present        -> DEAD
+                //   no value, no ldt             -> absent, never written
+                //
+                // Collapsing the middle case into the last one loses the deletion:
+                // the cell comes back as never-written and resurrects whatever it
+                // shadowed. `any_deletion` is set by `!c.live`, so the leaf is always
+                // there when something is dead -- the information was on disk all
+                // along and simply was not being read.
+                const bool has_ttl = ms.l1_ttl_index[k] &&
+                                     cd[*ms.l1_ttl_index[k]].def_levels[i] != 0;
+                const bool has_ldt = ms.l1_ldt_index[k] &&
+                                     cd[*ms.l1_ldt_index[k]].def_levels[i] != 0;
+                if (!present && !has_ldt) { continue; }
                 cell c;
-                c.live = true;
-                c.v = read_value(cd[vcol], ms.columns[vcol].type, i);
+                c.live = present;
+                if (present) { c.v = read_value(cd[vcol], ms.columns[vcol].type, i); }
                 c.timestamp = row_ts;
                 if (auto e = exc.find(k); e != exc.end()) {
                     c.timestamp = e->second;
@@ -899,14 +957,8 @@ std::vector<row> reassemble(const mapped_schema& ms,
                            ms.ts_exc_index[k] && cd[*ms.ts_exc_index[k]].def_levels[i]) {
                     c.timestamp = cd[*ms.ts_exc_index[k]].i64[i];
                 }
-                if (ms.l1_ttl_index[k]) {
-                    const size_t b = *ms.l1_ttl_index[k];
-                    if (cd[b].def_levels[i]) { c.ttl = cd[b].i32[i]; }
-                }
-                if (ms.l1_ldt_index[k]) {
-                    const size_t b = *ms.l1_ldt_index[k];
-                    if (cd[b].def_levels[i]) { c.local_deletion_time = cd[b].i32[i]; }
-                }
+                if (has_ttl) { c.ttl = cd[*ms.l1_ttl_index[k]].i32[i]; }
+                if (has_ldt) { c.local_deletion_time = cd[*ms.l1_ldt_index[k]].i32[i]; }
                 r.cells.emplace(k, std::move(c));
             }
         }
@@ -958,7 +1010,13 @@ std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 exception_encoding exc) {
     auto ms = map_schema(cols, level, rows, exc);
     auto data = shred(ms, cols, rows);
-    parquet_file_writer w(parquet_file_writer::nested_schema{ms.tree}, opt);
+    // The encoding hints have to be handed over separately: the tree cannot carry
+    // them. ms.columns is in leaf order -- build_tree() asserts that and writes the
+    // levels back by index -- so position is the correspondence.
+    std::vector<std::optional<encoding>> hints;
+    hints.reserve(ms.columns.size());
+    for (const auto& c : ms.columns) { hints.push_back(c.preferred); }
+    parquet_file_writer w(parquet_file_writer::nested_schema{ms.tree, std::move(hints)}, opt);
     w.add_key_value("scylla.folding_level", to_string(ms.level));
     if (ms.uniform_ts) {
         w.add_key_value("scylla.uniform_timestamp", std::to_string(*ms.uniform_ts));

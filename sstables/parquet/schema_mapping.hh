@@ -56,8 +56,18 @@ inline phys_type phys_of(cql_type t) {
 inline std::optional<int32_t> converted_of(cql_type t) {
     switch (t) {
     case cql_type::text:      return int32_t(converted::utf8);
-    // Scylla stores timestamps as microseconds since epoch.
-    case cql_type::timestamp: return int32_t(converted::timestamp_micros);
+    // MILLIS, not MICROS. Two different things are easy to conflate here: a cell's
+    // *write* timestamp (`USING TIMESTAMP`, and our `__ts` leaf) is microseconds
+    // since epoch, but a value of CQL type `timestamp` is **milliseconds** -- that
+    // is what timestamp_type serialises. Annotating the column MICROS while writing
+    // millisecond values makes every external reader report a date in 1970: the
+    // 2023-01-01 value 1672531200000 reads back as 1970-01-20T08:35:31.2Z.
+    //
+    // Our own reader is unaffected either way, because it inverts the mapping from
+    // `cql_type` and never consults the annotation -- which is exactly why this
+    // survived a round-trip suite and only showed up when pyarrow read the file.
+    // See docs/dev/parquet-storage-format.md section 10.1g.
+    case cql_type::timestamp: return int32_t(converted::timestamp_millis);
     default:                  return std::nullopt;
     }
 }
@@ -113,6 +123,35 @@ struct rtc_info {
     bool operator==(const rtc_info&) const = default;
 };
 
+// Two big-endian int64s in sixteen bytes.
+//
+// Counter cells reuse the collection representation -- one element per shard --
+// and this is how a shard's two halves are packed: the key holds its id (the
+// most and least significant bits of the UUID) and the value holds its counter
+// value and logical clock. Big-endian so the bytes sort like the numbers and the
+// encoding does not depend on the host.
+inline std::string pack_i64_pair(int64_t a, int64_t b) {
+    std::string s(16, '\0');
+    const uint64_t ua = uint64_t(a), ub = uint64_t(b);
+    for (int i = 0; i < 8; ++i) {
+        s[size_t(i)]     = char(uint8_t(ua >> (56 - 8 * i)));
+        s[size_t(8 + i)] = char(uint8_t(ub >> (56 - 8 * i)));
+    }
+    return s;
+}
+
+inline bool unpack_i64_pair(std::string_view s, int64_t& a, int64_t& b) {
+    if (s.size() != 16) { return false; }
+    uint64_t ua = 0, ub = 0;
+    for (int i = 0; i < 8; ++i) {
+        ua = (ua << 8) | uint8_t(s[size_t(i)]);
+        ub = (ub << 8) | uint8_t(s[size_t(8 + i)]);
+    }
+    a = int64_t(ua);
+    b = int64_t(ub);
+    return true;
+}
+
 // One entry of a non-frozen collection. Scylla stores these as (key, cell)
 // pairs: for a set the key is the element and the cell carries only liveness,
 // for a map the key is the map key, for a list a timeuuid. All serialised, so
@@ -131,6 +170,30 @@ struct collection_cell {
     std::vector<collection_element> elements;
     bool operator==(const collection_cell&) const = default;
 };
+
+// How much heap a buffered row costs, for the write-side memory budget (R-13).
+//
+// This is an *estimate that errs high*, on purpose: its only job is to make the writer
+// cut a row group before the shard runs out of memory, so under-counting is the
+// dangerous direction and over-counting merely cuts a little early.
+//
+// The structural part (sizeof + string contents) accounts for roughly 3/4 of what is
+// actually resident. The rest is allocator overhead: every std::map node is its own
+// malloc with a header and size-class rounding, and vectors carry capacity slack. The
+// per-entry constants below are therefore deliberately larger than a red-black tree
+// node needs -- calibrated against measured RSS, which came out at ~1.77 kB/row for a
+// 10-column time-series table (design doc 5.5a).
+inline constexpr size_t map_entry_overhead = 96;   // node + malloc header + rounding
+inline constexpr size_t vec_slack_num = 3, vec_slack_den = 2;   // assume 1.5x capacity
+
+inline size_t heap_bytes(const value& v) {
+    const auto* s = std::get_if<std::string>(&v);
+    return s ? s->capacity() : 0;
+}
+
+inline size_t heap_bytes(const cell& c) {
+    return sizeof(cell) + (c.v ? heap_bytes(*c.v) : 0);
+}
 
 struct row {
     std::vector<value>       key;             // partition key then clustering key
@@ -156,6 +219,29 @@ struct row {
     // Non-frozen collections, keyed in the same index space as `cells`.
     std::map<size_t, collection_cell> collections;
 };
+
+// See the note on map_entry_overhead above: errs high, by design.
+inline size_t heap_bytes(const collection_cell& cc) {
+    size_t n = sizeof(collection_cell)
+             + cc.elements.capacity() * sizeof(collection_element);
+    for (const auto& e : cc.elements) {
+        n += e.key.capacity() + (e.value ? e.value->capacity() : 0);
+    }
+    return n;
+}
+
+inline size_t heap_bytes(const row& r) {
+    size_t n = sizeof(row);
+    n += r.key.capacity() * sizeof(value) * vec_slack_num / vec_slack_den;
+    for (const auto& v : r.key) { n += heap_bytes(v); }
+    for (const auto& [k, c] : r.cells) {
+        n += map_entry_overhead + sizeof(k) + heap_bytes(c);
+    }
+    for (const auto& [k, cc] : r.collections) {
+        n += map_entry_overhead + sizeof(k) + heap_bytes(cc);
+    }
+    return n;
+}
 
 // ---------------------------------------------------------------- folding
 enum class folding_level {
@@ -259,7 +345,24 @@ struct schema_flags {
     std::optional<int64_t> single_ts;
 };
 
-schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<row>& rows);
+// Whether the leaf set may be derived from the rows, or has to cover every case up
+// front.
+//
+// Parquet fixes one leaf set for a whole file, before the first row group is written.
+// `derived` inspects every row and emits only the metadata leaves the data actually
+// needs, which is the smallest file and is correct as long as all rows are in hand --
+// i.e. as long as the sstable becomes a single row group. `conservative` emits every
+// optional metadata leaf regardless of use, which is what an incremental writer is
+// forced into: at its first flush it cannot know whether row ten million carries a TTL.
+//
+// The unused leaves are all-null, so they cost definition levels that RLE away plus a
+// fixed ~225 B per leaf. Measured: +2.52 % on a narrow table and +7.2 % on a small wide
+// one, falling to +0.55 % once the file is large -- which is exactly when cutting is
+// needed. See design doc 5.5a.
+enum class leaf_set { derived, conservative };
+
+schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<row>& rows,
+                       leaf_set = leaf_set::derived);
 
 // The single schema builder. Both map_schema (write side) and
 // recover_mapped_schema (read side) go through this, so there is exactly one
@@ -272,7 +375,8 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
 mapped_schema map_schema(const std::vector<cql_column>& cols,
                          folding_level requested,
                          const std::vector<row>& rows,
-                         exception_encoding = exception_encoding::sparse);
+                         exception_encoding = exception_encoding::sparse,
+                         leaf_set = leaf_set::derived);
 
 // Rebuild the mapped_schema of a file we did not write, from its footer. The
 // folding level comes from the scylla.folding_level key/value entry; which

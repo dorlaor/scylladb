@@ -186,7 +186,7 @@ inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> 
             if (w > 64) { throw decode_error("delta bit width > 64"); }
             if (w == 0) {
                 for (uint64_t i = 0; i < mini && out.size() < count && out.size() < total; ++i) {
-                    prev += min_delta;
+                    prev = int64_t(uint64_t(prev) + uint64_t(min_delta));
                     out.push_back(prev);
                 }
                 continue;
@@ -198,9 +198,15 @@ inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> 
             for (uint64_t i = 0; i < mini; ++i) {
                 while (bits < w) { acc |= uint64_t(in[q++]) << bits; bits += 8; }
                 const uint64_t v = (w == 64) ? acc : (acc & ((1ull << w) - 1));
-                acc >>= w; bits -= w;
+                // Shifting a 64-bit value by 64 is undefined, and w == 64 happens
+                // whenever a block's deltas wrapped; the accumulator is fully
+                // consumed in that case, so clear it instead.
+                if (w == 64) { acc = 0; } else { acc >>= w; }
+                bits -= w;
                 if (out.size() < count && out.size() < total) {
-                    prev += min_delta + int64_t(v);
+                    // Unsigned throughout, to undo the encoder's wrap exactly rather
+                    // than overflow a signed add. See format/encoders.hh.
+                    prev = int64_t(uint64_t(prev) + uint64_t(min_delta) + v);
                     out.push_back(prev);
                 }
             }

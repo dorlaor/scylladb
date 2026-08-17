@@ -8,6 +8,8 @@
 
 #include "sstables/parquet/writer_impl.hh"
 
+#include "exceptions/exceptions.hh"
+
 #include "mutation/mutation_fragment.hh"
 #include "schema/schema.hh"
 #include "types/types.hh"
@@ -22,8 +24,10 @@
 #include "dht/i_partitioner.hh"
 #include "sstables/mx/writer.hh"
 #include "mutation/collection_mutation.hh"
+#include "mutation/counters.hh"
 #include "types/collection.hh"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace sstables::parquet {
@@ -60,6 +64,34 @@ int32_t be32(const bytes_view& b) {
 // plus one entry per (key, cell) pair. Keys and values stay serialised -- the
 // mapping treats both as opaque bytes, which is what makes one code path work for
 // sets, lists, maps and non-frozen UDTs alike.
+// A counter cell, in the collection representation: one element per shard, keyed
+// by the shard's id, with its value and logical clock packed into the element
+// value. Counters are atomic cells, so without this they would be stored as an
+// opaque blob and lose the shard structure that makes them mergeable.
+//
+// The cell's own timestamp is repeated on every element -- it is the same for all
+// of them, so it costs nothing once compressed -- and a dead counter cell becomes
+// an element-less collection carrying the deletion in the collection tombstone
+// slot, which is how absent is told apart from deleted on the way back.
+static collection_cell read_counter_cell(const atomic_cell_view& av) {
+    collection_cell cc;
+    if (!av.is_live()) {
+        cc.tomb = deletion_info{av.timestamp(),
+                int32_t(av.deletion_time().time_since_epoch().count())};
+        return cc;
+    }
+    counter_cell_view ccv(av);
+    for (auto&& cs : ccv.shards()) {
+        const auto u = cs.id().uuid();
+        collection_element e;
+        e.key = pack_i64_pair(u.get_most_significant_bits(), u.get_least_significant_bits());
+        e.value = pack_i64_pair(cs.value(), cs.logical_clock());
+        e.timestamp = av.timestamp();
+        cc.elements.push_back(std::move(e));
+    }
+    return cc;
+}
+
 collection_cell read_collection_mutation(const atomic_cell_or_collection& acoc) {
     auto cmv = acoc.as_collection_mutation();
     collection_cell cc;
@@ -136,7 +168,7 @@ std::vector<cql_column> columns_of(const ::schema& s) {
     }
     for (const auto& c : s.regular_columns()) {
         cql_column col{c.name_as_text(), cql_type_of(*c.type), column_kind::regular};
-        col.multi_cell = !c.is_atomic();
+        col.multi_cell = !c.is_atomic() || c.is_counter();
         cols.push_back(std::move(col));
     }
     // Static columns ride along as ordinary value columns, appended after the
@@ -146,10 +178,125 @@ std::vector<cql_column> columns_of(const ::schema& s) {
     // The reader splits them back out by index; see static_base().
     for (const auto& c : s.static_columns()) {
         cql_column col{"__s_" + c.name_as_text(), cql_type_of(*c.type), column_kind::regular};
-        col.multi_cell = !c.is_atomic();
+        col.multi_cell = !c.is_atomic() || c.is_counter();
         cols.push_back(std::move(col));
     }
     return cols;
+}
+
+// ------------------------------------------------------- the `parquet = {...}` property
+namespace {
+
+size_t parse_count(const sstring& key, const sstring& v, size_t lo, size_t hi) {
+    size_t out = 0;
+    try {
+        size_t pos = 0;
+        unsigned long long n = std::stoull(std::string(v), &pos);
+        if (pos != v.size()) { throw std::invalid_argument("trailing"); }
+        out = size_t(n);
+    } catch (...) {
+        throw exceptions::configuration_exception(
+                seastar::format("Invalid value '{}' for '{}' in the 'parquet' option; expected a "
+                       "whole number", v, key));
+    }
+    if (out < lo || out > hi) {
+        throw exceptions::configuration_exception(
+                seastar::format("'{}' must be between {} and {} (got {})", key, lo, hi, out));
+    }
+    return out;
+}
+
+// Accepts a plain byte count or a KiB/MiB/GiB suffix, as design doc 8.2 shows.
+size_t parse_bytes(const sstring& key, const sstring& v, size_t lo, size_t hi) {
+    static const std::pair<const char*, size_t> units[] = {
+        {"GiB", 1024ull * 1024 * 1024}, {"MiB", 1024 * 1024}, {"KiB", 1024},
+    };
+    for (auto [suffix, mult] : units) {
+        const size_t sl = std::strlen(suffix);
+        if (v.size() > sl && v.compare(v.size() - sl, sl, suffix) == 0) {
+            auto head = v.substr(0, v.size() - sl);
+            return parse_count(key, head, (lo + mult - 1) / mult, hi / mult) * mult;
+        }
+    }
+    return parse_count(key, v, lo, hi);
+}
+
+} // namespace
+
+parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
+    for (const auto& [k, v] : opts) {
+        if (k == ROW_GROUP_ROWS) {
+            _cfg.row_group_rows = parse_count(k, v, min_row_group_rows, max_row_group_rows);
+        } else if (k == ROW_GROUP_BUFFER_BYTES) {
+            _cfg.row_group_buffer_bytes = parse_bytes(k, v, min_buffer_bytes, max_buffer_bytes);
+        } else if (k == PAGE_ROWS) {
+            // A page is the unit a point read decodes, so the same reasoning as row
+            // groups applies one level down.
+            _cfg.wopt.page_values = parse_count(k, v, 128, 1'000'000);
+        } else if (k == COMPRESSION) {
+            // Only what the writer can actually emit. See the note on the class.
+            if (v == "zstd") {
+                _cfg.wopt.compression = format::codec::zstd;
+            } else if (v == "none") {
+                _cfg.wopt.compression = format::codec::uncompressed;
+            } else {
+                throw exceptions::configuration_exception(
+                        seastar::format("Unsupported 'compression' value '{}' in the 'parquet' "
+                               "option; supported: none, zstd", v));
+            }
+        } else if (k == COMPRESSION_LEVEL) {
+            _cfg.wopt.zstd_level = int(parse_count(k, v, 1, 22));
+        } else if (k == METADATA_FOLDING) {
+            if (v == "auto" || v == "row") {
+                _cfg.level = folding_level::row_folded;
+            } else if (v == "verbatim") {
+                _cfg.level = folding_level::verbatim;
+            } else if (v == "uniform") {
+                _cfg.level = folding_level::uniform;
+            } else {
+                // 'logical' (L3) is export-only: it discards write times and TTLs, so it
+                // must never be reachable as a storage setting.
+                throw exceptions::configuration_exception(
+                        seastar::format("Unsupported 'metadata_folding' value '{}' in the 'parquet' "
+                               "option; supported: auto, verbatim, row, uniform", v));
+            }
+        } else {
+            throw exceptions::configuration_exception(
+                    seastar::format("Unknown sub-option '{}' for the 'parquet' option", k));
+        }
+    }
+}
+
+std::map<sstring, sstring> parquet_parameters::to_map() const {
+    const pq_writer_config def;
+    std::map<sstring, sstring> m;
+    if (_cfg.row_group_rows != def.row_group_rows) {
+        m[ROW_GROUP_ROWS] = seastar::format("{}", _cfg.row_group_rows);
+    }
+    if (_cfg.row_group_buffer_bytes != def.row_group_buffer_bytes) {
+        m[ROW_GROUP_BUFFER_BYTES] = seastar::format("{}", _cfg.row_group_buffer_bytes);
+    }
+    if (_cfg.wopt.page_values != def.wopt.page_values) {
+        m[PAGE_ROWS] = seastar::format("{}", _cfg.wopt.page_values);
+    }
+    if (_cfg.wopt.compression != def.wopt.compression) {
+        m[COMPRESSION] = _cfg.wopt.compression == format::codec::zstd ? "zstd" : "none";
+    }
+    if (_cfg.wopt.zstd_level != def.wopt.zstd_level) {
+        m[COMPRESSION_LEVEL] = seastar::format("{}", _cfg.wopt.zstd_level);
+    }
+    if (_cfg.level != def.level) {
+        // The user-facing vocabulary, not to_string()'s internal "L0"/"L1"/"L2". These
+        // have to be the words the parser accepts or the property does not survive a
+        // round trip through persistence -- which is exactly how this was caught.
+        switch (_cfg.level) {
+        case folding_level::verbatim:   m[METADATA_FOLDING] = "verbatim"; break;
+        case folding_level::row_folded: m[METADATA_FOLDING] = "row";      break;
+        case folding_level::uniform:    m[METADATA_FOLDING] = "uniform";  break;
+        default: break;   // L3 is export-only and unreachable as a stored setting
+        }
+    }
+    return m;
 }
 
 // ---------------------------------------------------------------- shredder
@@ -210,20 +357,20 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
     }
     r.part_del = _part_del;
     _saw_clustering_row = true;
-    // Static cells ride on every row of the partition.
-    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
-    for (const auto& [k, c] : _static_collections) { r.collections.emplace(k, c); }
+    replay_statics(r);
 
     // Regular cells. column_id indexes the regular columns, which is exactly the
     // index space schema_mapping uses for cells.
     cr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
         const column_definition& cdef = _schema.regular_column_at(id);
         if (cdef.is_counter()) {
-            // A counter cell is atomic, so it would otherwise sail down the
-            // ordinary path and be stored as an opaque blob -- losing the shard
-            // structure that makes counters mergeable. Excluded by design
-            // (design doc open question 5), so refuse rather than corrupt.
-            unrepresentable("counters");
+            // Counter updates are a pre-shard-transformation form that never
+            // reaches storage; a cell still in that form is a bug upstream, not
+            // something to invent a representation for.
+            auto av = acoc.as_atomic_cell(cdef);
+            if (av.is_counter_update()) { unrepresentable("counter updates"); }
+            r.collections.emplace(size_t(id), read_counter_cell(av));
+            return;
         }
         if (cdef.is_atomic()) {
             auto av = acoc.as_atomic_cell(cdef);
@@ -246,7 +393,17 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
             r.collections.emplace(size_t(id), read_collection_mutation(acoc));
         }
     });
+    push_row(std::move(r));
+}
+
+void fragment_shredder::push_row(row&& r) {
+    _buffered_bytes += heap_bytes(r);
     _rows.push_back(std::move(r));
+}
+
+void fragment_shredder::replay_statics(row& r) const {
+    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
+    for (const auto& [k, c] : _static_collections) { r.collections.emplace(k, c); }
 }
 
 void fragment_shredder::add_static_row(const static_row& sr) {
@@ -256,7 +413,12 @@ void fragment_shredder::add_static_row(const static_row& sr) {
     // end_partition().
     sr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
         const column_definition& cdef = _schema.static_column_at(id);
-        if (cdef.is_counter()) { unrepresentable("counters"); }
+        if (cdef.is_counter()) {
+            auto av = acoc.as_atomic_cell(cdef);
+            if (av.is_counter_update()) { unrepresentable("counter updates"); }
+            _static_collections.emplace(_static_base + size_t(id), read_counter_cell(av));
+            return;
+        }
         if (!cdef.is_atomic()) {
             _static_collections.emplace(_static_base + size_t(id),
                                         read_collection_mutation(acoc));
@@ -308,11 +470,11 @@ void fragment_shredder::add_range_tombstone_change(const range_tombstone_change&
     }
     r.rtc = ri;
     r.part_del = _part_del;
-    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
+    replay_statics(r);
 
     // The partition has content, so end_partition() must not add a placeholder.
     _saw_clustering_row = true;
-    _rows.push_back(std::move(r));
+    push_row(std::move(r));
 }
 
 void fragment_shredder::end_partition() {
@@ -332,8 +494,8 @@ void fragment_shredder::end_partition() {
     }
     r.no_ck = true;
     r.part_del = _part_del;
-    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
-    _rows.push_back(std::move(r));
+    replay_statics(r);
+    push_row(std::move(r));
 }
 
 std::vector<uint8_t> fragment_shredder::to_parquet(const pq_writer_config& cfg) const {
@@ -409,10 +571,118 @@ void pq_writer_impl::finish_open_partition() {
     _in_partition = false;
 }
 
+
+// ------------------------------------------------------ statistics collection
+//
+// Mirrors sstables/mx/writer.cc: write_cell() for atomic cells, write_liveness_info()
+// for row markers, and collect_row_stats() / collect_range_tombstone_stats() for the
+// counters. Keeping the same call order and the same is_live distinctions matters --
+// min_live_timestamp and the tombstone drop-time histogram feed tombstone GC
+// decisions, so "close enough" here is a correctness bug, not a reporting one.
+
+void pq_writer_impl::collect_atomic_cell(const atomic_cell_view& cell) {
+    if (!cell.is_live()) {
+        _c_stats.update_timestamp(cell.timestamp(), is_live::no);
+        _c_stats.update_local_deletion_time_and_tombstone_histogram(cell.deletion_time());
+        return;
+    }
+    _c_stats.update_timestamp(cell.timestamp(), is_live::yes);
+    if (cell.is_live_and_has_ttl()) {
+        _c_stats.update_ttl(cell.ttl());
+        // The histogram takes the *expiry*, not the TTL: if a long TTL were fed in
+        // instead, an sstable whose data expires far in the future would look fully
+        // expired now.
+        _c_stats.update_local_deletion_time_and_tombstone_histogram(cell.expiry());
+    } else {
+        _c_stats.update_local_deletion_time(std::numeric_limits<int32_t>::max());
+    }
+}
+
+void pq_writer_impl::collect_cell(const column_definition& cdef,
+                                  const atomic_cell_or_collection& acoc) {
+    if (!cdef.is_atomic()) {
+        // A non-frozen collection counts as one column and one cell per element,
+        // and carries its own collection-wide tombstone.
+        auto cmv = acoc.as_collection_mutation();
+        _c_stats.update(cmv.tomb());
+        for (auto&& kv : cmv) {
+            collect_atomic_cell(kv.second);
+            ++_c_stats.cells_count;
+        }
+        ++_c_stats.column_count;
+        return;
+    }
+    collect_atomic_cell(acoc.as_atomic_cell(cdef));
+    ++_c_stats.cells_count;
+    ++_c_stats.column_count;
+}
+
+void pq_writer_impl::collect_cells(const ::row& cells, ::column_kind kind) {
+    cells.for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
+        collect_cell(_schema.column_at(kind, id), acoc);
+    });
+}
+
+void pq_writer_impl::collect_marker(const row_marker& marker) {
+    if (marker.is_missing()) {
+        return;
+    }
+    if (marker.is_live()) {
+        _c_stats.update_timestamp(marker.timestamp(), is_live::yes);
+        _c_stats.update_live_row_marker_timestamp(marker.timestamp());
+    } else {
+        _c_stats.update_timestamp(marker.timestamp(), is_live::no);
+    }
+    if (!marker.is_live()) {
+        _c_stats.update_ttl(gc_clock::duration(sstables::expired_liveness_ttl));
+        _c_stats.update_local_deletion_time_and_tombstone_histogram(marker.deletion_time());
+    } else if (marker.is_expiring()) {
+        _c_stats.update_ttl(marker.ttl());
+        _c_stats.update_local_deletion_time_and_tombstone_histogram(marker.expiry());
+    } else {
+        _c_stats.update_ttl(0);
+        _c_stats.update_local_deletion_time(std::numeric_limits<int32_t>::max());
+    }
+}
+
+// Emit the buffered rows as one row group and drop them.
+//
+// Cut only at a partition boundary, so a partition never spans row groups. That keeps the
+// option-A index entry a single ordinal and keeps a point read inside one row group. The
+// cost is that a single partition larger than the budget is not split -- see design doc
+// 5.5a for why that needs the index entry to carry (row group, ordinal) and is sequenced
+// after this.
+void pq_writer_impl::cut_row_group() {
+    if (_shredder.size() == 0) { return; }
+    if (!_pq) {
+        // First cut. Parquet fixes one leaf set for the whole file, and we are only a
+        // prefix of the way through the rows, so it has to cover every case a later row
+        // might need rather than only what these rows use.
+        _ms.emplace(map_schema(_shredder.columns(), _pcfg.level, _shredder.rows(),
+                               _pcfg.exc, leaf_set::conservative));
+        if (!folding_is_lossless(_ms->level)) {
+            throw std::invalid_argument(
+                    std::string("folding level ") + to_string(_ms->level) +
+                    " discards cell metadata and cannot be used as a storage format");
+        }
+        std::vector<std::optional<format::encoding>> hints;
+        hints.reserve(_ms->columns.size());
+        for (const auto& c : _ms->columns) { hints.push_back(c.preferred); }
+        _pq = std::make_unique<format::parquet_file_writer>(
+                format::parquet_file_writer::nested_schema{_ms->tree, std::move(hints)},
+                _pcfg.wopt);
+        _pq->add_key_value("scylla.folding_level", to_string(_ms->level));
+    }
+    auto data = shred(*_ms, _shredder.columns(), _shredder.rows());
+    _pq->add_row_group(data);
+    _rows_flushed += _shredder.size();
+    _shredder.clear();
+}
+
 void pq_writer_impl::consume_new_partition(const dht::decorated_key& dk) {
     finish_open_partition();
     _shredder.new_partition(dk);
-    _partition_first_row = _shredder.size();
+    _partition_first_row = _rows_flushed + _shredder.size();
 
     if (_index_writer) {
         auto pk = key::from_partition_key(_schema, dk.key());
@@ -445,31 +715,77 @@ void pq_writer_impl::consume_new_partition(const dht::decorated_key& dk) {
 void pq_writer_impl::consume(tombstone t) {
     if (t) {
         _shredder.set_partition_tombstone(t);
+        _c_stats.update(t);
+        // A partition tombstone spans the whole clustering range, so it widens the
+        // min/max clustering key to both sentinels -- exactly what mx records.
+        _collector.update_min_max_components(
+                position_in_partition_view::before_all_clustered_rows());
+        _collector.update_min_max_components(
+                position_in_partition_view::after_all_clustered_rows());
     }
 }
 
 stop_iteration pq_writer_impl::consume(static_row&& sr) {
+    collect_cells(sr.cells(), ::column_kind::static_column);
     _shredder.add_static_row(sr);
     return stop_iteration::no;
 }
 
 stop_iteration pq_writer_impl::consume(clustering_row&& cr) {
+    _collector.update_min_max_components(cr.position());
+    collect_marker(cr.marker());
+    _c_stats.update(cr.tomb().regular());
+    _c_stats.update(cr.tomb().tomb());
+    collect_cells(cr.cells(), ::column_kind::regular_column);
+    ++_c_stats.rows_count;
+    if (cr.tomb()) {
+        ++_c_stats.dead_rows_count;
+    }
     _shredder.add_clustering_row(cr);
     return stop_iteration::no;
 }
 
 stop_iteration pq_writer_impl::consume(range_tombstone_change&& rtc) {
+    _collector.update_min_max_components(rtc.position());
+    _c_stats.update(rtc.tombstone());
+    // mx counts a range tombstone change as a row as well as a range tombstone,
+    // because on its side the marker occupies a row slot in the data file.
+    ++_c_stats.rows_count;
+    ++_c_stats.range_tombstones_count;
     _shredder.add_range_tombstone_change(rtc);
     return stop_iteration::no;
 }
 
 stop_iteration pq_writer_impl::consume_end_of_partition() {
     _shredder.end_partition();
+    // Byte offsets are not available per partition here: the whole Parquet image is
+    // encoded once at end of stream, so a partition has no start offset or on-disk
+    // length while it is being consumed. Everything else in column_stats is exact;
+    // partition_size stays 0, which only affects the estimated-partition-size
+    // histogram, not any GC decision.
+    _collector.update(std::move(_c_stats));
+    _c_stats.reset();
+    // A partition boundary is the only place a cut is allowed, so this is where the
+    // budget is checked.
+    if (_shredder.buffered_bytes() >= _pcfg.row_group_buffer_bytes ||
+        _shredder.size() >= _pcfg.row_group_rows) {
+        cut_row_group();
+    }
     return stop_iteration::no;
 }
 
 void pq_writer_impl::consume_end_of_stream() {
-    auto img = _shredder.to_parquet_for_storage(_pcfg);
+    // Two paths on purpose. If no cut ever happened the whole sstable fits the budget and
+    // goes out as a single row group with the *derived* leaf set -- identical to what this
+    // writer produced before row-group cutting existed. Only once a cut has forced the
+    // conservative leaf set does the streaming path take over.
+    std::vector<uint8_t> img;
+    if (_pq) {
+        cut_row_group();            // the tail
+        img = _pq->finish();
+    } else {
+        img = _shredder.to_parquet_for_storage(_pcfg);
+    }
     _pos = img.size();
 
     // A sink is the unit-test path: it lets the whole fragment -> Parquet route be
@@ -531,8 +847,20 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
         const sstables::sstable_writer_config& cfg,
         encoding_stats enc_stats,
         shard_id shard) {
+    // Compiled-in defaults, with an environment override so the row-group size can be
+    // swept and a default chosen from data. This is a stopgap: the real surface is the
+    // per-table `parquet = {...}` property specified in design doc 8.2, which does not
+    // exist yet (open question 14). It is read once here rather than threaded through
+    // any hot path, and it disappears when that property lands.
+    pq_writer_config pcfg;
+    if (const char* e = ::getenv("SCYLLA_PQ_ROW_GROUP_ROWS")) {
+        if (auto v = std::atol(e); v > 0) { pcfg.row_group_rows = size_t(v); }
+    }
+    if (const char* e = ::getenv("SCYLLA_PQ_ROW_GROUP_BUFFER_BYTES")) {
+        if (auto v = std::atol(e); v > 0) { pcfg.row_group_buffer_bytes = size_t(v); }
+    }
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
-                                            pq_writer_config{}, enc_stats, shard, nullptr);
+                                            std::move(pcfg), enc_stats, shard, nullptr);
 }
 
 } // namespace sstables::parquet
