@@ -68,6 +68,10 @@ struct cql_column {
     std::string name;
     cql_type    type;
     column_kind kind;
+    // A non-frozen collection. It becomes a Dremel MAP group rather than a
+    // single leaf (design doc 5.2); frozen ones are already opaque blobs and
+    // travel as ordinary BYTE_ARRAY values.
+    bool        multi_cell = false;
 };
 
 // A cell as the storage layer sees it: a value plus its own metadata. Key
@@ -109,6 +113,25 @@ struct rtc_info {
     bool operator==(const rtc_info&) const = default;
 };
 
+// One entry of a non-frozen collection. Scylla stores these as (key, cell)
+// pairs: for a set the key is the element and the cell carries only liveness,
+// for a map the key is the map key, for a list a timeuuid. All serialised, so
+// both sides are opaque bytes here.
+struct collection_element {
+    std::string                key;
+    std::optional<std::string> value;   // nullopt => the element is dead
+    int64_t                    timestamp = 0;
+    std::optional<int32_t>     ttl;
+    std::optional<int32_t>     local_deletion_time;
+    bool operator==(const collection_element&) const = default;
+};
+
+struct collection_cell {
+    std::optional<deletion_info>    tomb;       // collection-wide tombstone
+    std::vector<collection_element> elements;
+    bool operator==(const collection_cell&) const = default;
+};
+
 struct row {
     std::vector<value>       key;             // partition key then clustering key
     std::map<size_t, cell>   cells;           // index into the regular columns
@@ -126,6 +149,8 @@ struct row {
     bool no_ck = false;
     // Set when this "row" is really a range tombstone change.
     std::optional<rtc_info> rtc;
+    // Non-frozen collections, keyed in the same index space as `cells`.
+    std::map<size_t, collection_cell> collections;
 };
 
 // ---------------------------------------------------------------- folding
@@ -165,6 +190,10 @@ const char* to_string(folding_level);
 // the bookkeeping a reader needs to invert it.
 struct mapped_schema {
     std::vector<column_spec> columns;         // physical Parquet leaves
+    // The schema tree the leaves came from, depth-first with the root at index 0.
+    // Flat for a schema without collections; a collection contributes a MAP group.
+    // Kept so the writer always takes one path, nested or not.
+    std::vector<format::schema_element> tree;
     folding_level            level{};
     size_t                   n_key = 0;       // leading key columns
     size_t                   n_regular = 0;
@@ -186,6 +215,14 @@ struct mapped_schema {
     std::optional<size_t> no_ck_index;
     std::optional<size_t> rtc_w_index, rtc_reg_index, rtc_len_index,
                           rtc_ts_index, rtc_ldt_index;
+    // Per regular column: where its value lives, and whether that is a scalar
+    // leaf or the first of the five leaves a collection group contributes.
+    // Recorded rather than computed, because arithmetic over leaf positions is
+    // exactly what broke when the metadata groups were added.
+    std::vector<size_t> value_leaf;
+    std::vector<bool>   value_is_collection;
+    // Row-level collection tombstone leaves, per regular column.
+    std::vector<std::optional<size_t>> ct_ts_index, ct_ldt_index;
     // For L2: the single timestamp shared by every cell.
     std::optional<int64_t>   uniform_ts;
 

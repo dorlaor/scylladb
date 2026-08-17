@@ -128,6 +128,86 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
     return f;
 }
 
+// The tree a flat leaf list implies: a root and one child per leaf. Collections
+// will insert groups here instead of a bare leaf.
+// Build the tree the leaves imply, inserting a MAP group wherever a regular
+// column is a non-frozen collection. This is the only place that knows the
+// nesting, so it is also where the leaves' Dremel levels come from -- they are
+// filled in afterwards by walk_leaves(), the same function the reader uses.
+static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
+    std::vector<size_t> reg_idx;
+    for (size_t i = 0; i < cols.size(); ++i) {
+        if (cols[i].kind == column_kind::regular) { reg_idx.push_back(i); }
+    }
+    // Which leaf starts each collection group, and what the group is called.
+    std::map<size_t, std::string> group_at;
+    for (size_t k = 0; k < ms.value_is_collection.size(); ++k) {
+        if (ms.value_is_collection[k]) { group_at[ms.value_leaf[k]] = cols[reg_idx[k]].name; }
+    }
+
+    ms.tree.clear();
+    std::vector<format::schema_element> body;
+    int32_t top_children = 0;
+    for (size_t i = 0; i < ms.columns.size(); ) {
+        auto g = group_at.find(i);
+        if (g != group_at.end()) {
+            format::schema_element map_el;
+            map_el.name = g->second;
+            map_el.repetition_type = repetition::optional;
+            map_el.converted_type = int32_t(format::converted::map);
+            map_el.num_children = 1;
+            body.push_back(map_el);
+
+            format::schema_element kv;
+            kv.name = "key_value";
+            kv.repetition_type = repetition::repeated;
+            kv.num_children = 5;
+            body.push_back(kv);
+
+            for (size_t j = 0; j < 5; ++j) {
+                const auto& c = ms.columns[i + j];
+                format::schema_element e;
+                e.type = c.type;
+                e.repetition_type = c.rep;
+                e.name = c.name;
+                body.push_back(e);
+            }
+            ++top_children;
+            i += 5;
+            continue;
+        }
+        const auto& c = ms.columns[i];
+        format::schema_element e;
+        e.type = c.type;
+        e.repetition_type = c.rep;
+        e.name = c.name;
+        e.converted_type = c.converted_type;
+        body.push_back(e);
+        ++top_children;
+        ++i;
+    }
+
+    format::schema_element root;
+    root.name = "schema";
+    root.num_children = top_children;
+    ms.tree.push_back(root);
+    ms.tree.insert(ms.tree.end(), body.begin(), body.end());
+
+    // Levels and paths, from the tree that was just built.
+    format::file_metadata probe;
+    probe.schema = ms.tree;
+    auto leaves = format::walk_leaves(probe);
+    if (leaves.size() != ms.columns.size()) {
+        throw std::runtime_error("schema tree produced " + std::to_string(leaves.size()) +
+                                 " leaves but the mapping has " + std::to_string(ms.columns.size()));
+    }
+    for (size_t i = 0; i < leaves.size(); ++i) {
+        ms.columns[i].max_def = leaves[i].max_def;
+        ms.columns[i].max_rep = leaves[i].max_rep;
+        ms.columns[i].path    = leaves[i].path;
+    }
+}
+
 mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                                   folding_level requested,
                                   const schema_flags& flags,
@@ -144,6 +224,10 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     ms.n_regular = reg_idx.size();
     ms.ts_exc_index.assign(reg_idx.size(), std::nullopt);
     ms.meta_base_index.assign(reg_idx.size(), std::nullopt);
+    ms.value_leaf.assign(reg_idx.size(), 0);
+    ms.value_is_collection.assign(reg_idx.size(), false);
+    ms.ct_ts_index.assign(reg_idx.size(), std::nullopt);
+    ms.ct_ldt_index.assign(reg_idx.size(), std::nullopt);
 
     const bool any_ttl = flags.any_ttl, any_deletion = flags.any_deletion;
     const std::vector<bool>& col_diverges = flags.col_diverges;
@@ -184,13 +268,45 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
         // because they are monotonic by construction, where it demonstrably wins.
         // Choosing per column from the data is the real answer; see open
         // question 9.
+        ms.value_leaf[k] = ms.columns.size();
+        if (c.multi_cell) {
+            // A non-frozen collection becomes five leaves under a MAP group; the
+            // levels are filled in by the tree builder, which is the only place
+            // that knows the nesting.
+            ms.value_is_collection[k] = true;
+            ms.columns.push_back(column_spec{"key", phys_type::byte_array,
+                                             repetition::required, std::nullopt, std::nullopt});
+            ms.columns.push_back(column_spec{"value", phys_type::byte_array,
+                                             repetition::optional, std::nullopt, std::nullopt});
+            ms.columns.push_back(column_spec{"__ts", phys_type::int64,
+                                             repetition::required, std::nullopt, std::nullopt});
+            ms.columns.push_back(column_spec{"__ttl", phys_type::int32,
+                                             repetition::optional, std::nullopt, std::nullopt});
+            ms.columns.push_back(column_spec{"__ldt", phys_type::int32,
+                                             repetition::optional, std::nullopt, std::nullopt});
+            continue;
+        }
         ms.columns.push_back(column_spec{c.name, phys_of(c.type), repetition::optional,
                                          converted_of(c.type), std::nullopt});
+    }
+
+    for (size_t k = 0; k < reg_idx.size(); ++k) {
+        if (!ms.value_is_collection[k]) { continue; }
+        // The collection-wide tombstone belongs to the row, not to an element,
+        // so it cannot live inside the repeated group.
+        const auto& nm = cols[reg_idx[k]].name;
+        ms.ct_ts_index[k] = ms.columns.size();
+        ms.columns.push_back(column_spec{"__ct_ts_" + nm, phys_type::int64,
+                                         repetition::optional, std::nullopt, std::nullopt});
+        ms.ct_ldt_index[k] = ms.columns.size();
+        ms.columns.push_back(column_spec{"__ct_ldt_" + nm, phys_type::int32,
+                                         repetition::optional, std::nullopt, std::nullopt});
     }
 
     if (ms.level == folding_level::logical) {
         // Nothing beyond the user's own columns. Deliberately no __ts: the point
         // of L3 is a file an analytics reader sees as the plain CQL table.
+        build_tree(ms, cols);
         return ms;
     }
 
@@ -314,6 +430,7 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     } else {
         ms.uniform_ts = single_ts.value_or(0);
     }
+    build_tree(ms, cols);
     return ms;
 }
 
@@ -435,7 +552,9 @@ std::vector<column_data> shred(const mapped_schema& ms,
         auto mt = modal_timestamp(r);
 
         for (size_t k = 0; k < reg_idx.size(); ++k) {
-            const size_t vcol = key_idx.size() + k;
+            // Recorded, not computed: a collection column contributes five leaves
+            // rather than one, so leaf positions no longer follow from k.
+            const size_t vcol = ms.value_leaf[k];
             auto it = r.cells.find(k);
             const bool present = it != r.cells.end() && it->second.v.has_value();
             out[vcol].def_levels.push_back(present ? 1 : 0);
@@ -563,7 +682,9 @@ std::vector<row> reassemble(const mapped_schema& ms,
         }
 
         for (size_t k = 0; k < reg_idx.size(); ++k) {
-            const size_t vcol = key_idx.size() + k;
+            // Recorded, not computed: a collection column contributes five leaves
+            // rather than one, so leaf positions no longer follow from k.
+            const size_t vcol = ms.value_leaf[k];
             const bool present = cd[vcol].def_levels[i] != 0;
 
             if (ms.level == folding_level::verbatim) {
@@ -641,7 +762,7 @@ std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 exception_encoding exc) {
     auto ms = map_schema(cols, level, rows, exc);
     auto data = shred(ms, cols, rows);
-    parquet_file_writer w(ms.columns, opt);
+    parquet_file_writer w(parquet_file_writer::nested_schema{ms.tree}, opt);
     w.add_key_value("scylla.folding_level", to_string(ms.level));
     if (ms.uniform_ts) {
         w.add_key_value("scylla.uniform_timestamp", std::to_string(*ms.uniform_ts));
