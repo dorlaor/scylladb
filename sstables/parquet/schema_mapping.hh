@@ -97,6 +97,18 @@ struct marker_info {
     bool operator==(const marker_info&) const = default;
 };
 
+// A range tombstone change: not a row, but carried as one so that it keeps its
+// place in the clustering order without a second stream. The clustering-key
+// columns hold the bound's prefix, padded past `prefix_len` with values that
+// mean nothing.
+struct rtc_info {
+    int32_t weight = 0;       // bound_weight
+    int32_t region = 0;       // partition_region
+    int32_t prefix_len = 0;   // clustering components the bound actually sets
+    std::optional<deletion_info> tomb;   // nullopt: the change closes a range
+    bool operator==(const rtc_info&) const = default;
+};
+
 struct row {
     std::vector<value>       key;             // partition key then clustering key
     std::map<size_t, cell>   cells;           // index into the regular columns
@@ -112,6 +124,8 @@ struct row {
     // clustering-key values are meaningless. Marking the row is cheaper than
     // making every clustering-key column nullable for every table.
     bool no_ck = false;
+    // Set when this "row" is really a range tombstone change.
+    std::optional<rtc_info> rtc;
 };
 
 // ---------------------------------------------------------------- folding
@@ -170,6 +184,8 @@ struct mapped_schema {
     std::optional<size_t> rt_ts_index, rt_ldt_index;
     std::optional<size_t> pt_ts_index, pt_ldt_index;
     std::optional<size_t> no_ck_index;
+    std::optional<size_t> rtc_w_index, rtc_reg_index, rtc_len_index,
+                          rtc_ts_index, rtc_ldt_index;
     // For L2: the single timestamp shared by every cell.
     std::optional<int64_t>   uniform_ts;
 
@@ -191,6 +207,7 @@ struct schema_flags {
     bool any_row_del = false;
     bool any_part_del = false;
     bool any_no_ck = false;
+    bool any_rtc = false;
     std::vector<bool> col_diverges;      // per regular column
     std::optional<int64_t> single_ts;
 };

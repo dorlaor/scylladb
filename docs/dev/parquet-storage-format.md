@@ -1940,8 +1940,17 @@ table, not the size.
     to, so the writer emits one placeholder row marked with a `__no_ck` leaf, which is
     cheaper than making every clustering-key column nullable for every table.
 
-    Still unrepresentable: **range tombstones, multi-cell collections and counters**.
-    These now make the writer *throw* rather than drop the fragment. That
+    **Range tombstones** landed the same day. They are fragments *between* rows rather
+    than attributes of one, so they are carried as marked rows that keep their place in the
+    clustering order: the clustering columns hold the bound's prefix, `__rtc_len` says how
+    much of that prefix is real, and `__rtc_w` / `__rtc_reg` restore the bound weight and
+    partition region. Presence of `__rtc_w` is what marks the row, because a weight of zero
+    is legitimate. `__rtc_ts` absent means the change closes a range.
+
+    Still unrepresentable: **multi-cell collections and counters**. These make the writer
+    *throw*. Collections were the last silent-loss case: the shredder skipped any
+    non-atomic cell with a comment claiming they "travel opaquely", when in fact the
+    column's contents were dropped. That
     distinction matters more than the missing support: before, a partition tombstone was
     silently discarded, which produced a perfectly valid Parquet file that resurrected
     deleted rows. Refusing is recoverable; silence is not.
@@ -1950,10 +1959,7 @@ table, not the size.
     `sstable_conforms_to_mutation_source_test`, which runs the full
     `run_mutation_source_tests` battery. That needs four things, not one:
 
-    1. **Range tombstones** — fragments *between* rows rather than attributes of one. The
-       likely design reuses the `__no_ck` idea: interleave them as marked rows carrying the
-       bound's clustering prefix, a bound weight, and how many clustering components the
-       bound actually sets.
+    1. ~~**Range tombstones**~~ — **done 2026-08-17**, see above.
     2. **Multi-cell collections** — the shredder maps one leaf per column; a collection is
        a nested Dremel structure with its own repetition levels. The format library already
        supports definition levels but not repetition levels.
@@ -1966,8 +1972,10 @@ table, not the size.
        correct but buffers the partition; seeking natively by clustering position, which
        the ColumnIndex would support, is a later optimisation.
 
-    Item 1 is the largest and item 3 may never be wanted. Until 1–3 land, adding `pq` to
-    the array would fail for real reasons rather than plumbing ones.
+    That leaves **multi-cell collections** as the one substantive blocker, since counters
+    are excluded by design. Collections need repetition levels, which is the largest single
+    piece of unwritten format-library work: the encoder emits definition levels only, so
+    nesting is not expressible at all today.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.

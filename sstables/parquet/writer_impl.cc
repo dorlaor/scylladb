@@ -80,6 +80,16 @@ void explode_key(const std::vector<bytes>& parts,
     }
 }
 
+// Anything the shredder cannot represent must stop the write. Dropping a
+// fragment here does not corrupt the file -- it produces a *valid* Parquet file
+// that is quietly missing data, which is the worse failure: a dropped partition
+// tombstone resurrects deleted rows. Refusing is recoverable; silence is not.
+[[noreturn]] void unrepresentable(const char* what) {
+    throw std::runtime_error(
+            std::string("pq: cannot represent ") + what + " yet; this sstable would "
+            "silently lose data. See docs/dev/parquet-storage-format.md section 11.");
+}
+
 } // namespace
 
 std::vector<cql_column> columns_of(const ::schema& s) {
@@ -180,7 +190,12 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
             }
             r.cells.emplace(size_t(id), std::move(c));
         }
-        // Collections travel opaquely for now; see design doc section 5.3.
+        else {
+            // Non-atomic means a multi-cell collection, which needs Dremel
+            // repetition levels the format library does not emit yet. Silently
+            // skipping it would write a valid file missing a column's contents.
+            unrepresentable("multi-cell collections");
+        }
     });
     _rows.push_back(std::move(r));
 }
@@ -192,7 +207,7 @@ void fragment_shredder::add_static_row(const static_row& sr) {
     // end_partition().
     sr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
         const column_definition& cdef = _schema.static_column_at(id);
-        if (!cdef.is_atomic()) { return; }
+        if (!cdef.is_atomic()) { unrepresentable("multi-cell static collections"); }
         auto av = acoc.as_atomic_cell(cdef);
         cell c;
         c.timestamp = av.timestamp();
@@ -209,6 +224,41 @@ void fragment_shredder::add_static_row(const static_row& sr) {
         }
         _static_cells.emplace(_static_base + size_t(id), std::move(c));
     });
+}
+
+void fragment_shredder::add_range_tombstone_change(const range_tombstone_change& rtc) {
+    // Carried as a row so it keeps its place in the clustering order. The
+    // clustering-key columns hold the bound's prefix; anything past prefix_len is
+    // padding and is ignored on the way back.
+    const auto& pos = rtc.position();
+    row r;
+    r.key = _pk;
+
+    std::vector<bytes> parts;
+    if (pos.has_key()) {
+        for (auto&& v : pos.key().components(_schema)) { parts.push_back(linearized(v)); }
+    }
+    for (size_t i = 0; i < _n_ck; ++i) {
+        r.key.push_back(i < parts.size()
+                ? decode(_cols[_n_pk + i].type, bytes_view(parts[i]))
+                : decode(_cols[_n_pk + i].type, bytes_view()));
+    }
+
+    rtc_info ri;
+    ri.weight     = int32_t(pos.get_bound_weight());
+    ri.region     = int32_t(pos.region());
+    ri.prefix_len = int32_t(parts.size()); // ok
+    if (rtc.tombstone()) {
+        ri.tomb = deletion_info{rtc.tombstone().timestamp,
+                int32_t(rtc.tombstone().deletion_time.time_since_epoch().count())};
+    }
+    r.rtc = ri;
+    r.part_del = _part_del;
+    for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
+
+    // The partition has content, so end_partition() must not add a placeholder.
+    _saw_clustering_row = true;
+    _rows.push_back(std::move(r));
 }
 
 void fragment_shredder::end_partition() {
@@ -338,16 +388,6 @@ void pq_writer_impl::consume_new_partition(const dht::decorated_key& dk) {
     ++_num_partitions;
 }
 
-// Anything the shredder cannot represent must stop the write. Dropping a
-// fragment here does not corrupt the file -- it produces a *valid* Parquet file
-// that is quietly missing data, which is the worse failure: a dropped partition
-// tombstone resurrects deleted rows. Refusing is recoverable; silence is not.
-[[noreturn]] static void unrepresentable(const char* what) {
-    throw std::runtime_error(
-            std::string("pq: cannot represent ") + what + " yet; this sstable would "
-            "silently lose data. See docs/dev/parquet-storage-format.md section 11.");
-}
-
 void pq_writer_impl::consume(tombstone t) {
     if (t) {
         _shredder.set_partition_tombstone(t);
@@ -365,11 +405,7 @@ stop_iteration pq_writer_impl::consume(clustering_row&& cr) {
 }
 
 stop_iteration pq_writer_impl::consume(range_tombstone_change&& rtc) {
-    // An end-of-range marker carries no tombstone and closes a range that was
-    // never opened (because opening one would have thrown), so it is a no-op.
-    if (rtc.tombstone()) {
-        unrepresentable("range tombstones");
-    }
+    _shredder.add_range_tombstone_change(rtc);
     return stop_iteration::no;
 }
 

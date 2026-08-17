@@ -450,6 +450,31 @@ void pq_reader::emit_row(const row& r) {
         }
     }
 
+    // A range tombstone change: rebuild its bound from the stored prefix length,
+    // weight and region, and emit it in place. Everything past prefix_len in the
+    // clustering columns is padding the writer put there.
+    if (r.rtc) {
+        std::optional<clustering_key_prefix> prefix;
+        if (r.rtc->prefix_len > 0) {
+            std::vector<bytes> parts;
+            parts.reserve(size_t(r.rtc->prefix_len));
+            for (int32_t i = 0; i < r.rtc->prefix_len && size_t(i) < _n_ck; ++i) {
+                parts.push_back(encode(_cols[_n_pk + size_t(i)].type, r.key[_n_pk + size_t(i)]));
+            }
+            prefix = clustering_key_prefix::from_exploded(*_schema, std::move(parts));
+        }
+        auto pos = position_in_partition(partition_region(r.rtc->region),
+                                         bound_weight(r.rtc->weight), std::move(prefix));
+        tombstone t;
+        if (r.rtc->tomb) {
+            t = tombstone(r.rtc->tomb->timestamp,
+                          gc_clock::time_point(gc_clock::duration(r.rtc->tomb->local_deletion_time)));
+        }
+        push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
+                range_tombstone_change(std::move(pos), t)));
+        return;
+    }
+
     // A placeholder row exists only to carry the static row or the partition
     // tombstone; it has no clustering row of its own.
     if (r.no_ck) { return; }

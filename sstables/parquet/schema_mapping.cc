@@ -115,6 +115,7 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
         if (r.row_del)  { f.any_row_del = true; }
         if (r.part_del) { f.any_part_del = true; }
         if (r.no_ck)    { f.any_no_ck = true; }
+        if (r.rtc)      { f.any_rtc = true; }
         for (const auto& [ci, c] : r.cells) {
             if (c.ttl) { f.any_ttl = true; }
             if (c.local_deletion_time || !c.live) { f.any_deletion = true; }
@@ -151,7 +152,7 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     if (requested == folding_level::uniform &&
         !(flags.all_same_ts && !any_ttl && !any_deletion &&
           !flags.any_marker && !flags.any_row_del && !flags.any_part_del &&
-          !flags.any_no_ck)) {
+          !flags.any_no_ck && !flags.any_rtc)) {
         // Precondition broken -- fall back rather than lose information.
         ms.level = folding_level::row_folded;
     }
@@ -276,6 +277,25 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
             ms.columns.push_back({"__no_ck", phys_type::int32, repetition::optional,
                                   std::nullopt, std::nullopt});
         }
+        if (flags.any_rtc) {
+            // Presence of __rtc_w is what marks a row as a range tombstone
+            // change; the weight itself is legitimately 0 for an exact bound.
+            ms.rtc_w_index = ms.columns.size();
+            ms.columns.push_back({"__rtc_w", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.rtc_reg_index = ms.columns.size();
+            ms.columns.push_back({"__rtc_reg", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.rtc_len_index = ms.columns.size();
+            ms.columns.push_back({"__rtc_len", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.rtc_ts_index = ms.columns.size();
+            ms.columns.push_back({"__rtc_ts", phys_type::int64, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.rtc_ldt_index = ms.columns.size();
+            ms.columns.push_back({"__rtc_ldt", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+        }
         if (flags.any_part_del) {
             ms.pt_ts_index = ms.columns.size();
             ms.columns.push_back({"__pt_ts", phys_type::int64, repetition::optional,
@@ -370,6 +390,7 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
         f.any_row_del    = has("__rt_ts");
         f.any_part_del   = has("__pt_ts");
         f.any_no_ck      = has("__no_ck");
+        f.any_rtc        = has("__rtc_w");
     } else if (level == folding_level::uniform) {
         f.all_same_ts = true;
         const std::string* u = fm.kv("scylla.uniform_timestamp");
@@ -488,6 +509,13 @@ std::vector<column_data> shred(const mapped_schema& ms,
         opt_i32(ms.rt_ldt_index, r.row_del.has_value(),
                 r.row_del ? r.row_del->local_deletion_time : 0);
         opt_i32(ms.no_ck_index, r.no_ck, 1);
+        opt_i32(ms.rtc_w_index,   r.rtc.has_value(), r.rtc ? r.rtc->weight : 0);
+        opt_i32(ms.rtc_reg_index, r.rtc.has_value(), r.rtc ? r.rtc->region : 0);
+        opt_i32(ms.rtc_len_index, r.rtc.has_value(), r.rtc ? r.rtc->prefix_len : 0);
+        opt_i64(ms.rtc_ts_index,  bool(r.rtc && r.rtc->tomb),
+                r.rtc && r.rtc->tomb ? r.rtc->tomb->timestamp : 0);
+        opt_i32(ms.rtc_ldt_index, bool(r.rtc && r.rtc->tomb),
+                r.rtc && r.rtc->tomb ? r.rtc->tomb->local_deletion_time : 0);
         opt_i64(ms.pt_ts_index, r.part_del.has_value(), r.part_del ? r.part_del->timestamp : 0);
         opt_i32(ms.pt_ldt_index, r.part_del.has_value(),
                 r.part_del ? r.part_del->local_deletion_time : 0);
@@ -587,6 +615,17 @@ std::vector<row> reassemble(const mapped_schema& ms,
                                       present(ms.rt_ldt_index) ? cd[*ms.rt_ldt_index].i32[i] : 0};
         }
         if (present(ms.no_ck_index)) { r.no_ck = true; }
+        if (present(ms.rtc_w_index)) {
+            rtc_info ri;
+            ri.weight     = cd[*ms.rtc_w_index].i32[i];
+            ri.region     = present(ms.rtc_reg_index) ? cd[*ms.rtc_reg_index].i32[i] : 0;
+            ri.prefix_len = present(ms.rtc_len_index) ? cd[*ms.rtc_len_index].i32[i] : 0;
+            if (present(ms.rtc_ts_index)) {
+                ri.tomb = deletion_info{cd[*ms.rtc_ts_index].i64[i],
+                        present(ms.rtc_ldt_index) ? cd[*ms.rtc_ldt_index].i32[i] : 0};
+            }
+            r.rtc = ri;
+        }
         if (present(ms.pt_ts_index)) {
             r.part_del = deletion_info{cd[*ms.pt_ts_index].i64[i],
                                        present(ms.pt_ldt_index) ? cd[*ms.pt_ldt_index].i32[i] : 0};

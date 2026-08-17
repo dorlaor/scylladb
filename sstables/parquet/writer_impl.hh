@@ -75,6 +75,7 @@ public:
     void end_partition();
     void add_clustering_row(const clustering_row& cr);
     void add_static_row(const static_row& sr);
+    void add_range_tombstone_change(const range_tombstone_change& rtc);
 
     const std::vector<cql_column>& columns() const { return _cols; }
     const std::vector<row>& rows() const { return _rows; }

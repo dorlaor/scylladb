@@ -95,6 +95,18 @@ utils::chunked_vector<mutation> make_muts(schema_ptr s, int n_part, int n_rows) 
     return muts;
 }
 
+// The raw fragment stream, printed. Reassembling into mutations normalises
+// range-tombstone bounds, which hides a lost bound weight; the fragments do not.
+std::vector<sstring> fragments_of(shared_sstable sst, schema_ptr s, reader_permit permit) {
+    auto rd = sst->make_reader(s, permit, query::full_partition_range, s->full_slice());
+    auto close = deferred_close(rd);
+    std::vector<sstring> out;
+    while (auto mf = rd().get()) {
+        out.push_back(seastar::format("{}", mutation_fragment_v2::printer(*s, *mf)));
+    }
+    return out;
+}
+
 utils::chunked_vector<mutation> read_all(shared_sstable sst, schema_ptr s,
                                          reader_permit permit) {
     auto rd = sst->make_reader(s, permit, query::full_partition_range,
@@ -344,27 +356,62 @@ SEASTAR_THREAD_TEST_CASE(test_pq_static_rows_round_trip) {
     }).get();
 }
 
-// What the shredder still cannot represent must stop the write rather than
-// produce a valid Parquet file that is quietly missing data.
-SEASTAR_THREAD_TEST_CASE(test_pq_refuses_range_tombstones) {
+// Range tombstones. They are fragments *between* rows, not attributes of one, so
+// they are carried as marked rows that keep their place in the clustering order:
+// the clustering columns hold the bound's prefix, and __rtc_len says how much of
+// that prefix is real.
+SEASTAR_THREAD_TEST_CASE(test_pq_range_tombstones_round_trip) {
     sstables::test_env::do_with_async([] (sstables::test_env& env) {
         auto s = pq_schema();
-        auto pk = partition_key::from_single_value(*s, utf8_type->decompose(sstring("k")));
-        mutation m(s, pk);
-        auto start = clustering_key_prefix::from_single_value(*s, int32_type->decompose(1));
-        auto end   = clustering_key_prefix::from_single_value(*s, int32_type->decompose(9));
-        // Spell the bound kinds out: passing bare prefixes picks the
-        // position_in_partition_view overload, which asserts on a bound weight
-        // of `equal`.
-        m.partition().apply_delete(*s, range_tombstone(
-                std::move(start), bound_kind::incl_start,
-                std::move(end), bound_kind::incl_end,
-                tombstone(100, gc_clock::time_point(gc_clock::duration(1)))));
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 12; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 3000 + p;
+            for (int r = 0; r < 10; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.set_clustered_cell(ck, *s->get_column_definition(to_bytes("v_int")),
+                        atomic_cell::make_live(*int32_type, ts, int32_type->decompose(r)));
+            }
+            // A deleted band in the middle, with the bound kinds varied so both
+            // inclusive and exclusive bounds are exercised.
+            auto lo = clustering_key_prefix::from_single_value(*s, int32_type->decompose(3));
+            auto hi = clustering_key_prefix::from_single_value(*s, int32_type->decompose(6));
+            m.partition().apply_delete(*s, range_tombstone(
+                    std::move(lo), p % 2 ? bound_kind::incl_start : bound_kind::excl_start,
+                    std::move(hi), p % 2 ? bound_kind::excl_end : bound_kind::incl_end,
+                    tombstone(ts + 1, gc_clock::time_point(gc_clock::duration(p + 1)))));
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+        // Compare pq against the default format rather than against the in-memory
+        // mutation: the write path legitimately drops rows a newer range tombstone
+        // shadows, and the question here is whether pq behaves like mc, not
+        // whether either matches an unwritten mutation.
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
 
-        BOOST_REQUIRE_THROW(
-                make_sstable_containing(env.make_sstable(s, sstable_version_types::pq),
-                                        utils::chunked_vector<mutation>{std::move(m)}).get(),
-                std::exception);
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
+
+        // And the raw streams, which keep the bound weights that reassembly
+        // normalises away.
+        auto fw = fragments_of(ref, s, env.make_reader_permit());
+        auto fg = fragments_of(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(fg.size(), fw.size());
+        for (size_t i = 0; i < fg.size(); ++i) {
+            BOOST_REQUIRE_EQUAL(fg[i], fw[i]);
+        }
     }).get();
 }
 
