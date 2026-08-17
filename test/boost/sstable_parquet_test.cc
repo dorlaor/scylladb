@@ -33,6 +33,7 @@
 
 #include "schema/schema_builder.hh"
 #include "readers/from_mutations.hh"
+#include "readers/combined.hh"
 #include "sstables/sstables.hh"
 #include "mutation/mutation.hh"
 
@@ -306,5 +307,68 @@ SEASTAR_THREAD_TEST_CASE(test_pq_refuses_what_it_cannot_represent) {
                 make_sstable_containing(env.make_sstable(s, sstable_version_types::pq),
                                         utils::chunked_vector<mutation>{std::move(m)}).get(),
                 std::exception);
+    }).get();
+}
+
+// sstable::validate() deliberately excludes pq from mx::validate -- mx walks the
+// mx data format, which a Parquet Data component is not -- so it falls through
+// to the generic validator, which reads through make_full_scan_reader and hence
+// through the pq reader. That fall-through is easy to get wrong and silent when
+// it is: a validator that cannot parse the format would either crash or report
+// phantom errors.
+SEASTAR_THREAD_TEST_CASE(test_pq_sstable_validates_clean) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), make_muts(s, 20, 8)).get();
+
+        abort_source abort;
+        uint64_t reported = 0;
+        auto errors = sst->validate(env.make_reader_permit(), abort,
+                                    [&reported] (sstring) { ++reported; },
+                                    default_read_monitor()).get();
+        BOOST_REQUIRE_EQUAL(errors, 0);
+        BOOST_REQUIRE_EQUAL(reported, 0);
+    }).get();
+}
+
+// Compaction reads through make_full_scan_reader and writes through the normal
+// writer, so a pq-to-pq compaction exercises both halves at once. It is also the
+// path that a hybrid LSM would use to converge a table onto Parquet.
+SEASTAR_THREAD_TEST_CASE(test_pq_sstables_compact_into_one) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+
+        // Two disjoint halves, so the merged output should be their union.
+        auto all = make_muts(s, 24, 6);
+        utils::chunked_vector<mutation> a, b;
+        for (size_t i = 0; i < all.size(); ++i) {
+            (i % 2 ? b : a).push_back(all[i]);
+        }
+        auto sst_a = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(a)).get();
+        auto sst_b = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(b)).get();
+
+        // Merge the two full-scan readers and write the result as a third pq
+        // sstable, which is what compaction does.
+        auto out = env.make_sstable(s, sstable_version_types::pq);
+        {
+            std::vector<mutation_reader> rds;
+            rds.push_back(sst_a->make_full_scan_reader(s, env.make_reader_permit(), nullptr,
+                                                       default_read_monitor()));
+            rds.push_back(sst_b->make_full_scan_reader(s, env.make_reader_permit(), nullptr,
+                                                       default_read_monitor()));
+            auto merged = make_combined_reader(s, env.make_reader_permit(), std::move(rds));
+            auto cfg = env.manager().configure_writer("test");
+            out->write_components(std::move(merged), all.size(), s, cfg, encoding_stats{}).get();
+            out->open_data().get();
+        }
+
+        auto got = read_all(out, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), all.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(all[i]);
+        }
     }).get();
 }
