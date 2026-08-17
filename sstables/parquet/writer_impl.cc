@@ -103,8 +103,14 @@ fragment_shredder::fragment_shredder(const ::schema& s)
     _n_ck = s.clustering_key_size();
 }
 
+void fragment_shredder::set_partition_tombstone(tombstone t) {
+    _part_del = deletion_info{t.timestamp,
+                              int32_t(t.deletion_time.time_since_epoch().count())};
+}
+
 void fragment_shredder::new_partition(const dht::decorated_key& dk) {
     _pk.clear();
+    _part_del.reset();
     std::vector<cql_type> types;
     for (const auto& c : _schema.partition_key_columns()) { types.push_back(cql_type_of(*c.type)); }
     std::vector<bytes> parts;
@@ -120,6 +126,24 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
     std::vector<bytes> parts;
     for (auto&& v : cr.key().components(_schema)) { parts.push_back(linearized(v)); }
     explode_key(parts, ck_types, r.key);
+
+    // Row-level metadata. The marker is what makes a row with no live cells
+    // exist at all, so losing it deletes the row.
+    if (!cr.marker().is_missing()) {
+        marker_info m;
+        m.timestamp = cr.marker().timestamp();
+        if (cr.marker().is_expiring()) {
+            m.ttl    = int32_t(cr.marker().ttl().count());
+            m.expiry = int32_t(cr.marker().expiry().time_since_epoch().count());
+        }
+        r.marker = m;
+    }
+    if (cr.tomb()) {
+        const auto& t = cr.tomb().tomb();
+        r.row_del = deletion_info{t.timestamp,
+                                  int32_t(t.deletion_time.time_since_epoch().count())};
+    }
+    r.part_del = _part_del;
 
     // Regular cells. column_id indexes the regular columns, which is exactly the
     // index space schema_mapping uses for cells.
@@ -257,12 +281,26 @@ void pq_writer_impl::consume_new_partition(const dht::decorated_key& dk) {
     ++_num_partitions;
 }
 
-void pq_writer_impl::consume(tombstone) {
-    // Partition tombstones need a header section of their own; next step.
+// Anything the shredder cannot represent must stop the write. Dropping a
+// fragment here does not corrupt the file -- it produces a *valid* Parquet file
+// that is quietly missing data, which is the worse failure: a dropped partition
+// tombstone resurrects deleted rows. Refusing is recoverable; silence is not.
+[[noreturn]] static void unrepresentable(const char* what) {
+    throw std::runtime_error(
+            std::string("pq: cannot represent ") + what + " yet; this sstable would "
+            "silently lose data. See docs/dev/parquet-storage-format.md section 11.");
+}
+
+void pq_writer_impl::consume(tombstone t) {
+    if (t) {
+        _shredder.set_partition_tombstone(t);
+    }
 }
 
 stop_iteration pq_writer_impl::consume(static_row&& sr) {
-    _shredder.add_static_row(sr);
+    if (!sr.empty()) {
+        unrepresentable("static rows");
+    }
     return stop_iteration::no;
 }
 
@@ -271,7 +309,12 @@ stop_iteration pq_writer_impl::consume(clustering_row&& cr) {
     return stop_iteration::no;
 }
 
-stop_iteration pq_writer_impl::consume(range_tombstone_change&&) {
+stop_iteration pq_writer_impl::consume(range_tombstone_change&& rtc) {
+    // An end-of-range marker carries no tombstone and closes a range that was
+    // never opened (because opening one would have thrown), so it is a no-op.
+    if (rtc.tombstone()) {
+        unrepresentable("range tombstones");
+    }
     return stop_iteration::no;
 }
 

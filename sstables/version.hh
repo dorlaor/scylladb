@@ -24,13 +24,17 @@ enum class sstable_format_types { big };
 // NOTE: `pq` is intentionally absent from both arrays below. These mean "versions
 // the node can actually read / write", and pq is not there yet.
 //
-// As of 2026-08-16 the writer and reader ARE wired in: a pq sstable is written
-// with a full component set, reads back through sstable::make_reader, and its
-// Data component opens in pyarrow (test/boost/sstable_parquet_test.cc). What
-// still blocks membership is coverage, not plumbing -- the shredder drops static
-// rows, partition and range tombstones, row markers, multi-cell collections and
-// counters. Adding pq here would enrol it in the generic suites, including
-// sstable_conforms_to_mutation_source_test, which exercise all of those.
+// The writer and reader are wired in: a pq sstable is written with a full
+// component set, streams back through sstable::make_reader within bounded
+// memory, and its Data component opens in pyarrow
+// (test/boost/sstable_parquet_test.cc). Row markers, row tombstones and
+// partition tombstones round-trip as of 2026-08-17.
+//
+// What still blocks membership is coverage, not plumbing: static rows, range
+// tombstones, multi-cell collections and counters cannot be represented, and
+// the writer throws on them rather than dropping them. Adding pq here would
+// enrol it in the generic suites -- including
+// sstable_conforms_to_mutation_source_test -- which exercise all of those.
 // Add it in the change that closes those gaps; see
 // docs/dev/parquet-storage-format.md section 11, item 11.
 constexpr std::array<sstable_version_types, 7> all_sstable_versions = {

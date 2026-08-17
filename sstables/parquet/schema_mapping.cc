@@ -108,6 +108,12 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
             if (!f.single_ts) { f.single_ts = mt; }
             else if (*f.single_ts != *mt) { f.all_same_ts = false; }
         }
+        if (r.marker) {
+            f.any_marker = true;
+            if (r.marker->ttl) { f.any_marker_ttl = true; }
+        }
+        if (r.row_del)  { f.any_row_del = true; }
+        if (r.part_del) { f.any_part_del = true; }
         for (const auto& [ci, c] : r.cells) {
             if (c.ttl) { f.any_ttl = true; }
             if (c.local_deletion_time || !c.live) { f.any_deletion = true; }
@@ -142,7 +148,8 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     const std::optional<int64_t>& single_ts = flags.single_ts;
 
     if (requested == folding_level::uniform &&
-        !(flags.all_same_ts && !any_ttl && !any_deletion)) {
+        !(flags.all_same_ts && !any_ttl && !any_deletion &&
+          !flags.any_marker && !flags.any_row_del && !flags.any_part_del)) {
         // Precondition broken -- fall back rather than lose information.
         ms.level = folding_level::row_folded;
     }
@@ -222,26 +229,60 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                 }
             }
         }
+        // Remembered rather than back-computed from columns.size(): anything
+        // appended after these groups would otherwise silently shift the index.
+        std::optional<size_t> group_base;
         if (any_ttl) {
+            group_base = ms.columns.size();
             for (size_t k = 0; k < reg_idx.size(); ++k) {
                 ms.columns.push_back({"__ttl_" + cols[reg_idx[k]].name, phys_type::int32,
                                       repetition::optional, std::nullopt, std::nullopt});
             }
         }
         if (any_deletion) {
+            if (!group_base) { group_base = ms.columns.size(); }
             for (size_t k = 0; k < reg_idx.size(); ++k) {
                 ms.columns.push_back({"__ldt_" + cols[reg_idx[k]].name, phys_type::int32,
                                       repetition::optional, std::nullopt, std::nullopt});
             }
         }
+        // Row marker, row tombstone, partition tombstone. Each group appears only
+        // if some row uses it, so a table that never deletes pays nothing.
+        if (flags.any_marker) {
+            ms.rm_index = ms.columns.size();
+            ms.columns.push_back({"__rm", phys_type::int64, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            if (flags.any_marker_ttl) {
+                ms.rm_ttl_index = ms.columns.size();
+                ms.columns.push_back({"__rm_ttl", phys_type::int32, repetition::optional,
+                                      std::nullopt, std::nullopt});
+                ms.rm_ldt_index = ms.columns.size();
+                ms.columns.push_back({"__rm_ldt", phys_type::int32, repetition::optional,
+                                      std::nullopt, std::nullopt});
+            }
+        }
+        if (flags.any_row_del) {
+            ms.rt_ts_index = ms.columns.size();
+            ms.columns.push_back({"__rt_ts", phys_type::int64, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.rt_ldt_index = ms.columns.size();
+            ms.columns.push_back({"__rt_ldt", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+        }
+        if (flags.any_part_del) {
+            ms.pt_ts_index = ms.columns.size();
+            ms.columns.push_back({"__pt_ts", phys_type::int64, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.pt_ldt_index = ms.columns.size();
+            ms.columns.push_back({"__pt_ldt", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+        }
+
         ms.uniform_ts = std::nullopt;
         // Record which optional groups exist so reassemble() can invert.
         ms.meta_base_index.assign(reg_idx.size(), std::nullopt);
-        if (any_ttl || any_deletion) {
-            size_t base = ms.columns.size();
-            if (any_deletion) { base -= reg_idx.size(); }
-            if (any_ttl)      { base -= reg_idx.size(); }
-            for (size_t k = 0; k < reg_idx.size(); ++k) { ms.meta_base_index[k] = base + k; }
+        if (group_base) {
+            for (size_t k = 0; k < reg_idx.size(); ++k) { ms.meta_base_index[k] = *group_base + k; }
         }
     } else {
         ms.uniform_ts = single_ts.value_or(0);
@@ -317,6 +358,10 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
             f.any_ttl      = has("__ttl_" + cols[reg_idx[0]].name);
             f.any_deletion = has("__ldt_" + cols[reg_idx[0]].name);
         }
+        f.any_marker     = has("__rm");
+        f.any_marker_ttl = has("__rm_ttl");
+        f.any_row_del    = has("__rt_ts");
+        f.any_part_del   = has("__pt_ts");
     } else if (level == folding_level::uniform) {
         f.all_same_ts = true;
         const std::string* u = fm.kv("scylla.uniform_timestamp");
@@ -412,6 +457,31 @@ std::vector<column_data> shred(const mapped_schema& ms,
             out[*ms.tsx_vals_index].str.push_back(any ? vals : std::string());
         }
         if (ms.ts_index) { out[*ms.ts_index].i64.push_back(mt.value_or(0)); }
+
+        // Row marker as a delta against the row's own timestamp: an INSERT sets
+        // both from the same write, so this is almost always zero.
+        auto opt_i64 = [&] (std::optional<size_t> idx, bool present, int64_t v) {
+            if (!idx) { return; }
+            out[*idx].def_levels.push_back(present ? 1 : 0);
+            out[*idx].i64.push_back(present ? v : 0);
+        };
+        auto opt_i32 = [&] (std::optional<size_t> idx, bool present, int32_t v) {
+            if (!idx) { return; }
+            out[*idx].def_levels.push_back(present ? 1 : 0);
+            out[*idx].i32.push_back(present ? v : 0);
+        };
+        opt_i64(ms.rm_index, r.marker.has_value(),
+                r.marker ? r.marker->timestamp - mt.value_or(0) : 0);
+        opt_i32(ms.rm_ttl_index, bool(r.marker && r.marker->ttl),
+                r.marker && r.marker->ttl ? *r.marker->ttl : 0);
+        opt_i32(ms.rm_ldt_index, bool(r.marker && r.marker->expiry),
+                r.marker && r.marker->expiry ? *r.marker->expiry : 0);
+        opt_i64(ms.rt_ts_index, r.row_del.has_value(), r.row_del ? r.row_del->timestamp : 0);
+        opt_i32(ms.rt_ldt_index, r.row_del.has_value(),
+                r.row_del ? r.row_del->local_deletion_time : 0);
+        opt_i64(ms.pt_ts_index, r.part_del.has_value(), r.part_del ? r.part_del->timestamp : 0);
+        opt_i32(ms.pt_ldt_index, r.part_del.has_value(),
+                r.part_del ? r.part_del->local_deletion_time : 0);
     }
     return out;
 }
@@ -490,6 +560,26 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 }
                 r.cells.emplace(k, std::move(c));
             }
+        }
+
+        // Row marker and the two tombstone groups, inverting shred().
+        auto present = [&] (std::optional<size_t> idx) {
+            return idx && !cd[*idx].def_levels.empty() && cd[*idx].def_levels[i];
+        };
+        if (present(ms.rm_index)) {
+            marker_info m;
+            m.timestamp = row_ts + cd[*ms.rm_index].i64[i];
+            if (present(ms.rm_ttl_index)) { m.ttl = cd[*ms.rm_ttl_index].i32[i]; }
+            if (present(ms.rm_ldt_index)) { m.expiry = cd[*ms.rm_ldt_index].i32[i]; }
+            r.marker = m;
+        }
+        if (present(ms.rt_ts_index)) {
+            r.row_del = deletion_info{cd[*ms.rt_ts_index].i64[i],
+                                      present(ms.rt_ldt_index) ? cd[*ms.rt_ldt_index].i32[i] : 0};
+        }
+        if (present(ms.pt_ts_index)) {
+            r.part_del = deletion_info{cd[*ms.pt_ts_index].i64[i],
+                                       present(ms.pt_ldt_index) ? cd[*ms.pt_ldt_index].i32[i] : 0};
         }
     }
     return out;

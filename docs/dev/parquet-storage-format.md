@@ -1900,12 +1900,23 @@ table, not the size.
     reads a whole row group's *bytes* from disk to serve a few rows, which is why point
     reads are 120× native rather than the ≤1.2× §4 targeted. The fix is per-column-chunk
     reads driven by the OffsetIndex; see §10.4.
-11. **Fragment kinds the shredder drops.** Static rows, partition tombstones, range
-    tombstones, row markers, multi-cell collections and counters are not carried through
-    `fragment_shredder`. This — not the reader or the writer — is why `pq` is absent from
-    `all_sstable_versions` and why `sstable_conforms_to_mutation_source_test` cannot yet
-    include it. A row that exists with all-null columns currently reads back without a
-    marker.
+11. **Fragment kinds.** Partially closed 2026-08-17. **Row markers, row tombstones and
+    partition tombstones now round-trip** through the real sstable path
+    (`test/boost/sstable_parquet_test.cc`), each as an optional leaf group that is
+    materialised only when some row uses it — so a table that never deletes pays nothing.
+    The marker is stored as a delta against the row's own timestamp, which is zero for an
+    ordinary INSERT and costs nothing after zstd.
+
+    Still unrepresentable: **static rows, range tombstones, multi-cell collections and
+    counters**. These now make the writer *throw* rather than drop the fragment. That
+    distinction matters more than the missing support: before, a partition tombstone was
+    silently discarded, which produced a perfectly valid Parquet file that resurrected
+    deleted rows. Refusing is recoverable; silence is not.
+
+    Range tombstones are the remaining blocker for `all_sstable_versions` and for
+    `sstable_conforms_to_mutation_source_test`, because they are fragments *between* rows
+    rather than attributes of one, and so need a representation of their own — most likely
+    a side list in the file's key/value metadata, ordered by clustering position.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.

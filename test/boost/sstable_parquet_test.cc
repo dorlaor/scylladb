@@ -231,3 +231,80 @@ SEASTAR_THREAD_TEST_CASE(test_pq_full_scan_reader) {
         BOOST_REQUIRE_EQUAL(n, expected.size());
     }).get();
 }
+
+// Row markers and tombstones through the real sstable path. Each of these was a
+// silent-data-loss bug before: a lost marker deletes a row that exists, and a
+// lost tombstone resurrects one that does not.
+SEASTAR_THREAD_TEST_CASE(test_pq_markers_and_tombstones_round_trip) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        utils::chunked_vector<mutation> muts;
+
+        for (int p = 0; p < 24; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 2000 + p;
+
+            // Every fourth partition is deleted outright.
+            if (p % 4 == 0) {
+                m.partition().apply(tombstone(ts - 1, gc_clock::time_point(gc_clock::duration(p + 1))));
+            }
+            for (int r = 0; r < 6; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                auto& dr = m.partition().clustered_row(*s, ck);
+
+                if (r % 3 == 0) {
+                    // A row that exists purely because of its marker: no cells at
+                    // all. This is the case that vanished entirely before.
+                    dr.apply(row_marker(ts));
+                } else if (r % 3 == 1) {
+                    dr.apply(row_marker(ts, gc_clock::duration(3600),
+                                        gc_clock::time_point(gc_clock::duration(ts + 3600))));
+                    dr.cells().apply(*s->get_column_definition(to_bytes("v_int")),
+                            atomic_cell::make_live(*int32_type, ts, int32_type->decompose(r)));
+                } else {
+                    dr.apply(row_tombstone(tombstone(ts,
+                            gc_clock::time_point(gc_clock::duration(p * 10 + r)))));
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+        auto expected = muts;
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+        auto got = read_all(sst, s, env.make_reader_permit());
+
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+    }).get();
+}
+
+// What the shredder cannot represent must stop the write rather than produce a
+// valid Parquet file that is quietly missing data.
+SEASTAR_THREAD_TEST_CASE(test_pq_refuses_what_it_cannot_represent) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = schema_builder(1, "ks", "pq_static")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("st", int32_type, column_kind::static_column)
+            .with_column("v", int32_type)
+            .build();
+
+        auto pk = partition_key::from_single_value(*s, utf8_type->decompose(sstring("k")));
+        mutation m(s, pk);
+        m.set_static_cell(*s->get_column_definition(to_bytes("st")),
+                          atomic_cell::make_live(*int32_type, 100, int32_type->decompose(7)));
+
+        BOOST_REQUIRE_THROW(
+                make_sstable_containing(env.make_sstable(s, sstable_version_types::pq),
+                                        utils::chunked_vector<mutation>{std::move(m)}).get(),
+                std::exception);
+    }).get();
+}

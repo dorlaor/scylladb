@@ -53,12 +53,15 @@ class fragment_shredder {
     std::vector<cql_column> _cols;
     std::vector<row> _rows;
     std::vector<value> _pk;      // current partition's key components
+    std::optional<deletion_info> _part_del;
     size_t _n_pk = 0, _n_ck = 0;
 
 public:
     explicit fragment_shredder(const ::schema& s);
 
     void new_partition(const dht::decorated_key& dk);
+    // Applies to every row of the current partition until the next one.
+    void set_partition_tombstone(tombstone);
     void add_clustering_row(const clustering_row& cr);
     void add_static_row(const static_row& sr);
 

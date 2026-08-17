@@ -394,8 +394,15 @@ void pq_reader::emit_row(const row& r) {
             _skipping = true;
             return;
         }
+        // The partition tombstone rides on every row of the partition, so the
+        // first row of the run carries it.
+        tombstone pt;
+        if (r.part_del) {
+            pt = tombstone(r.part_del->timestamp,
+                           gc_clock::time_point(gc_clock::duration(r.part_del->local_deletion_time)));
+        }
         push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
-                partition_start(std::move(dk), tombstone())));
+                partition_start(std::move(dk), pt)));
         _open_pk = std::move(pk);
         _open = true;
         _skipping = false;
@@ -431,10 +438,21 @@ void pq_reader::emit_row(const row& r) {
         }
     }
 
-    // Row markers are not carried through the shredder yet, so a row that exists
-    // with no live cells reads back without one -- see design doc section 11.
+    row_marker rm;
+    if (r.marker) {
+        rm = (r.marker->ttl && r.marker->expiry)
+           ? row_marker(r.marker->timestamp,
+                        gc_clock::duration(*r.marker->ttl),
+                        gc_clock::time_point(gc_clock::duration(*r.marker->expiry)))
+           : row_marker(r.marker->timestamp);
+    }
+    row_tombstone rt;
+    if (r.row_del) {
+        rt = row_tombstone(tombstone(r.row_del->timestamp,
+                gc_clock::time_point(gc_clock::duration(r.row_del->local_deletion_time))));
+    }
     push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
-            clustering_row(std::move(ck), row_tombstone(), row_marker(), std::move(cells))));
+            clustering_row(std::move(ck), rt, rm, std::move(cells))));
 }
 
 } // namespace

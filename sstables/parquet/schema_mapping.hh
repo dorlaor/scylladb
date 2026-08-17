@@ -80,9 +80,33 @@ struct cell {
     std::optional<int32_t> local_deletion_time;
 };
 
+// A deletion: when it happened, and when it becomes collectable.
+struct deletion_info {
+    int64_t timestamp = 0;
+    int32_t local_deletion_time = 0;
+    bool operator==(const deletion_info&) const = default;
+};
+
+// The CQL row marker -- what makes a row exist even with every column null.
+// Almost every INSERT creates one, so it is stored as a delta against the row's
+// own timestamp, which is nearly always zero and costs nothing after zstd.
+struct marker_info {
+    int64_t                timestamp = 0;
+    std::optional<int32_t> ttl;
+    std::optional<int32_t> expiry;
+    bool operator==(const marker_info&) const = default;
+};
+
 struct row {
     std::vector<value>       key;             // partition key then clustering key
     std::map<size_t, cell>   cells;           // index into the regular columns
+    std::optional<marker_info>   marker;      // row marker, if the row has one
+    std::optional<deletion_info> row_del;     // row tombstone
+    // The partition's tombstone, repeated on every row of that partition. It
+    // costs nothing -- a column that is constant within a partition and usually
+    // absent entirely compresses away -- and it keeps a row self-describing,
+    // which is what lets the reader work a window at a time.
+    std::optional<deletion_info> part_del;
 };
 
 // ---------------------------------------------------------------- folding
@@ -135,6 +159,11 @@ struct mapped_schema {
     std::optional<size_t> tsx_vals_index;
     // For L0: index of the first of the four metadata leaves per column.
     std::vector<std::optional<size_t>> meta_base_index;
+    // Row marker, row tombstone and partition tombstone leaves. Each group is
+    // materialised only when the data needs it.
+    std::optional<size_t> rm_index, rm_ttl_index, rm_ldt_index;
+    std::optional<size_t> rt_ts_index, rt_ldt_index;
+    std::optional<size_t> pt_ts_index, pt_ldt_index;
     // For L2: the single timestamp shared by every cell.
     std::optional<int64_t>   uniform_ts;
 
@@ -151,6 +180,10 @@ struct schema_flags {
     bool any_ttl = false;
     bool any_deletion = false;
     bool all_same_ts = true;
+    bool any_marker = false;
+    bool any_marker_ttl = false;
+    bool any_row_del = false;
+    bool any_part_del = false;
     std::vector<bool> col_diverges;      // per regular column
     std::optional<int64_t> single_ts;
 };

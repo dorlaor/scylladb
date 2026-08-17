@@ -56,6 +56,12 @@ struct gen_opts {
     double divergence_rate = 0.0;   // fraction of rows with per-cell timestamps
     double ttl_rate = 0.0;
     double delete_rate = 0.0;
+    // Row-level metadata. Markers are the common case -- almost every CQL INSERT
+    // makes one -- so the default is "most rows have one".
+    double marker_rate = 0.0;
+    double marker_ttl_rate = 0.0;
+    double row_del_rate = 0.0;
+    double part_del_rate = 0.0;
     uint64_t seed = 7;
 };
 
@@ -93,6 +99,24 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
                                           c.local_deletion_time = int32_t(rng() % 100000); }
             r.cells.emplace(k, std::move(c));
         }
+        if (unit() < o.marker_rate) {
+            marker_info m;
+            // Usually the row's own timestamp, occasionally not -- the delta
+            // encoding has to survive both.
+            m.timestamp = (unit() < 0.8) ? row_ts : row_ts + int64_t(rng() % 5000);
+            if (unit() < o.marker_ttl_rate) {
+                m.ttl = int32_t(rng() % 86400);
+                m.expiry = int32_t(rng() % 100000);
+            }
+            r.marker = m;
+        }
+        if (unit() < o.row_del_rate) {
+            r.row_del = deletion_info{row_ts - int64_t(rng() % 1000), int32_t(rng() % 100000)};
+        }
+        if (unit() < o.part_del_rate) {
+            // Constant within a run of rows, as a real partition tombstone is.
+            r.part_del = deletion_info{base_ts + int64_t(i / 50), int32_t(i / 50)};
+        }
         rows.push_back(std::move(r));
     }
     return rows;
@@ -110,6 +134,20 @@ bool compare(const std::vector<row>& in, const std::vector<row>& out,
     if (in.size() != out.size()) { why = "row count"; return false; }
     for (size_t i = 0; i < in.size(); ++i) {
         if (in[i].key != out[i].key) { why = "key at row " + std::to_string(i); return false; }
+        // Row markers and tombstones must survive every lossless level. Losing a
+        // marker deletes a row that exists; losing a tombstone resurrects one
+        // that does not.
+        if (lvl != folding_level::verbatim) {
+            if (in[i].marker != out[i].marker) {
+                why = "row " + std::to_string(i) + ": marker differs"; return false;
+            }
+            if (in[i].row_del != out[i].row_del) {
+                why = "row " + std::to_string(i) + ": row tombstone differs"; return false;
+            }
+            if (in[i].part_del != out[i].part_del) {
+                why = "row " + std::to_string(i) + ": partition tombstone differs"; return false;
+            }
+        }
         for (const auto& [k, c] : in[i].cells) {
             const bool keeps = (lvl == folding_level::verbatim) || (c.live && c.v);
             auto it = out[i].cells.find(k);
@@ -173,6 +211,7 @@ int roundtrip() {
         for (double d : divs) for (double nl : nulls) for (double tt : ttls) for (double dl : dels) {
             gen_opts o; o.rows = 800; o.n_regular = w;
             o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = tt; o.delete_rate = dl;
+            o.marker_rate = 0.9; o.marker_ttl_rate = tt; o.row_del_rate = dl; o.part_del_rate = 0.1;
             auto rows = generate(cols, o);
             for (auto lvl : {folding_level::verbatim, folding_level::row_folded,
                              folding_level::uniform})
@@ -216,6 +255,8 @@ int filetrip() {
         for (double d : divs) for (double nl : nulls) for (auto& cp : comps) {
             gen_opts o; o.rows = 1500; o.n_regular = w;
             o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = 0.2;
+            o.marker_rate = 0.9; o.marker_ttl_rate = 0.1;
+            o.row_del_rate = 0.05; o.part_del_rate = 0.1;
             auto rows = generate(cols, o);
 
             for (auto lvl : {folding_level::verbatim, folding_level::row_folded}) {
@@ -366,6 +407,8 @@ int recovery() {
             for (double ttl : {0.0, 0.2}) {
                 gen_opts o; o.rows = 800; o.n_regular = w;
                 o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = ttl;
+                o.marker_rate = 0.9; o.marker_ttl_rate = ttl > 0 ? 0.2 : 0.0;
+                o.row_del_rate = 0.05; o.part_del_rate = 0.1;
                 auto rows = generate(cols, o);
 
                 for (auto lvl : {folding_level::verbatim, folding_level::row_folded,
