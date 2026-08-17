@@ -404,6 +404,14 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
             ms.rt_ldt_index = ms.columns.size();
             ms.columns.push_back({"__rt_ldt", phys_type::int32, repetition::optional,
                                   std::nullopt, std::nullopt});
+            // The regular half, which is usually equal to the shadowable one and
+            // therefore compresses away, but is not always.
+            ms.rtr_ts_index = ms.columns.size();
+            ms.columns.push_back({"__rtr_ts", phys_type::int64, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.rtr_ldt_index = ms.columns.size();
+            ms.columns.push_back({"__rtr_ldt", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
         }
         if (flags.any_no_ck) {
             ms.no_ck_index = ms.columns.size();
@@ -729,6 +737,10 @@ std::vector<column_data> shred(const mapped_schema& ms,
         opt_i64(ms.rt_ts_index, r.row_del.has_value(), r.row_del ? r.row_del->timestamp : 0);
         opt_i32(ms.rt_ldt_index, r.row_del.has_value(),
                 r.row_del ? r.row_del->local_deletion_time : 0);
+        opt_i64(ms.rtr_ts_index, r.row_del_regular.has_value(),
+                r.row_del_regular ? r.row_del_regular->timestamp : 0);
+        opt_i32(ms.rtr_ldt_index, r.row_del_regular.has_value(),
+                r.row_del_regular ? r.row_del_regular->local_deletion_time : 0);
         opt_i32(ms.no_ck_index, r.no_ck, 1);
         opt_i32(ms.rtc_w_index,   r.rtc.has_value(), r.rtc ? r.rtc->weight : 0);
         opt_i32(ms.rtc_reg_index, r.rtc.has_value(), r.rtc ? r.rtc->region : 0);
@@ -913,6 +925,11 @@ std::vector<row> reassemble(const mapped_schema& ms,
         if (present(ms.rt_ts_index)) {
             r.row_del = deletion_info{cd[*ms.rt_ts_index].i64[i],
                                       present(ms.rt_ldt_index) ? cd[*ms.rt_ldt_index].i32[i] : 0};
+        }
+        if (present(ms.rtr_ts_index)) {
+            r.row_del_regular = deletion_info{
+                    cd[*ms.rtr_ts_index].i64[i],
+                    present(ms.rtr_ldt_index) ? cd[*ms.rtr_ldt_index].i32[i] : 0};
         }
         if (present(ms.no_ck_index)) { r.no_ck = true; }
         if (present(ms.rtc_w_index)) {

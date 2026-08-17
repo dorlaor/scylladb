@@ -199,9 +199,14 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
         r.marker = m;
     }
     if (cr.tomb()) {
-        const auto& t = cr.tomb().tomb();
-        r.row_del = deletion_info{t.timestamp,
-                                  int32_t(t.deletion_time.time_since_epoch().count())};
+        const auto& sh = cr.tomb().tomb();          // the shadowable half
+        r.row_del = deletion_info{sh.timestamp,
+                                  int32_t(sh.deletion_time.time_since_epoch().count())};
+        const auto& reg = cr.tomb().regular();
+        if (reg) {
+            r.row_del_regular = deletion_info{
+                    reg.timestamp, int32_t(reg.deletion_time.time_since_epoch().count())};
+        }
     }
     r.part_del = _part_del;
     _saw_clustering_row = true;

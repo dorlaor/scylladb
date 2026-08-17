@@ -614,8 +614,16 @@ void pq_reader::emit_row(const row& r) {
     }
     row_tombstone rt;
     if (r.row_del) {
-        rt = row_tombstone(tombstone(r.row_del->timestamp,
-                gc_clock::time_point(gc_clock::duration(r.row_del->local_deletion_time))));
+        auto sh = tombstone(r.row_del->timestamp,
+                gc_clock::time_point(gc_clock::duration(r.row_del->local_deletion_time)));
+        // Rebuild both halves. Passing only one makes the regular tombstone as
+        // strong as the shadowable one, which deletes cells that should survive.
+        auto reg = r.row_del_regular
+                ? tombstone(r.row_del_regular->timestamp,
+                        gc_clock::time_point(
+                                gc_clock::duration(r.row_del_regular->local_deletion_time)))
+                : tombstone();
+        rt = row_tombstone(reg, shadowable_tombstone(sh));
     }
     push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
             clustering_row(std::move(ck), rt, rm, std::move(cells))));

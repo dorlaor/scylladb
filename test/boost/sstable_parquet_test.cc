@@ -670,7 +670,7 @@ SEASTAR_THREAD_TEST_CASE(test_pq_corpus_shaped_schema) {
         // Match the corpus more closely: it is 64 + 64 columns with 33 rows and
         // range tombstones, and it was the range tombstones that this test was
         // missing.
-        for (int i = 0; i < 12; ++i) {
+        for (int i = 0; i < 64; ++i) {
             sb.with_column(to_bytes(format("v{}", i)),
                            i % 2 ? data_type(list_b) : bytes_type);
             sb.with_column(to_bytes(format("s{}", i)),
@@ -707,15 +707,15 @@ SEASTAR_THREAD_TEST_CASE(test_pq_corpus_shaped_schema) {
                 7000,
             };
             const api::timestamp_type ts = extremes[p % 4] + p;
-            for (int i = 0; i < 12; ++i) {
+            for (int i = 0; i < 64; ++i) {
                 const auto& cdef = *s->get_column_definition(to_bytes(format("s{}", i)));
                 if (i % 2) { m.set_static_cell(cdef, make_list(ts, 2)); }
                 else       { m.set_static_cell(cdef, atomic_cell::make_live(
                                      *bytes_type, ts, bytes_view(blob(i)))); }
             }
-            for (int r = 0; r < 9; ++r) {
+            for (int r = 0; r < 33; ++r) {
                 auto ck = clustering_key::from_exploded(*s, {blob(r), blob(r + 1)});
-                for (int i = 0; i < 12; ++i) {
+                for (int i = 0; i < 64; ++i) {
                     const auto& cdef = *s->get_column_definition(to_bytes(format("v{}", i)));
                     if (i % 2) { m.set_clustered_cell(ck, cdef, make_list(ts, 1 + r % 2)); }
                     else       { m.set_clustered_cell(ck, cdef, atomic_cell::make_live(

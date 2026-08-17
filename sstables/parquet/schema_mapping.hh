@@ -136,7 +136,11 @@ struct row {
     std::vector<value>       key;             // partition key then clustering key
     std::map<size_t, cell>   cells;           // index into the regular columns
     std::optional<marker_info>   marker;      // row marker, if the row has one
-    std::optional<deletion_info> row_del;     // row tombstone
+    // A row tombstone has two halves and the shadowable one is always >= the
+    // regular one. Collapsing them into a single value turns a shadowable
+    // tombstone into a regular one, which deletes cells that should survive.
+    std::optional<deletion_info> row_del;          // shadowable
+    std::optional<deletion_info> row_del_regular;  // regular
     // The partition's tombstone, repeated on every row of that partition. It
     // costs nothing -- a column that is constant within a partition and usually
     // absent entirely compresses away -- and it keeps a row self-describing,
@@ -216,6 +220,7 @@ struct mapped_schema {
     // materialised only when the data needs it.
     std::optional<size_t> rm_index, rm_ttl_index, rm_ldt_index;
     std::optional<size_t> rt_ts_index, rt_ldt_index;
+    std::optional<size_t> rtr_ts_index, rtr_ldt_index;
     std::optional<size_t> pt_ts_index, pt_ldt_index;
     std::optional<size_t> no_ck_index;
     std::optional<size_t> rtc_w_index, rtc_reg_index, rtc_len_index,
