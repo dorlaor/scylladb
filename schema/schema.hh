@@ -573,6 +573,11 @@ public:
         // This is the compaction strategy that will be used by default on tables which don't have one explicitly specified.
         compaction::compaction_strategy_type compaction_strategy = compaction::compaction_strategy_type::incremental;
         std::map<sstring, sstring> compaction_strategy_options;
+        // The validated `parquet = {...}` property. Held as the raw map rather than a
+        // parquet_parameters so that schema does not have to depend on the sstable
+        // layer above it; validation already happened at CREATE/ALTER time, and the
+        // writer reconstitutes the object from this.
+        std::map<sstring, sstring> parquet_options;
         bool compaction_enabled = true;
         storage_engine_type storage_engine = storage_engine_type::normal;
         // Unset means the user never mentioned the property. That is distinct
@@ -803,6 +808,9 @@ public:
     // a schema cell is written at all.
     bool has_storage_format() const {
         return _raw._props.storage_format.has_value();
+    }
+    const std::map<sstring, sstring>& parquet_options() const {
+        return _raw._props.parquet_options;
     }
     // True when any SSTable of this table may be Parquet-encoded.
     bool uses_parquet_format() const {

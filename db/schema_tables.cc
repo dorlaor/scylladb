@@ -323,6 +323,7 @@ schema_ptr scylla_tables(schema_features features) {
 
         sb.with_column("storage_engine", utf8_type);
         sb.with_column("storage_format", utf8_type);
+        sb.with_column("parquet", map_type_impl::get_instance(utf8_type, utf8_type, false));
         sb.with_column("large_data_guardrails_enabled", boolean_type);
 
         sb.with_hash_version();
@@ -1700,6 +1701,9 @@ mutation make_scylla_tables_mutation(schema_ptr table, api::timestamp_type times
     // property writes no cell at all, so existing schemas keep their digest.
     // Same shape as the `tablets` column above, and the property can only be set
     // once PARQUET_SSTABLE_FORMAT is enabled (see cf_prop_defs::validate).
+    if (!table->parquet_options().empty()) {
+        store_map(m, ckey, "parquet", timestamp, table->parquet_options());
+    }
     if (table->has_storage_format()) {
         m.set_clustered_cell(ckey, "storage_format",
                 storage_format_type_to_sstring(table->storage_format()), timestamp);
@@ -2222,6 +2226,9 @@ static void prepare_builder_from_scylla_tables_row(const schema_ctxt& ctxt, sche
     if (auto opt_map = get_map<sstring, sstring>(table_row, "tablets")) {
         auto tablet_options = db::tablet_options(*opt_map);
         builder.set_tablet_options(tablet_options.to_map());
+    }
+    if (auto map = get_map<sstring, sstring>(table_row, "parquet")) {
+        builder.set_parquet_options(*map);
     }
     if (auto storage_format = table_row.get<sstring>("storage_format")) {
         builder.set_storage_format(sstring_to_storage_format_type(*storage_format));

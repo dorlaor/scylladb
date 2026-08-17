@@ -847,18 +847,9 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
         const sstables::sstable_writer_config& cfg,
         encoding_stats enc_stats,
         shard_id shard) {
-    // Compiled-in defaults, with an environment override so the row-group size can be
-    // swept and a default chosen from data. This is a stopgap: the real surface is the
-    // per-table `parquet = {...}` property specified in design doc 8.2, which does not
-    // exist yet (open question 14). It is read once here rather than threaded through
-    // any hot path, and it disappears when that property lands.
-    pq_writer_config pcfg;
-    if (const char* e = ::getenv("SCYLLA_PQ_ROW_GROUP_ROWS")) {
-        if (auto v = std::atol(e); v > 0) { pcfg.row_group_rows = size_t(v); }
-    }
-    if (const char* e = ::getenv("SCYLLA_PQ_ROW_GROUP_BUFFER_BYTES")) {
-        if (auto v = std::atol(e); v > 0) { pcfg.row_group_buffer_bytes = size_t(v); }
-    }
+    // From the table's `parquet = {...}` property. Already validated at CREATE/ALTER
+    // time, so anything stored here parses; an empty map yields the defaults.
+    pq_writer_config pcfg = parquet_parameters(s.parquet_options()).config();
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
                                             std::move(pcfg), enc_stats, shard, nullptr);
 }

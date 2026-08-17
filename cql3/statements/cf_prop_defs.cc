@@ -13,6 +13,7 @@
 #include "cql3/statements/request_validations.hh"
 #include "data_dictionary/data_dictionary.hh"
 #include "db/extensions.hh"
+#include "sstables/parquet/writer_impl.hh"
 #include "db/tags/extension.hh"
 #include "cdc/log.hh"
 #include "cdc/cdc_extension.hh"
@@ -61,6 +62,7 @@ const sstring cf_prop_defs::KW_TABLETS = "tablets";
 
 const sstring cf_prop_defs::KW_STORAGE_ENGINE = "storage_engine";
 const sstring cf_prop_defs::KW_STORAGE_FORMAT = "storage_format";
+const sstring cf_prop_defs::KW_PARQUET = "parquet";
 const sstring cf_prop_defs::KW_LARGE_DATA_GUARDRAILS_ENABLED = "large_data_guardrails_enabled";
 
 schema::extensions_map cf_prop_defs::make_schema_extensions(const db::extensions& exts) const {
@@ -112,6 +114,7 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         KW_SYNCHRONOUS_UPDATES, KW_TABLETS,
         KW_STORAGE_ENGINE,
         KW_STORAGE_FORMAT,
+        KW_PARQUET,
         KW_LARGE_DATA_GUARDRAILS_ENABLED,
     });
     static std::set<sstring> obsolete_keywords({
@@ -202,6 +205,15 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
             throw exceptions::configuration_exception("tablet options cannot be used until all nodes in the cluster enable this feature");
         }
         db::tablet_options::validate(*tablet_options_map, db.features());
+    }
+
+    if (has_property(KW_PARQUET)) {
+        // Constructing it is the validation: parquet_parameters rejects unknown
+        // sub-options, out-of-range values, and anything the writer cannot honour, so a
+        // bad value is a configuration error here rather than a surprise at write time.
+        if (auto opts = get_map(KW_PARQUET)) {
+            (void) sstables::parquet::parquet_parameters{*opts};
+        }
     }
 
     if (has_property(KW_STORAGE_FORMAT)) {
@@ -424,6 +436,9 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
         builder.set_tablet_options(std::move(*tablet_options_opt));
     }
 
+    if (auto opts = get_map(KW_PARQUET)) {
+        builder.set_parquet_options(*opts);
+    }
     if (has_property(KW_STORAGE_FORMAT)) {
         builder.set_storage_format(
                 sstring_to_storage_format_type(get_string(KW_STORAGE_FORMAT, "sstable")));

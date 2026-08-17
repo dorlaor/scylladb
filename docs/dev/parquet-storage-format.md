@@ -1016,11 +1016,22 @@ ALTER  TABLE ks.t       WITH storage_format = 'hybrid';    -- sstable | parquet 
 
 ### 8.2 Per-table Parquet parameters
 
-**Status 2026-08-17: `parquet_parameters` exists, validated and unit-tested; the CQL and
-persistence wiring does not.** The class parses and validates the map below into a
-`pq_writer_config` and serialises back with `to_map()`. What remains is `cf_prop_defs`
-accepting a `parquet` map option, a schema field to hold it, and `schema_tables`
-persistence -- after which the CQL in this section works.
+**Status 2026-08-18: working end to end.** `ALTER TABLE ... WITH parquet = {...}` parses,
+validates, persists, survives a schema reload, and reaches the writer.
+
+The chain: `cf_prop_defs` validates by constructing `parquet_parameters` and letting it throw;
+`user_properties::parquet_options` holds the validated map; `schema_tables` writes it as a
+`map<text,text>` column and reads it back; `make_writer()` builds its `pq_writer_config` from
+`parquet_parameters(s.parquet_options()).config()`.
+
+The schema stores the **raw map**, not a `parquet_parameters` object, so `schema.hh` does not
+have to include the sstable layer above it -- validation has already happened by then.
+
+Covered by `cql_ddl_test/test_parquet_table_property`, which drives CREATE, ALTER, a schema
+reload and four rejections, and was mutation-checked by removing the `store_map` call: the test
+fails, so it really covers persistence rather than just the in-memory path. That mattered here,
+because persistence is where this property had already broken once (see the round-trip note
+below).
 
 Two deliberate departures from the original specification:
 
