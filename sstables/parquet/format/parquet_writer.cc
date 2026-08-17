@@ -76,11 +76,15 @@ void write_dictionary_page_header(std::vector<uint8_t>& out,
 void parquet_file_writer::write_column_chunk(const column_spec& spec, const column_data& col,
                                      chunk_meta& out_meta) {
     const size_t n = col.num_values();
-    const bool optional = spec.rep == repetition::optional;
-    const uint8_t max_def = optional ? 1 : 0;
+    // A leaf inside a repeated group states its levels explicitly, because the
+    // schema tree they come from is not visible here. A flat leaf derives them.
+    const uint8_t max_rep = spec.max_rep;
+    const uint8_t max_def = spec.max_def ? spec.max_def
+                                        : uint8_t(spec.rep == repetition::optional ? 1 : 0);
+    const bool has_def = max_def > 0;
 
     out_meta.cm.type = spec.type;
-    out_meta.cm.path_in_schema = {spec.name};
+    out_meta.cm.path_in_schema = spec.path_or_name();
     out_meta.cm.compression = _opt.compression;
     out_meta.cm.num_values = int64_t(n);
     out_meta.first_page_offset = int64_t(_buf.size());
@@ -93,7 +97,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         std::vector<std::string> present;
         present.reserve(n);
         for (size_t i = 0; i < n; ++i) {
-            if (!optional || col.def_levels[i]) { present.push_back(col.str[i]); }
+            if (!has_def || col.def_levels[i] == max_def) { present.push_back(col.str[i]); }
         }
         dict = encode_dictionary_byte_array(present);
         // Dictionary only pays if it is small relative to the data.
@@ -135,17 +139,38 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     bool first_data_page = true;
     int64_t rows_written = 0;   // first_row_index of the next page
 
-    for (size_t off = 0; off < n || (n == 0 && off == 0); off += page_sz) {
-        const size_t cnt = std::min(page_sz, n - off);
-        if (n == 0) { break; }
+    // A page must never split a row, so with repetition the cut points are the
+    // rep_level==0 positions rather than every `page_values`-th value.
+    auto page_end = [&] (size_t from) {
+        size_t want = std::min(from + page_sz, n);
+        if (max_rep == 0 || want >= n) { return want; }
+        // Walk back to the start of the row `want` lands inside; never emit an
+        // empty page, so if that walk reaches `from`, walk forward instead.
+        size_t e = want;
+        while (e > from && col.rep_levels[e] != 0) { --e; }
+        if (e == from) {
+            e = want;
+            while (e < n && col.rep_levels[e] != 0) { ++e; }
+        }
+        return e;
+    };
 
-        // definition levels (never compressed in V2)
-        std::vector<uint8_t> def_bytes;
+    for (size_t off = 0; off < n || (n == 0 && off == 0); ) {
+        if (n == 0) { break; }
+        const size_t stop = page_end(off);
+        const size_t cnt = stop - off;
+
+        // definition and repetition levels (never compressed in V2)
+        std::vector<uint8_t> def_bytes, rep_bytes;
         int32_t page_nulls = 0;
-        if (optional) {
+        if (has_def) {
             std::span<const uint64_t> lv(col.def_levels.data() + off, cnt);
-            for (auto x : lv) { if (!x) { ++page_nulls; } }
+            for (auto x : lv) { if (x < max_def) { ++page_nulls; } }
             def_bytes = encode_levels_v2(lv, max_def);
+        }
+        if (max_rep > 0) {
+            std::span<const uint64_t> rv(col.rep_levels.data() + off, cnt);
+            rep_bytes = encode_levels_v2(rv, max_rep);
         }
         null_count += page_nulls;
 
@@ -161,7 +186,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                 std::vector<int32_t> present;
                 present.reserve(cnt);
                 for (size_t i = 0; i < cnt; ++i) {
-                    if (!optional || col.def_levels[off + i]) { present.push_back(col.i32[off + i]); }
+                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.i32[off + i]); }
                 }
                 encode_plain<int32_t>(body, present);
                 break;
@@ -170,7 +195,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                 std::vector<int64_t> present;
                 present.reserve(cnt);
                 for (size_t i = 0; i < cnt; ++i) {
-                    if (!optional || col.def_levels[off + i]) { present.push_back(col.i64[off + i]); }
+                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.i64[off + i]); }
                 }
                 if (spec.preferred && *spec.preferred == encoding::delta_binary_packed) {
                     encode_delta_binary_packed(body, present);
@@ -184,7 +209,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                 std::vector<double> present;
                 present.reserve(cnt);
                 for (size_t i = 0; i < cnt; ++i) {
-                    if (!optional || col.def_levels[off + i]) { present.push_back(col.f64[off + i]); }
+                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.f64[off + i]); }
                 }
                 if (spec.preferred && *spec.preferred == encoding::byte_stream_split) {
                     encode_byte_stream_split<double>(body, present);
@@ -198,7 +223,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                 std::vector<std::string> present;
                 present.reserve(cnt);
                 for (size_t i = 0; i < cnt; ++i) {
-                    if (!optional || col.def_levels[off + i]) { present.push_back(col.str[off + i]); }
+                    if (!has_def || col.def_levels[off + i] == max_def) { present.push_back(col.str[off + i]); }
                 }
                 encode_plain_byte_array(body, present);
                 break;
@@ -211,13 +236,24 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         auto comp = compress(body, _opt.compression, _opt.zstd_level);
         // In V2 the level bytes sit before the (compressed) values and are
         // counted in both page sizes but never compressed.
-        const int32_t uncompressed = int32_t(def_bytes.size() + body.size());
-        const int32_t compressed   = int32_t(def_bytes.size() + comp.size());
+        const size_t lvl_bytes = def_bytes.size() + rep_bytes.size();
+        const int32_t uncompressed = int32_t(lvl_bytes + body.size());
+        const int32_t compressed   = int32_t(lvl_bytes + comp.size());
+
+        // num_rows counts rows, not values; they differ once a column repeats.
+        int32_t page_rows = int32_t(cnt);
+        if (max_rep > 0) {
+            page_rows = 0;
+            for (size_t i = 0; i < cnt; ++i) {
+                if (col.rep_levels[off + i] == 0) { ++page_rows; }
+            }
+        }
 
         std::vector<uint8_t> hdr;
         write_data_page_v2_header(hdr, uncompressed, compressed,
-                                  int32_t(cnt), page_nulls, int32_t(cnt),
-                                  used, int32_t(def_bytes.size()), 0,
+                                  int32_t(cnt), page_nulls, page_rows,
+                                  used, int32_t(def_bytes.size()),
+                                  int32_t(rep_bytes.size()),
                                   _opt.compression != codec::uncompressed);
         const int64_t page_start = int64_t(_buf.size());
         if (first_data_page) {
@@ -230,8 +266,10 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                 page_start,
                 int32_t(hdr.size()) + compressed,
                 int64_t(rows_written)});
-        rows_written += int64_t(cnt);
+        rows_written += int64_t(page_rows);
         _buf.insert(_buf.end(), hdr.begin(), hdr.end());
+        // Spec order: repetition levels first, then definition levels.
+        _buf.insert(_buf.end(), rep_bytes.begin(), rep_bytes.end());
         _buf.insert(_buf.end(), def_bytes.begin(), def_bytes.end());
         _buf.insert(_buf.end(), comp.begin(), comp.end());
 
@@ -242,6 +280,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             == out_meta.cm.encodings.end()) {
             out_meta.cm.encodings.push_back(used);
         }
+        off = stop;
     }
 
     if (first_data_page) {   // zero-row column: still needs a valid offset
@@ -261,10 +300,14 @@ void parquet_file_writer::add_row_group(std::span<const column_data> cols) {
         throw std::runtime_error("writer: column count does not match schema");
     }
     rg_meta rg;
-    rg.num_rows = cols.empty() ? 0 : int64_t(cols[0].num_values());
+    // Rows, not values: a repeated column holds more values than rows, so the
+    // consistency check has to count rows or it rejects every nested schema.
+    rg.num_rows = cols.empty() ? 0 : int64_t(cols[0].num_rows());
     for (size_t i = 0; i < cols.size(); ++i) {
-        if (int64_t(cols[i].num_values()) != rg.num_rows) {
-            throw std::runtime_error("writer: ragged row group (column '" + _schema[i].name + "')");
+        if (int64_t(cols[i].num_rows()) != rg.num_rows) {
+            throw std::runtime_error("writer: ragged row group (column '" + _schema[i].name +
+                                     "': " + std::to_string(cols[i].num_rows()) + " rows, expected " +
+                                     std::to_string(rg.num_rows) + ")");
         }
         chunk_meta cmeta;
         write_column_chunk(_schema[i], cols[i], cmeta);

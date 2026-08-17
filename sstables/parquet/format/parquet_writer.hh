@@ -62,6 +62,10 @@ struct writer_options {
 struct column_data {
     // Empty means the column is REQUIRED and every value is present.
     std::vector<uint64_t>    def_levels;
+    // Dremel repetition levels. Empty for a column that is not inside a
+    // repeated group. A zero starts a new row, so the number of zeroes is the
+    // row count -- which is not the value count once a column repeats.
+    std::vector<uint64_t>    rep_levels;
     std::vector<int32_t>     i32;
     std::vector<int64_t>     i64;
     std::vector<double>      f64;
@@ -74,6 +78,16 @@ struct column_data {
         if (!str.empty()) { return str.size(); }
         return 0;
     }
+
+    // Rows, as opposed to values. They differ only for a repeated column.
+    size_t num_rows() const {
+        if (rep_levels.empty()) {
+            return def_levels.empty() ? num_values() : def_levels.size();
+        }
+        size_t n = 0;
+        for (auto r : rep_levels) { if (r == 0) { ++n; } }
+        return n;
+    }
 };
 
 struct column_spec {
@@ -84,6 +98,20 @@ struct column_spec {
     // Encoding hint. The writer may fall back (e.g. dictionary -> plain when the
     // dictionary grows past dictionary_max_bytes).
     std::optional<encoding> preferred;
+
+    // Dremel levels for this leaf. For a flat schema these follow from `rep`
+    // alone; a leaf inside a repeated group needs them stated, because the
+    // schema tree they come from is not visible here.
+    uint8_t max_def = 0;
+    uint8_t max_rep = 0;
+    // Full path from the root, for the ColumnMetaData. Empty means just `name`.
+    // Explicitly defaulted so that the existing positional initialisers in
+    // schema_mapping.cc stay complete under -Wmissing-field-initializers.
+    std::vector<std::string> path = {};
+
+    std::vector<std::string> path_or_name() const {
+        return path.empty() ? std::vector<std::string>{name} : path;
+    }
 };
 
 class parquet_file_writer {

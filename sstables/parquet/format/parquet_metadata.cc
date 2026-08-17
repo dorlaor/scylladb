@@ -200,6 +200,43 @@ key_value parse_key_value(compact_reader& r) {
 
 } // anonymous namespace
 
+std::vector<leaf_info> walk_leaves(const file_metadata& m) {
+    if (m.schema.empty()) { throw thrift_error("schema has no root"); }
+    std::vector<leaf_info> out;
+    size_t pos = 1;                       // schema[0] is the root
+
+    // Depth-first descent. A `repeated` element adds a repetition level; anything
+    // not `required` adds a definition level. The root itself contributes neither.
+    auto descend = [&] (auto&& self, std::vector<std::string>& path,
+                        uint8_t def, uint8_t rep, int32_t count) -> void {
+        for (int32_t i = 0; i < count; ++i) {
+            if (pos >= m.schema.size()) {
+                throw thrift_error("schema tree declares more children than it has elements");
+            }
+            const auto& e = m.schema[pos];
+            const size_t here = pos;
+            ++pos;
+
+            uint8_t d = def, r = rep;
+            const auto rt = e.repetition_type.value_or(repetition::required);
+            if (rt == repetition::repeated) { ++d; ++r; }
+            else if (rt == repetition::optional) { ++d; }
+
+            path.push_back(e.name);
+            if (e.is_leaf()) {
+                out.push_back(leaf_info{here, path, d, r});
+            } else {
+                self(self, path, d, r, *e.num_children);
+            }
+            path.pop_back();
+        }
+    };
+
+    std::vector<std::string> path;
+    descend(descend, path, 0, 0, m.schema[0].num_children.value_or(0));
+    return out;
+}
+
 void validate(const file_metadata& m) {
     if (m.schema.empty()) {
         throw thrift_error("footer has no schema");

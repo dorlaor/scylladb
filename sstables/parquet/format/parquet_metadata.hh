@@ -67,6 +67,16 @@ struct schema_element {
     bool is_leaf() const { return !num_children.has_value() || *num_children == 0; }
 };
 
+// One leaf of the schema tree, with the Dremel levels its position implies.
+// The footer stores the tree flat and depth-first with num_children, so these
+// have to be recovered by walking it -- there is nowhere they are written down.
+struct leaf_info {
+    size_t index = 0;                     // index into file_metadata::schema
+    std::vector<std::string> path;        // from the root's children downwards
+    uint8_t max_def = 0;
+    uint8_t max_rep = 0;
+};
+
 struct key_value { std::string key, value; };
 
 struct statistics {
@@ -165,6 +175,10 @@ struct file_metadata {
         return nullptr;
     }
 };
+
+// Leaves in column order, which is the order column chunks appear in a row group.
+// Throws if the tree is malformed (num_children overrunning the list).
+std::vector<leaf_info> walk_leaves(const file_metadata&);
 
 // Structural checks that Thrift itself cannot express. Without these a footer
 // that is merely well-formed Thrift -- a bare STOP byte, say -- decodes into an
