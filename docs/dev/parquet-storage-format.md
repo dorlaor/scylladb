@@ -748,6 +748,35 @@ leaning on. Changing a table's compressor today is an `ALTER TABLE` followed by 
 background rewrite; changing its storage format is the same operation with a different
 output encoder. Nothing about that reasoning involves tablets.
 
+### 6.2a Convergence: partly wired 2026-08-18
+
+`storage_format` now **converts on compaction**, in both directions. The creator in
+`compaction/compaction_manager.cc` reads the property and, for an explicit `'parquet'`, asks for
+a `pq` output; set it back to `'sstable'` and the next compaction falls through to the preferred
+native version. Until this, compaction was format-preserving and the property recorded an intent
+that never happened.
+
+Covered by `cql_ddl_test/test_storage_format_converts_on_compaction`, which drives native ->
+Parquet -> native and reads every key back after each switch rather than trusting the format to
+have changed. Mutation-checked by disabling the branch. **Converting back is tested
+deliberately** -- it is the direction nobody checks, and a table that cannot be un-converted is
+a trap rather than a feature.
+
+**What is still missing, and it is the harder half:**
+
+- **`'hybrid'` does nothing yet.** It has to consult `decide_output_format()`, which needs a
+  `compaction_context` carrying the tier. The manager builds the creator generically for all
+  compaction types and does not know the tier; the strategy does. So the context has to be
+  threaded from the strategy through `compaction_descriptor` into the creator.
+- **C1-C7 are not consulted on this path.** An explicit opt-in is taken at face value, so the
+  eligibility and predicted-gain checks -- including the estimator validated at 0.4 % error in
+  §10.3e -- are bypassed. That is defensible for an explicit setting and wrong for `'hybrid'`,
+  which is precisely a judgement call about whether conversion pays.
+- **Flushes are never Parquet**, only compaction outputs. That matches §6 (the bottom tier is
+  where the value is) but means a freshly flushed table stays native until it compacts.
+- **`nodetool upgradesstables` does not force convergence**; conversion happens on natural
+  compaction only.
+
 ### 6.2 Switching is a write-side policy
 
 - **The setting decides what new SSTables are written as.** At any instant a table has

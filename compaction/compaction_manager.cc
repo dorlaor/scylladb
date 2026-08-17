@@ -414,6 +414,21 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
     descriptor.creator = [&t] (shard_id) {
         // All compaction types going through this path will work on normal input sstables only.
         // Off-strategy, for example, waits until the sstables move out of staging state.
+        //
+        // A table that has explicitly opted into Parquet converts here. This is what makes
+        // `storage_format = 'parquet'` mean something rather than merely being recorded, and
+        // it converts back the same way: set the property to 'sstable' and the next
+        // compaction falls through to the preferred native version.
+        //
+        // Only the explicit case is handled. 'hybrid' has to consult
+        // parquet::decide_output_format(), which needs a compaction_context carrying the
+        // tier -- knowledge the strategy has and the descriptor does not carry yet. That
+        // also means the C1-C7 eligibility and gain checks are *not* applied on this path;
+        // an explicit opt-in is taken at face value. See design doc 6.4.
+        if (t.schema()->storage_format() == storage_format_type::parquet) {
+            return t.make_sstable(sstables::sstable_state::normal,
+                                  sstables::sstable_version_types::pq);
+        }
         return t.make_sstable(sstables::sstable_state::normal);
     };
     descriptor.replacer = [this, &t, &on_replace, offstrategy] (compaction_completion_desc desc) {

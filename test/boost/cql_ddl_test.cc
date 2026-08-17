@@ -13,6 +13,8 @@
 #include <seastar/testing/test_case.hh>
 
 #include "test/lib/cql_test_env.hh"
+#include "sstables/sstables.hh"
+#include "test/lib/cql_assertions.hh"
 
 BOOST_AUTO_TEST_SUITE(cql_ddl_test)
 
@@ -120,6 +122,59 @@ SEASTAR_TEST_CASE(test_parquet_table_property) {
         // The rejected ALTERs must not have changed anything.
         auto s = e.local_db().find_schema("ks", "pqt");
         BOOST_REQUIRE_EQUAL(s->parquet_options().at("row_group_rows"), "20000");
+    });
+}
+
+// storage_format actually converts on compaction, in both directions.
+//
+// The property has been parsed, validated and persisted for a while, but nothing acted on
+// it: compaction was format-preserving, so `ALTER TABLE ... WITH storage_format =
+// 'parquet'` recorded an intent that never happened. This drives the round trip that
+// matters -- native to Parquet and back -- because converting *back* is the direction
+// nobody thinks to check, and a table that cannot be un-converted is a trap.
+SEASTAR_TEST_CASE(test_storage_format_converts_on_compaction) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.conv (pk int PRIMARY KEY, v int)").get();
+        auto& db = e.local_db();
+        auto insert_and_flush = [&] (int base) {
+            for (int i = 0; i < 20; ++i) {
+                e.execute_cql(seastar::format(
+                        "INSERT INTO ks.conv (pk, v) VALUES ({}, {})", base + i, i)).get();
+            }
+            e.db().invoke_on_all([] (replica::database& d) {
+                return d.flush_all_memtables();
+            }).get();
+        };
+        auto versions = [&] {
+            std::set<sstables::sstable_version_types> out;
+            auto& t = db.find_column_family("ks", "conv");
+            for (auto&& sst : *t.get_sstables()) { out.insert(sst->get_version()); }
+            return out;
+        };
+
+        insert_and_flush(0);
+        // Flushes are never Parquet: the creator above only affects compaction outputs.
+        BOOST_REQUIRE(!versions().contains(sstables::sstable_version_types::pq));
+
+        e.execute_cql("ALTER TABLE ks.conv WITH storage_format = 'parquet'").get();
+        insert_and_flush(100);
+        db.find_column_family("ks", "conv").compact_all_sstables(tasks::task_info{}).get();
+        BOOST_REQUIRE(versions() == std::set<sstables::sstable_version_types>{
+                sstables::sstable_version_types::pq});
+
+        // The data has to survive the conversion, not merely change format: read every
+        // key back rather than trusting the format switch.
+        for (int i = 0; i < 20; ++i) {
+            assert_that(e.execute_cql(seastar::format(
+                    "SELECT v FROM ks.conv WHERE pk = {}", 100 + i)).get())
+                    .is_rows().with_size(1);
+        }
+
+        // And back again.
+        e.execute_cql("ALTER TABLE ks.conv WITH storage_format = 'sstable'").get();
+        insert_and_flush(200);
+        db.find_column_family("ks", "conv").compact_all_sstables(tasks::task_info{}).get();
+        BOOST_REQUIRE(!versions().contains(sstables::sstable_version_types::pq));
     });
 }
 
