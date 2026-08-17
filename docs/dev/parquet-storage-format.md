@@ -1405,6 +1405,24 @@ is little for the layout to exploit, while the row-oriented baseline's trained d
 still captures common substrings. D9 sits in between: its JSON payloads are individually
 large but share heavy structure across rows, which the layout does capture.
 
+**The per-column breakdown makes the mechanism concrete.** Compressed bytes per column,
+from the real footers:
+
+| D11 Wikipedia pageviews | | | D10 HackerNews | |
+|---|---:|---|---|---:|
+| `page` (pk) | **57.7 %** | | `url` | **38.5 %** |
+| `__ts` | 37.6 % | | `title` | **37.5 %** |
+| `views` | 2.9 % | | `time` | 10.1 % |
+| everything else | 1.8 % | | everything else | 13.9 % |
+
+`page` averages **1.79 repeats** across 163 845 rows at 15.2 characters — near-unique text,
+even though it is the partition key. It is not the *repetition* of the key that costs
+(pyarrow does dictionary-encode it); it is that there is almost nothing to repeat. The
+same is true of HackerNews `url` and `title`. In both tables three quarters or more of the
+file is a column whose values are individually distinct, which is the one thing a
+columnar layout cannot help with, and the one thing a trained dictionary over row bytes
+still can.
+
 **A narrow row also cannot amortise its per-row metadata.** D11 is the clearest case: at
 13.6 bytes per row in L1, the one mandatory `__ts` leaf is **37.5 %** of the file, and
 folding it away with L2 takes D11 from 93.0 % to **58.1 %** of the baseline. The same
