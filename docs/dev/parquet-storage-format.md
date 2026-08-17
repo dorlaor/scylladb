@@ -58,7 +58,7 @@ Derived from the prompt. `R-n` identifiers are referenced throughout the design.
 | R-3 | The mode can be switched **dynamically** on a live table, without downtime and without blocking reads or writes. |
 | R-4 | A **hybrid** mode: upper (small, hot) LSM tiers stay in native SSTable format; the bottom-most (large, cold) tiers are Parquet. |
 | R-5 | The Parquet format configuration (row group sizing, page sizing, encodings, compression) is user-controllable with sane defaults. |
-| R-6 | Round-trip must be **lossless**: cell timestamps, TTL/expiry, all tombstone kinds, static rows, collections, counters (or explicitly excluded — see §7.1). |
+| R-6 | Round-trip must be **lossless**: cell timestamps, TTL/expiry, all tombstone kinds, static rows, collections, counters. **Met 2026-08-17** — all of it, verified by `sstable_conforms_to_mutation_source_test` (§11 item 11). |
 | R-7 | Backup, restore, snapshot, repair, streaming, tablet migration/split/merge, scrub, and all other existing features continue to work. |
 
 ### 1.2 Non-functional targets
@@ -303,7 +303,7 @@ changes the story.
 | Mixed OLTP orders: numeric + text + timestamps, dense | 0.40–0.55 | 0.70–0.85 | Moderate, broad-based win |
 | **Wide sparse (100 cols, ~20 % filled)** | 0.9–1.5 | **1.0–1.6 (regression risk)** | Level + metadata overhead; the Scenario-3 case. Must be fixed by §5.3 or excluded by policy |
 | Large-blob store (pk + ≥ 64 KiB blob) | 0.95–1.05 | 0.98–1.05 | Payload dominates and is opaque |
-| Counter tables | n/a | n/a | Excluded in v1 (§7.1) |
+| Counter tables | see §11 item 11 | — | Supported 2026-08-17; one element per shard |
 | Non-frozen collection-heavy | 0.8–1.2 | 0.9–1.3 | Per-cell metadata per element; needs the folding work to be viable |
 
 Read this table as: **the Parquet case is strongest for append-mostly, dense,
@@ -551,6 +551,155 @@ the main new resource risk and must be designed for, not discovered.
 - Trade-off to measure: larger row groups → better ratio, worse point-read latency and
   more memory. This is the primary tuning axis and the reason §8 exposes it.
 
+### 5.5a Write-side memory — measured 2026-08-17, and R-13 is **not** met here
+
+§5.5 above specifies what should happen. What the writer actually does is emit **one row
+group per sstable**: `write_rows()` calls `add_row_group()` exactly once, `row_group_rows` is
+declared in `pq_writer_config` and never read, `row_group_bytes` does not exist, and there is
+no semaphore. So `fragment_shredder::_rows` accumulates every row of the sstable before
+anything is encoded.
+
+Measured with `scylla sstable parquet-export` on the D12 table, peak RSS against row count:
+
+| Rows | Peak RSS | SSTable in | Parquet out |
+|---:|---:|---:|---:|
+| 30 000 | 115 MiB | 356 kB | 179 720 |
+| 300 000 | 582 MiB | 3.6 MB | 1 548 377 |
+
+Ten times the rows costs 5.1× the memory, so this is a real linear term and not seastar's
+up-front reservation. Solving the two points gives **≈1.77 kB of buffered write memory per
+row** on top of a ≈63 MiB baseline, which projects to:
+
+| Rows in one sstable | Buffered |
+|---:|---:|
+| 1 000 000 | 1.8 GiB |
+| 10 000 000 | 17.0 GiB |
+| 100 000 000 | 169.1 GiB |
+
+Multiply by concurrent compactions × shards and this is the OOM that R-13 exists to prevent.
+The read path is bounded (1.13× memory for 8× rows, §10.4); the write path is not.
+
+**A refinement to §5.5 that the measurement forces.** §5.5 proposes bounding a row group by
+`row_group_bytes` (64 MiB uncompressed) and `row_group_rows` (1 000 000). Neither is the right
+budget on its own:
+
+- The quantity that can OOM a shard is the **shredder's in-memory footprint**, not the encoded
+  row-group size. They differ by a lot: 1.77 kB/row in memory against 5.2 B/row of compressed
+  output on D12 — **343×**. Budgeting 64 MiB of *encoded* bytes would therefore permit
+  something on the order of gigabytes of shredder memory. The budget has to be charged where
+  the memory actually is.
+- `row_group_rows = 1 000 000` is roughly **50× too large** for the current row model: a
+  64 MiB shredder budget is about **37 000 rows**. The byte budget would trip first every
+  time, which is exactly why §5.5 says "whichever trips first" — the row count is a backstop,
+  not the operative limit.
+
+**This also bears on point-read latency.** One row group per sstable means one dictionary page
+per column covering the entire sstable, and a dictionary must be decompressed in full before a
+single value can be decoded — the effect that dominated point reads until the threshold was
+tightened (§10.4). Cutting row groups shrinks every dictionary, so it is plausibly a larger
+point-read win than caching decoded state, and it should be measured before the caching work
+rather than after.
+
+Two further notes on the row model itself, since 1.77 kB/row is high for ten columns: `row`
+holds a `std::map<size_t, cell>` and each `value` carries a `std::string`. A flat vector keyed
+by column index, and interning or borrowing the value bytes, would cut the constant
+substantially — worth doing regardless of where the budget lands.
+
+#### Step 1 delivered: the budget has a number to cut on — calibrated 2026-08-17
+
+`fragment_shredder` now accounts for the heap its buffered rows hold, accumulated as rows
+are appended (`buffered_bytes()`). Every row enters through one `push_row()` so the
+accounting cannot drift away from the buffer — the same mistake the static-cell replay made
+when it had three copies of a two-line loop.
+
+The estimate deliberately **errs high**: under-counting is what OOMs a shard, over-counting
+only cuts a row group slightly early. Validated against measured RSS rather than trusted —
+`parquet-export` now reports `buffered_bytes_estimate`, so the two can be compared directly:
+
+| Rows | Estimate | Peak RSS |
+|---:|---:|---:|
+| 30 000 | 56 610 000 | 119 771 136 |
+| 300 000 | 566 100 000 | 609 484 800 |
+
+The RSS slope is **1 814 B/row** (the intercept is a ≈62 MiB fixed baseline); the estimator
+says **1 887 B/row**. So it is **4 % conservative** — accurate enough to budget on, and wrong
+in the safe direction. At a 64 MiB budget that is **≈35 600 rows per row group**, against the
+declared `row_group_rows` default of 1 000 000, confirming which of the two limits is
+operative.
+
+`test_parquet_buffered_bytes_accounting` pins the properties the budget depends on — it counts
+heap and not just the struct, it scales with rows, every row path feeds it including range
+tombstone changes, and `clear()` resets it — and was mutation-checked by making it count
+`sizeof(row)` only.
+
+#### Step 2a delivered: the conservative leaf set is a real, tested option
+
+`leaf_set::derived` / `leaf_set::conservative` is now a parameter of `map_schema()` rather than
+the throwaway switch the cost was first measured with. `conservative` forces every optional
+metadata leaf on, including the divergence channel — without that last one a later row whose
+cell timestamp differs from its row timestamp would have nowhere to record the difference.
+
+**The 540-case losslessness suite now runs over both leaf sets** — 1 080 cases became **2 160,
+all passing**. That matters more than a bespoke test would: the conservative set exercises a
+reassembly path the derived set never reaches, with every optional leaf present but null, and
+losslessness has to hold there or cutting row groups is unsafe.
+
+Two guards, because "the suite passes" is not evidence on its own:
+
+- The conservative leaf set must never be *smaller* than the derived one, and must sometimes be
+  larger. It is wider in **720 of the 1 080** case pairs; the rest are cases whose data already
+  needed every leaf. Without this check a silently-ignored flag would leave all 2 160 cases
+  passing and prove nothing.
+- Mutation-checked: making `leaf_set::conservative` a no-op fails the suite with
+  "conservative leaf set was never wider", which is the diagnosis rather than a vague mismatch.
+
+#### The obstacle to cutting row groups, and the way through it — measured 2026-08-17
+
+Cutting row groups is not just a matter of calling `add_row_group()` more than once. Parquet
+requires **one leaf set for the whole file**, fixed before the first row group is written, and
+the pq leaf set is *derived from the data*: `scan_rows()` walks every row to decide whether the
+file needs `__ttl_<col>`, `__ldt_<col>`, `__rm`, the row/partition tombstone groups, the
+divergence channel, and whether L2's uniform-timestamp precondition holds. An incremental
+writer does not know, at its first flush, whether row ten million carries a TTL.
+
+Three ways out, and only one survives contact:
+
+1. **Decide from the first row group.** Unsound: a later row with a TTL needs a leaf that does
+   not exist, and there is no way to add one.
+2. **Two passes.** Defeats the purpose — the first pass is the buffering we are trying to remove.
+3. **A conservative leaf set**: emit every optional metadata leaf regardless of use. Sound, and
+   compatible with the existing reader without changes, because the reader recovers the flags
+   from leaf *names* and will simply see them present. The unused leaves are all-null, so they
+   cost definition levels that RLE away plus a fixed per-leaf overhead.
+
+**Measured cost of the conservative leaf set** (temporary switch, since reverted):
+
+| Table | Regular cols | Rows | Derived | Conservative | Leaves | Cost |
+|---|---:|---:|---:|---:|---:|---:|
+| D12 ISD-Lite | 8 | 300 000 | 1 548 404 | 1 587 490 | 20 → 43 | **+2.52 %** |
+| D2 Backblaze | 197 | 20 000 | 1 261 238 | 1 352 258 | 199 → 604 | **+7.2 %** |
+
+The overhead is **≈225 bytes per extra leaf** — page header plus column-chunk metadata in the
+footer — so it is a *fixed* cost, not a proportional one. That is the important part, because it
+means the cost falls exactly where it needs to:
+
+| Case | Projected |
+|---|---:|
+| Backblaze at 300 000 rows (16.5 MB) | +0.55 % |
+| ISD at 300 000 rows, amortised | +0.33 % |
+
+**So the design is self-adjusting.** Use the derived leaf set when the whole sstable fits inside
+one row group — which is when the fixed overhead would hurt, and also when no cutting is needed —
+and switch to the conservative leaf set only once the budget forces a cut, which happens only on
+large sstables where 225 bytes per leaf is noise. No configuration required, and the small-file
+sizes measured throughout §10 are unaffected.
+
+The remaining wrinkle is a **single partition larger than the budget**. Cutting only at partition
+boundaries keeps a partition inside one row group, which keeps the option-A index simple and
+helps point reads, but it cannot bound memory for one enormous partition. That case needs a
+mid-partition cut and the index entry to carry (row group, ordinal) rather than a bare ordinal —
+worth doing second, and worth knowing about before starting.
+
 ### 5.6 Compression inside Parquet
 
 Reuse `sstable_compressor_factory` rather than introducing a second compression stack:
@@ -646,8 +795,10 @@ Prevents converting data that is still being overwritten.
 `parquet_max_garbage_fraction`, default **10 %**. High garbage means an imminent GC
 rewrite, and tombstones force the deletion metadata columns to materialise.
 
-**C5 — Schema eligibility.** No counters; no unsupported types; folded leaf count within
-`parquet_max_leaf_columns`.
+**C5 — Schema eligibility.** Folded leaf count within `parquet_max_leaf_columns`. As of
+2026-08-17 nothing else is ineligible: counters and non-frozen collections are both
+representable, and every other type falls back to an opaque blob column. The gate is kept
+as the place a future encoding gap belongs — see §11 item 11.
 
 **C6 — Predicted gain.** A sampling estimator predicts ≥ `parquet_min_gain_ratio`
 (default **15 %**) saving versus the table's current compressor. **Do not guess —
@@ -691,7 +842,7 @@ which then selects the writer format.
 | **Tablet split / merge** | Splits SSTables at the token boundary | Parquet split = row-group-aligned rewrite. Cheaper than native if the split point falls on a row-group boundary; otherwise a normal rewrite |
 | **Scrub / validate** | `nodetool scrub`, `scylla sstable` CLI | Must learn Parquet: page CRC verification, footer validation, fragment-stream revalidation |
 | **`scylla sstable` tooling** | dump/validate/write subcommands | Extend; also the natural home for the offline estimator (Phase 0) |
-| **Counters** | Counter cells have shard-level internal structure | **Excluded in v1.** Policy declines counter tables |
+| **Counters** | Counter cells have shard-level internal structure | **Supported 2026-08-17.** One element per shard, keyed by shard id, value and logical clock packed into the element value. Not self-describing to external readers — see §11 item 11 |
 | **CDC** | Separate log table, ordinary schema | No interaction |
 | **Materialized views / secondary indexes** | Backed by ordinary tables | Work; each MV table decides its own format |
 | **TTL / expiry** | Forces deletion columns to materialise | Supported; reduces the §5.3 folding win. Factored into the C6 estimate |
@@ -865,6 +1016,46 @@ ALTER  TABLE ks.t       WITH storage_format = 'hybrid';    -- sstable | parquet 
 
 ### 8.2 Per-table Parquet parameters
 
+**Status 2026-08-17: `parquet_parameters` exists, validated and unit-tested; the CQL and
+persistence wiring does not.** The class parses and validates the map below into a
+`pq_writer_config` and serialises back with `to_map()`. What remains is `cf_prop_defs`
+accepting a `parquet` map option, a schema field to hold it, and `schema_tables`
+persistence -- after which the CQL in this section works.
+
+Two deliberate departures from the original specification:
+
+- **Only knobs the writer can honour are accepted.** `compression` takes `none` or `zstd`
+  and rejects `lz4`, `snappy` and `gzip`, because the writer emits only those two. An
+  option that silently ignores what it cannot do is worse than one that refuses -- a user
+  who sets `gzip` and gets zstd has been told something untrue about their data. Likewise
+  `dictionary`, `dictionary_page_max_bytes`, `encoding_overrides`, `write_page_index`,
+  `statistics_level`, `bloom_filter_columns` and `writer_version` are **not** accepted
+  yet; each would be a lie until implemented.
+- **`metadata_folding` cannot select L3.** L3 discards write times and TTLs; it is
+  export-only, and `to_parquet_for_storage()` refuses it. Accepting it as a table property
+  would offer silent data loss as a configuration option.
+
+Guard rails, with reasons rather than round numbers:
+
+| Bound | Value | Why |
+|---|---:|---|
+| `row_group_rows` floor | 1 000 | Below this the fixed ~225 B per leaf per row group dominates: at 100 rows on a 20-leaf table that is 45 B/row against a 5.2 B/row total, so the file grows ~9x (§10.4c) |
+| `row_group_rows` ceiling | 100 000 000 | Sanity |
+| `row_group_buffer_bytes` | 1 MiB - 1 GiB | This is *buffered shredder memory*, not output; see §5.5a |
+| `page_rows` | 128 - 1 000 000 | |
+| `compression_level` | 1 - 22 | zstd's range |
+
+`row_group_buffer_bytes` accepts a `KiB`/`MiB`/`GiB` suffix as well as a plain count.
+
+**A round-trip asymmetry the test caught immediately:** `to_map()` first emitted
+`to_string(folding_level)`, which produces the internal `"L0"`/`"L1"`/`"L2"`, while the
+parser accepts `"verbatim"`/`"row"`/`"uniform"`. The property therefore did not survive
+persistence -- write it, read it back, and validation rejected your own output. Serialisation
+now uses the user-facing vocabulary. Worth recording because it is invisible to any test that
+only parses, and it would have shipped as "ALTER works but the table breaks on restart".
+
+### 8.2a Original specification (for reference)
+
 Mirrors the existing `compression = {...}` map property, parsed and validated into a
 `parquet_parameters` object analogous to `compression_parameters`:
 
@@ -1001,10 +1192,17 @@ Contract discovered here and now asserted: regular columns arrive in **name orde
 which is also the `column_id` order the shredder indexes cells by — not declaration
 order. The reader must use the same ordering to invert the mapping.
 
-**Not done:** the produced image goes to a caller-supplied sink, not into the Data
-component. Outstanding: component/TOC plumbing, the `pq` version enum, `pq::make_reader`,
-index components pointing at `(row_group, row_index)`, the mutation-source property
-suite, and — in the shredder — static rows, partition/range tombstones and collections.
+**Delivered since, 2026-08-17:** all of what this paragraph used to list as outstanding.
+Component/TOC plumbing, the `pq` version enum, `pq::make_reader` and the row-ordinal index
+(§5.4) are in; the shredder handles static rows, row markers, partition, row and range
+tombstones, non-frozen collections and counters; and the mutation-source property suite runs
+against `pq` and passes all 34 sub-tests
+(`test_sstable_conforms_to_mutation_source_pq_small`).
+
+**Not done:** statistics and metadata parity — the pq writer barely feeds its
+`metadata_collector`, which is what still keeps `pq` out of `all_sstable_versions` and is
+correctness rather than reporting, because tombstone GC reads that metadata. See §11 item 11
+and item 12.
 
 - `sstable_version_types::pq`; `writer_impl` subclass; `pq::make_reader`.
 - Component layout (§5.2); index components pointing at `(row_group, row_index)`.
@@ -1392,18 +1590,190 @@ regime, token order, zstd-3, L1 folding); all public data, all realistic Scylla 
 | **D9 GitHub Archive** | 180 387 | 7 | event log + JSON payload | 34 006 460 | 24 575 665 | **72.3 %** | 27.7 % |
 | **D10 HackerNews** | 300 000 | 7 | free text: titles, URLs | 23 136 733 | 21 244 885 | **91.8 %** | 8.2 % |
 | **D11 Wikipedia pageviews** | 176 082 | 5 | hourly metrics per page | 2 566 689 | 2 387 826 | **93.0 %** | 7.0 % |
+| **D12 NOAA ISD-Lite** | 300 000 | 10 | hourly station telemetry | 3 706 438 | 1 548 377 | **41.8 %** | 58.2 % |
 
 D9–D11 are pyarrow figures; §10.3h showed our own writer matches or beats pyarrow, so they
-are if anything pessimistic for Parquet.
+are if anything pessimistic for Parquet. D12 is our own writer (pyarrow's default is 1 961 695, 52.9 %; ours is 21 % smaller because
+it delta-encodes the clustering key and dictionary-encodes low-cardinality numerics — §10.1g).
 
-**Half the disk is not a property of the format. It is a property of wide tables.**
-The three that win have 20–197 columns. The two that barely win have five and seven, and
-in both the bytes are dominated by a **high-cardinality text column that is, or is part
-of, the partition key** — HackerNews `title`/`url`, pageviews `page`. Columnar grouping
-pays when a column's values repeat across rows; near-unique text barely repeats, so there
-is little for the layout to exploit, while the row-oriented baseline's trained dictionary
-still captures common substrings. D9 sits in between: its JSON payloads are individually
-large but share heavy structure across rows, which the layout does capture.
+**Half the disk is a property of value repetition, not of table width.** This was
+originally written as "a property of wide tables", because the three winners had 20–197
+columns and the two losers five and seven. D12 refutes the width version: NOAA ISD-Lite has
+**ten** columns and still saves 47 %. Width was a proxy, and D12 is the case that separates
+it from the real mechanism.
+
+What actually decides it is whether a column's values **repeat across rows**. Columnar
+grouping pays when they do, because the repeats end up adjacent. Near-unique text barely
+repeats, so there is little for the layout to exploit, while the row-oriented baseline's
+trained dictionary still captures common substrings. That is why the two losers are
+dominated by a **high-cardinality text column that is, or is part of, the partition key** —
+HackerNews `title`/`url`, pageviews `page` — and why D12 wins despite being narrow: its
+eight measures are low-cardinality integers (`temp` has 992 distinct values in 300 000 rows,
+`sky` has 11), so dictionary encoding collapses them regardless of how few columns there
+are. D9 sits in between: its JSON payloads are individually large but share heavy structure
+across rows, which the layout does capture.
+
+Read together with D5 (NYC TLC: 20 columns, numeric, 48.2 %) the rule is: **numeric or
+low-cardinality columns win big at any width; near-unique text does not win at any width.**
+
+### 10.1g D12 in detail — and a writer bug it exposed
+
+**The dataset.** NOAA ISD-Lite hourly surface observations for 2023, 59 station-years
+(`https://www.ncei.noaa.gov/pub/data/noaa/isd-lite/`). One gzip per station-year, 8 757
+hourly rows each. Schema is the canonical Scylla time-series table:
+`PRIMARY KEY ((station), ts)` with eight integer measures in tenths of a unit. This is the
+IoT/telemetry shape none of D1–D11 had: a high-cardinality series key, a **dense regular**
+clustering key, and a small all-numeric payload. Loader: `harness.py isd`.
+
+**Missing readings, and why it barely matters.** ISD-Lite codes "not reported" as `-9999`,
+at rates from 0.6 % (`temp`) to 96 % (`precip_6h`). Two defensible mappings were both
+measured, because binding `NULL` in a CQL `INSERT` writes a *deletion*, so the NULL variant
+carries roughly 1.1 M tombstones:
+
+| Variant | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio |
+|---|---:|---:|---:|
+| `isd` — `-9999` → NULL (tombstones) | 3 707 374 | 1 961 695 | 52.9 % |
+| `isdraw` — sentinel kept, all cells live | 3 770 433 | 1 973 753 | 52.4 % |
+
+Within half a point, so the headline does not rest on that modelling choice.
+
+**Floats widen the gap rather than closing it.** The obvious objection to a numeric win is
+that it is an artifact of integer encodings, and that real IoT tables store floats. Measured
+(`harness.py isdfloat`, same observations as doubles in real units):
+
+| Variant | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
+|---|---:|---:|---:|---:|
+| `isd` (int32) | 3 707 374 | 1 961 695 | 52.9 % | 47.1 % |
+| `isdfloat` (double) | 4 846 812 | 1 963 712 | **40.5 %** | **59.5 %** |
+
+Parquet's size is **unchanged** (1 961 695 → 1 963 712, +0.1 %) while the SSTable grows 31 %.
+The per-column footers explain it exactly: every measure is `RLE_DICTIONARY`, and the stored
+size is set by the number of *distinct* values — the index width — not by the declared type.
+`temp` costs 358 787 B as `INT32` and 359 003 B as `DOUBLE`; widening the values only grows
+the dictionary page, by 992 × 4 bytes. The SSTable stores each cell inline at its full width
+and relies on block compression, so it pays the full 4→8 byte increase. **Wider value types
+make the Parquet case stronger, not weaker.**
+
+**The clustering key is the largest column, and a writer bug means we are not exploiting it.**
+Under pyarrow's defaults `ts` alone is 528 482 B — 27 % of the whole file — dictionary-encoded
+over 8 760 distinct hourly timestamps. Re-encoding just that column as
+`DELTA_BINARY_PACKED`, which is exact for a regular stride, gives:
+
+| `ts` encoding | `ts` bytes | Whole file |
+|---|---:|---:|
+| `RLE_DICTIONARY` (pyarrow default) | 528 482 | 1 961 695 |
+| `DELTA_BINARY_PACKED` | **36 015** (14.7× smaller) | **1 469 167** (−25.1 %) |
+
+That would put D12 at **39.6 %** of the SSTable, the best ratio of any dataset measured.
+
+`schema_mapping.cc` already asks for exactly this — key columns of type `bigint`/`timestamp`
+get `encoding::delta_binary_packed` — and `parquet_writer.cc` honours `column_spec::preferred`
+when it sees it. But `scylla sstable parquet-export` produced **2 612 496 B**, worse than
+pyarrow, with `ts` at 912 882 B and the footer reporting `PLAIN`. So did `__ts`. **No column
+was getting its preferred encoding.**
+
+The cause: `write_rows()` constructed the writer as
+`parquet_file_writer(nested_schema{ms.tree}, opt)` — from the schema **tree**, while the hints
+live in `ms.columns`. The tree is a list of `schema_element`, which mirrors the Parquet Thrift
+`SchemaElement` and correctly has no encoding field, and `walk_leaves()` recovers only path and
+Dremel levels. So the hints had been silently dropped since nesting landed, and nothing noticed
+because **an encoding is self-describing**: the reader honours whatever the page header says, so
+files still round-tripped, just much larger.
+
+**Fixed 2026-08-17.** `nested_schema` gained a per-leaf `preferred` list, passed alongside the
+tree — structure from the tree, encoding from the caller, which is the right split given the
+Thrift schema cannot carry an encoding. Result on D12, through our own writer:
+
+| | Parquet bytes | `ts` | vs SSTable 3 707 186 |
+|---|---:|---:|---:|
+| before (hints dropped) | 2 612 496 | 912 882 | 70.5 % |
+| **after** | **1 736 856** | **37 445** | **46.9 %** |
+
+A 33.5 % reduction, and 11.5 % smaller than pyarrow's default — so §10.3h's "our writer matches
+or beats pyarrow" is restored on this shape too, rather than merely holding where no column
+benefits from delta.
+
+Three further things came out of enabling it, which is the real argument for having measured
+rather than reasoned:
+
+1. **A latent UB bug in the delta codec, never before exercised.** With the hints dropped,
+   `DELTA_BINARY_PACKED` was dead code on this path. Turning it on made the losslessness suite
+   fail and UBSan name the reason: signed overflow computing `vals[i] - _prev` and
+   `delta - min_delta` in the encoder, `prev += min_delta + v` in the decoder, and a
+   shift-by-64 when a block's width came out at 64. All of it is now done in unsigned space,
+   which is the wrap the format actually relies on and is well defined. The codec round-trips
+   `int64` extremes exactly and UBSan-clean — single values, 200-value runs, and alternating
+   `int64_min`/`int64_max`.
+
+2. **The mapping's leaf order is now asserted against the tree's.** Position was already the
+   only correspondence between `ms.columns` and the tree's leaves — `build_tree()` writes the
+   Dremel levels back by index — and the hints ride the same assumption. A count match does not
+   prove an order match, so the names are now compared too; a silent mismatch would attach one
+   column's levels and encoding to another.
+
+3. **`__ts` is deliberately left on PLAIN.** Asking for delta on the folded row timestamp makes
+   `test_pq_corpus_shaped_schema` fail: cell write timestamps near `int64`'s minimum come back
+   with the top bit relocated — `-2**63 + 74` reads back as `2**57 + 74`, so the low bits
+   survive and the high ones do not. That is **not** the codec, which is now clean on exactly
+   those values, and not leaf misalignment, which is now asserted; something in the interaction
+   remains unaccounted for. Enabling it would trade a real correctness failure for about 4 KB —
+   `__ts` is 2 456 bytes on PLAIN against 3 772 on delta, so it is not even a size win. Left
+   off, documented, and tracked as open question 13.
+
+Both fixes are locked in by `test_parquet_key_encoding_and_timestamp_unit`, which asserts the
+*encoding* rather than a size (a size assertion would drift with any unrelated change) and was
+mutation-checked against both regressions.
+
+**A second, unrelated bug the same file exposed: timestamp columns were annotated in the wrong
+unit.** A CQL `timestamp` *column value* is milliseconds since epoch; a cell's *write* timestamp
+— and our `__ts` leaf — is microseconds. `converted_of()` conflated the two and annotated
+columns `TIMESTAMP_MICROS` while writing millisecond values, so pyarrow read every date as
+1970: the 2023-01-01 value 1 672 531 200 000 came back as 1970-01-20T08:35:31.2Z. Our own reader
+inverts the mapping from `cql_type` and never consults the annotation, which is exactly why a
+full round-trip suite could not catch it and a foreign decoder could. Now `TIMESTAMP_MILLIS`;
+pyarrow reads 2023-01-01 through 2023-12-31. Metadata only, so no size change — but it directly
+undermined §7.4's interoperability claim, which is one of the format's main justifications.
+
+**Numeric dictionary encoding — measured, then implemented, 2026-08-17.** Dictionary
+encoding was gated on `spec.type == phys_type::byte_array`, so numeric columns got neither a
+dictionary nor (before the hint fix) a delta. The per-column comparison against pyarrow showed
+it is not a uniform win, which is why it was measured per column rather than switched on:
+
+| column | distinct | PLAIN + zstd | dictionary | change |
+|---|---:|---:|---:|---:|
+| `temp` | 992 | 353 285 | 354 757 | **+0.4 %** |
+| `dewp` | 819 | 341 858 | 336 720 | −1.5 % |
+| `slp` | 976 | 252 283 | 223 706 | −11.3 % |
+| `wind_dir` | 362 | 286 864 | 254 403 | −11.3 % |
+| `wind_speed` | 220 | 230 304 | 161 807 | **−29.7 %** |
+| `sky` | 11 | 80 872 | 59 550 | −26.4 % |
+| `precip_1h` | 128 | 20 433 | 15 965 | −21.9 % |
+| `precip_6h` | 135 | 25 667 | 21 719 | −15.4 % |
+
+Net **−162 939 bytes**, taking the file from 1 736 856 to **1 548 377** — 10.9 % smaller, and
+D12 from 46.9 % to **41.8 %** of the SSTable. Verified externally: pyarrow reads all 300 000
+rows back with the null and distinct counts intact, which is the part worth checking because
+the heavily-null columns (`precip_6h` is 96 % null) are where a present-value cursor goes wrong.
+
+`ts` stayed at 37 445 bytes: an explicit encoding hint now wins outright over the dictionary
+decision. Without that precedence a monotonic clustering key qualifies for a dictionary on
+cardinality alone — 8 760 distinct in 300 000 rows — and loses its delta encoding, which is the
+difference between 37 kB and 528 kB.
+
+**Cardinality does not predict which way it goes**, and that is worth recording rather than
+tuning around: `slp` has 976 distinct values and gains 11 %, while `temp` has 992 and loses
+0.4 %. The threshold is the same `num_distinct × 8 < rows` the byte_array path uses, and it is
+a heuristic that happens to net out well here, not a rule. §10.3f reached the same conclusion
+from the other direction — both obvious type-based encoding rules lost — and open question 9
+already names the real answer: try both per column and keep the smaller. The remaining prize
+is the 1 472 bytes `temp` gives up, so this is a correctness-free refinement, not a gap.
+
+**Why this dataset and not the earlier ones.** It took a table whose largest column is a
+monotonic clustering key to expose any of this. §10.3h's conclusion held on D1/D2/D5 because
+none of their columns benefits much from delta encoding, so dropping the hints cost almost
+nothing there and the loss stayed invisible. A time-series table is the shape that makes the
+clustering key dominate — 27 % of the file — and so the shape that turns a silently ignored
+hint into a third of the output.
 
 **The per-column breakdown makes the mechanism concrete.** Compressed bytes per column,
 from the real footers:
@@ -1755,7 +2125,8 @@ bytes, which would make every format look alike.
 | Data size | 3 994 586 B | 1 275 614 B | **0.32×** | — | — |
 | Peak scan memory | 256 kB | 15 552 kB | 61× | bounded | **yes** — see below |
 
-**R-13 (bounded memory) holds.** Peak scan memory against sstable size, same schema:
+**R-13 (bounded memory) holds on the read path.** Peak *scan* memory against sstable size,
+same schema. The **write** path is a different story and is not bounded at all — see §5.5a:
 
 | Rows | Data bytes | Peak scan memory | Point read |
 |---:|---:|---:|---:|
@@ -1840,6 +2211,138 @@ size ratio is better than the 0.48–0.92× measured on real datasets (§10.1, �
 generated values repeat more than real ones. The *timing* ratios are the point of this
 table, not the size.
 
+### 10.4c Row-group size is the cheap lever — swept 2026-08-17
+
+Review pushed back on adding caches to fix point-read latency: too much complexity, too much
+resident memory, and only worth it if critical. The proposed alternative was to shrink the row
+group instead, accepting a size cost. Swept it. 20 000 partitions x 5 rows, 2 000 random point
+reads, byte budget lifted so the row count is what cuts.
+
+| rows/group | point mean | point p50 | scan memory | size | write | scan |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | **1 026 us** | 966 us | **2 156 kB** | 1 573 659 (+36 %) | 630 ms | 139 ms |
+| 5 000 | 1 190 us | 1 121 us | 5 620 kB | 1 271 504 (+10 %) | 546 ms | 123 ms |
+| 10 000 | 1 460 us | 1 492 us | 11 176 kB | 1 219 822 (+5.5 %) | 553 ms | 126 ms |
+| 35 000 (today) | 1 967 us | 1 915 us | 20 160 kB | 1 182 530 (+2.3 %) | 605 ms | 136 ms |
+| 1 000 000 | 2 508 us | 2 486 us | 21 688 kB | 1 156 110 | 606 ms | 131 ms |
+
+**The review's instinct was right, and by more than latency alone.** Going from one row group to
+1 000 rows per group gives **2.4x lower point-read latency and 10x less scan memory** for +36 %
+size. Scan memory matters as much as latency here: `pq` sits at ~21 MB against the row format's
+256 kB, and that is decode windows, so it falls with the row group.
+
+**Write and scan throughput are flat across the whole sweep** (546-630 ms and 123-139 ms, noise).
+So this is not a throughput trade at all -- only size against latency and memory.
+
+**Recommended default: 5 000-10 000 rows.** At 5 000 the point read is 2.1x faster and scan memory
+3.9x smaller for +10 % size; at 10 000, 1.7x and 1.9x for +5.5 %. Either is a better bargain than
+caching, and neither adds a cached component or a line of new state.
+
+**A consequence worth stating:** with `row_group_rows` at 5 000, a row group holds about 9 MB of
+shredder buffer, far under the 64 MiB budget -- so the row count becomes the operative limit and
+`row_group_buffer_bytes` reverts to being purely a safety net against a pathological partition.
+That is the right division of labour between the two knobs, and it is the opposite of today's
+situation where the byte budget does all the cutting.
+
+**What this does not fix.** Even at 1 000 rows per group the point read is 1 026 us, still ~35x
+the native format's 29 us. Row-group size roughly halves the gap; the remaining ~1 ms is the
+per-reader footer parse and schema recovery, the OffsetIndex read, and page decode (10.4b). So
+caching is not made unnecessary, only much less urgent -- which is the correct order to do them
+in.
+
+### 10.4b The point-read measurement was unsound — corrected 2026-08-17
+
+The point-read figure quoted throughout §10.4 came from **50 partitions at evenly-spaced
+strides**, reported as a single mean. Two things wrong with that, both raised in review:
+
+- **Too small a sample to describe a latency**, and reported without a distribution.
+- **A stride is not a point-read pattern.** Walking indices in order gives the partition
+  index and summary locality that a real random-key workload does not have.
+
+Now: **10 000 uniformly random distinct partitions** (seeded, so it is reproducible), each read
+timed individually on a fresh reader, reporting mean and percentiles. Both formats get the
+identical key list. Overridable with `PQ_PERF_POINTS`.
+
+Two runs, 20 000 partitions x 5 rows, single shard:
+
+| Format | mean | p50 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| default (`me`) | 28.7 / 29.5 us | 24.9 / 25.6 us | 31.4 / 32.2 us | 235 / 236 us |
+| `pq` | 2 227 / 2 304 us | 2 166 / 2 177 us | 2 967 / 3 416 us | 3 354 / 3 824 us |
+| ratio | **77.5x / 78.1x** | **86.9x / 85.0x** | 94x / 106x | **14.3x / 16.2x** |
+
+**Correcting the method made `pq` look worse, not better.** The native format got *faster* with
+a proper sample — 29 us against the 39 us previously reported — so the honest gap is **~78x on
+the mean and ~85x at p50**, not 55x. The earlier number flattered both formats and the row
+format more.
+
+**The distribution is the new information, and it is the useful part.** `pq` is *tight*: p95 is
+only 1.3-1.6x its own p50. The native format is long-tailed: its p99 is 9x its p50. So at p99
+the gap narrows to **14-16x**. `pq`'s cost is a consistent fixed overhead per read — open a row
+group, decompress a dictionary page — rather than variance. That matters for the fix: caching
+decoded page and dictionary state attacks a constant, which is the most tractable kind of
+latency problem.
+
+**A caveat this test cannot escape, and it runs against `pq`.** The point reads execute
+immediately after a full scan of the same file, so everything is warm in the page cache; the
+numbers are pure CPU/decode cost. Cold, `pq` has to read **3.4x fewer bytes** (1 182 602 against
+3 994 586), so I/O would move in its favour and none of that is visible here. A cold-cache
+variant is the next methodology fix, and until it exists these figures should be read as
+`pq`'s worst case rather than its expected one.
+
+**Scan timing on this machine is too noisy to quote.** The same binary gave 0.97x and 1.61x on
+consecutive runs, with reactor stalls logged in both. Write is stable at 1.14-1.16x and size at
+0.296x; the scan ratio needs a quiet machine before it means anything.
+
+### 10.4a Row groups, statistics and numeric dictionaries — the throughput bill, measured 2026-08-17
+
+Re-run of `sstable_parquet_perf_test` after this session's changes (statistics collection,
+numeric dictionary encoding, row-group cutting). 20 000 partitions x 5 rows.
+
+| Path | Default (`me`) | `pq` | Ratio | Was (§10.4) |
+|---|---:|---:|---:|---:|
+| Write | 588 ms | 712 ms | 1.21x | 0.98x |
+| Scan | 142 ms | 159 ms | 1.12x | 0.98x |
+| **Point read** | **39.1 us** | **2 614 us** | **66.9x** | 55x (2 173 us) |
+| Size | 3 994 586 | 1 182 602 | **0.296x** | 0.319x |
+| Scan memory at 8x rows | — | — | **1.04x** | 1.13x |
+
+Size and bounded-memory both improved; throughput and point-read latency both got worse.
+**Attributed by measurement, not by reasoning** — rebuilt with the numeric-dictionary branch
+disabled and re-run:
+
+| | Point read | Size | Write | Scan |
+|---|---:|---:|---:|---:|
+| numeric dictionaries **on** | 2 614 us (66.9x) | 0.296x | 1.21x | 1.12x |
+| numeric dictionaries **off** | 2 146 us (60.6x) | 0.308x | 1.15x | 1.04x |
+
+So numeric dictionaries alone cost **+22 % point-read latency** and buy **−3.9 %** size here
+(−10.9 % on D12). With them off, the point read is 2 146 us against the 2 173 us measured
+before this session — i.e. the whole point-read regression is theirs, and the residual write
+(1.15x) and scan (1.04x) cost belongs to the statistics collection and row-group cutting.
+
+**This is the same mechanism §10.4 already identified**: a dictionary page must be decompressed
+in full before a single value can be decoded, which is why the threshold was tightened from 2x
+to 8x repeats in the first place. Extending dictionaries to numeric columns re-applied that
+cost to many more columns.
+
+**So the trade is now explicit and should be decided, not defaulted.** Spending 22 % of the
+weakest metric to gain 4–11 % of the strongest one is a poor exchange for a table serving point
+reads, and a good one for a bottom-tier analytical table that is scanned. Three ways to resolve
+it, in order of preference:
+
+1. Tune the threshold by *measured benefit per column*, which open question 9 already proposes —
+   with a read-cost term added. On D12 `sky` (11 distinct) gains 26 % of its column while `temp`
+   (992 distinct) gains nothing, so a stricter numeric threshold would keep most of the size and
+   little of the latency.
+2. Make it follow the tiering intent: the hybrid policy (§6) already knows whether a table is
+   bottom-tier.
+3. Cache decoded dictionary state across point reads, which is the pre-existing plan and would
+   reduce the cost of *all* dictionaries rather than trading them away.
+
+Until one of those lands, the honest statement of single-row-read latency is **2.6 ms, 67x the
+native format** — and 2.1 ms / 61x with numeric dictionaries off.
+
 ### 10.5 Decision log
 
 | Date | Decision | Rationale |
@@ -1900,7 +2403,12 @@ table, not the size.
    it? Probably yes; needs the receiver-side feature gate. (This is where tablet
    migration touches the format — but only as one caller of file streaming, not as a
    design input.)
-5. **Counters.** Excluded in v1 — is there demand?
+5. ~~**Counters.** Excluded in v1 — is there demand?~~ **Resolved 2026-08-17: implemented**
+   rather than excluded, because the conformance suite's shared corpus mandates them and a
+   storage format that cannot hold counters is not a general table format. The open part is
+   narrower: they currently reuse the collection representation, so a counter column reads
+   as `map<blob, blob>` to an external reader. Splitting the shard's value and logical clock
+   into named leaves is a schema change worth making before the format leaves experimental.
 6. **Does folding Level 2 survive real data?** It requires row-group-uniform timestamps;
    real write patterns may break it often enough to make it useless.
 7. ~~**`zstd_with_dicts` inside Parquet**~~ — **Answered 2026-08-17: no.** A trained
@@ -1972,77 +2480,227 @@ table, not the size.
     against pyarrow's own `max_definition_level`/`max_repetition_level`, reading a pyarrow
     `list<string>`, and writing one for pyarrow to read back (suites 15–17).
 
-    Still unrepresentable: **counters**, excluded by design (open question 5). They are
-    atomic, so they would otherwise have been stored as opaque blobs, losing the shard
-    structure that makes them mergeable; the writer now throws. That
-    distinction matters more than the missing support: before, a partition tombstone was
-    silently discarded, which produced a perfectly valid Parquet file that resurrected
-    deleted rows. Refusing is recoverable; silence is not.
+    **Counters — implemented 2026-08-17, which retires the last exclusion.** They are
+    atomic cells whose value is a set of per-replica shards, and merging two counter cells
+    means merging shards by id rather than taking the newer value. Stored as an opaque blob
+    they would still read back byte-identical from a single sstable while being wrong the
+    moment anything merged them — the failure mode that only appears after compaction.
 
-    **What `all_sstable_versions` would actually require.** Membership enrols `pq` in
-    `sstable_conforms_to_mutation_source_test`, which runs the full
-    `run_mutation_source_tests` battery. That needs four things, not one:
+    They reuse the collection representation rather than getting their own: one element per
+    shard, keyed by the shard id, with the shard's value and logical clock packed into the
+    element value as two big-endian `int64`s. The cell's timestamp is repeated on each
+    element — identical across them, so it compresses away — and a dead counter cell becomes
+    an element-less collection carrying the deletion in the collection-tombstone slot, which
+    is what distinguishes *absent* from *deleted*. On the way back the shards go through
+    `counter_cell_builder::add_maybe_unsorted_shard` and are re-sorted: `counter_cell_view`
+    requires them ordered by id, and although our writer emits them already ordered, relying
+    on that would make the reader depend on an invariant it does not enforce.
 
-    1. ~~**Range tombstones**~~ — **done 2026-08-17**, see above.
-    2. **Multi-cell collections** — the shredder maps one leaf per column; a collection is
-       a nested Dremel structure with its own repetition levels. The format library already
-       supports definition levels but not repetition levels.
-    3. **Counters** — excluded in v1 by design (open question 5).
-    4. ~~**Intra-partition forwarding**~~ — **fixed 2026-08-17.** It was worse than
-       missing: the reader accepted `forwarding::yes` and then ignored the position range,
-       so a forwarding caller silently got rows it had not asked for. `make_reader` now
-       wraps a non-forwarding reader in `make_forwardable()`, as the kl path does, and
-       `fast_forward_to(position_range)` is an internal error rather than a no-op. That is
-       correct but buffers the partition; seeking natively by clustering position, which
-       the ColumnIndex would support, is a later optimisation.
+    The honest cost of reusing the collection shape: **a counter column is not
+    self-describing to an external reader.** It appears as `map<blob, blob>` where the value
+    blob is two packed integers, rather than as a group with named `value` and `clock`
+    leaves. Splitting it into proper leaves is a schema change, not a data change, and is
+    the right thing to do before the format is anything but experimental. What it buys today
+    is that counters ride an already-tested pipeline — the same shred, page, and reassemble
+    path as every collection — rather than a second nesting implementation written from
+    scratch.
 
-    **Measured rather than reasoned about, 2026-08-17.** `pq` was temporarily added to both
-    arrays and the conformance suite actually run against it, which is more informative than
-    listing what is missing. Three things came out of it:
+    Counter **updates** — the pre-shard-transformation form — remain unrepresentable and
+    throw. Those never reach storage; a cell still in that form is an upstream bug, not a
+    representation gap.
 
-    1. The two arrays are coupled. `check_sstable_versions` requires every version at or
-       after `oldest_writable_sstable_format` to appear in `writable_sstable_versions`, and
-       `pq` sorts after `mc`, so it cannot be readable-but-not-writable. There is also a
-       `static_assert(writable_sstable_versions.size() == 5)` in the conformance test whose
-       whole job is to make someone notice.
-    2. It does **not** fail on collections. It gets as far as `test_range_tombstones_v2` in
-       `run_mutation_reader_tests_basic`, well inside the suite.
-    3. It failed because **the reader ignored the query's clustering slice** — `make_reader`
-       took `slice` and dropped it, so a sliced read returned rows outside the requested
-       ranges. **Fixed the same day**: rows are now filtered against
-       `slice.row_ranges()`. Two things worth recording about that fix:
+    **`pq` is in `all_sstable_versions` and `writable_sstable_versions` as of 2026-08-17,**
+    and clears all **34** sub-tests of `sstable_conforms_to_mutation_source_test`
+    (`test_sstable_conforms_to_mutation_source_pq_small`). The two arrays are coupled:
+    `check_sstable_versions` requires every version at or after
+    `oldest_writable_sstable_format` to appear in `writable_sstable_versions`, and `pq` sorts
+    after `mc`, so it cannot be readable-but-not-writable. The
+    `static_assert(writable_sstable_versions.size() == N)` in the conformance test — whose
+    whole job is to make someone notice — went from 5 to 6.
 
-       - It exposed a **dangling reference that had been latent since the reader was
-         written**. Holding `const query::partition_slice&` looks like what mx does, but a
-         pq reader outlives the call that made it, and the reversed path in
-         `sstable::make_reader` builds its slice with `reverse_slice()` — a temporary. The
-         bug was invisible while the slice was never dereferenced. The reader now holds the
-         slice **by value**.
-       - Filtering rows is not enough on its own: a range tombstone that spans into the
-         slice has to be **re-opened at the slice boundary**. Rather than hand-roll that,
-         the reader now drives `mutation_fragment_filter`, the same helper mx uses, which
-         owns the `clustering_ranges_walker` and returns the clipped changes to emit.
+    ### What the enrolment experiment found that unit tests had not
 
-    **Re-running the enrolment experiment after that fix**, `pq` gets through ten of the
-    conformance suite's sub-tests, including all of the ones this work was aimed at:
+    Enrolling `pq` and running the suite was worth more than reasoning about what was
+    missing. Besides the clustering-slice bug and the forwarding bug recorded above, it
+    surfaced two defects that every targeted test had passed straight over. Both are now
+    covered by `test_pq_statics_survive_a_leading_range_tombstone`, and both fixes were
+    mutation-checked — broken deliberately, confirmed failing, restored.
 
+    1. **An absent clustering prefix is not an empty one.** The bounds that cover a whole
+       partition — `before_all_clustered_rows` and `after_all_clustered_rows` — are an
+       *empty but present* clustering prefix carrying bound weight −1 or +1
+       (`bound_view::bottom()`/`top()`). The reader rebuilt a range-tombstone bound with
+       `prefix_len == 0` as an **absent** prefix, which is not a valid clustered position.
+       Comparing one against those bounds does not fail — it silently yields nonsense: the
+       position compared as less than *neither* sentinel, which sent the
+       `clustering_ranges_walker` past every range, and from there the filter answered
+       `ignore` for every row. The symptom was a partition returning its static row and no
+       clustering rows at all.
+
+       The diagnostic lesson is the one worth keeping: the position *printed* as
+       `{position: clustered, null, -1}`, which reads exactly like `before_all_clustered_rows`
+       and is why reading the code repeatedly failed to find it. What settled it was printing
+       the comparator's answers — `less(pos, after_all)` and `less(pos, before_all)` were
+       *both* false, which is impossible for any valid position, since the sentinels are
+       ordered with respect to each other.
+
+    2. **Static collections were dropped whenever a partition's first row was not a
+       clustering row.** The writer replays static content onto every row, and the reader
+       rebuilds the static row from whichever row it sees first — so the first row's identity
+       is load-bearing. Two shapes make it something other than a clustering row: a range
+       tombstone change opening before all rows, and the placeholder row emitted for a
+       partition with no rows. Both replayed `_static_cells` and not `_static_collections`,
+       so every static collection vanished in exactly those shapes. The atomic static cells
+       came back, which is what made it look like a collection-encoding bug rather than a
+       replay bug. The three replay sites are now one `replay_statics()` helper, because
+       three copies of a two-line loop is how the omission happened.
+
+    The placeholder case was the worse of the two: a partition whose only content was a
+    static collection produced a placeholder row carrying nothing at all, even though the
+    guard deciding whether to emit that placeholder explicitly tested
+    `_static_collections`.
+
+    **Consequence for tiering.** C5's schema-eligibility gate (§6.3) previously declined
+    counter tables and tables with non-frozen collections. Both are now representable, and
+    every remaining type falls back to an opaque blob column that round-trips because the
+    bytes are what Scylla stores anyway — so no schema is currently ineligible and
+    `schema_is_parquet_eligible` returns a constant. The gate is kept rather than deleted:
+    it is where a future encoding gap belongs, and refusing a schema is how the policy avoids
+    silently mangling one.
+
+    ### The real remaining blocker: statistics and metadata parity
+
+    With the mutation model complete, `pq` was enrolled in both version arrays and the
+    **generic** sstable suites run — not just the conformance one. That is a different and
+    weaker gate than conformance, and it is where `pq` still fails. `sstable_datafile_test`
+    reports roughly a dozen failures, and they share one cause: **the pq writer populates
+    almost none of the Statistics metadata.** It feeds its `metadata_collector` only
+    `add_key()`. mx additionally feeds:
+
+    - `update_min_max_components(position)` — at the partition tombstone (both sentinel
+      bounds), every clustering row, and every row marker. This is what produces the min/max
+      clustering key range.
+    - a per-partition `column_stats` via `_collector.update(...)`: the timestamp tracker, the
+      *min live* timestamp and *min live row marker* timestamp trackers, the local-deletion-time
+      and TTL trackers, the tombstone drop-time histogram, and the row / cell / range-tombstone
+      / dead-row counts.
+    - `add_compression_ratio(...)`, and `get_ext_timestamp_stats()` at seal time.
+
+    The failing assertions name exactly those fields: `min_max_clustering_key_test`,
+    `sstable_tombstone_metadata_check` and its two composite variants,
+    `sstable_tombstone_histogram_test`, `sstable_timestamp_metadata_correcness_with_negative`,
+    `test_sstable_max_local_deletion_time`, `test_may_have_partition_tombstones`,
+    `sstable_partition_estimation_sanity_test`, `test_sstable_bytes_on_disk_correctness`,
+    `sstable_run_clustering_disjoint_invariant_test`, `sstable_reader_with_timeout`, and
+    `find_first_position_in_partition_from_sstable_test` — the last of which needs a pq path
+    in `sstable::find_first_position_in_partition` rather than a collector call.
+
+    **This is correctness, not bookkeeping.** The min/max timestamp and local-deletion-time
+    trackers and the tombstone drop-time histogram are what tombstone garbage collection and
+    compaction decisions read. An sstable that under-reports them can have a tombstone
+    dropped while data it shadows is still live. That is precisely the class of silent
+    resurrection bug this project has twice been bitten by, so the parity work should be done
+    with the same "watch it fail first" discipline, not inferred from the tests going green.
+
+    Two more things enrolment turned up that are worth writing down, because they are traps
+    rather than gaps:
+
+    - Several `sstable_datafile_test` cases loop `all_sstable_versions` to open **checked-in
+      reference sstables** under `test/resource/sstables`. Those fixtures exist for the kl and
+      m families only, so enrolling `pq` makes them look for a `pq-1-big-TOC.txt` that was
+      never generated. Those loops need an explicit "has a reference fixture" guard; the right
+      answer is not to generate pq fixtures, since that would only test our writer against our
+      own reader, which the pq suites already do directly.
+    - `sstable_datafile_test` has three failures at baseline in this environment
+      (`datafile_generation_16_gs`, `test_sstable_bytes_on_{gs,s3}_correctness` — they pull a
+      docker image) plus `test_small_sstable_has_reasonable_memory_usage`, which measures
+      allocator growth and passes alone but not after the rest of the suite has run. Verified
+      by stashing the whole change and re-running: the baseline fails the same four. Worth
+      knowing before attributing them to the format.
+
+    **Meanwhile the conformance guarantee does not depend on membership.**
+    `test_sstable_conforms_to_mutation_source_pq_small` calls
+    `test_sstable_conforms_to_mutation_source(sstable_version_types::pq, ...)` directly and
+    passes all 34 sub-tests with `pq` absent from both arrays. So that test stays enrolled and
+    keeps the mutation-model guarantee locked in, while the arrays wait for metadata parity.
+
+12. ~~**Statistics and metadata parity (the blocker for `all_sstable_versions`).**~~
+    **Done 2026-08-17, and `pq` is now in both version arrays.** The writer maintains a
+    per-partition `column_stats` with mx's exact semantics (`collect_atomic_cell` /
+    `collect_cell` / `collect_marker` in `writer_impl.cc`, mirroring mx's `write_cell()` and
+    `write_liveness_info()`) and calls `update_min_max_components()` at the partition
+    tombstone's two sentinel bounds, every clustering row and every range-tombstone change.
+    `sstable_datafile_test` went from roughly a dozen failures to its pre-existing baseline
+    for this environment, and the whole generic battery plus all 34 conformance sub-tests
+    pass with `pq` enrolled.
+
+    Enrolling it turned up two things that mattered more than the statistics:
+
+    **a) A dead cell was silently dropped in L1 and L2 — the default folding levels.**
+    L0 carries a per-column `__live_` flag; L1 and L2 do not, so deadness has to be read off
+    the `__ldt_` leaf. The reassembler bailed first:
+
+    ```cpp
+    if (!present) { continue; }     // no value -> assumed absent
     ```
-    run_mutation_reader_tests_basic
-    test_range_tombstones_v2
-    test_time_window_clustering_slicing
-    test_clustering_slices
-    test_streamed_mutation_forwarding_across_range_tombstones
-    test_streamed_mutation_forwarding_guarantees
-    test_streamed_mutation_slicing_returns_only_relevant_tombstones
-    test_streamed_mutation_forwarding_is_consistent_with_slicing
+
+    so every deleted cell in an L1 file came back as a cell that had *never been written*.
+    That is the worst shape this format can fail in: the file is valid, the read succeeds,
+    and the deletion stops shadowing what it was hiding, so the old value reappears on the
+    next merge. The discriminator is now three-way — value present means live, no value with
+    an `__ldt_` means **dead**, neither means absent — and `any_deletion` is set by `!c.live`,
+    so the leaf was always on disk. The information was there all along and simply was not
+    being read.
+
+    **The losslessness suite had been asserting the bug as correct behaviour.** Its check read
+
+    ```cpp
+    const bool keeps = (lvl == folding_level::verbatim) || (c.live && c.v);
     ```
 
-    It then stops on `pq: cannot represent multi-cell static collections yet` — the
-    writer's own guard, firing exactly where it should. **Collections are now the only
-    thing left**, and that is measured rather than assumed. They need Dremel repetition
-    levels: the encoder emits definition levels only, so nesting is not expressible at all
-    today. Counters are excluded by design (open question 5).
-12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
+    and reported a *preserved* dead cell as `"dead cell resurrected"` — the concept exactly
+    backwards, since dropping a dead cell is what resurrects data. The expectation had been
+    written to match what the reassembler did rather than what R-6 requires, which is how a
+    real data-loss bug looked correct across 540 generated cases. The check now requires every
+    cell to survive every lossless level and compares liveness and deletion time as well;
+    reverting the fix now reports `"cell lost"`, which is the honest diagnosis. §10.3a's
+    "losslessness proven over 540 cases" was therefore overstated for deletions until now.
+
+    **b) Enrolling `pq` made Parquet the default format for the whole node.**
+    `get_highest_sstable_version()` returned `all_sstable_versions.back()`, and `pq` sorts
+    last, so every one of its 31 callers — including every test that creates an sstable
+    without naming a version — silently started writing Parquet. It now skips `pq`, which is
+    the same principle `implies_mx_generation()` already encodes: `pq` is a different format,
+    not a newer generation of the native one, and it stays opt-in per table.
+
+    Still missing, none of it blocking: `partition_size` / `start_offset` stay 0 (byte offsets
+    do not exist per partition — the Parquet image is encoded once at end of stream, so a
+    partition has no on-disk length while it is being consumed; this only feeds the
+    estimated-partition-size histogram), `add_compression_ratio()` is not called (pq carries
+    the CRC component set, not CompressionInfo), and
+    `sstable::find_first_position_in_partition` has no pq path.
+
+13. **`__ts` cannot use DELTA_BINARY_PACKED yet.** The dropped-encoding-hints regression is
+    fixed (§10.1g) and key columns are delta-encoded again, but asking for it on the folded row
+    timestamp still makes `test_pq_corpus_shaped_schema` fail: write timestamps near `int64`'s
+    minimum come back with the top bit relocated, `-2**63 + 74` reading back as `2**57 + 74`.
+    The codec is not the cause — it round-trips those values exactly and UBSan-clean — and leaf
+    order is asserted, so the interaction is still unaccounted for. Currently left on PLAIN,
+    which costs nothing (2 456 bytes against 3 772 on delta). Also still open: dictionary
+    encoding is attempted only for `byte_array`, so numeric columns get no dictionary, which is
+    pyarrow's whole advantage on low-cardinality numerics.
+
+    Superseded (fixed 2026-08-17): ~~**Preferred column encodings are dropped by the writer.**~~ `schema_mapping.cc`
+    sets `column_spec::preferred = delta_binary_packed` for `bigint`/`timestamp` key columns
+    and for `__ts`, and `parquet_writer.cc` honours it — but `write_rows()` builds the writer
+    from `ms.tree`, not `ms.columns`, so the hints never arrive. Every column comes out
+    `PLAIN`. Measured cost on a time-series table: our writer produces 2 612 496 B where
+    pyarrow produces 1 961 695 B, and delta-encoding the clustering key alone would give
+    ~1 469 167 B (§10.1g). Fix: thread per-leaf hints alongside the tree. Also worth doing at
+    the same time: dictionary encoding is attempted only for `byte_array`, so numeric columns
+    get no dictionary either.
+
+14. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
 
