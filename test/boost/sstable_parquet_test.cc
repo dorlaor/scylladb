@@ -430,3 +430,37 @@ SEASTAR_THREAD_TEST_CASE(test_pq_sstables_compact_into_one) {
         }
     }).get();
 }
+
+// Intra-partition forwarding. The reader itself cannot seek by clustering
+// position, so make_reader() wraps it in the forwardable adapter rather than
+// accepting forwarding::yes and ignoring the position range -- which is what it
+// used to do, and which silently returned rows the caller had not asked for.
+SEASTAR_THREAD_TEST_CASE(test_pq_forwarding_reader_honours_position_range) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 6, 10);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        const auto& want = expected[0];
+        auto pr = dht::partition_range::make_singular(want.decorated_key());
+        auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice(),
+                                   nullptr, streamed_mutation::forwarding::yes);
+        auto ck = [&] (int i) {
+            return clustering_key::from_single_value(*s, int32_type->decompose(i));
+        };
+        assert_that(std::move(rd))
+            .produces_partition_start(want.decorated_key())
+            // Nothing until forwarded: that is what forwarding means.
+            .produces_end_of_stream()
+            .fast_forward_to(ck(3), ck(6))
+            .produces_row_with_key(ck(3))
+            .produces_row_with_key(ck(4))
+            .produces_row_with_key(ck(5))
+            .produces_end_of_stream()
+            .fast_forward_to(ck(8), ck(9))
+            .produces_row_with_key(ck(8))
+            .produces_end_of_stream();
+    }).get();
+}

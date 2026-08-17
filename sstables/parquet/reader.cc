@@ -12,6 +12,7 @@
 #include "sstables/parquet/format/parquet_reader.hh"
 #include "sstables/sstables.hh"
 #include "sstables/index_reader.hh"
+#include "readers/forwardable.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/mutation.hh"
 #include "keys/keys.hh"
@@ -70,7 +71,6 @@ bytes encode(cql_type t, const value& v) {
 class pq_reader : public mutation_reader::impl {
     sstables::shared_sstable _sst;
     const dht::partition_range* _pr;
-    streamed_mutation::forwarding _fwd;
     sstables::read_monitor& _mon;
     const bool _use_index;
 
@@ -122,11 +122,15 @@ class pq_reader : public mutation_reader::impl {
     }
 
 public:
+    // Always constructed non-forwarding. Intra-partition forwarding is provided
+    // by wrapping in make_forwardable() -- see make_reader() -- because seeking
+    // by clustering position inside a row group is not implemented, and honouring
+    // the interface while ignoring the position range would silently return rows
+    // the caller did not ask for.
     pq_reader(sstables::shared_sstable sst, schema_ptr s, reader_permit permit,
-              const dht::partition_range& pr, streamed_mutation::forwarding fwd,
-              sstables::read_monitor& mon, bool use_index)
+              const dht::partition_range& pr, sstables::read_monitor& mon, bool use_index)
         : impl(std::move(s), std::move(permit))
-        , _sst(std::move(sst)), _pr(&pr), _fwd(fwd), _mon(mon), _use_index(use_index) {}
+        , _sst(std::move(sst)), _pr(&pr), _mon(mon), _use_index(use_index) {}
 
     future<> fill_buffer() override {
         if (_end_of_stream) { co_return; }
@@ -174,9 +178,10 @@ public:
     }
 
     future<> fast_forward_to(position_range) override {
-        // Intra-partition forwarding is not implemented; the reader is wrapped in
-        // a forwarding adapter by the caller when it is needed.
-        return make_ready_future<>();
+        // Unreachable: this reader is never handed to a caller that forwards.
+        // make_reader() wraps it in make_forwardable() instead.
+        on_internal_error(sstlog, "pq_reader: intra-partition forwarding should be "
+                                  "handled by the forwardable adapter");
     }
 
     future<> close() noexcept override { return make_ready_future<>(); }
@@ -512,8 +517,12 @@ mutation_reader make_reader(
     // projection down into the page reader is where the big scan win lives
     // (design doc 10.1c) and is tracked separately.
     (void)slice;
-    return make_mutation_reader<pq_reader>(std::move(sst), std::move(query_schema),
-                                           std::move(permit), range, fwd, mon, true);
+    auto rd = make_mutation_reader<pq_reader>(std::move(sst), std::move(query_schema),
+                                              std::move(permit), range, mon, true);
+    if (fwd) {
+        rd = make_forwardable(std::move(rd));
+    }
+    return rd;
 }
 
 mutation_reader make_full_scan_reader(
@@ -523,8 +532,7 @@ mutation_reader make_full_scan_reader(
         tracing::trace_state_ptr,
         sstables::read_monitor& mon) {
     return make_mutation_reader<pq_reader>(std::move(sst), std::move(schema),
-            std::move(permit), query::full_partition_range,
-            streamed_mutation::forwarding::no, mon, false);
+            std::move(permit), query::full_partition_range, mon, false);
 }
 
 } // namespace sstables::parquet

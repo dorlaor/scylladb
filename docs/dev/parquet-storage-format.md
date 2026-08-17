@@ -1958,12 +1958,16 @@ table, not the size.
        a nested Dremel structure with its own repetition levels. The format library already
        supports definition levels but not repetition levels.
     3. **Counters** — excluded in v1 by design (open question 5).
-    4. **Intra-partition forwarding** — `pq_reader::fast_forward_to(position_range)` is a
-       no-op. The reader would need to seek within a partition by clustering position,
-       which the Parquet ColumnIndex supports but the reader does not use yet.
+    4. ~~**Intra-partition forwarding**~~ — **fixed 2026-08-17.** It was worse than
+       missing: the reader accepted `forwarding::yes` and then ignored the position range,
+       so a forwarding caller silently got rows it had not asked for. `make_reader` now
+       wraps a non-forwarding reader in `make_forwardable()`, as the kl path does, and
+       `fast_forward_to(position_range)` is an internal error rather than a no-op. That is
+       correct but buffers the partition; seeking natively by clustering position, which
+       the ColumnIndex would support, is a later optimisation.
 
-    Item 1 is the largest and item 3 may never be wanted. Until all four land, adding `pq`
-    to the array would fail for real reasons rather than plumbing ones.
+    Item 1 is the largest and item 3 may never be wanted. Until 1–3 land, adding `pq` to
+    the array would fail for real reasons rather than plumbing ones.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
