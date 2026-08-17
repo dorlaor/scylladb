@@ -497,9 +497,16 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
         // The __ttl_/__ldt_ groups are all-or-nothing: the builder emits one
         // leaf per regular column or none at all, so testing the first is
         // enough, and the leaf-count check below catches any disagreement.
-        if (!reg_idx.empty()) {
-            f.any_ttl      = has("__ttl_" + cols[reg_idx[0]].name);
-            f.any_deletion = has("__ldt_" + cols[reg_idx[0]].name);
+        // Probe a *scalar* regular column: a collection never gets these leaves
+        // (its per-element metadata lives inside the group), so probing the first
+        // regular column infers "no TTLs" for any table whose first regular column
+        // happens to be a collection -- and then the recovered tree has the wrong
+        // number of leaves.
+        for (size_t k = 0; k < reg_idx.size(); ++k) {
+            if (cols[reg_idx[k]].multi_cell) { continue; }
+            f.any_ttl      = has("__ttl_" + cols[reg_idx[k]].name);
+            f.any_deletion = has("__ldt_" + cols[reg_idx[k]].name);
+            break;
         }
         f.any_marker     = has("__rm");
         f.any_marker_ttl = has("__rm_ttl");

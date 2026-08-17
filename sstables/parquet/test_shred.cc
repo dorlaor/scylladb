@@ -486,19 +486,38 @@ int recovery() {
 // interesting states are absent, present-but-empty, populated, populated with a
 // dead element, and deleted-and-empty. Absent and present-but-empty are the pair
 // most easily conflated, and conflating them resurrects a cleared collection.
-std::vector<cql_column> make_collection_schema(size_t n_scalar, size_t n_coll) {
-    auto c = make_schema(n_scalar);
-    for (size_t i = 0; i < n_coll; ++i) {
-        cql_column col{"m" + std::to_string(i), cql_type::blob, column_kind::regular};
-        col.multi_cell = true;
-        c.push_back(col);
+// `coll_first` puts a collection at regular index 0. That matters because the
+// TTL/deletion probe in recover_mapped_schema looks at a regular column to decide
+// whether the __ttl_/__ldt_ groups exist, and a collection never has them -- so
+// probing a collection infers "no TTLs" and recovers a tree with the wrong number
+// of leaves.
+std::vector<cql_column> make_collection_schema(size_t n_scalar, size_t n_coll,
+                                               bool coll_first = false) {
+    std::vector<cql_column> c;
+    c.push_back({"pk", cql_type::bigint, column_kind::partition_key});
+    c.push_back({"ck", cql_type::timestamp, column_kind::clustering_key});
+    auto add_colls = [&] {
+        for (size_t i = 0; i < n_coll; ++i) {
+            cql_column col{"m" + std::to_string(i), cql_type::blob, column_kind::regular};
+            col.multi_cell = true;
+            c.push_back(col);
+        }
+    };
+    static const cql_type cycle[] = {cql_type::bigint, cql_type::int32,
+                                     cql_type::dbl, cql_type::text};
+    if (coll_first) { add_colls(); }
+    for (size_t i = 0; i < n_scalar; ++i) {
+        c.push_back({"c" + std::to_string(i), cycle[i % 4], column_kind::regular});
     }
+    if (!coll_first) { add_colls(); }
     return c;
 }
 
 std::vector<row> generate_with_collections(const std::vector<cql_column>& cols,
                                           size_t nrows, size_t n_scalar, size_t n_coll,
-                                          uint64_t seed) {
+                                          uint64_t seed, bool coll_first = false) {
+    const size_t scalar_base = coll_first ? n_coll : 0;
+    const size_t coll_base   = coll_first ? 0 : n_scalar;
     std::mt19937_64 rng(seed);
     auto unit = [&] { return double(rng() % 1000000) / 1000000.0; };
     const int64_t base_ts = 1700000000000000LL;
@@ -510,22 +529,28 @@ std::vector<row> generate_with_collections(const std::vector<cql_column>& cols,
         r.key.push_back(base_ts + int64_t(i) * 1000);
         const int64_t row_ts = base_ts + int64_t(rng() % 1000000);
 
-        for (size_t k = 0; k < n_scalar; ++k) {
+        for (size_t kk = 0; kk < n_scalar; ++kk) {
+            const size_t k = scalar_base + kk;
             if (unit() < 0.3) { continue; }
             cell c;
             c.live = true;
             c.timestamp = row_ts;
+            // Some scalars carry a TTL, so the __ttl_/__ldt_ groups exist and the
+            // recovery probe has something to find.
+            if (unit() < 0.25) { c.ttl = int32_t(3600); }
+            if (unit() < 0.15) { c.live = false; c.local_deletion_time = int32_t(kk + 1); }
             switch (cols[2 + k].type) {
             case cql_type::bigint: c.v = int64_t(rng() % 100000); break;
             case cql_type::int32:  c.v = int32_t(rng() % 1000); break;
             case cql_type::dbl:    c.v = double(rng() % 10000) / 100.0; break;
             default:               c.v = std::string("s") + std::to_string(rng() % 20); break;
             }
+            if (!c.live) { c.v.reset(); }
             r.cells.emplace(k, std::move(c));
         }
 
         for (size_t j = 0; j < n_coll; ++j) {
-            const size_t k = n_scalar + j;
+            const size_t k = coll_base + j;
             const size_t kind = (i + j) % 6;
             if (kind == 0) { continue; }                       // absent
             collection_cell cc;
@@ -590,11 +615,13 @@ bool compare_collections(const std::vector<row>& in, const std::vector<row>& out
 
 int collections() {
     size_t cases = 0, fails = 0;
+    for (bool coll_first : {false, true}) {
     for (size_t n_scalar : {0u, 2u, 5u}) {
         for (size_t n_coll : {1u, 3u}) {
             for (size_t nrows : {1u, 7u, 900u}) {
-                auto cols = make_collection_schema(n_scalar, n_coll);
-                auto rows = generate_with_collections(cols, nrows, n_scalar, n_coll, 5 + nrows);
+                auto cols = make_collection_schema(n_scalar, n_coll, coll_first);
+                auto rows = generate_with_collections(cols, nrows, n_scalar, n_coll,
+                                                      5 + nrows, coll_first);
 
                 // In-memory: shred then reassemble.
                 for (auto lvl : {folding_level::row_folded, folding_level::verbatim}) {
@@ -640,6 +667,7 @@ int collections() {
                 }
             }
         }
+    }
     }
     std::printf("collections: %zu cases, %zu failures\n", cases, fails);
     std::printf("%s\n", fails ? "COLLECTIONS FAIL" : "COLLECTIONS PASS");
