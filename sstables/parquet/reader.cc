@@ -510,8 +510,16 @@ void pq_reader::emit_row(const row& r) {
             st.append_cell(column_id(k - _static_base), build_collection(cdef, cc));
         }
         if (!st.empty()) {
-            push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
-                    static_row(std::move(st))));
+            // The filter has to be told about the static row even though the slice
+            // cannot exclude it, because the walker tracks position and every
+            // later advance must be monotonic. mx does the same; skipping it left
+            // the walker behind the first clustering position and it then reported
+            // out-of-range, silently dropping every row in the partition.
+            ::static_row sr(std::move(st));
+            if (_filter->apply(sr) == mutation_fragment_filter::result::emit) {
+                push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
+                        std::move(sr)));
+            }
         }
     }
 

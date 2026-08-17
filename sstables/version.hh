@@ -33,11 +33,12 @@ enum class sstable_format_types { big };
 // Row markers, row and partition tombstones, and static rows all round-trip.
 // What still blocks membership is coverage, not plumbing. Enrolling pq here runs
 // it through run_mutation_source_tests, which needs four things it does not have:
-// multi-cell collections, which need Dremel repetition levels the encoder does
-// not emit. Measured, not assumed: with pq temporarily enrolled, the conformance
-// suite clears ten sub-tests -- range tombstones, clustering slices and all the
-// forwarding ones -- and then stops on the writer's own guard for collections.
-// Counters sit beside them and are excluded by design.
+// counters, which are excluded by design, and one unresolved conformance failure.
+// Measured, not assumed: with pq temporarily enrolled the suite clears 19
+// sub-tests -- range tombstones, clustering slices, forwarding, slicing and fast
+// forwarding -- and then stops inside test_reader_conversions with the
+// partition's clustering rows missing. See docs/dev/parquet-storage-format.md
+// section 11 item 11 for what has been ruled out.
 // Note that pq cannot be added here alone: check_sstable_versions() requires
 // anything at or after oldest_writable_sstable_format to be writable too. Adding pq here would
 // enrol it in the generic suites -- including

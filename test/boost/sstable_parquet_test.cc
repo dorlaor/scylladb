@@ -34,12 +34,15 @@
 #include "schema/schema_builder.hh"
 #include "readers/from_mutations.hh"
 #include "readers/combined.hh"
+#include "readers/mutation_fragment_v1_stream.hh"
 #include "sstables/sstables.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
 #include "mutation/collection_mutation.hh"
 #include "types/map.hh"
 #include "types/set.hh"
+#include "types/list.hh"
+#include "utils/UUID_gen.hh"
 
 #include <cstdio>
 #include <filesystem>
@@ -567,10 +570,12 @@ SEASTAR_THREAD_TEST_CASE(test_pq_collections_round_trip) {
             .with_column("v", int32_type)
             .with_column("m", map_si)
             .with_column("t", set_i)
+            .with_column("sm", map_si, column_kind::static_column)
             .build();
 
         const auto& mdef = *s->get_column_definition(to_bytes("m"));
         const auto& tdef = *s->get_column_definition(to_bytes("t"));
+        const auto& smdef = *s->get_column_definition(to_bytes("sm"));
 
         auto make_map = [&] (api::timestamp_type ts, int n, bool tomb, bool dead_first) {
             collection_mutation_writer w(tomb
@@ -606,6 +611,11 @@ SEASTAR_THREAD_TEST_CASE(test_pq_collections_round_trip) {
                     *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
             mutation m(s, pk);
             const api::timestamp_type ts = 4000 + p;
+            // A static collection on most partitions: it belongs to the partition,
+            // so it must come back on the static row rather than on any row.
+            if (p % 3 != 2) {
+                m.set_static_cell(smdef, make_map(ts, 2, p % 6 == 1, false));
+            }
             for (int r = 0; r < 3; ++r) {
                 auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
                 m.set_clustered_cell(ck, *s->get_column_definition(to_bytes("v")),
@@ -641,6 +651,108 @@ SEASTAR_THREAD_TEST_CASE(test_pq_collections_round_trip) {
         BOOST_REQUIRE_EQUAL(got.size(), want.size());
         for (size_t i = 0; i < got.size(); ++i) {
             assert_that(got[i]).is_equal_to(want[i]);
+        }
+    }).get();
+}
+
+// A local stand-in for the conformance corpus's schema: two bytes clustering
+// columns, and every column doubled as regular and static with a mix of scalars
+// and multi-cell lists. That combination is what test_reader_conversions builds,
+// and it is worth having locally because iterating on the conformance suite means
+// a three-minute build for every guess.
+SEASTAR_THREAD_TEST_CASE(test_pq_corpus_shaped_schema) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto list_b = list_type_impl::get_instance(bytes_type, true);
+        auto sb = schema_builder(1, "ks", "pq_corpus")
+            .with_column("pk", bytes_type, column_kind::partition_key)
+            .with_column("ck1", bytes_type, column_kind::clustering_key)
+            .with_column("ck2", bytes_type, column_kind::clustering_key);
+        for (int i = 0; i < 4; ++i) {
+            sb.with_column(to_bytes(format("v{}", i)),
+                           i % 2 ? data_type(list_b) : bytes_type);
+            sb.with_column(to_bytes(format("s{}", i)),
+                           i % 2 ? data_type(list_b) : bytes_type,
+                           column_kind::static_column);
+        }
+        auto s = sb.build();
+
+        auto blob = [] (int n) { return bytes(bytes::initialized_later(), size_t(2 + n % 3)); };
+        auto make_list = [&] (api::timestamp_type ts, int n) {
+            collection_mutation_writer w{tombstone{}};
+            for (int i = 0; i < n; ++i) {
+                auto k = timeuuid_type->decompose(
+                        utils::UUID_gen::get_time_UUID(std::chrono::system_clock::now()));
+                auto kb = managed_bytes(reinterpret_cast<const int8_t*>(k.data()), k.size());
+                w.push_back(managed_bytes_view(kb),
+                            atomic_cell::make_live(*bytes_type, ts + i, bytes_view(blob(i))));
+            }
+            return atomic_cell_or_collection(std::move(w).finish());
+        };
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 6; ++p) {
+            auto pk = partition_key::from_single_value(*s, blob(p));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 7000 + p;
+            for (int i = 0; i < 4; ++i) {
+                const auto& cdef = *s->get_column_definition(to_bytes(format("s{}", i)));
+                if (i % 2) { m.set_static_cell(cdef, make_list(ts, 2)); }
+                else       { m.set_static_cell(cdef, atomic_cell::make_live(
+                                     *bytes_type, ts, bytes_view(blob(i)))); }
+            }
+            for (int r = 0; r < 4; ++r) {
+                auto ck = clustering_key::from_exploded(*s, {blob(r), blob(r + 1)});
+                for (int i = 0; i < 4; ++i) {
+                    const auto& cdef = *s->get_column_definition(to_bytes(format("v{}", i)));
+                    if (i % 2) { m.set_clustered_cell(ck, cdef, make_list(ts, 1 + r % 2)); }
+                    else       { m.set_clustered_cell(ck, cdef, atomic_cell::make_live(
+                                        *bytes_type, ts, bytes_view(blob(r + i)))); }
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            // Row count first: an empty `rows: []` against a populated one is the
+            // failure mode the conformance suite showed, and comparing whole
+            // mutations buries it in 400 lines of diff.
+            BOOST_REQUIRE_EQUAL(got[i].partition().clustered_rows().calculate_size(),
+                                want[i].partition().clustered_rows().calculate_size());
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
+
+        // And through the v1 fragment stream, which is what
+        // test_reader_conversions exercises: the v2->v1 conversion reassembles
+        // range tombstones and is the one reader path nothing else here covers.
+        auto read_v1 = [&] (shared_sstable t) {
+            mutation_fragment_v1_stream st(
+                    t->make_reader(s, env.make_reader_permit(),
+                                   query::full_partition_range, s->full_slice()));
+            auto close = deferred_close(st);
+            utils::chunked_vector<mutation> out;
+            while (auto m = read_mutation_from_mutation_reader(st).get()) {
+                out.push_back(std::move(*m));
+            }
+            return out;
+        };
+        auto want_v1 = read_v1(ref);
+        auto got_v1  = read_v1(sst);
+        BOOST_REQUIRE_EQUAL(got_v1.size(), want_v1.size());
+        for (size_t i = 0; i < got_v1.size(); ++i) {
+            BOOST_REQUIRE_EQUAL(got_v1[i].partition().clustered_rows().calculate_size(),
+                                want_v1[i].partition().clustered_rows().calculate_size());
+            assert_that(got_v1[i]).is_equal_to(want_v1[i]);
         }
     }).get();
 }

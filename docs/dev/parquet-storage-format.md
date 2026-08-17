@@ -1947,10 +1947,34 @@ table, not the size.
     partition region. Presence of `__rtc_w` is what marks the row, because a weight of zero
     is legitimate. `__rtc_ts` absent means the change closes a range.
 
-    Still unrepresentable: **multi-cell collections and counters**. These make the writer
-    *throw*. Collections were the last silent-loss case: the shredder skipped any
-    non-atomic cell with a comment claiming they "travel opaquely", when in fact the
-    column's contents were dropped. That
+    **Multi-cell collections landed 2026-08-17**, as Dremel MAP groups per §5.2 rather
+    than opaque blobs:
+
+    ```
+    optional group <col> (MAP) {
+      repeated group key_value {
+        required binary key;  optional binary value;
+        required int64  __ts; optional int32 __ttl; optional int32 __ldt;
+      }
+    }
+    ```
+
+    Keys and values stay serialised, which is what lets one code path serve sets, lists,
+    maps and non-frozen UDTs alike. Per-element timestamps, TTLs and dead elements live
+    inside the group; the collection-wide tombstone is a row-level pair, because it belongs
+    to the row. Five states are distinguished and all are tested: absent,
+    present-but-empty, populated, populated with a dead element, and deleted-and-empty.
+    Absent versus present-but-empty differs only by a definition level, and conflating them
+    resurrects a collection the user cleared.
+
+    Getting there needed the format library to support Dremel at all — it emitted definition
+    levels only. That work is validated in both directions against parquet-cpp: leaf levels
+    against pyarrow's own `max_definition_level`/`max_repetition_level`, reading a pyarrow
+    `list<string>`, and writing one for pyarrow to read back (suites 15–17).
+
+    Still unrepresentable: **counters**, excluded by design (open question 5). They are
+    atomic, so they would otherwise have been stored as opaque blobs, losing the shard
+    structure that makes them mergeable; the writer now throws. That
     distinction matters more than the missing support: before, a partition tombstone was
     silently discarded, which produced a perfectly valid Parquet file that resurrected
     deleted rows. Refusing is recoverable; silence is not.
