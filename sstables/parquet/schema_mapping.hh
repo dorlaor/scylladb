@@ -207,6 +207,11 @@ struct mapped_schema {
     std::optional<size_t> tsx_vals_index;
     // For L0: index of the first of the four metadata leaves per column.
     std::vector<std::optional<size_t>> meta_base_index;
+    // For L1: the per-column TTL and local-deletion-time leaves. Recorded
+    // individually rather than as base + k, because the groups are skipped for
+    // collection columns (their per-element metadata lives inside the group) and
+    // because writing only one of the two silently produced a ragged row group.
+    std::vector<std::optional<size_t>> l1_ttl_index, l1_ldt_index;
     // Row marker, row tombstone and partition tombstone leaves. Each group is
     // materialised only when the data needs it.
     std::optional<size_t> rm_index, rm_ttl_index, rm_ldt_index;

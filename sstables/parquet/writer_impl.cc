@@ -21,6 +21,8 @@
 #include "keys/keys.hh"
 #include "dht/i_partitioner.hh"
 #include "sstables/mx/writer.hh"
+#include "mutation/collection_mutation.hh"
+#include "types/collection.hh"
 
 #include <cstring>
 
@@ -52,6 +54,38 @@ int32_t be32(const bytes_view& b) {
     const size_t n = std::min<size_t>(4, b.size());
     for (size_t i = 0; i < n; ++i) { v = (v << 8) | uint8_t(b[i]); }
     return int32_t(v);
+}
+
+// A non-frozen collection as the mapping sees it: the collection-level tombstone
+// plus one entry per (key, cell) pair. Keys and values stay serialised -- the
+// mapping treats both as opaque bytes, which is what makes one code path work for
+// sets, lists, maps and non-frozen UDTs alike.
+collection_cell read_collection_mutation(const atomic_cell_or_collection& acoc) {
+    auto cmv = acoc.as_collection_mutation();
+    collection_cell cc;
+    if (cmv.tomb()) {
+        cc.tomb = deletion_info{cmv.tomb().timestamp,
+                int32_t(cmv.tomb().deletion_time.time_since_epoch().count())};
+    }
+    for (auto&& kv : cmv) {
+        auto kb = linearized(kv.first);
+        collection_element e;
+        e.key.assign(reinterpret_cast<const char*>(kb.data()), kb.size());
+        e.timestamp = kv.second.timestamp();
+        if (kv.second.is_live()) {
+            auto lv = kv.second.value().linearize();
+            e.value = std::string(reinterpret_cast<const char*>(lv.data()), lv.size());
+            if (kv.second.is_live_and_has_ttl()) {
+                e.ttl = int32_t(kv.second.ttl().count());
+                e.local_deletion_time = int32_t(kv.second.expiry().time_since_epoch().count());
+            }
+        } else {
+            e.local_deletion_time =
+                    int32_t(kv.second.deletion_time().time_since_epoch().count());
+        }
+        cc.elements.push_back(std::move(e));
+    }
+    return cc;
 }
 
 value decode(cql_type t, bytes_view b) {
@@ -101,7 +135,9 @@ std::vector<cql_column> columns_of(const ::schema& s) {
         cols.push_back({c.name_as_text(), cql_type_of(*c.type), column_kind::clustering_key});
     }
     for (const auto& c : s.regular_columns()) {
-        cols.push_back({c.name_as_text(), cql_type_of(*c.type), column_kind::regular});
+        cql_column col{c.name_as_text(), cql_type_of(*c.type), column_kind::regular};
+        col.multi_cell = !c.is_atomic();
+        cols.push_back(std::move(col));
     }
     // Static columns ride along as ordinary value columns, appended after the
     // regular ones. That gets them the whole cell machinery -- timestamps, TTLs,
@@ -109,7 +145,9 @@ std::vector<cql_column> columns_of(const ::schema& s) {
     // static value is constant within its partition and so compresses away.
     // The reader splits them back out by index; see static_base().
     for (const auto& c : s.static_columns()) {
-        cols.push_back({"__s_" + c.name_as_text(), cql_type_of(*c.type), column_kind::regular});
+        cql_column col{"__s_" + c.name_as_text(), cql_type_of(*c.type), column_kind::regular};
+        col.multi_cell = !c.is_atomic();
+        cols.push_back(std::move(col));
     }
     return cols;
 }
@@ -131,6 +169,7 @@ void fragment_shredder::new_partition(const dht::decorated_key& dk) {
     _pk.clear();
     _part_del.reset();
     _static_cells.clear();
+    _static_collections.clear();
     _saw_clustering_row = false;
     std::vector<cql_type> types;
     for (const auto& c : _schema.partition_key_columns()) { types.push_back(cql_type_of(*c.type)); }
@@ -168,11 +207,19 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
     _saw_clustering_row = true;
     // Static cells ride on every row of the partition.
     for (const auto& [k, c] : _static_cells) { r.cells.emplace(k, c); }
+    for (const auto& [k, c] : _static_collections) { r.collections.emplace(k, c); }
 
     // Regular cells. column_id indexes the regular columns, which is exactly the
     // index space schema_mapping uses for cells.
     cr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
         const column_definition& cdef = _schema.regular_column_at(id);
+        if (cdef.is_counter()) {
+            // A counter cell is atomic, so it would otherwise sail down the
+            // ordinary path and be stored as an opaque blob -- losing the shard
+            // structure that makes counters mergeable. Excluded by design
+            // (design doc open question 5), so refuse rather than corrupt.
+            unrepresentable("counters");
+        }
         if (cdef.is_atomic()) {
             auto av = acoc.as_atomic_cell(cdef);
             cell c;
@@ -191,10 +238,7 @@ void fragment_shredder::add_clustering_row(const clustering_row& cr) {
             r.cells.emplace(size_t(id), std::move(c));
         }
         else {
-            // Non-atomic means a multi-cell collection, which needs Dremel
-            // repetition levels the format library does not emit yet. Silently
-            // skipping it would write a valid file missing a column's contents.
-            unrepresentable("multi-cell collections");
+            r.collections.emplace(size_t(id), read_collection_mutation(acoc));
         }
     });
     _rows.push_back(std::move(r));
@@ -207,7 +251,12 @@ void fragment_shredder::add_static_row(const static_row& sr) {
     // end_partition().
     sr.cells().for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
         const column_definition& cdef = _schema.static_column_at(id);
-        if (!cdef.is_atomic()) { unrepresentable("multi-cell static collections"); }
+        if (cdef.is_counter()) { unrepresentable("counters"); }
+        if (!cdef.is_atomic()) {
+            _static_collections.emplace(_static_base + size_t(id),
+                                        read_collection_mutation(acoc));
+            return;
+        }
         auto av = acoc.as_atomic_cell(cdef);
         cell c;
         c.timestamp = av.timestamp();
@@ -266,7 +315,7 @@ void fragment_shredder::end_partition() {
         _saw_clustering_row = false;
         return;
     }
-    if (_static_cells.empty() && !_part_del) {
+    if (_static_cells.empty() && _static_collections.empty() && !_part_del) {
         return;                       // nothing to record
     }
     // Static-only (or tombstone-only) partition: one placeholder row, whose

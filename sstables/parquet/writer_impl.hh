@@ -59,6 +59,7 @@ class fragment_shredder {
     std::vector<value> _pk;      // current partition's key components
     std::optional<deletion_info> _part_del;
     std::map<size_t, cell> _static_cells;     // indexed as value columns
+    std::map<size_t, collection_cell> _static_collections;
     size_t _static_base = 0;
     bool _saw_clustering_row = false;
     size_t _n_pk = 0, _n_ck = 0;

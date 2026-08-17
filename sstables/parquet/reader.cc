@@ -14,6 +14,8 @@
 #include "sstables/index_reader.hh"
 #include "sstables/mutation_fragment_filter.hh"
 #include "readers/forwardable.hh"
+#include "mutation/collection_mutation.hh"
+#include "types/collection.hh"
 #include "mutation/mutation_fragment.hh"
 #include "mutation/mutation.hh"
 #include "keys/keys.hh"
@@ -59,6 +61,43 @@ bytes encode(cql_type t, const value& v) {
         return bytes(reinterpret_cast<const int8_t*>(s.data()), s.size());
     }
     }
+}
+
+// Rebuild a collection cell from the mapping's element list. Keys and values are
+// the serialised forms the writer took apart, so they go back verbatim; the
+// element's own value type is used for the atomic cell so that a fixed-width
+// element is stored the way the rest of Scylla stores it.
+atomic_cell_or_collection build_collection(const column_definition& cdef,
+                                           const collection_cell& cc) {
+    const auto& ctype = dynamic_cast<const collection_type_impl&>(*cdef.type);
+    auto vtype = ctype.value_comparator();
+
+    tombstone t;
+    if (cc.tomb) {
+        t = tombstone(cc.tomb->timestamp,
+                      gc_clock::time_point(gc_clock::duration(cc.tomb->local_deletion_time)));
+    }
+    collection_mutation_writer w(t);
+    for (const auto& e : cc.elements) {
+        auto key = managed_bytes(reinterpret_cast<const int8_t*>(e.key.data()), e.key.size());
+        if (!e.value) {
+            auto ldt = gc_clock::time_point(
+                    gc_clock::duration(e.local_deletion_time.value_or(0)));
+            w.push_back(managed_bytes_view(key), atomic_cell::make_dead(e.timestamp, ldt));
+            continue;
+        }
+        auto vb = bytes(reinterpret_cast<const int8_t*>(e.value->data()), e.value->size());
+        if (e.ttl && e.local_deletion_time) {
+            w.push_back(managed_bytes_view(key),
+                    atomic_cell::make_live(*vtype, e.timestamp, bytes_view(vb),
+                            gc_clock::time_point(gc_clock::duration(*e.local_deletion_time)),
+                            gc_clock::duration(*e.ttl)));
+        } else {
+            w.push_back(managed_bytes_view(key),
+                    atomic_cell::make_live(*vtype, e.timestamp, bytes_view(vb)));
+        }
+    }
+    return atomic_cell_or_collection(std::move(w).finish());
 }
 
 // Streams a pq sstable: footer once, then one row group's bytes at a time,
@@ -244,7 +283,6 @@ future<> pq_reader::init() {
             }
             auto pos = present ? ir->data_file_positions() : sstables::data_file_positions_range{0, 0};
             if (!present) { _sst->get_filter_tracker().add_false_positive(); }
-            if (getenv("PQDBG")) fprintf(stderr, "[pqdbg] eof=%d data_size=%llu want_tok=%s sum_tok=%s\n", int(ir->eof()), (unsigned long long)_sst->data_size(), _pr->start()->value().token().to_sstring().c_str(), _sst->get_summary().entries.empty()?"-":_sst->get_summary().entries[0].get_token().to_sstring().c_str());
             _row_lo = std::min<int64_t>(int64_t(pos.start), acc);
             _row_hi = pos.end ? std::min<int64_t>(int64_t(*pos.end), acc) : acc;
             if (_row_hi < _row_lo) { _row_hi = _row_lo; }
@@ -465,6 +503,12 @@ void pq_reader::emit_row(const row& r) {
                         atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw)));
             }
         }
+        for (const auto& [k, cc] : r.collections) {
+            if (k < _static_base) { continue; }
+            const column_definition& cdef =
+                    _schema->static_column_at(column_id(k - _static_base));
+            st.append_cell(column_id(k - _static_base), build_collection(cdef, cc));
+        }
         if (!st.empty()) {
             push_mutation_fragment(mutation_fragment_v2(*_schema, _permit,
                     static_row(std::move(st))));
@@ -543,6 +587,13 @@ void pq_reader::emit_row(const row& r) {
             cells.append_cell(column_id(k),
                     atomic_cell::make_live(*cdef.type, c.timestamp, bytes_view(raw)));
         }
+    }
+
+    // Non-frozen collections. Static ones were emitted with the static row above.
+    for (const auto& [k, cc] : r.collections) {
+        if (k >= _static_base) { continue; }
+        const column_definition& cdef = _schema->regular_column_at(column_id(k));
+        cells.append_cell(column_id(k), build_collection(cdef, cc));
     }
 
     row_marker rm;

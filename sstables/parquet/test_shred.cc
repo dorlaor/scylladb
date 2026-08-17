@@ -255,6 +255,10 @@ int filetrip() {
         for (double d : divs) for (double nl : nulls) for (auto& cp : comps) {
             gen_opts o; o.rows = 1500; o.n_regular = w;
             o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = 0.2;
+            // Both at once: with only one of them the __ttl_/__ldt_ groups
+            // happened to line up, which hid a ragged row group for years'
+            // worth of cases.
+            o.delete_rate = 0.15;
             o.marker_rate = 0.9; o.marker_ttl_rate = 0.1;
             o.row_del_rate = 0.05; o.part_del_rate = 0.1;
             auto rows = generate(cols, o);

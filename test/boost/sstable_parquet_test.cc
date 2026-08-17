@@ -37,6 +37,9 @@
 #include "sstables/sstables.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
+#include "mutation/collection_mutation.hh"
+#include "types/map.hh"
+#include "types/set.hh"
 
 #include <cstdio>
 #include <filesystem>
@@ -547,5 +550,97 @@ SEASTAR_THREAD_TEST_CASE(test_pq_read_honours_clustering_slice) {
                                    re.key().explode(*s)[0])));
         }
         BOOST_REQUIRE_EQUAL(keys, sstring("4,5,6,7"));
+    }).get();
+}
+
+// Non-frozen collections, through the real sstable path. They are the one thing
+// in the mutation stream that needs Dremel nesting rather than another leaf, and
+// the states that matter are absent, present-but-empty, populated, and deleted --
+// conflating absent with empty resurrects a collection the user cleared.
+SEASTAR_THREAD_TEST_CASE(test_pq_collections_round_trip) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto map_si = map_type_impl::get_instance(utf8_type, int32_type, true);
+        auto set_i  = set_type_impl::get_instance(int32_type, true);
+        auto s = schema_builder(1, "ks", "pq_coll")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("v", int32_type)
+            .with_column("m", map_si)
+            .with_column("t", set_i)
+            .build();
+
+        const auto& mdef = *s->get_column_definition(to_bytes("m"));
+        const auto& tdef = *s->get_column_definition(to_bytes("t"));
+
+        auto make_map = [&] (api::timestamp_type ts, int n, bool tomb, bool dead_first) {
+            collection_mutation_writer w(tomb
+                    ? tombstone(ts - 1, gc_clock::time_point(gc_clock::duration(7)))
+                    : tombstone());
+            for (int i = 0; i < n; ++i) {
+                auto k = utf8_type->decompose(sstring(format("k{}", i)));
+                auto kb = managed_bytes(reinterpret_cast<const int8_t*>(k.data()), k.size());
+                if (dead_first && i == 0) {
+                    w.push_back(managed_bytes_view(kb), atomic_cell::make_dead(ts,
+                            gc_clock::time_point(gc_clock::duration(3))));
+                } else {
+                    w.push_back(managed_bytes_view(kb), atomic_cell::make_live(
+                            *int32_type, ts, int32_type->decompose(i * 10)));
+                }
+            }
+            return atomic_cell_or_collection(std::move(w).finish());
+        };
+        auto make_set = [&] (api::timestamp_type ts, int n) {
+            collection_mutation_writer w{tombstone{}};
+            for (int i = 0; i < n; ++i) {
+                auto k = int32_type->decompose(i);
+                auto kb = managed_bytes(reinterpret_cast<const int8_t*>(k.data()), k.size());
+                w.push_back(managed_bytes_view(kb),
+                            atomic_cell::make_live(*bytes_type, ts, bytes_view()));
+            }
+            return atomic_cell_or_collection(std::move(w).finish());
+        };
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 18; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 4000 + p;
+            for (int r = 0; r < 3; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.set_clustered_cell(ck, *s->get_column_definition(to_bytes("v")),
+                        atomic_cell::make_live(*int32_type, ts, int32_type->decompose(r)));
+                const int kind = (p + r) % 5;
+                if (kind == 1) {
+                    m.set_clustered_cell(ck, mdef, make_map(ts, 3, false, false));
+                } else if (kind == 2) {
+                    m.set_clustered_cell(ck, mdef, make_map(ts, 2, true, false));
+                } else if (kind == 3) {
+                    m.set_clustered_cell(ck, mdef, make_map(ts, 2, false, true));
+                } else if (kind == 4) {
+                    m.set_clustered_cell(ck, tdef, make_set(ts, 4));
+                }
+                // kind == 0: neither collection present at all
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        // Against the reference format rather than the in-memory mutation: the
+        // write path may legitimately normalise a collection, and the question is
+        // whether pq behaves like mc.
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
     }).get();
 }

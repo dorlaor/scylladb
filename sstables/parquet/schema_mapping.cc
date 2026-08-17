@@ -228,6 +228,8 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     ms.value_is_collection.assign(reg_idx.size(), false);
     ms.ct_ts_index.assign(reg_idx.size(), std::nullopt);
     ms.ct_ldt_index.assign(reg_idx.size(), std::nullopt);
+    ms.l1_ttl_index.assign(reg_idx.size(), std::nullopt);
+    ms.l1_ldt_index.assign(reg_idx.size(), std::nullopt);
 
     const bool any_ttl = flags.any_ttl, any_deletion = flags.any_deletion;
     const std::vector<bool>& col_diverges = flags.col_diverges;
@@ -314,6 +316,7 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
         // Four metadata leaves per regular column, unconditionally. This is the
         // 2020 mapping and it is here to be measured against, not used.
         for (size_t k = 0; k < reg_idx.size(); ++k) {
+            if (ms.value_is_collection[k]) { continue; }   // metadata is per element
             ms.meta_base_index[k] = ms.columns.size();
             const auto& nm = cols[reg_idx[k]].name;
             ms.columns.push_back({"__live_" + nm, phys_type::int32, repetition::required, std::nullopt, std::nullopt});
@@ -348,19 +351,18 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                 }
             }
         }
-        // Remembered rather than back-computed from columns.size(): anything
-        // appended after these groups would otherwise silently shift the index.
-        std::optional<size_t> group_base;
         if (any_ttl) {
-            group_base = ms.columns.size();
             for (size_t k = 0; k < reg_idx.size(); ++k) {
+                if (ms.value_is_collection[k]) { continue; }
+                ms.l1_ttl_index[k] = ms.columns.size();
                 ms.columns.push_back({"__ttl_" + cols[reg_idx[k]].name, phys_type::int32,
                                       repetition::optional, std::nullopt, std::nullopt});
             }
         }
         if (any_deletion) {
-            if (!group_base) { group_base = ms.columns.size(); }
             for (size_t k = 0; k < reg_idx.size(); ++k) {
+                if (ms.value_is_collection[k]) { continue; }
+                ms.l1_ldt_index[k] = ms.columns.size();
                 ms.columns.push_back({"__ldt_" + cols[reg_idx[k]].name, phys_type::int32,
                                       repetition::optional, std::nullopt, std::nullopt});
             }
@@ -424,9 +426,6 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
         ms.uniform_ts = std::nullopt;
         // Record which optional groups exist so reassemble() can invert.
         ms.meta_base_index.assign(reg_idx.size(), std::nullopt);
-        if (group_base) {
-            for (size_t k = 0; k < reg_idx.size(); ++k) { ms.meta_base_index[k] = *group_base + k; }
-        }
     } else {
         ms.uniform_ts = single_ts.value_or(0);
     }
@@ -611,8 +610,6 @@ std::vector<column_data> shred(const mapped_schema& ms,
         (cols[i].kind == column_kind::regular ? reg_idx : key_idx).push_back(i);
     }
     std::vector<column_data> out(ms.columns.size());
-    const bool has_ttl_block = ms.level == folding_level::row_folded &&
-                               ms.meta_base_index[0].has_value();
 
     for (const auto& r : rows) {
         // key columns
@@ -655,11 +652,18 @@ std::vector<column_data> shred(const mapped_schema& ms,
                     out[x].def_levels.push_back(diverges ? 1 : 0);
                     out[x].i64.push_back(diverges ? it->second.timestamp : 0);
                 }
-                if (has_ttl_block) {
-                    const size_t b = *ms.meta_base_index[k];
+                if (ms.l1_ttl_index[k]) {
+                    const size_t b = *ms.l1_ttl_index[k];
                     bool has_ttl = it != r.cells.end() && it->second.ttl.has_value();
                     out[b].def_levels.push_back(has_ttl ? 1 : 0);
                     out[b].i32.push_back(has_ttl ? *it->second.ttl : 0);
+                }
+                if (ms.l1_ldt_index[k]) {
+                    const size_t b = *ms.l1_ldt_index[k];
+                    bool has_ldt = it != r.cells.end() &&
+                                   it->second.local_deletion_time.has_value();
+                    out[b].def_levels.push_back(has_ldt ? 1 : 0);
+                    out[b].i32.push_back(has_ldt ? *it->second.local_deletion_time : 0);
                 }
             }
         }
@@ -795,8 +799,6 @@ std::vector<row> reassemble(const mapped_schema& ms,
     for (size_t i = 0; i < cols.size(); ++i) {
         (cols[i].kind == column_kind::regular ? reg_idx : key_idx).push_back(i);
     }
-    const bool has_ttl_block = ms.level == folding_level::row_folded &&
-                               !ms.meta_base_index.empty() && ms.meta_base_index[0].has_value();
 
     std::vector<row> out(nrows);
     // Per collection column, where the next row's slots and values begin. A
@@ -863,9 +865,13 @@ std::vector<row> reassemble(const mapped_schema& ms,
                            ms.ts_exc_index[k] && cd[*ms.ts_exc_index[k]].def_levels[i]) {
                     c.timestamp = cd[*ms.ts_exc_index[k]].i64[i];
                 }
-                if (has_ttl_block) {
-                    const size_t b = *ms.meta_base_index[k];
+                if (ms.l1_ttl_index[k]) {
+                    const size_t b = *ms.l1_ttl_index[k];
                     if (cd[b].def_levels[i]) { c.ttl = cd[b].i32[i]; }
+                }
+                if (ms.l1_ldt_index[k]) {
+                    const size_t b = *ms.l1_ldt_index[k];
+                    if (cd[b].def_levels[i]) { c.local_deletion_time = cd[b].i32[i]; }
                 }
                 r.cells.emplace(k, std::move(c));
             }
