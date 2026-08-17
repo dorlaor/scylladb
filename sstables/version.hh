@@ -33,9 +33,12 @@ enum class sstable_format_types { big };
 // Row markers, row and partition tombstones, and static rows all round-trip.
 // What still blocks membership is coverage, not plumbing. Enrolling pq here runs
 // it through run_mutation_source_tests, which needs four things it does not have:
-// multi-cell collections -- which need Dremel repetition levels the encoder does
-// not emit -- and counters, which are excluded by design. Both make the writer
-// throw rather than drop data. Adding pq here would
+// (a) the reader ignores the query's clustering slice, so a sliced read returns
+// too many rows -- this is what the conformance suite actually trips on, in
+// test_range_tombstones_v2; (b) multi-cell collections need Dremel repetition
+// levels the encoder does not emit; (c) counters are excluded by design.
+// Note that pq cannot be added here alone: check_sstable_versions() requires
+// anything at or after oldest_writable_sstable_format to be writable too. Adding pq here would
 // enrol it in the generic suites -- including
 // sstable_conforms_to_mutation_source_test -- which exercise all of those.
 // Add it in the change that closes those gaps; see

@@ -1972,10 +1972,28 @@ table, not the size.
        correct but buffers the partition; seeking natively by clustering position, which
        the ColumnIndex would support, is a later optimisation.
 
-    That leaves **multi-cell collections** as the one substantive blocker, since counters
-    are excluded by design. Collections need repetition levels, which is the largest single
-    piece of unwritten format-library work: the encoder emits definition levels only, so
-    nesting is not expressible at all today.
+    **Measured rather than reasoned about, 2026-08-17.** `pq` was temporarily added to both
+    arrays and the conformance suite actually run against it, which is more informative than
+    listing what is missing. Three things came out of it:
+
+    1. The two arrays are coupled. `check_sstable_versions` requires every version at or
+       after `oldest_writable_sstable_format` to appear in `writable_sstable_versions`, and
+       `pq` sorts after `mc`, so it cannot be readable-but-not-writable. There is also a
+       `static_assert(writable_sstable_versions.size() == 5)` in the conformance test whose
+       whole job is to make someone notice.
+    2. It does **not** fail on collections. It gets as far as `test_range_tombstones_v2` in
+       `run_mutation_reader_tests_basic`, well inside the suite.
+    3. It fails because **the reader ignores the query's clustering slice**. `make_reader`
+       takes `slice` and drops it on the floor, so a sliced read returns rows outside the
+       requested clustering ranges — the same class of bug as the forwarding one fixed
+       earlier the same day, and now the next thing to fix. Honouring a slice means
+       filtering emitted rows against `slice.row_ranges()` *and* clipping range tombstone
+       changes to those ranges; the ColumnIndex would let a later version seek rather than
+       filter.
+
+    So the order of work is: clustering slices, then multi-cell collections (which need
+    Dremel repetition levels — the encoder emits definition levels only, so nesting is not
+    expressible at all today). Counters are excluded by design.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
