@@ -20,5 +20,19 @@ for i in range(md.num_columns):
     cols.append({"path": c.path, "max_def": c.max_definition_level,
                  "max_rep": c.max_repetition_level})
 (out / "nested.levels.json").write_text(json.dumps(cols, indent=1))
+
+# tags as a line-per-row text form, so the C++ side needs no JSON parser:
+#   NULL        the list itself is null
+#   EMPTY       present but zero elements
+#   a|b|~       elements, ~ for a null element
+lines = []
+for v in t.column("tags").to_pylist():
+    if v is None:
+        lines.append("NULL")
+    elif len(v) == 0:
+        lines.append("EMPTY")
+    else:
+        lines.append("|".join("~" if e is None else e for e in v))
+(out / "nested.tags.txt").write_text("\n".join(lines) + "\n")
 print(f"wrote {p} rows={md.num_rows} cols={md.num_columns} rgs={md.num_row_groups}")
 for c in cols: print("  ", c)

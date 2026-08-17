@@ -104,16 +104,55 @@ void append_values(column_data& cd, phys_type pt, encoding enc,
 // A null in an optional column occupies a definition-level slot but no value, so
 // the value vectors have to be re-expanded to one entry per row for the caller,
 // which indexes them positionally alongside def_levels.
-// Keep `keep` rows starting at `drop`. Values are dense after expand_nulls, so
-// definition levels and values slice identically.
-void trim(column_data& cd, size_t drop, size_t keep) {
-    auto cut = [&] (auto& v) {
-        if (drop >= v.size()) { v.clear(); return; }
-        v.erase(v.begin(), v.begin() + long(drop));
-        if (v.size() > keep) { v.resize(keep); }
+// Keep `keep` rows starting at `drop`. For a flat column values are dense after
+// expand_nulls, so levels and values slice identically. For a repeated one a row
+// spans several slots, so the row boundaries have to be found in rep_levels and
+// the value vectors sliced by how many values those slots actually carried.
+void trim(column_data& cd, size_t drop, size_t keep, bool repeated) {
+    auto cut = [&] (auto& v, size_t from, size_t count) {
+        if (from >= v.size()) { v.clear(); return; }
+        v.erase(v.begin(), v.begin() + long(from));
+        if (v.size() > count) { v.resize(count); }
     };
-    if (!cd.def_levels.empty()) { cut(cd.def_levels); }
-    cut(cd.i32); cut(cd.i64); cut(cd.f64); cut(cd.str);
+    if (!repeated) {
+        if (!cd.def_levels.empty()) { cut(cd.def_levels, drop, keep); }
+        cut(cd.i32, drop, keep); cut(cd.i64, drop, keep);
+        cut(cd.f64, drop, keep); cut(cd.str, drop, keep);
+        return;
+    }
+
+    // Slot range covering rows [drop, drop + keep).
+    const size_t n = cd.rep_levels.size();
+    size_t slot_lo = n, slot_hi = n, row = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (cd.rep_levels[i] == 0) {
+            if (row == drop) { slot_lo = i; }
+            if (row == drop + keep) { slot_hi = i; break; }
+            ++row;
+        }
+    }
+    if (slot_lo == n) { slot_lo = n; }
+    if (row < drop + keep) { slot_hi = n; }
+
+    // Values are present-only, so count how many fall before and inside.
+    const bool has_def = !cd.def_levels.empty();
+    auto present_in = [&] (size_t from, size_t to) {
+        if (!has_def) { return to - from; }
+        size_t maxd = 0;
+        for (auto d : cd.def_levels) { maxd = std::max<size_t>(maxd, d); }
+        size_t k = 0;
+        for (size_t i = from; i < to && i < cd.def_levels.size(); ++i) {
+            if (cd.def_levels[i] == maxd) { ++k; }
+        }
+        return k;
+    };
+    const size_t vdrop = present_in(0, slot_lo);
+    const size_t vkeep = present_in(slot_lo, slot_hi);
+
+    cut(cd.rep_levels, slot_lo, slot_hi - slot_lo);
+    if (has_def) { cut(cd.def_levels, slot_lo, slot_hi - slot_lo); }
+    cut(cd.i32, vdrop, vkeep); cut(cd.i64, vdrop, vkeep);
+    cut(cd.f64, vdrop, vkeep); cut(cd.str, vdrop, vkeep);
 }
 
 void expand_nulls(column_data& cd, phys_type pt, size_t first, size_t count,
@@ -156,11 +195,9 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
     if (row_hi > rg.num_rows) { row_hi = rg.num_rows; }
     if (row_hi < row_lo) { row_hi = row_lo; }
 
-    // Leaf schema elements, in order, so repetition type is known per column.
-    std::vector<const schema_element*> leaves;
-    for (size_t i = 1; i < md.schema.size(); ++i) {
-        if (md.schema[i].is_leaf()) { leaves.push_back(&md.schema[i]); }
-    }
+    // Levels come from the schema *tree*: a leaf's own repetition type does not
+    // determine them once it sits inside a repeated group.
+    auto leaves = walk_leaves(md);
     if (leaves.size() != rg.columns.size()) {
         throw decode_error("row group chunk count does not match the schema");
     }
@@ -172,8 +209,10 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
         const auto& cc = rg.columns[c];
         if (!cc.meta) { throw decode_error("column chunk without metadata"); }
         const auto& cm = *cc.meta;
-        const bool optional = leaves[c]->repetition_type &&
-                              *leaves[c]->repetition_type == repetition::optional;
+        const uint8_t max_def = leaves[c].max_def;
+        const uint8_t max_rep = leaves[c].max_rep;
+        const bool optional = max_def > 0;
+        const bool repeated = max_rep > 0;
 
         // The dictionary page stays as raw bytes with a view table over it; see
         // index_plain_byte_array() for why materialising it was the single
@@ -264,9 +303,15 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                 const size_t dl = size_t(h.definition_levels_byte_length);
                 if (rl + dl > body.size()) { throw decode_error("level lengths exceed page body"); }
 
+                if (repeated) {
+                    rle_decoder rd(body.subspan(0, rl), bit_width_for(max_rep));
+                    auto reps = rd.decode_all(n);
+                    if (reps.size() != n) { throw decode_error("short repetition level stream"); }
+                    out[c].rep_levels.insert(out[c].rep_levels.end(), reps.begin(), reps.end());
+                }
                 std::vector<uint64_t> levels;
                 if (optional) {
-                    rle_decoder ld(body.subspan(rl, dl), 1);
+                    rle_decoder ld(body.subspan(rl, dl), bit_width_for(max_def));
                     levels = ld.decode_all(n);
                     if (levels.size() != n) { throw decode_error("short definition level stream"); }
                     out[c].def_levels.insert(out[c].def_levels.end(), levels.begin(), levels.end());
@@ -282,11 +327,14 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                                       uncompressed_values);
 
                 const size_t present = optional
-                        ? size_t(std::count(levels.begin(), levels.end(), uint64_t(1))) : n;
+                        ? size_t(std::count(levels.begin(), levels.end(), uint64_t(max_def))) : n;
                 const size_t before = out[c].num_values();
                 append_values(out[c], cm.type, h.value_encoding, raw, present,
                               dict_ba, dict_i32, dict_i64, dict_f64);
-                if (optional) {
+                // Densifying to one value per *slot* only makes sense when a slot
+                // is a row. Under repetition the caller has to walk the levels, so
+                // the values stay as the file has them: present only.
+                if (optional && !repeated) {
                     expand_nulls(out[c], cm.type, before, n, levels);
                 }
                 produced += int64_t(n);
@@ -312,7 +360,7 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
         const int64_t start = first_row_decoded[c] < 0 ? row_lo : first_row_decoded[c];
         const size_t drop = size_t(row_lo - start);
         const size_t keep = size_t(row_hi - row_lo);
-        trim(out[c], drop, keep);
+        trim(out[c], drop, keep, leaves[c].max_rep > 0);
     }
     return out;
 }

@@ -25,6 +25,9 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined \
 g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
     -o /tmp/pq_write_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/test_writer.cc -lzstd || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
+    -o /tmp/pq_nested_read_t $S/test_nested_read.cc $S/parquet_reader.cc \
+       $S/parquet_metadata.cc $S/page_header.cc -lzstd -lsnappy || FAIL=1
+g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_levels_tree_t $S/test_levels_tree.cc $S/parquet_metadata.cc || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_rowrange_t $S/test_row_range.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
@@ -67,6 +70,9 @@ echo; echo "### 13. schema recovery from the file alone ###"; /tmp/pq_shred_t re
 echo; echo "### 15. Dremel levels from the schema tree, vs pyarrow ###"
 if [ -f "$DATA"/nested/nested.parquet ]; then
   /tmp/pq_levels_tree_t "$DATA"/nested/nested.parquet "$DATA"/nested/nested.levels.json || FAIL=1
+  echo; echo "### 16. read a nested list column, vs pyarrow ###"
+  /tmp/pq_nested_read_t "$DATA"/nested/nested.parquet "$DATA"/nested/nested.tags.txt \
+      tags.list.element || FAIL=1
 else
   echo "  (no nested fixture; generate with sstables/parquet/format/gen_nested.py)"
 fi
