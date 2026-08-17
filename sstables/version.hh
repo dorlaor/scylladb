@@ -31,9 +31,11 @@ enum class sstable_format_types { big };
 // partition tombstones round-trip as of 2026-08-17.
 //
 // Row markers, row and partition tombstones, and static rows all round-trip.
-// What still blocks membership is coverage, not plumbing: range tombstones,
-// multi-cell collections and counters cannot be represented, and the writer
-// throws on them rather than dropping them. Adding pq here would
+// What still blocks membership is coverage, not plumbing. Enrolling pq here runs
+// it through run_mutation_source_tests, which needs four things it does not have:
+// range tombstones, multi-cell collections, counters (excluded by design), and
+// intra-partition forwarding -- fast_forward_to(position_range) is a no-op.
+// The first three make the writer throw rather than drop data. Adding pq here would
 // enrol it in the generic suites -- including
 // sstable_conforms_to_mutation_source_test -- which exercise all of those.
 // Add it in the change that closes those gaps; see

@@ -1946,11 +1946,24 @@ table, not the size.
     silently discarded, which produced a perfectly valid Parquet file that resurrected
     deleted rows. Refusing is recoverable; silence is not.
 
-    Range tombstones are the remaining blocker for `all_sstable_versions` and for
-    `sstable_conforms_to_mutation_source_test`, because they are fragments *between* rows
-    rather than attributes of one. The likely design reuses the `__no_ck` idea: interleave
-    them as marked rows carrying the bound's clustering prefix, a bound weight, and how
-    many clustering components the bound actually sets.
+    **What `all_sstable_versions` would actually require.** Membership enrols `pq` in
+    `sstable_conforms_to_mutation_source_test`, which runs the full
+    `run_mutation_source_tests` battery. That needs four things, not one:
+
+    1. **Range tombstones** — fragments *between* rows rather than attributes of one. The
+       likely design reuses the `__no_ck` idea: interleave them as marked rows carrying the
+       bound's clustering prefix, a bound weight, and how many clustering components the
+       bound actually sets.
+    2. **Multi-cell collections** — the shredder maps one leaf per column; a collection is
+       a nested Dremel structure with its own repetition levels. The format library already
+       supports definition levels but not repetition levels.
+    3. **Counters** — excluded in v1 by design (open question 5).
+    4. **Intra-partition forwarding** — `pq_reader::fast_forward_to(position_range)` is a
+       no-op. The reader would need to seek within a partition by clustering position,
+       which the Parquet ColumnIndex supports but the reader does not use yet.
+
+    Item 1 is the largest and item 3 may never be wanted. Until all four land, adding `pq`
+    to the array would fail for real reasons rather than plumbing ones.
 12. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
