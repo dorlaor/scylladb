@@ -45,16 +45,33 @@ namespace {
 
 using clk = steady_clock;
 
+// Extra int columns appended to the schema, via PQ_PERF_EXTRA_COLS. Exists because the
+// size cost of a small row group scales with *leaf count* -- every row group writes a
+// column-chunk header plus statistics per leaf -- so a 5-column table cannot tell you what
+// the row-group default costs a 197-column one (design doc 10.1f-prod, open question 15).
+// Default 0 keeps the historical schema, so previously published numbers stay comparable.
+int extra_cols() {
+    if (const char* e = std::getenv("PQ_PERF_EXTRA_COLS")) {
+        return std::max(0, std::atoi(e));
+    }
+    return 0;
+}
+
+sstring extra_col_name(int i) { return sstring(format("x_{:03d}", i)); }
+
 schema_ptr perf_schema() {
-    return schema_builder(1, "ks", "perf")
-        .with_column("pk", utf8_type, column_kind::partition_key)
-        .with_column("ck", int32_type, column_kind::clustering_key)
-        .with_column("v_int", int32_type)
-        .with_column("v_big", long_type)
-        .with_column("v_dbl", double_type)
-        .with_column("v_txt", utf8_type)
-        .with_column("v_txt2", utf8_type)
-        .build();
+    auto b = schema_builder(1, "ks", "perf");
+    b.with_column("pk", utf8_type, column_kind::partition_key)
+     .with_column("ck", int32_type, column_kind::clustering_key)
+     .with_column("v_int", int32_type)
+     .with_column("v_big", long_type)
+     .with_column("v_dbl", double_type)
+     .with_column("v_txt", utf8_type)
+     .with_column("v_txt2", utf8_type);
+    for (int i = 0, n = extra_cols(); i < n; ++i) {
+        b.with_column(to_bytes(extra_col_name(i)), int32_type);
+    }
+    return b.build();
 }
 
 // Values with realistic redundancy: a small vocabulary for the text columns and
@@ -83,6 +100,12 @@ utils::chunked_vector<mutation> gen(schema_ptr s, int n_part, int n_rows) {
             put("v_txt", utf8_type->decompose(sstring(WORDS[rng() % 8])));
             put("v_txt2", utf8_type->decompose(
                     sstring(format("{}/{}/{}", WORDS[rng() % 8], p % 997, r))));
+            // Low-cardinality, like the SMART counters that make real wide tables wide:
+            // the point of these columns is their number, not their content.
+            for (int i = 0, n = extra_cols(); i < n; ++i) {
+                put(extra_col_name(i).c_str(),
+                    int32_type->decompose(int32_t((p + r + i) % 64)));
+            }
         }
         muts.push_back(std::move(m));
     }

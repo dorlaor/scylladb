@@ -1725,6 +1725,44 @@ mechanism is unchanged from what §10.1f argued: value repetition decides it. Wh
 that sparse wide telemetry against a *trained dictionary* is now measured as very nearly a
 wash, where the export figures made it look like a 23 % win.
 
+### 10.1f-rg Does `row_group_rows` need to scale with leaf count? Partly answered
+
+Open question 15 proposes scaling the row-group row count inversely with leaf count. The size
+half is answerable without a code change, because `row_group_rows` is already a per-table
+property: load once, then for each candidate value convert native -> `pq` and measure what the
+server writes (`~/pq-lab/sweep_rg_by_width.sh`).
+
+**Narrow table (NOAA ISD-Lite, 20 leaves) — clean, and independently corroborated.** The
+5 000-row point reproduces §10.1f-prod's 50.9 % exactly, from a separate run and a separate
+script, which is the cross-check that makes the rest of the column trustworthy:
+
+| `row_group_rows` | pq bytes | Ratio |
+|---:|---:|---:|
+| 5 000 (default) | 1 887 314 | 50.9 % |
+| 20 000 | 1 809 544 | 48.8 % |
+| 50 000 | 1 803 905 | 48.7 % |
+| 200 000 | 1 803 905 | 48.7 % |
+
+So on a narrow table the whole size penalty of the small row group is **2.2 points**, and 20 000
+recovers 2.1 of them. It saturates by 50 000 — identical bytes at 50 000 and 200 000, because
+300 000 rows in one row group is the same file either way.
+
+**Wide table (Backblaze, 199 leaves) — the arm is invalid and no conclusion is drawn from it.**
+It reported 264 % at three different settings with **byte-identical** output (85 138 044 three
+times), which is the tell: no rewrite happened, so the same files were measured three times. The
+cause was mine again — a major compaction leaves superseded sstables on disk until they are
+reclaimed, and summing the directory then counts the same data twice over. Both measurement
+scripts now wait for the sstable set to stop changing and require exactly one sstable before
+recording anything; §10.1f-prod already recorded that count as 1 for all seven datasets, which is
+why it was unaffected.
+
+**So the rule is not yet decided.** What the narrow arm shows is that the size cost of a small
+row group is small when leaves are few, which is consistent with the leaf-count hypothesis but
+does not establish the exponent. The wide arm has to be re-run under the new guard, and the
+latency side is still unmeasured at any width — `sstable_parquet_perf_test` now takes
+`PQ_PERF_EXTRA_COLS` so that it can be, since a 5-column table cannot tell you what the default
+costs a 197-column one. **The default stays at 5 000 until both arms exist.**
+
 ### 10.1f The same corpus through the export tool — superseded for absolute sizes
 
 #### Method and provenance of the export measurement
