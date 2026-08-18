@@ -21,9 +21,16 @@
 // keeps the policy honest -- if a criterion cannot be expressed as a number the
 // caller can supply, it does not belong here.
 //
+// C3 (a minimum data age) was removed on 2026-08-18. It gated on
+// now - max_cell_timestamp, which is write time rather than settle time: a backfill
+// carrying historical timestamps passed it while being brand new on disk, and a cold
+// table with one recent write failed it. C1 answers the question C3 was proxying for --
+// "is anything going to rewrite this again" -- structurally rather than by elapsed time,
+// and C4 catches the churn that C3 was meant to smell. The remaining criteria keep their
+// original numbers so that every reference to C4-C7 elsewhere stays valid.
+//
 // See docs/dev/parquet-storage-format.md section 6.3.
 
-#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -34,7 +41,6 @@ namespace sstables::parquet {
 // ones argued for there.
 struct tiering_thresholds {
     uint64_t min_output_bytes   = 256ull << 20;   // C2: >= 4 row groups at 64 MiB
-    std::chrono::seconds min_data_age{24 * 3600}; // C3
     double   max_garbage_fraction = 0.10;         // C4
     // C5. Was 2000, i.e. effectively unbounded -- no CQL table reaches it, so the
     // criterion never fired. Now derived from a latency budget, because a Parquet point
@@ -65,8 +71,6 @@ struct tiering_inputs {
     bool bottom_tier = false;
     // C2
     uint64_t estimated_output_bytes = 0;
-    // C3: age of the newest data in the output.
-    std::chrono::seconds data_age{0};
     // C4: droppable tombstones + shadowed cells, as a fraction of the output.
     double garbage_fraction = 0.0;
     // C5

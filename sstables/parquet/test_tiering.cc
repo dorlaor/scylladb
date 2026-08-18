@@ -30,7 +30,6 @@ tiering_inputs good() {
     tiering_inputs in;
     in.bottom_tier = true;
     in.estimated_output_bytes = 512ull << 20;
-    in.data_age = std::chrono::seconds{48 * 3600};
     in.garbage_fraction = 0.01;
     in.schema_eligible = true;
     in.estimated_leaf_columns = 110;   // ClickBench's width: admitted, and saves 40 %
@@ -79,12 +78,6 @@ int main() {
       expect_reject(in, "C2 one byte under", "below the"); }
     { auto in = good(); in.estimated_output_bytes = 256ull << 20;
       expect(evaluate_tiering(in).parquet(), "C2 exactly at threshold accepted"); }
-
-    // C3 -- age
-    { auto in = good(); in.data_age = std::chrono::seconds{3600};
-      expect_reject(in, "C3 too young", "younger than"); }
-    { auto in = good(); in.data_age = std::chrono::seconds{24 * 3600};
-      expect(evaluate_tiering(in).parquet(), "C3 exactly at threshold accepted"); }
 
     // C4 -- garbage
     { auto in = good(); in.garbage_fraction = 0.5;

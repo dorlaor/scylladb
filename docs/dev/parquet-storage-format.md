@@ -832,7 +832,24 @@ Three compactions, three decisions, and the output stayed at version `me`. So th
 the policy is consulted per compaction, the criterion that settled it is named with the actual
 numbers, and nothing converted — which is the correct answer for a 2 kB output.
 
-**A limit of that verification worth stating:** C2's 256 MiB floor rejects before any later
+**C2's floor is measured per compaction output, not per table, and that makes it far harder to
+reach than table size suggests.** A 298 MB wide table was loaded specifically to get past it. The
+major compaction produced four outputs of 13-26 MB, each of which C2 declined:
+
+```
+pqlab.c5_probe: hybrid storage_format chose native for this compaction:
+    output 16537625 B is below the 268435456 B minimum
+```
+
+Compaction runs per compaction group, so a table is compacted in independent pieces and the
+output size is the piece, not the whole. On this host a table would need to be roughly 4 GB
+before any single output crossed 256 MiB. Two consequences: **C2 as defaulted is much more
+restrictive than section 6.3 implies**, and it means C5, C6 and the estimator still cannot be
+observed through the compaction path without a multi-gigabyte table. That is a threshold worth
+revisiting -- 256 MiB was argued as "4 row groups at 64 MiB", which was reasoning about a single
+file and not about how compaction actually divides work.
+
+**A limit of that verification worth stating:** C2's floor therefore rejects before any later
 criterion is reached, so a hybrid table cannot exercise C5, C6 or the estimator until it is
 genuinely large. Observing those end to end needs a >256 MiB dataset on this host, which is
 also why C6's estimator is covered by a unit test against a real sstable
@@ -913,8 +930,18 @@ repeatedly for no benefit.
 **C2 — Size.** Output ≥ `parquet_min_output_bytes`, default **256 MiB** — at least four
 64 MiB row groups, enough to amortise the footer and per-chunk metadata.
 
-**C3 — Data age.** `max_timestamp` older than `parquet_min_data_age`, default **24 h**.
-Prevents converting data that is still being overwritten.
+**C3 — Removed 2026-08-18.** This was a minimum data age, defaulting to 24 hours, on the
+reasoning that freshly written data is still churning. It gated on
+`now - max_cell_timestamp`, which is *write* time and not settle time, so it was wrong in
+both directions: a backfill carrying historical timestamps passed it while being brand new
+on disk, and a genuinely cold table with one recent write failed it. C1 answers the question
+C3 was proxying for — is anything going to rewrite this again — structurally rather than by
+elapsed time, and C4 catches the churn C3 was meant to smell. Removing it also removes a
+`system_clock::now()` from the decision, which makes the policy a pure function of its inputs.
+
+The remaining criteria keep their original numbers, so every reference to C4–C7 in this
+document and in the commit history stays valid.
+
 
 **C4 — Low garbage.** Estimated droppable-tombstone plus shadowed-cell fraction ≤
 `parquet_max_garbage_fraction`, default **10 %**. High garbage means an imminent GC

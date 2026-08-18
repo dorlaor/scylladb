@@ -40,13 +40,6 @@ tiering_decision evaluate_tiering(const tiering_inputs& in,
                                    in.estimated_output_bytes, th.min_output_bytes));
     }
 
-    // C3 -- age. Converting data that is still being overwritten pays the encode
-    // cost twice.
-    if (in.data_age < th.min_data_age) {
-        return decline(fmt::format("data is {}s old, younger than the {}s minimum",
-                                   in.data_age.count(), th.min_data_age.count()));
-    }
-
     // C4 -- garbage. High tombstone density means an imminent GC rewrite, and
     // tombstones force the deletion metadata columns to materialise.
     if (in.garbage_fraction > th.max_garbage_fraction) {
@@ -81,8 +74,8 @@ tiering_decision evaluate_tiering(const tiering_inputs& in,
     }
 
     return {tiering_verdict::use_parquet,
-            fmt::format("bottom tier, {} B, {}s old, garbage {:.3f}, predicted gain {:.3f}",
-                        in.estimated_output_bytes, in.data_age.count(),
+            fmt::format("bottom tier, {} B, garbage {:.3f}, predicted gain {:.3f}",
+                        in.estimated_output_bytes,
                         in.garbage_fraction, *in.predicted_gain)};
 }
 

@@ -54,20 +54,11 @@ tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& 
     // *uncompressed* length, which on a Zstd-with-dictionary table runs several
     // times larger.
     uint64_t bytes = 0;
-    int64_t newest = std::numeric_limits<int64_t>::min();
     for (const auto& sst : inputs) {
         bytes += sst->ondisk_data_size();
-        newest = std::max(newest, sst->get_stats_metadata().max_timestamp);
     }
     in.estimated_output_bytes = bytes;
 
-    // Cell timestamps are microseconds since the epoch.
-    if (newest != std::numeric_limits<int64_t>::min()) {
-        const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-        const auto age_us = now_us > newest ? now_us - newest : 0;
-        in.data_age = std::chrono::seconds{age_us / 1'000'000};
-    }
     return in;
 }
 
