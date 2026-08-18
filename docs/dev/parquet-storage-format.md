@@ -2571,6 +2571,43 @@ size ratio is better than the 0.51–0.96× measured on real datasets (§10.1, �
 generated values repeat more than real ones. The *timing* ratios are the point of this
 table, not the size.
 
+### 10.4e Point-read cost is linear in leaf count — ~90 us per leaf
+
+Measured to choose C5's ceiling. One batch, one pinned core, 1 000 random point reads per
+row, and the native column measured in the *same* run as the `pq` column each time, so a row
+is internally consistent even if the machine drifts between rows
+(`~/pq-lab/width_curve.sh`). This method exists because an earlier wide-vs-narrow comparison
+was spread across runs and the native numbers moved by the same factor as `pq`'s, which made
+the ratio unreadable.
+
+| Leaves | native p50 | `pq` p50 | Ratio | `pq` p99 | `pq` p50 per leaf |
+|---:|---:|---:|---:|---:|---:|
+| 10 | 26.2 us | 1 149.6 us | 43.9x | 1 560.9 us | 115 us |
+| 30 | 36.3 us | 2 822.3 us | 77.7x | 3 274.0 us | 94 us |
+| 60 | 56.4 us | 5 448.6 us | 96.6x | 6 460.9 us | 91 us |
+| 110 | 81.1 us | 9 373.0 us | 115.6x | 10 577.7 us | 85 us |
+| 200 | 136.3 us | 18 287.7 us | 134.2x | 20 016.4 us | 91 us |
+
+**The per-leaf cost is flat at ~90 us**, so `pq` point-read latency is linear in width while
+the native format's grows gently (26 -> 136 us over the same range, 5x for 20x the columns).
+The mechanism follows directly: a point read must locate and decode a page in every column
+chunk it projects, and there is no per-row locality to amortise that against, whereas the row
+format reads one contiguous row whatever its width.
+
+**There is no knee.** The ratio degrades smoothly from 44x at 10 leaves to 134x at 200, so no
+threshold falls out of the data — any ceiling is a policy choice about acceptable absolute
+latency. `max_leaf_columns` is therefore now derived from a budget rather than picked: at
+~90 us per leaf, **128 leaves is a p50 of roughly 11.5 ms**, which is the default. On this
+corpus it admits everything that saves meaningfully (ClickBench, 110 leaves, 40 % saved) and
+excludes only Backblaze (200 leaves, 4 % saved, 134x point reads).
+
+**What this is really standing in for.** C5 is a schema-eligibility gate; the criterion that
+ought to refuse a wide table is C7, and C7 cannot be evaluated because Scylla has no counter
+separating point reads from scans (§6.2a). Refusing on width alone is strictly cruder — it
+declines a wide table that is only ever scanned, and a scan is the case where Parquet is
+*fastest* (0.82x the native format, §10.4c). That false negative is the price of not
+instrumenting the read path, and it is worth paying at 134x.
+
 ### 10.4c Row-group size is the cheap lever — swept 2026-08-17
 
 Review pushed back on adding caches to fix point-read latency: too much complexity, too much

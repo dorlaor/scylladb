@@ -33,7 +33,7 @@ tiering_inputs good() {
     in.data_age = std::chrono::seconds{48 * 3600};
     in.garbage_fraction = 0.01;
     in.schema_eligible = true;
-    in.estimated_leaf_columns = 50;
+    in.estimated_leaf_columns = 110;   // ClickBench's width: admitted, and saves 40 %
     in.predicted_gain = 0.42;
     return in;
 }
@@ -95,7 +95,10 @@ int main() {
     // C5 -- schema
     { auto in = good(); in.schema_eligible = false;
       expect_reject(in, "C5 ineligible schema", "not eligible"); }
-    { auto in = good(); in.estimated_leaf_columns = 5000;
+    // 200 leaves, the width at which point reads measured 134x native (design doc
+    // 10.4e) and the default ceiling of 128 exists to refuse. Was 5 000, which no CQL
+    // table can reach -- it proved the comparison worked without pinning a real boundary.
+    { auto in = good(); in.estimated_leaf_columns = 200;
       expect_reject(in, "C5 too many leaves", "leaf columns"); }
 
     // C6 -- the load-bearing criterion. Unmeasured must be a rejection, not an

@@ -36,7 +36,23 @@ struct tiering_thresholds {
     uint64_t min_output_bytes   = 256ull << 20;   // C2: >= 4 row groups at 64 MiB
     std::chrono::seconds min_data_age{24 * 3600}; // C3
     double   max_garbage_fraction = 0.10;         // C4
-    size_t   max_leaf_columns   = 2000;           // C5
+    // C5. Was 2000, i.e. effectively unbounded -- no CQL table reaches it, so the
+    // criterion never fired. Now derived from a latency budget, because a Parquet point
+    // read costs a page locate-and-decode in *every* column chunk it projects, and that
+    // cost is linear in leaf count at ~90 us per leaf (design doc 10.4e): 10 leaves is
+    // 1.15 ms, 200 leaves is 18.3 ms, against 26-136 us for the native format.
+    //
+    // 128 leaves is a p50 point read of roughly 11.5 ms. It admits every dataset in the
+    // corpus that saves meaningfully -- ClickBench at 110 leaves saves 40 % -- and
+    // excludes the one that does not: Backblaze at 200 leaves saves 4 % and point-reads
+    // at 134x. So on this corpus the criterion costs nothing it should not cost.
+    //
+    // This is a stand-in for C7, which is the criterion that ought to make this call and
+    // cannot, because Scylla has no counter distinguishing point reads from scans (6.2a).
+    // Refusing on width alone is strictly cruder: it declines a wide table that is only
+    // ever scanned, and that is the case where Parquet is fastest. That is the trade until
+    // the read path can say otherwise.
+    size_t   max_leaf_columns   = 128;
     double   min_gain_ratio     = 0.15;           // C6: >= 15 % saved
 };
 
