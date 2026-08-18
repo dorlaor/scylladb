@@ -648,10 +648,14 @@ void pq_writer_impl::collect_marker(const row_marker& marker) {
 // Emit the buffered rows as one row group and drop them.
 //
 // Cut only at a partition boundary, so a partition never spans row groups. That keeps the
-// option-A index entry a single ordinal and keeps a point read inside one row group. The
-// cost is that a single partition larger than the budget is not split -- see design doc
-// 5.5a for why that needs the index entry to carry (row group, ordinal) and is sequenced
-// after this.
+// option-A index entry a single ordinal and keeps a point read inside one row group.
+//
+// A partition larger than the budget therefore overshoots it rather than being split, and
+// that is deliberate (decided 2026-08-18): keeping a partition whole is worth more than
+// holding the budget exactly. Splitting one would mean the index entry carrying
+// (row group, ordinal) instead of a bare ordinal, and a point read spanning row groups --
+// complexity paid on every read to bound a rare case. The budget is a target, not a
+// guarantee; see design doc 5.5a for the residual exposure.
 void pq_writer_impl::cut_row_group() {
     if (_shredder.size() == 0) { return; }
     if (!_pq) {

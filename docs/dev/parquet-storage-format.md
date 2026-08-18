@@ -694,11 +694,26 @@ and switch to the conservative leaf set only once the budget forces a cut, which
 large sstables where 225 bytes per leaf is noise. No configuration required, and the small-file
 sizes measured throughout §10 are unaffected.
 
-The remaining wrinkle is a **single partition larger than the budget**. Cutting only at partition
-boundaries keeps a partition inside one row group, which keeps the option-A index simple and
-helps point reads, but it cannot bound memory for one enormous partition. That case needs a
-mid-partition cut and the index entry to carry (row group, ordinal) rather than a bare ordinal —
-worth doing second, and worth knowing about before starting.
+**A single partition larger than the budget stays in one row group — decided 2026-08-18.**
+
+Cutting only at partition boundaries means an oversized partition overshoots the budget rather
+than being split. That is the intended behaviour, not a deferred fix. Splitting one would cost:
+
+- the index entry carrying `(row group, ordinal)` instead of a bare ordinal (§5.4 option A), and
+- a point read spanning row groups, so the reader would have to stitch a partition together
+  across chunk boundaries.
+
+Both are complexity paid on **every** read to bound a rare case, so the budget is a **target,
+not a guarantee**.
+
+The residual exposure, stated plainly: at ~1.9 kB of buffered shredder memory per row (§5.5a),
+a single partition of one million rows would hold ~1.8 GiB while it is being written, and
+nothing stops it. Two things make that tolerable rather than alarming — Scylla already tracks
+large partitions and warns about them (`maybe_record_large_partitions`, which the pq writer
+feeds), so this is visible rather than silent; and a partition that large is a schema problem
+the operator needs to know about independently of the storage format. If it ever needs bounding,
+the cheap answer is a hard ceiling at some multiple of the budget that forces a cut only in the
+pathological case, paying the index complexity there and nowhere else.
 
 ### 5.6 Compression inside Parquet
 
