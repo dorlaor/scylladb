@@ -126,6 +126,17 @@ parquet_file_writer::parquet_file_writer(nested_schema ns, writer_options opt)
     }
 }
 
+void parquet_file_writer::drain() {
+    if (!_sink || _buf.empty()) {
+        return;
+    }
+    _sink(std::span<const uint8_t>(_buf.data(), _buf.size()));
+    _flushed += _buf.size();
+    // clear() and not shrink_to_fit(): the capacity is one row group's worth, which is
+    // exactly what the next row group needs, so keeping it avoids reallocating per group.
+    _buf.clear();
+}
+
 void parquet_file_writer::write_column_chunk(const column_spec& spec, const column_data& col,
                                      chunk_meta& out_meta) {
     // Slots, not values. Parquet's ColumnMetaData.num_values counts level
@@ -144,7 +155,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     out_meta.cm.path_in_schema = spec.path_or_name();
     out_meta.cm.compression = _opt.compression;
     out_meta.cm.num_values = int64_t(n);
-    out_meta.first_page_offset = int64_t(_buf.size());
+    out_meta.first_page_offset = pos();
 
     // ---- decide encoding
     bool use_dict = false;
@@ -233,7 +244,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     int64_t null_count = 0;
 
     if (use_dict) {
-        out_meta.cm.dictionary_page_offset = int64_t(_buf.size());
+        out_meta.cm.dictionary_page_offset = pos();
         auto comp = compress(dict.dictionary_page, _opt.compression, _opt.zstd_level);
         std::vector<uint8_t> hdr;
         write_dictionary_page_header(hdr, int32_t(dict.dictionary_page.size()),
@@ -396,7 +407,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                                   used, int32_t(def_bytes.size()),
                                   int32_t(rep_bytes.size()),
                                   _opt.compression != codec::uncompressed);
-        const int64_t page_start = int64_t(_buf.size());
+        const int64_t page_start = pos();
         if (first_data_page) {
             out_meta.cm.data_page_offset = page_start;
             first_data_page = false;
@@ -426,7 +437,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     }
 
     if (first_data_page) {   // zero-row column: still needs a valid offset
-        out_meta.cm.data_page_offset = int64_t(_buf.size());
+        out_meta.cm.data_page_offset = pos();
     }
     out_meta.cm.total_uncompressed_size = total_uncompressed;
     out_meta.cm.total_compressed_size   = total_compressed;
@@ -458,6 +469,10 @@ void parquet_file_writer::add_row_group(std::span<const column_data> cols) {
     }
     _num_rows += rg.num_rows;
     _rgs.push_back(std::move(rg));
+    // A row group boundary is the only safe place to hand bytes out: every offset that
+    // refers into it has already been recorded, and the page index and footer that will
+    // reference those offsets are written later from _rgs, not from the buffer.
+    drain();
 }
 
 void parquet_file_writer::write_page_indexes() {
@@ -477,7 +492,7 @@ void parquet_file_writer::write_page_indexes() {
                     w.field_i64(3, pl.first_row_index);
                 }
             }
-            ch.offset_index_offset = int64_t(_buf.size());
+            ch.offset_index_offset = pos();
             ch.offset_index_length = int32_t(blob.size());
             _buf.insert(_buf.end(), blob.begin(), blob.end());
         }
@@ -561,6 +576,10 @@ void parquet_file_writer::write_footer() {
 std::vector<uint8_t> parquet_file_writer::finish() {
     write_page_indexes();
     write_footer();
+    if (_sink) {
+        drain();
+        return {};      // the file has already gone to the sink
+    }
     return std::move(_buf);
 }
 

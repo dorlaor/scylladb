@@ -171,43 +171,89 @@ int emit(const std::string& dir) {
 // This is separate from the shredder budget (R-13), which *is* bounded: 5 000 rows or 64 MiB
 // of buffered rows, whichever trips first. The bounded thing is the input side; the output
 // image is not bounded by anything.
-int check_image_accumulates() {
-    std::vector<column_spec> schema{
-        {.name = "a", .type = phys_type::int64, .rep = repetition::required},
+// Peak write memory, both ways, and the property that makes the streaming path safe: the
+// streamed bytes must be byte-identical to the buffered image. Every offset the writer
+// records -- page locations, column-chunk starts, the OffsetIndex, the footer's pointers --
+// is a file position, so a drain that forgot the flushed base would still produce a
+// parseable file pointing at the wrong bytes. Comparing the two images catches exactly that,
+// because only the buffered path can be wrong in a way the other is not.
+int check_streaming_matches_buffered() {
+    auto build = [] (bool streaming, size_t* peak_buffered) {
+        std::vector<column_spec> schema{
+            {.name = "k", .type = phys_type::int64, .rep = repetition::required},
+            {.name = "v", .type = phys_type::byte_array, .rep = repetition::optional,
+             .max_def = 1},
+        };
+        static const char* WORDS[] = {"active", "pending", "closed", "archived"};
+        parquet_file_writer w(schema, writer_options{});
+        std::vector<uint8_t> streamed;
+        if (streaming) {
+            // The sink sees exactly what was buffered at each drain, so the largest chunk
+            // *is* the peak buffer. Sampling buffered_bytes() after add_row_group() cannot
+            // see it -- the drain happens inside, so it always reads zero.
+            w.set_sink([&streamed, peak_buffered] (std::span<const uint8_t> b) {
+                *peak_buffered = std::max(*peak_buffered, b.size());
+                streamed.insert(streamed.end(), b.begin(), b.end());
+            });
+        }
+        *peak_buffered = 0;
+        for (int rg = 0; rg < 8; ++rg) {
+            // In buffered mode this is the running file size, which peaks just before
+            // finish() moves the buffer out -- so the footer is not included and the peak
+            // reads a little under the final image. Close enough to make the point.
+            *peak_buffered = std::max(*peak_buffered, w.buffered_bytes());
+            std::vector<column_data> cols(2);
+            for (int i = 0; i < 5000; ++i) {
+                const int64_t k = int64_t(rg) * 5000 + i;
+                cols[0].i64.push_back(k);
+                const bool present = (i % 7) != 0;
+                cols[1].def_levels.push_back(present ? 1 : 0);
+                cols[1].str.push_back(present ? std::string(WORDS[i % 4]) : std::string());
+            }
+            w.add_row_group(cols);
+            *peak_buffered = std::max(*peak_buffered, w.buffered_bytes());
+        }
+        auto img = w.finish();
+        return streaming ? streamed : img;
     };
-    parquet_file_writer w(schema, writer_options{});
-    std::vector<size_t> marks;
-    for (int rg = 0; rg < 8; ++rg) {
-        std::vector<column_data> cols(1);
-        for (int i = 0; i < 5000; ++i) {
-            cols[0].i64.push_back(int64_t(rg) * 5000 + i);
-        }
-        w.add_row_group(cols);
-        marks.push_back(w.size_so_far());
-    }
-    // Strictly growing, and the last mark is within a footer's worth of the final image:
-    // nothing was drained along the way.
+
     int fail = 0;
-    for (size_t i = 1; i < marks.size(); ++i) {
-        if (marks[i] <= marks[i - 1]) {
-            std::printf("  FAIL image did not grow at row group %zu: %zu -> %zu\n",
-                        i, marks[i - 1], marks[i]);
-            ++fail;
-        }
-    }
-    const size_t final_size = w.finish().size();
-    if (marks.back() > final_size) {
-        std::printf("  FAIL buffer %zu exceeds final image %zu\n", marks.back(), final_size);
+    size_t peak_buffered = 0, peak_streamed = 0;
+    const auto buffered = build(false, &peak_buffered);
+    const auto streamed = build(true,  &peak_streamed);
+
+    if (buffered != streamed) {
+        std::printf("  FAIL streamed image differs from buffered (%zu vs %zu bytes)\n",
+                    buffered.size(), streamed.size());
         ++fail;
     }
-    std::printf("  image after 8 row groups: %zu B of %zu B final (%.0f %%) -- O(output), "
-                "as documented\n", marks.back(), final_size,
-                100.0 * double(marks.back()) / double(final_size));
+    // Buffered mode holds the whole file; streaming must hold far less. The bound is one row
+    // group plus the footer, so a small multiple of a row group -- asserted loosely as "under
+    // a third", which a regression that stopped draining would blow through immediately.
+    // Buffered mode holds essentially the whole file. Not exactly all of it: the peak is
+    // sampled before finish() appends the footer and moves the buffer out, so 95 % is the
+    // honest bar.
+    if (peak_buffered * 100 < buffered.size() * 95) {
+        std::printf("  FAIL buffered peak %zu is under 95 %% of the %zu B image\n",
+                    peak_buffered, buffered.size());
+        ++fail;
+    }
+    if (peak_streamed * 3 > buffered.size()) {
+        std::printf("  FAIL streaming peak %zu is not far below the %zu B image\n",
+                    peak_streamed, buffered.size());
+        ++fail;
+    }
+    std::printf("  image %zu B: buffered peak %zu B (%.0f %%), streaming peak %zu B (%.0f %%)"
+                " -- identical bytes: %s\n",
+                buffered.size(), peak_buffered,
+                100.0 * double(peak_buffered) / double(buffered.size()),
+                peak_streamed, 100.0 * double(peak_streamed) / double(buffered.size()),
+                buffered == streamed ? "yes" : "NO");
     return fail;
 }
 
 int main(int argc, char** argv) {
-    int extra_fail = check_image_accumulates();
+    int extra_fail = check_streaming_matches_buffered();
     // Runs with or without an emit target, so the image-accounting check is not something
     // you can skip by invoking the tool the usual way.
     if (argc < 3) {

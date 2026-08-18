@@ -1359,7 +1359,8 @@ interop (7 fixtures), real V2 level decode vs. writer statistics (684 pages), fu
 (12 714 mutations, 0 crashes).
 **Not done:** page index emission, column/offset index, bloom filters, DELTA_BYTE_ARRAY,
 per-page dictionary index splitting (a dictionary-encoded chunk is currently one page),
-and the seastar-native I/O layer — the writer builds a whole file image in memory.
+and the seastar-native I/O layer. The writer *can* stream its output as of 2026-08-18
+(`set_sink()`), but the sstable write path does not use it yet — see below.
 
 **Quantified, 2026-08-18.** `check_image_accumulates()` in `format/test_writer.cc` writes eight
 row groups and measures the buffer against the finished file: **45 103 B of 45 701 B, or 99 %**.
@@ -1373,7 +1374,35 @@ Worth separating clearly: the *input* side is bounded and was made so deliberate
 rows or 64 MiB of buffered rows, whichever trips first, §5.5a). The *output* image is bounded by
 nothing. Cutting row groups at 5 000 rows fixed the shredder, not the file.
 
-**The fix, and why it is not a small change.** `parquet_file_writer` computes every offset it
+**Layer 1 fixed, 2026-08-18.** `parquet_file_writer::set_sink()` streams the file out as it is
+produced: completed row groups are handed to the sink and dropped. Measured on an 8-row-group,
+2-leaf file — buffered peak **98 %** of the image against streaming peak **19 %**, and the two
+images are **byte-identical**.
+
+That identity is the assertion that matters, and it is what
+`check_streaming_matches_buffered()` exists for. Every offset the writer records is a *file*
+position, so a drain that forgot the flushed base would still produce a parseable file pointing
+at the wrong bytes. Comparing the streamed bytes against the buffered image catches precisely
+that class of error, because only one of the two paths can be wrong in a way the other is not.
+The mechanism is a single `pos()` accessor returning `_flushed + _buf.size()`; the five sites
+that previously used `_buf.size()` as an offset — first page, dictionary page, page start, data
+page, offset index — all go through it, and using `_buf.size()` for an offset is now wrong by
+construction rather than by convention.
+
+The 19 % is dominated by the *footer*, not by a row group: the largest single drain is the page
+index plus footer at the end. So the saving improves with file size, since the row-group chunk
+stays constant while the footer grows only with row-group count. Independently validated by
+emitting the nine interop fixtures and reading them back with pyarrow, including each row
+group's `data_page_offset` — the structure most likely to be wrong if a position were computed
+relative to the buffer.
+
+**Still to do: the storage path does not use it yet.** `pq_writer_impl` calls `finish()` and
+receives the whole image (`writer_impl.cc`), so an sstable write still materialises the output.
+Wiring it means giving the sstable's data-file output stream to `set_sink()`, which is a change
+on the Scylla side rather than in the format layer, and the format layer no longer stands in the
+way of it.
+
+**Why this was not a small change.** `parquet_file_writer` computes every offset it
 records — page locations, column-chunk starts, the OffsetIndex and the footer's own pointers —
 from `_buf.size()`, i.e. from the position within a buffer that holds the file from byte zero.
 Draining completed row groups to a sink means those offsets have to come from

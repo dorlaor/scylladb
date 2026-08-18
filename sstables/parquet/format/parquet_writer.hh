@@ -21,6 +21,7 @@
 #include "parquet_metadata.hh"
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <string>
@@ -139,7 +140,15 @@ class parquet_file_writer {
         int64_t total_byte_size = 0;
     };
 
-    std::vector<uint8_t>     _buf;      // whole file image
+    // Bytes not yet handed to the sink. Without a sink this is the whole file image;
+    // with one it holds at most the row group being written plus the footer.
+    std::vector<uint8_t>     _buf;
+    // Bytes already handed to the sink. Every offset this writer records is a position
+    // in the *file*, so it must be _flushed + _buf.size() and never _buf.size() alone --
+    // see pos(). An offset that forgets the base yields a file that parses and points at
+    // the wrong bytes, which is why there is a single accessor for it.
+    uint64_t                 _flushed = 0;
+    std::function<void(std::span<const uint8_t>)> _sink;
     // The schema tree exactly as Parquet stores it: flat, depth-first, root at
     // index 0. A flat schema is just a root with one leaf per column; a nested
     // one is supplied by the caller.
@@ -149,6 +158,11 @@ class parquet_file_writer {
     std::vector<rg_meta>     _rgs;
     int64_t                  _num_rows = 0;
     std::vector<std::pair<std::string, std::string>> _kv;
+
+    // The one way to ask "where are we in the file". Never use _buf.size() for an offset.
+    int64_t pos() const { return int64_t(_flushed + _buf.size()); }
+    // Hand everything buffered to the sink, if there is one, and advance the base.
+    void drain();
 
     void write_column_chunk(const column_spec&, const column_data&, chunk_meta&);
     // Emitted after all row groups and before the footer, which is where the
@@ -193,10 +207,29 @@ public:
     // All columns must carry the same number of values.
     void add_row_group(std::span<const column_data> cols);
 
-    // Finalises the footer and returns the file image.
+    // Stream the file out as it is produced instead of accumulating it. Completed row
+    // groups are handed to the sink and dropped, so peak memory becomes one row group
+    // plus the footer rather than the whole output -- which for a 256 MB bottom-tier
+    // sstable is the difference between ~253 MB resident and a few MB (design doc 7.2).
+    //
+    // The footer still has to be held: it carries one column-chunk entry per leaf per row
+    // group and cannot be written until the last row group is known. That cost is
+    // inherent to the format, and it is small -- measured at 1 % of the file.
+    //
+    // Must be set before the first add_row_group(). With a sink, finish() returns an
+    // empty vector, because the file has already gone to the sink.
+    void set_sink(std::function<void(std::span<const uint8_t>)> sink) {
+        _sink = std::move(sink);
+    }
+
+    // Finalises the footer and returns the file image, or an empty vector if a sink is set.
     std::vector<uint8_t> finish();
 
-    size_t size_so_far() const { return _buf.size(); }
+    // Total file bytes produced so far, flushed or not.
+    size_t size_so_far() const { return size_t(pos()); }
+    // Bytes currently held in memory. Equals size_so_far() without a sink; bounded by one
+    // row group plus the footer with one.
+    size_t buffered_bytes() const { return _buf.size(); }
 };
 
 } // namespace sstables::parquet::format
