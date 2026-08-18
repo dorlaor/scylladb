@@ -1361,6 +1361,28 @@ interop (7 fixtures), real V2 level decode vs. writer statistics (684 pages), fu
 per-page dictionary index splitting (a dictionary-encoded chunk is currently one page),
 and the seastar-native I/O layer — the writer builds a whole file image in memory.
 
+**Quantified, 2026-08-18.** `check_image_accumulates()` in `format/test_writer.cc` writes eight
+row groups and measures the buffer against the finished file: **45 103 B of 45 701 B, or 99 %**.
+The footer is 1 % of the file, so peak write memory is essentially the entire output plus the
+shredder budget. Extrapolated to a 256 MB bottom-tier output that is ~253 MB resident plus up to
+64 MiB of shredder, per concurrent compaction per shard — which is the one place this
+implementation is not yet safe to run at production scale, and it is a memory bound rather than a
+correctness bug.
+
+Worth separating clearly: the *input* side is bounded and was made so deliberately (R-13 — 5 000
+rows or 64 MiB of buffered rows, whichever trips first, §5.5a). The *output* image is bounded by
+nothing. Cutting row groups at 5 000 rows fixed the shredder, not the file.
+
+**The fix, and why it is not a small change.** `parquet_file_writer` computes every offset it
+records — page locations, column-chunk starts, the OffsetIndex and the footer's own pointers —
+from `_buf.size()`, i.e. from the position within a buffer that holds the file from byte zero.
+Draining completed row groups to a sink means those offsets have to come from
+`bytes_already_flushed + _buf.size()` instead, everywhere, and an offset that keeps using the
+buffer-relative value will produce a file that parses and points at the wrong bytes — the failure
+mode is silent corruption, not a crash. That is why the test above pins the current behaviour: it
+is the assertion that has to be consciously updated when the drain lands, rather than a comment
+that can be read past.
+
 - `sstables/parquet/` with the two-layer split of §7.8; hand-rolled `TCompactProtocol`
   metadata codec (no libthrift dependency).
 - Writer + reader, V2 pages, `PLAIN`/`RLE_DICTIONARY`/

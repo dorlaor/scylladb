@@ -161,10 +161,61 @@ int emit(const std::string& dir) {
 
 } // namespace
 
+
+// The whole file image is held in memory until finish(), so peak write memory is O(output).
+// Pinned rather than merely noted in the design doc, because the fix changes offset
+// arithmetic throughout the writer and this is what will catch a drain that forgets to keep
+// absolute file positions: if row groups are ever streamed out, size_so_far() stops tracking
+// the total and this assertion has to be updated deliberately.
+//
+// This is separate from the shredder budget (R-13), which *is* bounded: 5 000 rows or 64 MiB
+// of buffered rows, whichever trips first. The bounded thing is the input side; the output
+// image is not bounded by anything.
+int check_image_accumulates() {
+    std::vector<column_spec> schema{
+        {.name = "a", .type = phys_type::int64, .rep = repetition::required},
+    };
+    parquet_file_writer w(schema, writer_options{});
+    std::vector<size_t> marks;
+    for (int rg = 0; rg < 8; ++rg) {
+        std::vector<column_data> cols(1);
+        for (int i = 0; i < 5000; ++i) {
+            cols[0].i64.push_back(int64_t(rg) * 5000 + i);
+        }
+        w.add_row_group(cols);
+        marks.push_back(w.size_so_far());
+    }
+    // Strictly growing, and the last mark is within a footer's worth of the final image:
+    // nothing was drained along the way.
+    int fail = 0;
+    for (size_t i = 1; i < marks.size(); ++i) {
+        if (marks[i] <= marks[i - 1]) {
+            std::printf("  FAIL image did not grow at row group %zu: %zu -> %zu\n",
+                        i, marks[i - 1], marks[i]);
+            ++fail;
+        }
+    }
+    const size_t final_size = w.finish().size();
+    if (marks.back() > final_size) {
+        std::printf("  FAIL buffer %zu exceeds final image %zu\n", marks.back(), final_size);
+        ++fail;
+    }
+    std::printf("  image after 8 row groups: %zu B of %zu B final (%.0f %%) -- O(output), "
+                "as documented\n", marks.back(), final_size,
+                100.0 * double(marks.back()) / double(final_size));
+    return fail;
+}
+
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: %s emit <dir>\n", argv[0]); return 2; }
+    int extra_fail = check_image_accumulates();
+    // Runs with or without an emit target, so the image-accounting check is not something
+    // you can skip by invoking the tool the usual way.
+    if (argc < 3) {
+        std::fprintf(stderr, "usage: %s emit <dir>\n", argv[0]);
+        return extra_fail ? 1 : 2;
+    }
     try {
-        if (std::string(argv[1]) == "emit") { return emit(argv[2]); }
+        if (std::string(argv[1]) == "emit") { return emit(argv[2]) + extra_fail; }
         std::fprintf(stderr, "unknown command\n"); return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what()); return 1;
