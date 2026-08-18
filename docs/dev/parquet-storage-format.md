@@ -2822,6 +2822,41 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
+### 10.4l The footer cache: specified, and one constraint that makes the obvious version wrong
+
+§10.4k established the sequence — lazy parse to make the cached object small (~128 kB rather than
+tens of megabytes), then cache it to remove the repeated Thrift byte walk. Writing it revealed a
+constraint worth recording before anyone implements it.
+
+**The obvious version is a cross-shard data race.** Per-sstable state lives in
+`shareable_components`, reached through `sstable::get_shared_components()`. That member is declared
+`foreign_ptr<lw_shared_ptr<shareable_components>>` — it can belong to a different shard, and
+`foreign_ptr` exists to make cross-shard misuse hard to write by accident. So caching a parsed
+footer there and having each reader call `materialise_row_group()` on it, which is what "cache the
+footer" naturally means, mutates shard-foreign state from whichever shard happens to be reading.
+Single-shard testing would never show it.
+
+**So the cached object must be immutable and materialisation must be per-reader:**
+
+- **Cached, written once, never mutated:** the lazily-parsed `file_metadata` (schema, per-group
+  `num_rows`, per-group column-list extents) plus the footer bytes those extents index into. Both
+  are pure functions of an immutable file, so there is no invalidation problem at all — the cache
+  dies with the sstable.
+- **Per-reader:** the materialised column metadata, held in reader-local state keyed by row group.
+  A point read touches one group, so this is one entry.
+
+**One thing that makes it more than a small change.** `format::read_row_range()` takes the
+`file_metadata` and indexes `row_groups[rg].columns` itself, so a reader holding its columns
+separately cannot use it as it stands. The column list has to be threaded through the format-layer
+read functions as a parameter instead of being looked up from the metadata. That is the bulk of the
+work, and it is mechanical rather than subtle.
+
+**Expected payoff, stated as an expectation rather than a measurement:** the Thrift walk becomes
+once per sstable instead of once per point read, so `footer_parse` should fall from 4.32 us per row
+group to roughly nothing on the steady-state path — which on the 8 000-group sstable of §10.4j is
+the difference between ~34 ms and ~0 per read. That number should be measured on a deliberately
+large sstable and not on the 100 000-row perf file, for the reason §10.4j gives.
+
 ### 10.4k Lazy footer parsing: 12 %, because Thrift skip is O(content)
 
 §10.4j argued the fix for a footer parse that scales with file size was to parse only the row
