@@ -3307,6 +3307,12 @@ native format** — and 2.1 ms / 61x with numeric dictionaries off.
 
 ## 11. Open questions
 
+> Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
+> 2026-08-18 — the backlog, why each item is not done, and the trap that would catch a first
+> attempt. Read-path optimisation is explicitly paused there. The questions below are the design
+> questions; that file is the work list.
+
+
 1. **Row-group boundaries vs. partition boundaries.** Should a partition be forbidden
    from spanning row groups? It would simplify point lookup and split, but a single
    large partition would then force an oversized row group. Leaning: allow spanning,
