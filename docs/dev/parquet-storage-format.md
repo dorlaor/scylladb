@@ -2822,6 +2822,42 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
+### 10.4h The reader, profiled — and three of four hypotheses were wrong
+
+§10.4g named four candidates for the 586 us fixed floor and said instrumentation was needed
+rather than another sweep. `PQ_READER_PROFILE=1` adds per-phase timers to the real reader (always
+compiled, so the profile is of the shipped path). 2 000 random point reads:
+
+| phase | us/call | share |
+|---|---:|---:|
+| **page_decode** | **628.0** | **81.8 %** |
+| footer_parse | 87.3 | 11.4 % |
+| footer_io | 13.5 | 3.5 % |
+| offset_index | 15.8 | 2.1 % |
+| schema_recover | 5.8 | 0.8 % |
+| index_lookup | 3.7 | 0.5 % |
+
+**Three of the four candidates are negligible.** The partition-index lookup (0.5 %), per-reader
+schema-mapping construction (0.8 %) and the OffsetIndex read (2.1 %) come to **3.4 % combined**.
+Caching any of them — which the notes have proposed since §10.4b — would be invisible. That is
+three ideas retired by one measurement, and none of them would have been retired by reasoning.
+
+**Reconciling with §10.4g rather than discarding it.** The fit said 586 us fixed and 234 us decode;
+the profile says 628 us in `decode_paged`. Both are right, because `decode_paged` is a composite:
+it fetches the pages, parses a page header per column chunk, *and* decodes values. Only the last
+of those scales with `page_values`. So the fit's 234 us is the value decode inside that 628 us, and
+the remaining ~394 us is per-column-chunk fetch and header parse — which is exactly what §10.4g
+guessed the fixed floor was, sitting in a phase it did not expect to find it in. The lesson is
+that phase boundaries chosen for instrumentation convenience can hide the very split being looked
+for; `decode_paged` needs sub-splitting before this goes further.
+
+**One clean win is already visible.** `footer_parse` is 87 us per reader, 11.4 %, and it is a pure
+function of bytes that do not change between readers of the same sstable. Caching parsed
+`FileMetaData` per sstable rather than per reader would remove essentially all of it. Note this is
+*not* what §10.4g's row-group experiment measured: shrinking the footer 20-fold moved the total
+only 7 %, because most of the parse is schema elements rather than row-group entries, so the win
+comes from not re-parsing at all rather than from parsing something smaller.
+
 ### 10.4g Where the point read actually goes: 71 % is a fixed floor
 
 Two knob fixes in a row (§10.4c, §10.4f) and a real implementation change (dictionary paging)

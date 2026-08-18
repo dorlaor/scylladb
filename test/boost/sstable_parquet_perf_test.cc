@@ -31,6 +31,7 @@
 #include "test/lib/sstable_utils.hh"
 
 #include <map>
+#include "sstables/parquet/reader.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/sstables.hh"
 #include "mutation/mutation.hh"
@@ -262,6 +263,9 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
             std::printf("  %-14s  %10.1f  %10.1f  %10.1f  %10.1f\n",
                         r.label.c_str(), r.point_us, r.point_p50, r.point_p95, r.point_p99);
         }
+        // Where the pq point read went, when PQ_READER_PROFILE is set. Printed next to the
+        // ratios so the attribution and the number being attributed are read together.
+        std::printf("%s", sstables::parquet::reader_profile_report().c_str());
         std::printf("  point ratios: mean %.1fx  p50 %.1fx  p95 %.1fx  p99 %.1fx\n",
                     pq.point_us / def.point_us, pq.point_p50 / def.point_p50,
                     pq.point_p95 / def.point_p95, pq.point_p99 / def.point_p99);

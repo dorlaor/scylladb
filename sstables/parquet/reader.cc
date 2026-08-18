@@ -7,6 +7,10 @@
  */
 
 #include "sstables/parquet/reader.hh"
+
+#include <array>
+#include <chrono>
+#include <cstdlib>
 #include "sstables/parquet/writer_impl.hh"
 #include "sstables/parquet/schema_mapping.hh"
 #include "sstables/parquet/format/parquet_reader.hh"
@@ -139,6 +143,47 @@ atomic_cell_or_collection build_collection(const column_definition& cdef,
 // a byte offset (design doc 5.4, option A), and read_row_range() steps over
 // pages outside the requested rows using the V2 header's num_rows without
 // decompressing them.
+// ---------------------------------------------------------------- profiling
+// Six phases, chosen to match the candidates in design doc 10.4g so the report answers the
+// question that was actually asked rather than whatever was easy to instrument.
+enum class rphase : size_t {
+    footer_io,      // the two bounded reads that fetch the footer
+    footer_parse,   // Thrift decode of FileMetaData
+    schema_recover, // rebuilding the mapped schema from the footer
+    index_lookup,   // partition key -> row ordinal, via the sstable index
+    offset_index,   // reading and parsing the OffsetIndex for the projected columns
+    page_decode,    // fetching and decoding the pages themselves
+    _count
+};
+
+struct rprof {
+    static inline bool enabled = [] {
+        const char* e = std::getenv("PQ_READER_PROFILE");
+        return e && *e && *e != '0';
+    }();
+    static inline std::array<uint64_t, size_t(rphase::_count)> ns{};
+    static inline std::array<uint64_t, size_t(rphase::_count)> hits{};
+};
+
+// Scoped. The I/O phases deliberately span their co_await, because fetch time is the thing being
+// attributed; the honest caveat is that they therefore include any scheduler delay before
+// resumption, so treat them as an upper bound on the I/O itself. CPU phases contain no
+// suspension point and need no such caveat.
+class rtimer {
+    rphase _p;
+    std::chrono::steady_clock::time_point _t0;
+public:
+    explicit rtimer(rphase p) : _p(p) {
+        if (rprof::enabled) { _t0 = std::chrono::steady_clock::now(); }
+    }
+    ~rtimer() {
+        if (!rprof::enabled) { return; }
+        const auto dt = std::chrono::steady_clock::now() - _t0;
+        rprof::ns[size_t(_p)] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count());
+        ++rprof::hits[size_t(_p)];
+    }
+};
+
 class pq_reader : public mutation_reader::impl {
     sstables::shared_sstable _sst;
     const dht::partition_range* _pr;
@@ -275,16 +320,30 @@ future<> pq_reader::init() {
     // Footer only: the last 8 bytes give its length, then one bounded read.
     const uint64_t len = _sst->ondisk_data_size();
     if (len < 12) { throw std::runtime_error("pq: data component too small"); }
-    auto tail = co_await _sst->data_read(len - 8, 8, _permit);
+    temporary_buffer<char> tail;
+    {
+        rtimer _t{rphase::footer_io};
+        tail = co_await _sst->data_read(len - 8, 8, _permit);
+    }
     uint32_t flen;
     std::memcpy(&flen, tail.get(), 4);
     if (uint64_t(flen) + 12 > len) { throw std::runtime_error("pq: bad footer length"); }
-    auto fbuf = co_await _sst->data_read(len - 8 - flen, flen, _permit);
-    _md = format::parse_file_metadata(
-            std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fbuf.get()), fbuf.size()));
+    temporary_buffer<char> fbuf;
+    {
+        rtimer _t{rphase::footer_io};
+        fbuf = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+    }
+    {
+        rtimer _t{rphase::footer_parse};
+        _md = format::parse_file_metadata(
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fbuf.get()), fbuf.size()));
+    }
 
     _cols = columns_of(*_schema);
-    _ms = recover_mapped_schema(_md, _cols);
+    {
+        rtimer _t{rphase::schema_recover};
+        _ms = recover_mapped_schema(_md, _cols);
+    }
     _n_pk = _schema->partition_key_size();
     _n_ck = _schema->clustering_key_size();
     _static_base = static_base(*_schema);
@@ -307,9 +366,11 @@ future<> pq_reader::init() {
                 // advance_to() positions for a *range* and leaves both bounds at
                 // the start for a point, which reads back as an empty window.
                 // This is the same call mx makes for a single-partition read.
+                rtimer _t{rphase::index_lookup};
                 present = co_await ir->advance_lower_and_check_if_present(
                         dht::ring_position_view(_pr->start()->value()));
             } else {
+                rtimer _t{rphase::index_lookup};
                 co_await ir->advance_to(*_pr);
             }
             auto pos = present ? ir->data_file_positions() : sstables::data_file_positions_range{0, 0};
@@ -361,6 +422,7 @@ future<bool> pq_reader::next_window() {
 
     std::vector<format::column_data> colsdata;
     if (bounded) {
+        rtimer _t{rphase::page_decode};
         colsdata = co_await decode_paged(rg, lo - _rg_start[rg], hi - _rg_start[rg]);
     } else {
         co_await load_row_group(rg);
@@ -388,6 +450,7 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
         hi = std::max(hi, *cc.offset_index_offset + *cc.offset_index_length);
     }
     if (lo >= hi) { co_return; }        // file has no page index; caller falls back
+    rtimer _t{rphase::offset_index};
     auto buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
     auto img = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
     for (size_t c = 0; c < _oi.size(); ++c) {
@@ -699,6 +762,33 @@ mutation_reader make_full_scan_reader(
     auto& s_ref = *schema;
     return make_mutation_reader<pq_reader>(std::move(sst), schema,
             std::move(permit), query::full_partition_range, s_ref.full_slice(), mon, false);
+}
+
+void reader_profile_reset() {
+    rprof::ns.fill(0);
+    rprof::hits.fill(0);
+}
+
+std::string reader_profile_report() {
+    if (!rprof::enabled) {
+        return "reader profile disabled (set PQ_READER_PROFILE=1)\n";
+    }
+    static constexpr const char* names[] = {
+        "footer_io", "footer_parse", "schema_recover",
+        "index_lookup", "offset_index", "page_decode",
+    };
+    uint64_t total = 0;
+    for (auto v : rprof::ns) { total += v; }
+    std::string out = "  reader phase        total ms    calls     us/call     share\n";
+    for (size_t i = 0; i < size_t(rphase::_count); ++i) {
+        const double ms = double(rprof::ns[i]) / 1e6;
+        const double per = rprof::hits[i] ? double(rprof::ns[i]) / 1e3 / double(rprof::hits[i]) : 0.0;
+        const double share = total ? 100.0 * double(rprof::ns[i]) / double(total) : 0.0;
+        out += fmt::format("  {:<18} {:>9.1f} {:>8} {:>11.2f} {:>8.1f} %\n",
+                           names[i], ms, rprof::hits[i], per, share);
+    }
+    out += fmt::format("  {:<18} {:>9.1f}\n", "instrumented", double(total) / 1e6);
+    return out;
 }
 
 } // namespace sstables::parquet

@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <string>
+
 // Reader for the `pq` sstable format: the inverse of writer_impl.hh.
 //
 // The Data component of a pq sstable is a complete, externally-valid Parquet
@@ -59,5 +61,16 @@ mutation_reader make_full_scan_reader(
         reader_permit permit,
         tracing::trace_state_ptr trace_state,
         sstables::read_monitor& mon);
+
+// Per-phase reader timings, for attributing point-read cost. Opt-in at runtime via
+// PQ_READER_PROFILE=1; the instrumentation is always compiled, because a profile taken from
+// a differently-built binary is a guess rather than a measurement.
+//
+// Exists because external sweeps ran out of resolution: page size and row-group count between
+// them explain only 29 % of a point read, and the remaining 586 us could be any of four things
+// (design doc 10.4g). Guessing which cost a wrong answer once already -- the footer looked
+// obvious and turned out to be 7 %.
+std::string reader_profile_report();
+void reader_profile_reset();
 
 } // namespace sstables::parquet
