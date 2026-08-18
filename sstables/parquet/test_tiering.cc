@@ -74,9 +74,9 @@ int main() {
       expect_reject(in, "C1 non-bottom-tier", "bottom-tier"); }
 
     // C2 -- size. Exactly at the threshold must pass; one byte under must not.
-    { auto in = good(); in.estimated_output_bytes = (256ull << 20) - 1;
+    { auto in = good(); in.estimated_output_bytes = (256ull << 10) - 1;
       expect_reject(in, "C2 one byte under", "below the"); }
-    { auto in = good(); in.estimated_output_bytes = 256ull << 20;
+    { auto in = good(); in.estimated_output_bytes = 256ull << 10;
       expect(evaluate_tiering(in).parquet(), "C2 exactly at threshold accepted"); }
 
     // C4 -- garbage
@@ -113,10 +113,10 @@ int main() {
     // Custom thresholds must actually be honoured, not just the defaults.
     {
         tiering_thresholds th;
-        th.min_output_bytes = 1ull << 20;
+        th.min_output_bytes = 1ull << 20;   // a custom C2 floor this output clears
         th.min_gain_ratio = 0.80;
         auto in = good();
-        in.estimated_output_bytes = 2ull << 20;   // under the default, over this one
+        in.estimated_output_bytes = 2ull << 20;   // clears both floors, so only C6 decides
         ++g_cases;
         auto d = evaluate_tiering(in, th);
         if (d.parquet()) { ++g_fail; std::printf("  FAIL custom min_gain_ratio not applied\n"); }

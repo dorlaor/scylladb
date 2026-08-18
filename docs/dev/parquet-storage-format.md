@@ -1790,6 +1790,31 @@ mechanism is unchanged from what §10.1f argued: value repetition decides it. Wh
 that sparse wide telemetry against a *trained dictionary* is now measured as very nearly a
 wash, where the export figures made it look like a 23 % win.
 
+### 10.1f-c2 Where Parquet stops paying — C2's floor was 1000x too high
+
+C2 declined every real compaction output (§6.2a), so its 256 MiB floor was checked against
+measurement. NOAA ISD-Lite loaded at four row counts, each converted through the server:
+
+| Rows | Native | `pq` | Ratio |
+|---:|---:|---:|---:|
+| 5 000 | 34 588 | 38 647 | **111.7 %** — Parquet is bigger |
+| 20 000 | 237 811 | 146 332 | 61.5 % |
+| 60 000 | 726 872 | 381 534 | 52.5 % |
+| 300 000 | 3 709 848 | 1 887 530 | 50.9 % |
+
+**The crossover is between 35 kB and 238 kB of output**, and 5 000 rows — the point where
+Parquet loses — is exactly *one* row group at the current default. So the original
+justification, "at least four row groups", was the right instinct with stale arithmetic: it was
+written when the 64 MiB byte budget cut row groups, making four of them 256 MiB. Row groups are
+now cut at 5 000 rows, so four of them is about 200 kB on this shape. The floor is now
+**256 KiB**.
+
+**The shape-independent form is a row floor, not a byte floor**, and that is the remaining gap.
+At 6.3 B/row four row groups is 126 kB; at Backblaze's 69 B/row it is 1.4 MB, so a single byte
+threshold admits under one row group on a wide table while correctly excluding it on a narrow
+one. The right criterion is `rows >= 4 x row_group_rows`, which needs a row count in
+`tiering_inputs` that the sstable stats can supply. Recorded as an open item.
+
 ### 10.1f-rg Does `row_group_rows` need to scale with leaf count? Partly answered
 
 Open question 15 proposes scaling the row-group row count inversely with leaf count. The size
@@ -3189,6 +3214,12 @@ native format** — and 2.1 ms / 61x with numeric dictionaries off.
    would equalise the metadata overhead across shapes; the target has to be chosen against
    point-read latency, which is what the row count buys. Until then, wide tables should be given
    a larger `row_group_rows` explicitly via the `parquet` property (§8.2).
+16. **C2 should gate on rows, not bytes.** Its purpose is "enough row groups to amortise the
+   per-row-group metadata", which is a row count. Expressed in bytes it is shape-dependent: four
+   row groups is 126 kB at ISD-Lite's 6.3 B/row and 1.4 MB at Backblaze's 69 B/row, so any single
+   byte threshold admits under one row group on a wide table while correctly excluding it on a
+   narrow one. The fix is `rows >= 4 x row_group_rows` in `tiering_inputs`, fed from sstable
+   stats. The 256 KiB byte floor set in §10.1f-c2 is the interim form.
 
 ## 12. References
 
