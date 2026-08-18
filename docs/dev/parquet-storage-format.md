@@ -822,12 +822,32 @@ asserts all of that, including determinism, so the decision cannot flap between 
 
 **What is still missing:**
 
-- **C7 has no data source.** The criterion and its tests exist, and `tiering_mode::adaptive`
-  consults it, but nothing can currently answer "is this table point-read dominated":
-  `compaction_group_view` exposes no read counters, and `'auto'` is rejected by CQL, so
-  adaptive mode has no caller. Wiring it means plumbing per-table read statistics down to the
-  compaction layer — a bigger change than the rest of C1–C7 combined, for the least
-  consequential criterion.
+- **C7 has no data source, and this was investigated rather than assumed (2026-08-18).** The
+  criterion and its tests exist and `tiering_mode::adaptive` consults it, but nothing can answer
+  "is this table point-read dominated". What was checked:
+
+  - `replica::table_stats` has no counter separating single-partition reads from range scans.
+    `reads` is a latency histogram over all reads; the count is there, the shape is not.
+  - The counter that would have served is `live_scanned` — rows touched per read, which is a
+    sound proxy, since a point read resolves one partition and a scan touches many. It is
+    **exposed through the REST API and `nodetool tablehistograms` and never incremented
+    anywhere in the tree**: a Cassandra-compatibility stub with no write site. A proxy built on
+    it would have silently reported zero.
+  - `'auto'` is still rejected by CQL, so adaptive mode has no caller either way.
+
+  So C7 costs **new read-path instrumentation**, not plumbing: two counters incremented where
+  single-partition and range queries enter `replica::table`, exposed through
+  `compaction_group_view`, plus a `storage_format = 'auto'` enum value with its persistence and
+  round-trip test. That is small in lines and large in blast radius — it puts a compaction
+  heuristic's accounting on the read path.
+
+  **Worth reconsidering on the strength of §10.1f-rg.** C7 was previously the least consequential
+  criterion; the 85–120× point-read penalty measured on a 199-leaf table makes it the
+  best-justified one. A wide table on a point-read path should be refused conversion however well
+  it compresses, and no other criterion expresses that. An interim measure that needs no
+  instrumentation: refuse conversion above a leaf-count threshold outright, which C5 already has
+  the shape for — that trades a false negative on wide scan-only tables for never hitting the
+  120× case by accident.
 - **Flushes are never Parquet**, only compaction outputs. That matches §6 (the bottom tier is
   where the value is) but means a freshly flushed table stays native until it compacts.
 - **`nodetool upgradesstables` does not force convergence**; conversion happens on natural
