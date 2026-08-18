@@ -43,24 +43,25 @@ struct page_location {
 struct writer_options {
     codec   compression = codec::zstd;
     int     zstd_level = 3;
-    // Values per data page. The writer uses min(page_values, row group size), so this only
-    // bites when it is smaller than the row group -- and at 8 192 against row groups cut at
-    // 5 000 rows (design doc 10.4c) it never did. It was dead in exactly the way
-    // `row_group_rows` was dead before that change: a knob whose value could not reach the
-    // code.
+    // Values per data page. The writer uses min(page_values, row group size), so at 8 192
+    // against row groups cut at 5 000 rows (design doc 10.4c) this does not bind and a page
+    // covers a whole row group.
     //
-    // Re-swept at the current row-group default, 3 000 random point reads (10.4f):
+    // It was set to 2 048 on the strength of a +6.3 % size cost measured on the perf schema,
+    // and reverted the same day when the corpus was measured: the real cost is **+16.7 %**,
+    // consistently on a 10-column numeric table and a 197-column sparse one, which is 2.5x what
+    // the one-schema measurement predicted (10.4m). At 2 048 Backblaze goes from 95.8 % of the
+    // SSTable to 111.9 %, i.e. from a marginal win to a net loss.
     //
-    //   page_rows   point p50    size
-    //     8 192      1 158 us    base      (i.e. one page per row group)
-    //     2 048        820 us    +6.3 %
-    //     1 024        839 us    +11.8 %
-    //       256        731 us    +54.9 %
+    // The latency it bought was genuine -- point-read p50 971 -> 587 us, 1.65x -- and it is
+    // still not worth it. The point read remains 20-33x the row format either way, so the trade
+    // spent a sixth of the format's entire reason for existing to move a metric that stays
+    // uncompetitive. Disk is what Parquet is for; 4 096 is no better a compromise, buying 1.14x
+    // for +7.5 %.
     //
-    // 2 048 dominates 1 024 -- faster and smaller -- and buys **1.41x on point-read p50 for
-    // 6.3 % of size**, with scan time and scan memory flat. 256 spends 55 % of the file for a
-    // further 12 % of latency, which is the wrong side of the curve.
-    size_t  page_values = 2048;
+    // If point-read latency becomes a priority, the footer cache (10.4l) is the lever: at
+    // production scale footer parse dominates everything measured here and costs no size at all.
+    size_t  page_values = 8192;
     bool    use_dictionary = true;
     // Dictionary-encode *numeric* columns too, not just byte_array ones.
     //

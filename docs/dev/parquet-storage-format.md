@@ -2899,6 +2899,34 @@ group is decoded. Every chunk a reader actually looks at is still checked; the s
 row-count checks — the ones that catch a truncated or fabricated footer — still run up front. All
 34 conformance sub-tests pass.
 
+### 10.4m `page_values = 2048` reverted — the one-schema cost estimate was 2.5x low
+
+§10.4f set `page_values` to 2 048 for a 1.41x point read at a measured +6.3 % size. That +6.3 %
+came from the perf schema. Measured on real data, varying only `page_rows` on current code so
+that dictionary paging is not confounded with it:
+
+| dataset | 8 192 | 4 096 | 2 048 |
+|---|---:|---:|---:|
+| NOAA ISD-Lite, `pq` bytes | 1 803 440 | 1 922 751 (+6.6 %) | 2 105 580 (**+16.8 %**) |
+| Backblaze, ratio to SSTable | 95.8 % | 103.8 % | **111.9 %** |
+
+**The real cost is +16.7 %, not +6.3 %** — consistent across a 10-column numeric table and a
+197-column sparse one, so it is not a quirk of one shape. And at 2 048 Backblaze crosses from a
+marginal win to a **net loss**.
+
+The latency was genuine and, measured again on current code, larger than first reported: p50
+971.6 → 587.4 µs, **1.65×** (the batched-read fix of §10.4i amplifies it). **Reverted anyway.**
+A point read is 20–33× the row format at either setting, so the trade spent a sixth of the
+format's entire reason for existing to move a metric that stays uncompetitive. 4 096 is not a
+compromise worth taking either: 1.14× for +7.5 %, and Backblaze still loses at 103.8 %.
+
+**Two things this says beyond the one default.** A size cost measured on one schema transferred
+badly by a factor of 2.5, which is the same failure that produced the C2 threshold and the 78×
+point-read figure; a per-dataset check is cheap and should precede any default that trades size.
+And the direction of travel for point-read latency should be the footer cache (§10.4l), which at
+production scale dominates everything measured in §10.4 and costs no size at all — as against page
+and row-group tuning, which are now both spent and both paid in disk.
+
 ### 10.4j Footer parse scales with sstable size — and it invalidates the ranking above
 
 `footer_parse` was 89 us and 10 % of a point read, and the plan was to cache it. Before doing

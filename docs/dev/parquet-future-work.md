@@ -155,13 +155,18 @@ three-column ISD variant, and a slide explaining delta encoding of timestamps. T
 appears in the **filename** as well as the title slide, so a copy sitting in someone's Downloads
 folder can be identified without opening it.
 
-**Regression found while doing it, and it needs a decision.** The `page_values = 2048` default
+**Regression found while doing it — now resolved, see below.** Original note kept for the record: The `page_values = 2048` default
 (§10.4f) was chosen on a +6.3 % size cost measured on the perf schema. On the real corpus it costs
 **9–17 %**: ISD-Lite 50.9 % → 59.4 %, NYC TLC 56.8 % → 64.5 %, ClickBench 60.2 % → 65.6 %, and
 **Backblaze 95.9 % → 111.7 %, i.e. from a marginal win to a net loss**. The 1.41× point-read win
 is real but it was priced on one schema. Either revert `page_values` to a size-optimal value and
 give back the latency, or keep it and accept that Parquet loses outright on sparse wide telemetry.
-Not decided here because read-path work is paused; it is a one-line default change either way.
+**Resolved 2026-08-18: reverted to 8 192.** Isolating `page_rows` on current code put the real
+cost at **+16.7 %** on both a narrow numeric and a wide sparse table — 2.5× what the perf schema
+predicted — against a 1.65× point read that leaves the format 20–33× slower than the row format
+regardless. Disk is what Parquet is for. §10.4m has the numbers; the corpus figures in the v2.2
+deck were measured at 2 048 and are therefore pessimistic by about that much, which is the one
+loose end: **the deck needs re-measuring at 8 192 before it is shown to anyone.**
 
 ### 12. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
