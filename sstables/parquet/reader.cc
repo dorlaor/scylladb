@@ -215,6 +215,8 @@ class pq_reader : public mutation_reader::impl {
     int64_t _rg_base = 0;               // file offset of _rg_buf[0]
     size_t _oi_rg = size_t(-1);
     std::vector<std::optional<format::offset_index>> _oi;
+    // The raw footer, kept alive because row-group metadata is decoded from it lazily.
+    temporary_buffer<char> _footer;
 
     // Decoded window.
     std::vector<row> _rows;
@@ -236,6 +238,16 @@ class pq_reader : public mutation_reader::impl {
     future<bool> next_window();         // false at end of the ordinal range
     future<> load_row_group(size_t rg);
     future<> load_offset_indexes(size_t rg);
+
+    std::span<const uint8_t> footer_bytes() const {
+        return std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(_footer.get()), _footer.size());
+    }
+    // Decode this row group's column metadata if it has not been decoded yet. Cheap and
+    // idempotent; called before anything reads _md.row_groups[rg].columns.
+    void need_columns(size_t rg) {
+        format::materialise_row_group(_md, rg, footer_bytes());
+    }
     // Reads only the pages covering [lo, hi). Falls back to the whole row group
     // when the file carries no OffsetIndex.
     future<std::vector<format::column_data>> decode_paged(size_t rg, int64_t lo, int64_t hi);
@@ -331,15 +343,18 @@ future<> pq_reader::init() {
     uint32_t flen;
     std::memcpy(&flen, tail.get(), 4);
     if (uint64_t(flen) + 12 > len) { throw std::runtime_error("pq: bad footer length"); }
-    temporary_buffer<char> fbuf;
     {
         rtimer _t{rphase::footer_io};
-        fbuf = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+        _footer = co_await _sst->data_read(len - 8 - flen, flen, _permit);
     }
     {
+        // Lazy: decode the schema and each row group's row count, but not the per-column
+        // metadata, which is 4.3 us per row group and irrelevant to every group but the one
+        // this read touches (design doc 10.4j). The footer bytes are retained so the wanted
+        // group can be decoded on demand.
         rtimer _t{rphase::footer_parse};
-        _md = format::parse_file_metadata(
-                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(fbuf.get()), fbuf.size()));
+        _md = format::parse_file_metadata(footer_bytes(), {}, format::semantic_check::yes,
+                                          format::metadata_mode::lazy);
     }
 
     _cols = columns_of(*_schema);
@@ -391,6 +406,7 @@ future<> pq_reader::init() {
 
 future<> pq_reader::load_row_group(size_t rg) {
     if (_cur_rg == rg) { co_return; }
+    need_columns(rg);
     const auto& g = _md.row_groups[rg];
     int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
     for (const auto& cc : g.columns) {
@@ -441,6 +457,7 @@ future<bool> pq_reader::next_window() {
 
 future<> pq_reader::load_offset_indexes(size_t rg) {
     if (_oi_rg == rg) { co_return; }
+    need_columns(rg);
     _oi.assign(_md.row_groups[rg].columns.size(), std::nullopt);
     _oi_rg = rg;
 
@@ -468,6 +485,7 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
 
 future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int64_t lo, int64_t hi) {
     co_await load_offset_indexes(rg);
+    need_columns(rg);
     const auto& g = _md.row_groups[rg];
 
     bool all = true;

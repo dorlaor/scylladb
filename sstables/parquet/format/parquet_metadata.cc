@@ -139,6 +139,34 @@ column_chunk parse_column_chunk(compact_reader& r) {
     return c;
 }
 
+// Same as parse_row_group but skips the column list, recording where it was. Everything else
+// is cheap and some of it is load-bearing: num_rows in particular, because mapping a row
+// ordinal to a row group needs every group's count even when only one group will be read.
+row_group parse_row_group_light(compact_reader& r) {
+    compact_reader::struct_scope sc(r);
+    row_group g;
+    for (;;) {
+        auto f = r.field_begin();
+        if (f.stop) { break; }
+        switch (f.id) {
+        case 1: {
+            const size_t at = r.position();
+            r.skip(f.type);
+            g.columns_offset = uint32_t(at);
+            g.columns_length = uint32_t(r.position() - at);
+            break;
+        }
+        case 2: g.total_byte_size = r.i64v(); break;
+        case 3: g.num_rows = r.i64v(); break;
+        case 5: g.file_offset = r.i64v(); break;
+        case 6: g.total_compressed_size = r.i64v(); break;
+        case 7: g.ordinal = r.i16v(); break;
+        default: r.skip(f.type);
+        }
+    }
+    return g;
+}
+
 row_group parse_row_group(compact_reader& r) {
     compact_reader::struct_scope sc(r);
     row_group g;
@@ -254,6 +282,16 @@ void validate(const file_metadata& m) {
     int64_t rows = 0;
     for (const auto& g : m.row_groups) {
         if (g.num_rows < 0) { throw thrift_error("negative row group num_rows"); }
+        // A lazily-parsed group has not decoded its chunks yet, so the per-chunk checks below
+        // cannot run on it. They are not skipped, only deferred: materialise_row_group()
+        // applies them when the group is decoded, so every chunk a reader actually looks at
+        // is still checked. Deciding this here rather than turning semantic_check off keeps
+        // the schema and row-count checks, which are exactly the ones that catch a truncated
+        // or fabricated footer.
+        if (g.columns.empty() && g.columns_length > 0) {
+            rows += g.num_rows;
+            continue;
+        }
         // Every row group must describe exactly one chunk per leaf, otherwise a
         // reader cannot line columns up with the schema.
         if (g.columns.size() != leaves) {
@@ -274,7 +312,39 @@ void validate(const file_metadata& m) {
     }
 }
 
-file_metadata parse_file_metadata(std::span<const uint8_t> blob, limits lim, semantic_check chk) {
+void materialise_row_group(file_metadata& m, size_t rg, std::span<const uint8_t> blob,
+                           limits lim) {
+    if (rg >= m.row_groups.size()) {
+        throw std::out_of_range("pq: row group index out of range");
+    }
+    auto& g = m.row_groups[rg];
+    if (!g.columns.empty() || g.columns_length == 0) {
+        return;             // already materialised, or eagerly parsed
+    }
+    if (size_t(g.columns_offset) + size_t(g.columns_length) > blob.size()) {
+        throw std::runtime_error("pq: row group column extent outside the footer");
+    }
+    compact_reader r(blob.subspan(g.columns_offset, g.columns_length), lim);
+    auto hd = r.list_begin();
+    g.columns.reserve(hd.size);
+    for (size_t i = 0; i < hd.size; ++i) { g.columns.push_back(parse_column_chunk(r)); }
+
+    // The checks validate() had to defer for this group, applied now that its chunks exist.
+    const size_t leaves = m.leaf_count();
+    if (g.columns.size() != leaves) {
+        throw thrift_error("row group has " + std::to_string(g.columns.size()) +
+                           " chunks but schema has " + std::to_string(leaves) + " leaves");
+    }
+    for (const auto& c : g.columns) {
+        if (!c.meta) { throw thrift_error("column chunk without metadata (encrypted?)"); }
+        if (c.meta->num_values < 0 || c.meta->total_compressed_size < 0) {
+            throw thrift_error("negative column chunk size");
+        }
+    }
+}
+
+file_metadata parse_file_metadata(std::span<const uint8_t> blob, limits lim, semantic_check chk,
+                                  metadata_mode mode) {
     compact_reader r(blob, lim);
     compact_reader::struct_scope sc(r);
     file_metadata m;
@@ -293,7 +363,10 @@ file_metadata parse_file_metadata(std::span<const uint8_t> blob, limits lim, sem
         case 4: {
             auto h = r.list_begin();
             m.row_groups.reserve(h.size);
-            for (size_t i = 0; i < h.size; ++i) { m.row_groups.push_back(parse_row_group(r)); }
+            for (size_t i = 0; i < h.size; ++i) {
+                m.row_groups.push_back(mode == metadata_mode::lazy ? parse_row_group_light(r)
+                                                                  : parse_row_group(r));
+            }
             break;
         }
         case 5: {

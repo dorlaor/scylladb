@@ -62,6 +62,7 @@ struct limits {
 };
 
 class compact_reader {
+    const uint8_t* _base;
     const uint8_t* _p;
     const uint8_t* _end;
     limits _lim;
@@ -72,9 +73,12 @@ class compact_reader {
 
 public:
     explicit compact_reader(std::span<const uint8_t> buf, limits l = {})
-        : _p(buf.data()), _end(buf.data() + buf.size()), _lim(l) {}
+        : _base(buf.data()), _p(buf.data()), _end(buf.data() + buf.size()), _lim(l) {}
 
     size_t remaining() const noexcept { return size_t(_end - _p); }
+    // Byte offset from the start of the buffer. Needed to record the extent of a struct that
+    // was skipped rather than decoded, so it can be decoded later on demand.
+    size_t position() const noexcept { return size_t(_p - _base); }
     bool eof() const noexcept { return _p >= _end; }
 
     uint8_t byte() {

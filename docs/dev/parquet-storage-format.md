@@ -2822,6 +2822,48 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
+### 10.4k Lazy footer parsing: 12 %, because Thrift skip is O(content)
+
+§10.4j argued the fix for a footer parse that scales with file size was to parse only the row
+group a read touches. Implemented: `metadata_mode::lazy` decodes the schema and each group's
+`num_rows` — needed regardless, since mapping a row ordinal to a group requires every count —
+records the byte extent of each group's column list, and decodes none of them.
+`materialise_row_group()` decodes one on demand.
+
+**It bought 12 %, not an order of magnitude:**
+
+| row groups | eager | lazy |
+|---:|---:|---:|
+| 100 | 440.1 us | 388.4 us |
+| 20 | 89.4 us | 82.2 us |
+
+**The reason is a property of the format, not of the implementation.** TCompactProtocol writes no
+length prefix on a struct or a list, so skipping one means walking its contents to find where it
+ends: field headers, varints, nested structs, all of it. `skip()` is O(content), so a lazy parse
+still reads every byte of every column chunk it means to ignore. What it avoids is *constructing*
+the objects — and that turns out to be only 12 % of the cost, with the byte walk being the rest.
+
+**Which is worth keeping anyway, for a reason that is not latency.** An eager parse of an
+8 000-group, 18-leaf footer allocates roughly **144 000 `column_chunk` objects, transiently, on
+every point read**. Lazy parsing allocates a `num_rows` and two `uint32_t` per group and builds
+chunk objects only for the group being read. The allocation cost was never separately measured and
+is not in the 12 %, since the profile times parse rather than allocator pressure; but a per-read
+allocation that scales with file size is a hazard on its own.
+
+**And it makes caching viable, which §10.4j had rejected.** The objection there was that caching
+parsed `FileMetaData` means holding tens of megabytes per sstable. Lazily-parsed metadata is a
+different object: 8 000 groups times about sixteen bytes is **~128 kB**, three orders of magnitude
+smaller, and it is exactly what would eliminate the repeated byte walk. So the sequence is
+lazy-then-cache: lazy parsing alone does not fix the latency, but it turns the cache from
+prohibitive into cheap. That is the next step, and it needs a per-sstable store rather than
+per-reader state.
+
+**Validation is deferred, not dropped.** `validate()` cannot check chunk-per-leaf counts on a group
+whose chunks are not decoded, so those checks moved into `materialise_row_group()` and run when a
+group is decoded. Every chunk a reader actually looks at is still checked; the schema and
+row-count checks — the ones that catch a truncated or fabricated footer — still run up front. All
+34 conformance sub-tests pass.
+
 ### 10.4j Footer parse scales with sstable size — and it invalidates the ranking above
 
 `footer_parse` was 89 us and 10 % of a point read, and the plan was to cache it. Before doing

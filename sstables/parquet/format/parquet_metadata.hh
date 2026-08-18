@@ -147,7 +147,14 @@ struct column_chunk {
 };
 
 struct row_group {
+    // Empty when the footer was parsed lazily and this row group has not been materialised.
+    // A point read touches exactly one row group, so decoding every group's column metadata
+    // costs 4.3 us per group -- 34 ms on an 8 000-group sstable -- for data it will not look
+    // at (design doc 10.4j). `columns_extent` says where to find it when it is wanted.
     std::vector<column_chunk> columns;
+    // Byte range of the encoded `columns` list within the footer blob, when lazy.
+    uint32_t columns_offset = 0;
+    uint32_t columns_length = 0;
     int64_t                   total_byte_size = 0;
     int64_t                   num_rows = 0;
     std::optional<int64_t>    file_offset;
@@ -191,8 +198,19 @@ void validate(const file_metadata&);
 // `check` runs validate() on the result; the fuzz driver turns it off so it can
 // exercise the decoder alone.
 enum class semantic_check { no, yes };
+// Whether to decode every row group's per-column metadata up front. `lazy` records each
+// group's column-list extent and decodes nothing, which makes footer parse cost independent
+// of file size; the caller then calls materialise_row_group() for the groups it reads.
+enum class metadata_mode { eager, lazy };
+
+// Decode one row group's column list, for a footer parsed with metadata_mode::lazy. The blob
+// must be the same footer bytes the metadata came from.
+void materialise_row_group(file_metadata&, size_t rg, std::span<const uint8_t> thrift_blob,
+                           limits = {});
+
 file_metadata parse_file_metadata(std::span<const uint8_t> thrift_blob, limits = {},
-                                  semantic_check = semantic_check::yes);
+                                  semantic_check = semantic_check::yes,
+                                  metadata_mode = metadata_mode::eager);
 
 // Validate the footer envelope of a whole file image and parse it. Checks the
 // leading and trailing "PAR1" magic and the footer length.
