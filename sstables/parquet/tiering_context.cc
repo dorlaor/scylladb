@@ -39,25 +39,10 @@ tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& 
                                    const compaction_context& ctx) {
     tiering_inputs in;
     in.bottom_tier = ctx.bottom_tier;
-    in.garbage_fraction = ctx.estimated_droppable_tombstone_ratio;
     in.predicted_gain = ctx.predicted_gain;
-    in.point_read_dominated = ctx.point_read_dominated;
     in.schema_eligible = schema_is_parquet_eligible(s);
     in.estimated_leaf_columns = estimated_leaf_columns(s);
 
-    // Sum of input sizes is an upper bound on the output: compaction only ever
-    // removes data. Overestimating here is the safe direction -- it can only let
-    // a marginal candidate through C2, and C6 still has to agree.
-    //
-    // ondisk_data_size(), not data_size(): C2 is a threshold on how big the
-    // resulting file is, and data_size() reports the data component's
-    // *uncompressed* length, which on a Zstd-with-dictionary table runs several
-    // times larger.
-    uint64_t bytes = 0;
-    for (const auto& sst : inputs) {
-        bytes += sst->ondisk_data_size();
-    }
-    in.estimated_output_bytes = bytes;
 
     return in;
 }
@@ -65,8 +50,7 @@ tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& 
 tiering_decision decide_output_format(const std::vector<sstables::shared_sstable>& inputs,
                                       const ::schema& s,
                                       const compaction_context& ctx,
-                                      const tiering_thresholds& th,
-                                      tiering_mode mode) {
+                                      const tiering_thresholds& th) {
     // A table that has not opted in is never converted, whatever the numbers say.
     switch (s.storage_format()) {
     case storage_format_type::sstable:
@@ -78,7 +62,7 @@ tiering_decision decide_output_format(const std::vector<sstables::shared_sstable
     case storage_format_type::hybrid:
         break;
     }
-    return evaluate_tiering(make_tiering_inputs(inputs, s, ctx), th, mode);
+    return evaluate_tiering(make_tiering_inputs(inputs, s, ctx), th);
 }
 
 } // namespace sstables::parquet

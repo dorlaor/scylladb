@@ -42,7 +42,6 @@ tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& 
 tiering_decision decide_output_format(const std::vector<sstables::shared_sstable>& inputs,
                                       const ::schema&,
                                       const compaction_context&,
-                                      const tiering_thresholds& = {},
-                                      tiering_mode = tiering_mode::hybrid);
+                                      const tiering_thresholds& = {});
 
 } // namespace sstables::parquet

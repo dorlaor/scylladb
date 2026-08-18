@@ -29,8 +29,6 @@ size_t g_fail = 0, g_cases = 0;
 tiering_inputs good() {
     tiering_inputs in;
     in.bottom_tier = true;
-    in.estimated_output_bytes = 512ull << 20;
-    in.garbage_fraction = 0.01;
     in.schema_eligible = true;
     in.estimated_leaf_columns = 110;   // ClickBench's width: admitted, and saves 40 %
     in.predicted_gain = 0.42;
@@ -43,10 +41,9 @@ void expect(bool cond, const std::string& what) {
 }
 
 void expect_reject(const tiering_inputs& in, const std::string& what,
-                   const std::string& reason_contains,
-                   tiering_mode mode = tiering_mode::hybrid) {
+                   const std::string& reason_contains) {
     ++g_cases;
-    auto d = evaluate_tiering(in, {}, mode);
+    auto d = evaluate_tiering(in);
     if (d.parquet()) {
         ++g_fail;
         std::printf("  FAIL %s: accepted when it should have been rejected\n", what.c_str());
@@ -73,18 +70,6 @@ int main() {
     { auto in = good(); in.bottom_tier = false;
       expect_reject(in, "C1 non-bottom-tier", "bottom-tier"); }
 
-    // C2 -- size. Exactly at the threshold must pass; one byte under must not.
-    { auto in = good(); in.estimated_output_bytes = (256ull << 10) - 1;
-      expect_reject(in, "C2 one byte under", "below the"); }
-    { auto in = good(); in.estimated_output_bytes = 256ull << 10;
-      expect(evaluate_tiering(in).parquet(), "C2 exactly at threshold accepted"); }
-
-    // C4 -- garbage
-    { auto in = good(); in.garbage_fraction = 0.5;
-      expect_reject(in, "C4 too much garbage", "garbage fraction"); }
-    { auto in = good(); in.garbage_fraction = 0.10;
-      expect(evaluate_tiering(in).parquet(), "C4 exactly at threshold accepted"); }
-
     // C5 -- schema
     { auto in = good(); in.schema_eligible = false;
       expect_reject(in, "C5 ineligible schema", "not eligible"); }
@@ -103,20 +88,11 @@ int main() {
     { auto in = good(); in.predicted_gain = 0.15;
       expect(evaluate_tiering(in).parquet(), "C6 exactly at threshold accepted"); }
 
-    // C7 -- only consulted in adaptive mode.
-    { auto in = good(); in.point_read_dominated = true;
-      expect(evaluate_tiering(in, {}, tiering_mode::hybrid).parquet(),
-             "C7 ignored in hybrid mode");
-      expect_reject(in, "C7 honoured in adaptive mode", "point-read dominated",
-                    tiering_mode::adaptive); }
-
     // Custom thresholds must actually be honoured, not just the defaults.
     {
         tiering_thresholds th;
-        th.min_output_bytes = 1ull << 20;   // a custom C2 floor this output clears
         th.min_gain_ratio = 0.80;
         auto in = good();
-        in.estimated_output_bytes = 2ull << 20;   // clears both floors, so only C6 decides
         ++g_cases;
         auto d = evaluate_tiering(in, th);
         if (d.parquet()) { ++g_fail; std::printf("  FAIL custom min_gain_ratio not applied\n"); }

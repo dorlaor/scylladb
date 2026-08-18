@@ -442,7 +442,6 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_schema_eligibility) {
 SEASTAR_THREAD_TEST_CASE(test_parquet_storage_format_gates_conversion) {
     pq::compaction_context ctx;
     ctx.bottom_tier = true;
-    ctx.estimated_droppable_tombstone_ratio = 0.0;
     ctx.predicted_gain = 0.9;                  // everything else says yes
 
     // Default table: never converted, however good the numbers look.
@@ -451,12 +450,31 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_storage_format_gates_conversion) {
     BOOST_REQUIRE(!d.parquet());
     BOOST_REQUIRE(d.reason.find("storage_format") != std::string::npos);
 
-    // Opted in, but with no input sstables the size criterion must still bite --
-    // opting in is permission to convert, not an instruction to convert anything.
+    // Opted into hybrid, and every criterion satisfied: converts.
     auto opted = schema_builder(schema_ptr(make_test_schema()))
         .set_storage_format(storage_format_type::hybrid)
         .build();
     auto d2 = pq::decide_output_format({}, *opted, ctx);
-    BOOST_REQUIRE(!d2.parquet());
-    BOOST_REQUIRE(d2.reason.find("below the") != std::string::npos);
+    BOOST_REQUIRE(d2.parquet());
+
+    // Fail closed. This used to be asserted via the minimum-size criterion, which no longer
+    // exists -- C6 subsumed it (see tiering_policy.hh). What guards an unmeasurable candidate
+    // now is C6 itself: no gain means no conversion, which matters because the estimator
+    // returns nullopt whenever it cannot sample, and "could not measure" must never read as
+    // "go ahead".
+    auto unmeasured = ctx;
+    unmeasured.predicted_gain.reset();
+    auto d3 = pq::decide_output_format({}, *opted, unmeasured);
+    BOOST_REQUIRE(!d3.parquet());
+    BOOST_REQUIRE(d3.reason.find("no measured gain") != std::string::npos);
+
+    // And the width bound, which is the only thing standing in for C7.
+    auto wide = ctx;
+    auto d4 = pq::evaluate_tiering([&] {
+        auto in = pq::make_tiering_inputs({}, *opted, wide);
+        in.estimated_leaf_columns = 500;
+        return in;
+    }());
+    BOOST_REQUIRE(!d4.parquet());
+    BOOST_REQUIRE(d4.reason.find("leaf columns") != std::string::npos);
 }

@@ -21,7 +21,27 @@
 // keeps the policy honest -- if a criterion cannot be expressed as a number the
 // caller can supply, it does not belong here.
 //
-// C3 (a minimum data age) was removed on 2026-08-18. It gated on
+// Trimmed to three criteria on 2026-08-18: C1 (bottom tier), C5 (width) and C6 (measured
+// gain). Four went, and each for a reason the measurements supplied rather than for tidiness:
+//
+//   C2, a minimum output size, is subsumed by C6. A file too small to pay is exactly one whose
+//     *measured* gain is bad -- NOAA ISD-Lite at 5 000 rows measured 111.7 % of the SSTable,
+//     a gain of -0.117, which fails C6's 0.15 floor on its own. The crossover C2 encoded is the
+//     crossover C6 discovers, and C6 discovers it per table instead of assuming one byte count
+//     fits every row width (10.1f-c2).
+//   C4, a maximum garbage fraction, had no measurement behind its 0.10 and guarded against one
+//     wasted encode: a bottom-tier output about to be tombstone-GC'd would be re-evaluated by
+//     this same policy on the rewrite. A reasoned round number is the category that has been
+//     wrong three times in this project.
+//   C7, a read-pattern gate, cannot be evaluated at all -- Scylla has no counter separating
+//     point reads from scans (6.2a). It is kept as a design note there, not as dead code here.
+//     C5's leaf ceiling is the crude stand-in, and it is derived from measurement (10.4e).
+//   C3 (a minimum data age) was removed earlier the same day.
+//
+// Fewer criteria also means fewer thresholds nobody has measured, which is the failure mode
+// this decision function kept hitting.
+//
+// C3 detail: It gated on
 // now - max_cell_timestamp, which is write time rather than settle time: a backfill
 // carrying historical timestamps passed it while being brand new on disk, and a cold
 // table with one recent write failed it. C1 answers the question C3 was proxying for --
@@ -40,19 +60,6 @@ namespace sstables::parquet {
 // Every threshold is a per-table knob (design doc section 8.3). Defaults are the
 // ones argued for there.
 struct tiering_thresholds {
-    // C2. Was 256 MiB, justified as ">= 4 row groups at 64 MiB" -- reasoning about the
-    // byte budget when it was the thing that cut row groups. Row groups are now cut at
-    // 5 000 rows (10.4c), so four of them is ~200 kB on a narrow table, not 256 MB. The
-    // old value was three orders of magnitude too high and meant hybrid mode never fired:
-    // real compaction outputs on a 298 MB table measured 13-26 MB, because compaction runs
-    // per compaction group and this floor applies to one output, not to the table.
-    //
-    // 256 KiB is where the measurement puts the crossover (10.1f-c2). On NOAA ISD-Lite:
-    // 5 000 rows -> Parquet is 12 % *bigger*; 20 000 rows -> 38 % smaller; and it asymptotes
-    // at 49 % by 300 000. 5 000 rows is exactly one row group, so the original "four row
-    // groups" instinct was right and only its arithmetic was stale.
-    uint64_t min_output_bytes   = 256ull << 10;
-    double   max_garbage_fraction = 0.10;         // C4
     // C5. Was 2000, i.e. effectively unbounded -- no CQL table reaches it, so the
     // criterion never fired. Now derived from a latency budget, because a Parquet point
     // read costs a page locate-and-decode in *every* column chunk it projects, and that
@@ -80,18 +87,12 @@ struct tiering_inputs {
     // C1: is this output in the largest size tier / max level? Operationally,
     // "expected remaining rewrites <= 1".
     bool bottom_tier = false;
-    // C2
-    uint64_t estimated_output_bytes = 0;
-    // C4: droppable tombstones + shadowed cells, as a fraction of the output.
-    double garbage_fraction = 0.0;
     // C5
     bool   schema_eligible = true;      // no counters, no unsupported types
     size_t estimated_leaf_columns = 0;  // after folding
     // C6: measured, not guessed. Fraction saved vs the table's current
     // compressor, e.g. 0.42 for "42 % smaller". Unset means not measured yet.
     std::optional<double> predicted_gain;
-    // C7: only consulted in 'auto' mode.
-    std::optional<bool> point_read_dominated;
 };
 
 // The parts the compaction layer must supply because only it can know them.
@@ -104,13 +105,9 @@ struct compaction_context {
     // this code guessing from a level number that means different things to
     // ICS, LCS and STCS.
     bool bottom_tier = false;
-    // C4. The compaction code already computes this while estimating output size.
-    double estimated_droppable_tombstone_ratio = 0.0;
     // C6. Filled from the estimator; unset means "not measured", which the
     // policy treats as a rejection.
     std::optional<double> predicted_gain;
-    // C7, adaptive mode only.
-    std::optional<bool> point_read_dominated;
 };
 
 enum class tiering_verdict { use_parquet, use_native };
@@ -125,12 +122,8 @@ struct tiering_decision {
     explicit operator bool() const { return parquet(); }
 };
 
-// `adaptive` corresponds to storage_format = 'auto', which additionally consults
-// C7. In plain 'hybrid' mode the read pattern is ignored.
-enum class tiering_mode { hybrid, adaptive };
 
 tiering_decision evaluate_tiering(const tiering_inputs&,
-                                  const tiering_thresholds& = {},
-                                  tiering_mode = tiering_mode::hybrid);
+                                  const tiering_thresholds& = {});
 
 } // namespace sstables::parquet

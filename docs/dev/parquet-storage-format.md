@@ -955,25 +955,22 @@ per-table config knob (§8.3). None of them mention tablets.
 ≤ 1*. Converting data that will be re-compacted three more times pays the encode cost
 repeatedly for no benefit.
 
-**C2 — Size.** Output ≥ `parquet_min_output_bytes`, default **256 MiB** — at least four
-64 MiB row groups, enough to amortise the footer and per-chunk metadata.
-
-**C3 — Removed 2026-08-18.** This was a minimum data age, defaulting to 24 hours, on the
-reasoning that freshly written data is still churning. It gated on
-`now - max_cell_timestamp`, which is *write* time and not settle time, so it was wrong in
-both directions: a backfill carrying historical timestamps passed it while being brand new
-on disk, and a genuinely cold table with one recent write failed it. C1 answers the question
-C3 was proxying for — is anything going to rewrite this again — structurally rather than by
-elapsed time, and C4 catches the churn C3 was meant to smell. Removing it also removes a
-`system_clock::now()` from the decision, which makes the policy a pure function of its inputs.
-
-The remaining criteria keep their original numbers, so every reference to C4–C7 in this
-document and in the commit history stays valid.
+**C2 — Removed 2026-08-18, subsumed by C6.** This was a minimum output size. A file too small
+to pay is exactly one whose *measured* gain is bad: NOAA ISD-Lite at 5 000 rows — one row group —
+came out at 111.7 % of the SSTable, a gain of −0.117, which fails C6's 0.15 floor on its own
+(§10.1f-c2). So C2 was re-deriving, from a byte count, a conclusion C6 reaches by measuring, and
+it was doing so shape-blind: four row groups is 126 kB at 6.3 B/row and 1.4 MB at 69 B/row, so no
+single threshold was right for both. Its whole history is a caution — the original 256 MiB was
+1000× too high and silently prevented every conversion.
 
 
-**C4 — Low garbage.** Estimated droppable-tombstone plus shadowed-cell fraction ≤
-`parquet_max_garbage_fraction`, default **10 %**. High garbage means an imminent GC
-rewrite, and tombstones force the deletion metadata columns to materialise.
+**C4 — Removed 2026-08-18.** This was a maximum droppable-tombstone fraction, default 0.10, on
+the reasoning that high garbage density implies an imminent GC rewrite. Two problems. The 0.10 had
+no measurement behind it, and a reasoned round number is precisely the category that turned out
+wrong for C2, for C3 and for the numeric-dictionary figure. And the cost it avoided was one wasted
+encode: a bottom-tier output that is then tombstone-GC'd gets re-evaluated by this same policy on
+the rewrite, so the error is self-correcting.
+
 
 **C5 — Schema eligibility.** Folded leaf count within `parquet_max_leaf_columns`. As of
 2026-08-17 nothing else is ineligible: counters and non-frozen collections are both
@@ -986,9 +983,17 @@ measure.** Implemented in `sstables/parquet/gain_estimator.cc`; see §6.2a for h
 and §10.1f for why no formula would do — the corpus spans 0.47× to 0.85× with the same
 folding and the same codec.
 
-**C7 — Read-pattern gate (optional).** Decline if the table is point-read dominated and
-latency-classified. Off unless `storage_format = 'auto'`, which CQL does not accept yet; the
-criterion is implemented and tested but has no data source (§6.2a).
+**C7 — Removed from the policy 2026-08-18, kept as a design note.** A read-pattern gate is the
+right idea and cannot be evaluated: Scylla has no counter separating point reads from scans, and
+`live_scanned`, which would have served, is an unpopulated Cassandra-compatibility stub (§6.2a).
+Leaving it in the policy meant carrying a branch that could never fire, plus a whole
+`tiering_mode` enum whose `adaptive` value existed only to reach it. **C5's leaf ceiling is the
+stand-in**, and unlike C7 it is derived from measurement: point-read cost is linear in leaf count
+at ~90 µs each, so past 128 leaves a table is too slow to point-read as Parquet however well it
+compresses (§10.4e). Cruder than C7 — it declines a wide table that is only ever scanned, which
+is the case where Parquet is *fastest* — and that is the trade until the read path can answer.
+
+
 
 C6 is what makes this safe: it turns "will Parquet help this schema?" — which §3.4 can
 only guess at — into a measurement on the actual data, before any bytes are rewritten.
@@ -1227,6 +1232,12 @@ Two deliberate departures from the original specification:
 - **`metadata_folding` cannot select L3.** L3 discards write times and TTLs; it is
   export-only, and `to_parquet_for_storage()` refuses it. Accepting it as a table property
   would offer silent data loss as a configuration option.
+
+**The decision function is three criteria as of 2026-08-18: C1, C5 and C6** — tier, width and
+measured gain. C2, C3, C4 and C7 were all removed, and the pattern in why is worth stating: three
+of the four were thresholds nobody had measured, and the fourth could not be evaluated at all.
+Every surviving criterion is either structural (C1), derived from a measurement (C5) or a
+measurement itself (C6). The numbering is left alone so that references elsewhere stay valid.
 
 Guard rails, with reasons rather than round numbers:
 
