@@ -2822,6 +2822,48 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
+### 10.4i 35 serial reads per point read — fixed, 1.35x
+
+Sub-splitting `decode_paged` as §10.4h said it needed gave the answer immediately, and it was not
+a decode problem at all:
+
+| sub-phase | before | |
+|---|---:|---|
+| `page_fetch` | 338 us over **35 calls** | 43 % of the point read |
+| `decode_cpu` | 287 us | |
+
+**Thirty-five sequential awaited reads to return one row.** Two extents per leaf — the dictionary
+page and the run of data pages covering the wanted rows — over roughly eighteen leaves, each
+`co_await`ed inside the loop that computed it. The reads have no dependency on one another; the
+serialisation was purely an artifact of planning and fetching in the same pass.
+
+Split into plan-then-fetch: build the extent list from the OffsetIndex with no I/O, then issue
+every read at once and `when_all_succeed`.
+
+| | before | after | |
+|---|---:|---:|---|
+| `page_fetch` | 338 us, 35 calls | **81 us, 1 batch** | 4.2x |
+| `decode_paged` | 646 us | 378 us | |
+| point p50 | 782 us | **581 us** | **1.35x** |
+| point mean | 867 us | 616 us | |
+| ratio to native | ~29x | **22.5x** | |
+
+**Cumulative, across four changes:** point-read p50 has gone 1 915 -> 1 158 (row-group default)
+-> 820 (page size) -> 782 (dictionary paging) -> **581 us**, a total of **3.3x**, for about 14 % of
+size. Two of the four were knobs whose values could not reach the code, one was a missing
+implementation, and this one was a loop that awaited what it could have batched. None of them
+needed a cache, which is what §10.4b assumed the answer would be.
+
+**What is left, and it is now decode.** `decode_cpu` is 279 us and 31 % — the largest single phase
+— followed by `footer_parse` at 89 us and 10 %, which is the cacheable one identified in §10.4h.
+Everything else is under 5 % individually.
+
+**A risk worth recording rather than discovering later.** Thirty-five concurrent reads per point
+read is easier on latency and harder on the I/O queue: under many concurrent point reads this
+multiplies queue depth by the leaf count. The reads are small and against one file, and nothing
+here measures a loaded node, so if this shows up as queueing under concurrency the fix is to cap
+the batch rather than to go back to serial.
+
 ### 10.4h The reader, profiled — and three of four hypotheses were wrong
 
 §10.4g named four candidates for the 586 us fixed floor and said instrumentation was needed
