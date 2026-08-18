@@ -165,8 +165,22 @@ give back the latency, or keep it and accept that Parquet loses outright on spar
 cost at **+16.7 %** on both a narrow numeric and a wide sparse table — 2.5× what the perf schema
 predicted — against a 1.65× point read that leaves the format 20–33× slower than the row format
 regardless. Disk is what Parquet is for. §10.4m has the numbers; the corpus figures in the v2.2
-deck were measured at 2 048 and are therefore pessimistic by about that much, which is the one
-loose end: **the deck needs re-measuring at 8 192 before it is shown to anyone.**
+deck were measured at 2 048 and are therefore pessimistic by about that much, **Re-measured at 8 192 and
+published as v2.3.** The revert reproduced the pre-regression figures exactly — ISD-Lite 50.9 %,
+ClickBench 60.0 %, NYC TLC 56.9 %, GitHub 68.1 % — which is the cleanest possible confirmation
+that `page_values` was the whole of it.
+
+**New best case: the three-column ISD variant at 33.8 %, i.e. 66.2 % saved.** At 2 048 it read
+42.7 %, so the revert is worth nearly nine points on the dataset that shows the format at its
+best.
+
+**Backblaze is not reproducible and is the one figure in the deck not from that batch.** Three
+runs of the identical command produced lz4 sizes of 59.4, 64.5 and 67.5 MB at identical row and
+column counts, and this batch produced a 171.5 % outlier against 95.8 % and 95.9 % from two other
+runs at this setting. lz4 is deterministic for fixed input, so the instability is in the loader,
+not in the writer. The two agreeing figures are used and the deck says so. **Worth fixing before
+Backblaze is quoted again** — it is the corpus's worst case, so it carries more argumentative
+weight than any other row.
 
 ### 12. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
