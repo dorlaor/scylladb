@@ -2822,6 +2822,53 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
+### 10.4j Footer parse scales with sstable size — and it invalidates the ranking above
+
+`footer_parse` was 89 us and 10 % of a point read, and the plan was to cache it. Before doing
+that, one check: does the cost depend on how many row groups the file has? It does, linearly.
+
+| row groups | `footer_parse` | point p50 |
+|---:|---:|---:|
+| 100 | **440.1 us** | 807.9 us |
+| 20 | 89.4 us | 573.5 us |
+| 1 | 15.3 us | 515.7 us |
+
+Least squares over those three points: **7.4 us + 4.32 us per row group.** Extrapolated at the
+5 000-row default:
+
+| | row groups | footer parse |
+|---|---:|---:|
+| the perf test (100 000 rows) | 20 | 0.09 ms |
+| 1 M rows | 200 | 0.87 ms |
+| 256 MB of ISD-Lite at 6 B/row | 8 000 | **34.6 ms** |
+
+**So the 89 us is an artifact of measuring a 1.27 MB file.** A real bottom-tier sstable — the only
+kind hybrid mode converts — would spend tens of milliseconds parsing its footer on *every point
+read*, dwarfing every other cost in §10.4h and making the format unusable for point reads at
+production scale. It is a per-read cost that grows with file size, which is the worst shape a cost
+can have.
+
+**This invalidates the ranking, not the measurements.** Every figure in §10.4c through §10.4i is
+correct for a 100 000-row sstable, and the four fixes are all real: the knobs really were dead,
+the dictionary chunks really were unpaged, the reads really were serial. But `decode_cpu` at 31 %
+is only the largest phase *at this file size*, and the conclusion "what remains is decode" does not
+survive extrapolation. **Everything in §10.4 should be read as measured on a file two to three
+orders of magnitude smaller than the target workload.** That caveat should have been attached from
+the start.
+
+**And it makes caching the wrong fix.** Caching parsed `FileMetaData` per sstable would hold a
+structure that also grows with file size — 8 000 row groups times ~18 leaves is ~144 000
+column-chunk entries per sstable, tens of megabytes resident, multiplied by every sstable being
+read. That is precisely the "cached components that fill memory" the review warned against, and it
+would trade an unusable latency for an unusable memory bill.
+
+**The fix is to stop parsing what is not needed.** A point read touches exactly one row group. The
+footer's schema section is small and fixed; its row-group section is the part that scales, and
+almost all of it is irrelevant to any single read. Parsing row-group metadata lazily — locating the
+wanted entry and decoding only that — makes the cost independent of file size without caching
+anything. That is a change to `parse_file_metadata` and its callers, and it is now the highest
+priority item in the read path by a wide margin.
+
 ### 10.4i 35 serial reads per point read — fixed, 1.35x
 
 Sub-splitting `decode_paged` as §10.4h said it needed gave the answer immediately, and it was not
