@@ -1953,12 +1953,13 @@ in its codec sweep so it is the reference point rather than an afterthought. Unc
 are the `-Data.db` size of the same table, same rows, rewritten with compression off, read through
 `live_table_dir.py` like every other figure here.
 
-**Backblaze is excluded from the table above**, and this run is why: it produced raw 242 357 583,
-native 32 504 461 and `pq` 84 538 396 — 260.1 % of native. Its `pq` output has been observed in
-two clearly separated states, ~20.8 MB and ~84.5 MB, across runs of the identical command, and the
-directory-selection fixes did not remove the split. Whatever causes it is in the conversion of
-that one table rather than in the measurement, and until it is understood its figures are not
-quotable. See parquet-future-work.md.
+**Backblaze is excluded from the table above** because its uncompressed figure came from a batch
+run that also produced an anomalous `pq` size. Its raw volume, 242 357 583, is plausible on its
+face — 807 B/row across 197 columns — but the same run reported `pq` 84 538 396 where every
+controlled run gives 20 803 872. A subsequent `row_group_rows` sweep on one loaded table lands on
+20 803 872 at the default and varies only 18.0–26.9 MB across settings, so no configuration
+produces 84.5 MB. The anomaly has appeared only inside full-corpus batches and never in isolation;
+it is recorded in parquet-future-work.md and no figure here depends on it.
 
 ### 10.1f-prod The corpus as ScyllaDB actually writes it (2026-08-18)
 

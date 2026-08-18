@@ -189,19 +189,34 @@ to swing between 95.4 % and 263.9 %, and it was withheld from v2.4 on that basis
 Under the id lookup, two consecutive runs give lz4 **byte-identical** at 59 351 983 and pq
 **byte-identical** at 20 803 872, ratio 95.8 % / 95.9 %. Backblaze is restored at 95.8 %.
 
-**Reopened 2026-08-19: the split is real and is in the conversion, not the measurement.** With the
-id-based lookup in place, a corpus run produced raw 242 357 583, native 32 504 461 and `pq`
-84 538 396 — 260.1 % of native — where other runs give `pq` 20 803 872 at 95.8 %. Two clearly
-separated states, ~20.8 MB and ~84.5 MB, from the identical command. The measurement path is now
-exonerated by construction, so the cause is upstream of it.
+**Leaf-set hypothesis disproven, 2026-08-19.** The suspicion was that a row-group cut flips the
+writer from the *derived* leaf set to the *conservative* one — 199 leaves against 394 on this
+table — and that this caused the 4x swing. Swept `row_group_rows` on one loaded table under the
+id-based lookup:
 
-The best remaining lead is the writer's **leaf set**: with no row-group cut it uses the *derived*
-set, and after a cut it must use the *conservative* one, which on a 197-column sparse table has
-been observed at 394 leaves against 199. Whether a cut happens depends on the shredder's memory
-estimate crossing `row_group_buffer_bytes`, which is close to the threshold for this table — so a
-small variation flips the leaf set and, plausibly, the file size. A forced-path experiment gave
-+22.7 % rather than 4x, but it ran through the old mtime lookup and needs redoing under the id
-lookup before it means anything. **Do that before anything else here.**
+| `row_group_rows` | `pq` bytes |
+|---:|---:|
+| no cut (10⁸ rows, 1 GiB buffer) | 18 037 425 |
+| 20 000 | 19 908 060 |
+| **5 000 — the default** | **20 803 872** |
+| 2 000 | 26 862 193 |
+
+Two things follow. The leaf set is worth **+10.4 %**, not 4x — real, and the cost of the
+conservative set is modest even on the corpus's widest table. And the default reproduces
+**20 803 872 exactly**, the same value every controlled run gives, with size growing smoothly as
+row groups shrink. **No row-group setting produces 84.5 MB**, so the mechanism is not this.
+
+**Where that leaves it.** Backblaze at the shipped defaults is 20 803 872 bytes against a
+~21.7 MB native, i.e. 95.8 %, established by repeated isolated runs and now by a controlled sweep
+that lands on the same number. The 84.5 MB and 32.5 MB readings have only ever occurred inside
+**full-corpus batch runs**, where Backblaze runs after five other datasets, and never in an
+isolated run. Since `pq` output does not depend on the compression dictionary at all, a
+batch-polluted dictionary cannot explain the `pq` figure either.
+
+So: the controlled value is trustworthy and is what the corpus should quote; the batch anomaly is
+real, unexplained, and confined to a setting no published figure depends on. Not worth more
+iterations until it reproduces in isolation — **if it does, capture the sstable and diff its footer
+against a good one**, which is the one diagnostic not yet tried.
 
 **Two conclusions I published and then had to withdraw**, worth recording because both were
 confidently argued from a broken selector: that the stable 59 351 983 was a fossil (it was the
