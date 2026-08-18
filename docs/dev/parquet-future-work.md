@@ -7,7 +7,8 @@ know that is not obvious from the code.
 Every item names the trap that would catch a reasonable first attempt, because in this project
 that has been the expensive part rather than the implementation.
 
-Last reviewed 2026-08-18.
+Last reviewed 2026-08-18. Corpus figures live in `parquet-storage-format.md` §10.1f-prod; the
+decks are generated from `~/pq-lab/deck_data.py` and are at v2.5.
 
 ---
 
@@ -178,7 +179,14 @@ selector checked first.
 **Unverified as a result:** the row-group-cut leaf-set experiment (+22.7 % for a cut, 69.1 → 84.7
 MB) ran through its own mtime-based lookup and should be redone before it is cited.
 
-### 12. Environment traps worth knowing
+### 12. Measure through `live_table_dir.py`, never by glob or mtime
+Every measurement script resolves the table's data directory from its id in
+`system_schema.tables`. Do not reintroduce a glob or an mtime heuristic: deleting files from a
+directory updates that directory's mtime, so a dropped table outranks the live one and the
+pipeline silently measures a corpse. This cost two published conclusions before it was found
+(item 11).
+
+### 13. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
   precondition on all measurement scripts for this reason; it cost real debugging time three times
   before it existed.

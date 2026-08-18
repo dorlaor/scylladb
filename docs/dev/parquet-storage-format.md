@@ -1872,15 +1872,36 @@ major-compact, read the native `-Data.db`; then `ALTER TABLE ... WITH storage_fo
 sstable is version `pq`, and sum them. Production output against production output. Each
 dataset converted to exactly **one** `pq` sstable.
 
-| Dataset | Rows | Native (me, Zstd+dicts) | Parquet (`pq`) | Ratio | Saved |
-|---|---:|---:|---:|---:|---:|
-| NOAA ISD-Lite | 300 000 | 3 711 188 | 1 887 378 | **50.9 %** | 49.1 % |
-| NYC TLC | 200 000 | 6 313 595 | 3 588 192 | **56.8 %** | 43.2 % |
-| ClickBench | 200 000 | 27 038 282 | 16 271 864 | **60.2 %** | 39.8 % |
-| GitHub Archive | 180 386 | 34 153 407 | 23 306 561 | **68.2 %** | 31.8 % |
-| HackerNews | 300 000 | 23 064 064 | 19 028 923 | **82.5 %** | 17.5 % |
-| Wikipedia pageviews | 163 845 | 2 556 681 | 2 300 769 | **90.0 %** | 10.0 % |
-| Backblaze | 300 000 | 21 699 420 | 20 803 872 | **95.9 %** | 4.1 % |
+| Dataset | Rows | Cols | Native (me, Zstd+dicts) | Parquet (`pq`) | Ratio | Saved |
+|---|---:|---:|---:|---:|---:|---:|
+| **D13 NOAA ISD-Lite, 3 cols** | 300 000 | 3 | 1 431 489 | 483 767 | **33.8 %** | **66.2 %** |
+| D12 NOAA ISD-Lite | 300 000 | 10 | 3 706 835 | 1 888 584 | **50.9 %** | 49.1 % |
+| D5 NYC TLC | 200 000 | 20 | 6 314 576 | 3 589 983 | **56.9 %** | 43.1 % |
+| D1 ClickBench | 200 000 | 105 | 27 113 847 | 16 271 864 | **60.0 %** | 40.0 % |
+| D9 GitHub Archive | 180 386 | 7 | 34 217 880 | 23 306 561 | **68.1 %** | 31.9 % |
+| D10 HackerNews | 300 000 | 7 | 23 069 409 | 19 029 182 | **82.5 %** | 17.5 % |
+| D11 Wikipedia pageviews | 163 845 | 5 | 2 567 684 | 2 300 769 | **89.6 %** | 10.4 % |
+| D2 Backblaze | 300 000 | 197 | 21 709 715 | 20 803 872 | **95.8 %** | 4.2 % |
+
+**D13, added 2026-08-18, is the corpus's best result and settles the width question.** It is D12
+cut to `station, ts, temp` — one series key, one regular clustering timestamp, one measure. It
+saves **66.2 %**, against 49.1 % for the same data with eight more measures and 40.0 % for a
+105-column analytics table. A table that is nearly all *key* compresses better than one carrying a
+payload, because both of its keys are ideal cases: `station` is low-cardinality and `ts` is
+perfectly regular (§10.1g). **Width is not the variable; value repetition is** — and the extreme
+of that is a table with almost nothing but repeating keys.
+
+**Measurement integrity.** Every row above is read from the directory named by the table's own id
+in `system_schema.tables` (`~/pq-lab/live_table_dir.py`), after waiting for the sstable set to
+stop changing and asserting exactly one sstable. That is not incidental: three successive ways of
+locating the directory were wrong, and the second was worse than the first. Selecting by newest
+mtime is actively misleading, because *deleting files from a directory updates that directory's
+mtime*, so a table being dropped acquires a fresh timestamp and outranks the live one. Under that
+selector Backblaze read 263.9 % and 95.4 % on consecutive runs and was briefly withdrawn from the
+corpus; under the id lookup it reads 20 803 872 bytes byte-identically on repeated runs, with lz4
+byte-identical too. **Both a figure that repeats and a figure that varies are uninterpretable
+until the selector is known to be right** — repetition was, in this instance, evidence of reading
+the same dead directory every time.
 
 **Every export figure was optimistic, and unevenly so.** Against the single-row-group export
 numbers below, production is worse by 1.2 points on NYC TLC and **18.6 points on Backblaze**:
@@ -2197,6 +2218,35 @@ size is set by the number of *distinct* values — the index width — not by th
 the dictionary page, by 992 × 4 bytes. The SSTable stores each cell inline at its full width
 and relies on block compression, so it pays the full 4→8 byte increase. **Wider value types
 make the Parquet case stronger, not weaker.**
+
+**How `DELTA_BINARY_PACKED` actually works, since this is the largest encoding effect in the
+corpus.** The encoder never stores a timestamp. It writes blocks of 128 values split into four
+miniblocks of 32:
+
+1. the first value verbatim, once, in the page header;
+2. per block, all 128 deltas, and the **smallest** of them as a single zigzag varint;
+3. per miniblock, the bit width needed for the largest remainder after subtracting that
+   minimum — one byte;
+4. the 32 remainders, bit-packed at exactly that width.
+
+ISD-Lite is one reading per station per hour, so every delta is the same number, 3 600 000 ms.
+The block minimum *is* the delta, every remainder is **zero**, and a bit width of zero means the
+miniblock body is **omitted entirely**. A block of 128 timestamps costs 4 bytes of minimum plus 4
+width bytes plus nothing at all: **8 bytes for 128 values, against 1 024 as `PLAIN`** — 0.06
+bytes per value.
+
+Measured it is 0.12 bytes per value rather than 0.06, and the gap is the useful part: stations do
+miss hours, and a gap makes one delta exceed the block minimum, so that block needs a real bit
+width and its miniblocks reappear. Roughly half the blocks here are perfectly regular. **The
+encoding degrades in proportion to how irregular the series actually is**, which is what makes it
+safe as a default rather than a synthetic-data trick.
+
+Two consequences. A **dictionary** is the wrong tool even though the column is low-cardinality:
+8 760 distinct hours still costs an index per row, so dictionary cost scales with *rows* where
+delta cost scales with *irregularity*. And the win is **ordering-dependent** — it exists only
+because sstables are written sorted by `(token, partition key, clustering key)`, so a partition's
+timestamps arrive monotonically. Written in arrival order the deltas would be noise and this
+column would be the largest in the file again.
 
 **The clustering key is the largest column, and a writer bug means we are not exploiting it.**
 Under pyarrow's defaults `ts` alone is 528 482 B — 27 % of the whole file — dictionary-encoded
@@ -2765,7 +2815,7 @@ stay on SSTables, and criterion C7 already refuses conversion when a table is
 point-read-dominated.
 
 Threats to validity: single shard, warm page cache, one synthetic schema, and the 0.32×
-size ratio is better than the 0.51–0.96× measured on real datasets (§10.1, §10.1f-prod) because
+size ratio is better than the 0.34–0.96× measured on real datasets (§10.1, §10.1f-prod) because
 generated values repeat more than real ones. The *timing* ratios are the point of this
 table, not the size.
 
