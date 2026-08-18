@@ -763,34 +763,71 @@ leaning on. Changing a table's compressor today is an `ALTER TABLE` followed by 
 background rewrite; changing its storage format is the same operation with a different
 output encoder. Nothing about that reasoning involves tablets.
 
-### 6.2a Convergence: partly wired 2026-08-18
+### 6.2a Convergence: wired, including `'hybrid'` (2026-08-18)
 
-`storage_format` now **converts on compaction**, in both directions. The creator in
-`compaction/compaction_manager.cc` reads the property and, for an explicit `'parquet'`, asks for
-a `pq` output; set it back to `'sstable'` and the next compaction falls through to the preferred
-native version. Until this, compaction was format-preserving and the property recorded an intent
-that never happened.
+`storage_format` **converts on compaction**, in both directions, for all three settings.
+`compaction/compaction_manager.cc` picks the output format once per compaction, before the
+sstable creator is installed, because the creator is synchronous and C6 has to read data:
+
+- **`'sstable'`** — native, the preferred writable version.
+- **`'parquet'`** — `pq`, taken at face value. C1–C7 exist to make the *automatic* choice;
+  overruling an operator who named the format would make the property mean nothing. Set it
+  back to `'sstable'` and the next compaction converts back.
+- **`'hybrid'`** — `decide_output_format()` decides, per compaction, and the decision is
+  logged either way with the criterion that settled it. An operator who sets `'hybrid'` and
+  sees nothing convert has no other way to find out which check said no.
 
 Covered by `cql_ddl_test/test_storage_format_converts_on_compaction`, which drives native ->
-Parquet -> native and reads every key back after each switch rather than trusting the format to
-have changed. Mutation-checked by disabling the branch. **Converting back is tested
+Parquet -> native and reads every key back after each switch rather than trusting the format
+to have changed. Mutation-checked by disabling the branch. **Converting back is tested
 deliberately** -- it is the direction nobody checks, and a table that cannot be un-converted is
 a trap rather than a feature.
 
-**What is still missing, and it is the harder half:**
+**How C1 reaches the decision.** The tier is the one input only the strategy can supply, so
+`compaction_descriptor` now carries a `sstables::parquet::compaction_context` that the strategy
+fills in:
 
-- **`'hybrid'` does nothing yet.** It has to consult `decide_output_format()`, which needs a
-  `compaction_context` carrying the tier. The manager builds the creator generically for all
-  compaction types and does not know the tier; the strategy does. So the context has to be
-  threaded from the strategy through `compaction_descriptor` into the creator.
-- **C1-C7 are not consulted on this path.** An explicit opt-in is taken at face value, so the
-  eligibility and predicted-gain checks -- including the estimator validated at 0.4 % error in
-  §10.3e -- are bypassed. That is defensible for an explicit setting and wrong for `'hybrid'`,
-  which is precisely a judgement call about whether conversion pays.
+| Strategy | What counts as bottom tier |
+|---|---|
+| any, major compaction | always — one output, nothing larger can follow |
+| STCS | the picked bucket contains the largest candidate sstable |
+| ICS | same rule, over the sstables its runs expand to |
+| LCS | the output level is the deepest level currently holding data |
+| TWCS | left `false` — a window is a time bucket, not a size tier |
+
+The default is `false`, which is the conservative answer: a strategy that says nothing gets no
+conversion. The rule for STCS and ICS is deliberately stated as "includes the largest
+candidate" rather than in terms of tier boundaries, because both bucket by size *ratio* and a
+bucket index means nothing across tables.
+
+**How C6 reaches it.** `sstables/parquet/gain_estimator.cc` runs the real writer over a bounded
+sample — up to 100 000 rows or 256 MiB of shredder memory, stopping only at a partition
+boundary — of the largest input sstable, and compares the Parquet bytes against
+`ondisk_data_size()` scaled by the fraction of partitions read. On-disk, emphatically not
+`data_size()`: that returns the data component's *uncompressed* length, and comparing a
+compressed Parquet file against it would report the native compressor's savings as ours.
+
+The policy is evaluated twice. The first pass substitutes a passing gain so that only C1–C5
+run: there is no point reading data for a candidate that is in the wrong tier or too small, and
+the sample is by far the most expensive part of the decision. A failed or unusable estimate
+returns "unknown", which the policy treats as a rejection — **failing to measure must never be
+a reason to convert.** `sstable_parquet_test/test_c6_parquet_gain_is_measured_over_real_data`
+asserts all of that, including determinism, so the decision cannot flap between compactions.
+
+**What is still missing:**
+
+- **C7 has no data source.** The criterion and its tests exist, and `tiering_mode::adaptive`
+  consults it, but nothing can currently answer "is this table point-read dominated":
+  `compaction_group_view` exposes no read counters, and `'auto'` is rejected by CQL, so
+  adaptive mode has no caller. Wiring it means plumbing per-table read statistics down to the
+  compaction layer — a bigger change than the rest of C1–C7 combined, for the least
+  consequential criterion.
 - **Flushes are never Parquet**, only compaction outputs. That matches §6 (the bottom tier is
   where the value is) but means a freshly flushed table stays native until it compacts.
 - **`nodetool upgradesstables` does not force convergence**; conversion happens on natural
   compaction only.
+- **The estimate is not cached.** One sample per converting compaction. Bounded, but a table
+  that repeatedly fails C6 pays for the sample every time it reaches the bottom tier.
 
 ### 6.2 Switching is a write-side policy
 
@@ -846,11 +883,13 @@ as the place a future encoding gap belongs — see §11 item 11.
 
 **C6 — Predicted gain.** A sampling estimator predicts ≥ `parquet_min_gain_ratio`
 (default **15 %**) saving versus the table's current compressor. **Do not guess —
-measure.** Reuses the dictionary autotrainer's sampling path and is exposed as
-`/storage_service/estimate_parquet_ratios`.
+measure.** Implemented in `sstables/parquet/gain_estimator.cc`; see §6.2a for how it samples
+and §10.1f for why no formula would do — the corpus spans 0.47× to 0.85× with the same
+folding and the same codec.
 
 **C7 — Read-pattern gate (optional).** Decline if the table is point-read dominated and
-latency-classified. Off unless `storage_format = 'auto'`.
+latency-classified. Off unless `storage_format = 'auto'`, which CQL does not accept yet; the
+criterion is implemented and tested but has no data source (§6.2a).
 
 C6 is what makes this safe: it turns "will Parquet help this schema?" — which §3.4 can
 only guess at — into a measurement on the actual data, before any bytes are rewritten.
@@ -1623,44 +1662,85 @@ layout has redundancy left to exploit. Reported as measured rather than tidied.
 **Consequences.**
 
 1. **§10's ratios are fair, not conservative.** Parquet is not being handicapped by the
-   absence of a dictionary, so the 47.9–50.6 % figures stand as like-for-like.
+   absence of a dictionary, so the ratios stand as like-for-like. (The specific percentages
+   quoted when this was written have since been superseded by the single-binary
+   re-measurement in §10.1f; the like-for-like argument is unaffected.)
 2. **Open question 7 is resolved: no.** A dictionary inside Parquet would cost external
    readability — no other implementation could open the file without being handed the
    dictionary out of band — in exchange for roughly zero, and for a loss on unseen data.
    The format keeps `scylla.folding_level` as its only private metadata and stays
    openable by pyarrow, which `test/boost/sstable_parquet_test.cc` asserts.
 
-### 10.1f Where the win is small — three datasets added to look for it
+### 10.1f The corpus, re-measured end to end with our own writer (2026-08-18)
 
-The three original datasets are wide analytics and telemetry tables, which is the shape
-Parquet is known to suit. Three more were added on 2026-08-17 specifically to look for a
-case where it does *not* pay. Two were found. Same method as §10.1 (realistic timestamp
-regime, token order, zstd-3, L1 folding); all public data, all realistic Scylla schemas.
+Every figure in this table comes from one binary, `build/dev/scylla`, in one batch run
+(`~/pq-lab/remeasure_all.sh`, log in `~/pq-lab/out/remeasure.log`):
 
-| Dataset | Rows | Cols | Shape | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
+- the **SSTable** column is a live Scylla node — load over CQL, train the compression
+  dictionary, upgrade the sstables, major-compact, then read the `-Data.db` size;
+- the **Parquet** column is `scylla sstable parquet-export --stats-only` over those same
+  sstables, i.e. our own shredder, encoders and file writer.
+
+No number here comes from pyarrow. This replaces an earlier version of the table that mixed
+three vintages — three rows measured with pyarrow, three with our writer as it stood before
+the encoding-hint and numeric-dictionary work, one current — which made the columns not
+comparable with each other. Where a row moved, both causes are named below.
+
+| Dataset | Rows | Leaves | Shape | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
 |---|---:|---:|---|---:|---:|---:|---:|
-| D1 ClickBench | 200 000 | 105 | web analytics | 27 327 989 | 13 099 368 | **47.9 %** | 52.1 % |
-| D5 NYC TLC | 200 000 | 20 | numeric trips | 5 317 307 | 2 562 753 | **48.2 %** | 51.8 % |
-| D2 Backblaze | 300 000 | 197 | sparse telemetry | 32 671 140 | 16 547 521 | **50.6 %** | 49.4 % |
-| **D9 GitHub Archive** | 180 387 | 7 | event log + JSON payload | 34 006 460 | 24 575 665 | **72.3 %** | 27.7 % |
-| **D10 HackerNews** | 300 000 | 7 | free text: titles, URLs | 23 136 733 | 21 244 885 | **91.8 %** | 8.2 % |
-| **D11 Wikipedia pageviews** | 176 082 | 5 | hourly metrics per page | 2 566 689 | 2 387 826 | **93.0 %** | 7.0 % |
-| **D12 NOAA ISD-Lite** | 300 000 | 10 | hourly station telemetry | 3 706 438 | 1 548 377 | **41.8 %** | 58.2 % |
+| D12 NOAA ISD-Lite | 300 000 | 20 | hourly station telemetry | 3 707 948 | 1 737 372 | **46.9 %** | 53.1 % |
+| D1 ClickBench | 200 000 | 107 | web analytics | 27 103 967 | 13 588 131 | **50.1 %** | 49.9 % |
+| D5 NYC TLC | 200 000 | 22 | numeric trips | 6 288 641 | 3 528 760 | **56.1 %** | 43.9 % |
+| D9 GitHub Archive | 180 386 | 9 | event log + JSON payload | 34 506 386 | 23 139 952 | **67.1 %** | 32.9 % |
+| D2 Backblaze | 300 000 | 199 | sparse telemetry | 22 256 160 | 17 213 883 | **77.3 %** | 22.7 % |
+| D10 HackerNews | 300 000 | 14 | free text: titles, URLs | 23 112 344 | 18 648 016 | **80.7 %** | 19.3 % |
+| D11 Wikipedia pageviews | 163 845 | 7 | hourly metrics per page | 2 567 124 | 2 180 777 | **85.0 %** | 15.0 % |
 
-D9–D11 are pyarrow figures; §10.3h showed our own writer matches or beats pyarrow, so they
-are if anything pessimistic for Parquet. D12 is our own writer (pyarrow's default is 1 961 695, 52.9 %; ours is 21 % smaller because
-it delta-encodes the clustering key and dictionary-encodes low-cardinality numerics — §10.1g).
+`Leaves` is Parquet leaf columns after L1 folding, which is why it exceeds the CQL column
+count: `__ts` plus the two sparse-exception leaves, and one leaf per element for collections.
+
+**The range is 0.47× to 0.85×.** Parquet is smaller on every dataset in the corpus, but the
+size of the win varies by a factor of three and a half, and the ordering is not the ordering
+of table width — D12 has ten CQL columns and wins most; D2 has 197 and wins second least.
+
+**What changed against the earlier mixed table, and why.** Three rows got *worse*. That is
+expected and deliberate: since those figures were taken, the writer stopped dictionary-encoding
+numeric columns by default and started cutting row groups at the configured size instead of
+emitting one row group per dataset. Both trade size for point-read latency, which is this
+format's weakest metric (§10.4c, §10.4d). The numbers below are the price.
+
+- **D2 Backblaze, 50.6 % → 77.3 %.** Mostly the baseline, not us: the *SSTable* fell
+  32 671 140 → 22 256 160, a 32 % improvement, while our Parquet output grew 16 547 521 →
+  17 213 883 (+4 %). The trained-dictionary baseline got much better at sparse wide
+  telemetry — 195 mostly-empty SMART columns give the dictionary an enormous amount of
+  repeated structure to learn. Parquet's win here is real but modest, and the earlier 49 %
+  was flattering it against a weaker baseline. Backblaze is also the one dataset where
+  pyarrow now edges us out, 17 055 064 against 17 213 883 (0.9 %).
+- **D5 NYC TLC, 48.2 % → 56.1 %.** Both sides moved: baseline 5 317 307 → 6 288 641 (+18 %),
+  ours 2 562 753 → 3 528 760 (+38 %). NYC TLC is the corpus's all-numeric table, so it is
+  the one that loses most from numeric dictionaries defaulting off — the same change measured
+  at 10.9 % on a numeric time-series table — with row-group cutting on top. The baseline's
+  own 18 % growth is not fully attributed and predates this run.
+- **D1 ClickBench, 47.9 % → 50.1 %,** and **D12, 41.8 % → 46.9 %.** Baselines essentially
+  unchanged (27 327 989 → 27 103 967; 3 706 438 → 3 707 948); ours grew 3.7 % and 12 %
+  respectively, entirely from row-group cutting and numeric dictionaries.
+- **D9 GitHub 72.3 % → 67.1 %, D10 HackerNews 91.8 % → 80.7 %, D11 pageviews 93.0 % → 85.0 %.**
+  These three were the pyarrow rows, and our writer beats pyarrow on all of them — by 5, 11
+  and 8 points — for the reason §10.1g gives: we delta-encode the clustering key and hint
+  encodings per column instead of letting a reference encoder pick defaults. The weak cases
+  are therefore less weak than previously documented, and they are still the weak cases.
 
 **Half the disk is a property of value repetition, not of table width.** This was
 originally written as "a property of wide tables", because the three winners had 20–197
 columns and the two losers five and seven. D12 refutes the width version: NOAA ISD-Lite has
-**ten** columns and still saves 47 %. Width was a proxy, and D12 is the case that separates
-it from the real mechanism.
+**ten** columns and still saves 53 %. Width was a proxy, and D12 is the case that separates
+it from the real mechanism. The re-measurement strengthens this: with all seven rows produced
+by one writer, the widest table in the corpus (D2, 197 columns) is second from bottom.
 
 What actually decides it is whether a column's values **repeat across rows**. Columnar
 grouping pays when they do, because the repeats end up adjacent. Near-unique text barely
 repeats, so there is little for the layout to exploit, while the row-oriented baseline's
-trained dictionary still captures common substrings. That is why the two losers are
+trained dictionary still captures common substrings. That is why the two weakest cases are
 dominated by a **high-cardinality text column that is, or is part of, the partition key** —
 HackerNews `title`/`url`, pageviews `page` — and why D12 wins despite being narrow: its
 eight measures are low-cardinality integers (`temp` has 992 distinct values in 300 000 rows,
@@ -1668,8 +1748,12 @@ eight measures are low-cardinality integers (`temp` has 992 distinct values in 3
 are. D9 sits in between: its JSON payloads are individually large but share heavy structure
 across rows, which the layout does capture.
 
-Read together with D5 (NYC TLC: 20 columns, numeric, 48.2 %) the rule is: **numeric or
+Read together with D5 (NYC TLC: 20 columns, numeric, 56.1 %) the rule is: **numeric or
 low-cardinality columns win big at any width; near-unique text does not win at any width.**
+
+This spread is also the argument for measuring C6 rather than predicting it (§6.3): no
+formula over column counts and type widths orders these seven correctly, so the tiering
+decision samples the real data with the real writer instead.
 
 ### 10.1g D12 in detail — and a writer bug it exposed
 
@@ -1850,7 +1934,9 @@ still can.
 
 **A narrow row also cannot amortise its per-row metadata.** D11 is the clearest case: at
 13.6 bytes per row in L1, the one mandatory `__ts` leaf is **37.5 %** of the file, and
-folding it away with L2 takes D11 from 93.0 % to **58.1 %** of the baseline. The same
+folding it away with L2 takes D11 from 93.0 % to **58.1 %** of the baseline (both measured
+on the pyarrow vintage of D11; §10.1f now puts L1 at 85.0 % with our writer, so the absolute
+ratios shift while the 35-point size of the L2 saving is what matters here). The same
 folding is worth 13.3 % on D2 and under 3 % on the wide tables. So metadata folding matters
 most precisely where the format is otherwise weakest — which makes L2, and better
 timestamp encoding generally, a bigger lever for narrow tables than any layout change.
@@ -2075,6 +2161,11 @@ reading the real SSTables.
 | Backblaze | 300 000 | 32 671 140 | **16 547 521** | **50.6 %** | 17 055 064 | 52.5 % |
 | NYC TLC (§10.3d schema) | 200 000 | 5 317 307 | **2 562 753** | **48.2 %** | — | — |
 
+> Superseded for absolute sizes by §10.1f, which re-measures all seven datasets in one run
+> of one binary. This table is kept for the writer-versus-pyarrow comparison it makes, which
+> still holds: §10.1f puts our writer ahead of pyarrow on five of the six datasets where both
+> have been measured, behind by 0.9 % on Backblaze.
+
 **Our writer is not worse than pyarrow, and on ClickBench it is materially better** —
 47.9 % against 59.3 %. The headline claim of §10.1 therefore holds when measured with the
 implementation rather than a reference encoder. The threat-to-validity "sizes come from
@@ -2262,7 +2353,7 @@ stay on SSTables, and criterion C7 already refuses conversion when a table is
 point-read-dominated.
 
 Threats to validity: single shard, warm page cache, one synthetic schema, and the 0.32×
-size ratio is better than the 0.48–0.92× measured on real datasets (§10.1, §10.1f) because
+size ratio is better than the 0.47–0.85× measured on real datasets (§10.1, §10.1f) because
 generated values repeat more than real ones. The *timing* ratios are the point of this
 table, not the size.
 
