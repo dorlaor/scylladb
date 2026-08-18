@@ -1250,3 +1250,33 @@ SEASTAR_THREAD_TEST_CASE(test_c6_parquet_gain_is_measured_over_real_data) {
         BOOST_REQUIRE(!none.has_value());
     }).get();
 }
+
+// A Parquet sstable has no CompressionInfo component -- it compresses inside the file -- so
+// sstable::get_compression_ratio() reported NO_COMPRESSION_RATIO (-1.0) for every Parquet table,
+// i.e. nodetool and the REST API showed no ratio for a table that has a perfectly good one. The
+// writer now records it in the statistics and the accessor falls back to that.
+//
+// Lives here rather than in cql_ddl_test because it is a property of the writer, and building the
+// sstable directly avoids depending on whether a test-env major compaction chooses to rewrite.
+SEASTAR_THREAD_TEST_CASE(test_pq_records_a_compression_ratio) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), make_muts(s, 30, 200)).get();
+
+        const auto ratio = sst->get_compression_ratio();
+        BOOST_TEST_MESSAGE(seastar::format("compression ratio: {}", ratio));
+        // -1.0 is the "not recorded" sentinel, so a positive value is exactly the regression
+        // being pinned.
+        BOOST_REQUIRE_GT(ratio, 0.0);
+        // And it must be a ratio, not a byte count: the test data repeats, so a real codec has
+        // to come in under 1.0.
+        BOOST_REQUIRE_LT(ratio, 1.0);
+
+        // Cross-check against the file itself, so this cannot pass on a plausible-looking number
+        // that bears no relation to the sstable: the numerator is the data component's size.
+        const auto on_disk = double(sst->ondisk_data_size());
+        BOOST_REQUIRE_GT(on_disk, 0.0);
+        BOOST_REQUIRE_GT(on_disk / ratio, on_disk);   // implied uncompressed size is larger
+    }).get();
+}

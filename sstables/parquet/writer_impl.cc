@@ -839,6 +839,28 @@ void pq_writer_impl::consume_end_of_stream() {
         _pos = img.size();          // streaming keeps _pos as it goes
     }
 
+    // Compression ratio, for `nodetool` and the REST API. Without this a Parquet table reports
+    // no ratio at all, because sstable::get_compression_ratio() looks for a CompressionInfo
+    // component and Parquet has none -- it compresses inside the file. The honest numerator is
+    // the file we wrote and the denominator is the sum of the column chunks' uncompressed sizes,
+    // which is the serialised volume before the codec.
+    const int64_t uncompressed = _pq ? _pq->uncompressed_bytes() : [&] {
+        // No cut happened, so the whole file is in `img` and its footer is the only place the
+        // per-chunk uncompressed sizes exist.
+        if (img.empty()) { return int64_t(0); }
+        try {
+            auto md = format::parse_footer(img);
+            int64_t n = 0;
+            for (const auto& rg : md.row_groups) { n += rg.total_byte_size; }
+            return n;
+        } catch (...) {
+            return int64_t(0);      // reporting must never fail a write
+        }
+    }();
+    if (uncompressed > 0 && _pos > 0) {
+        _collector.add_compression_ratio(_pos, uint64_t(uncompressed));
+    }
+
     // A sink is the unit-test path: it lets the whole fragment -> Parquet route be
     // driven without constructing an sstable.
     if (_sink) {

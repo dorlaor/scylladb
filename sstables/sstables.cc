@@ -3684,9 +3684,17 @@ std::strong_ordering sstable::compare_by_first_key(const sstable& other) const {
 double sstable::get_compression_ratio() const {
     if (this->has_component(component_type::CompressionInfo)) {
         return double(_components->compression.compressed_file_length()) / _components->compression.uncompressed_file_length();
-    } else {
-        return metadata_collector::NO_COMPRESSION_RATIO;
     }
+    // A format that compresses inside its own container has no CompressionInfo component but can
+    // still have recorded a ratio in its statistics -- `pq` does. Without this fall-back Scylla
+    // reports no compression ratio at all for such a table, which is wrong rather than merely
+    // missing. Formats that record nothing still leave the statistics value at
+    // NO_COMPRESSION_RATIO, so their behaviour is unchanged.
+    const auto& contents = _components->statistics.contents;
+    if (contents.contains(metadata_type::Stats)) {
+        return get_stats_metadata().compression_ratio;
+    }
+    return metadata_collector::NO_COMPRESSION_RATIO;
 }
 
 void sstable::set_sstable_level(uint32_t new_level) {

@@ -239,6 +239,16 @@ public:
     // Finalises the footer and returns the file image, or an empty vector if a sink is set.
     std::vector<uint8_t> finish();
 
+    // Sum of every column chunk's uncompressed size, i.e. the serialised volume before the
+    // codec. This is what a compression ratio for a `pq` sstable has to be measured against:
+    // Parquet compresses internally, so there is no CompressionInfo component and Scylla would
+    // otherwise report no ratio at all for a Parquet table.
+    int64_t uncompressed_bytes() const {
+        int64_t n = 0;
+        for (const auto& rg : _rgs) { n += rg.total_byte_size; }
+        return n;
+    }
+
     // Total file bytes produced so far, flushed or not.
     size_t size_so_far() const { return size_t(pos()); }
     // Bytes currently held in memory. Equals size_so_far() without a sink; bounded by one

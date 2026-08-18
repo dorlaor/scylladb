@@ -888,6 +888,7 @@ sstable on a live node rather than reasoned about:
 
 | Operation | Result |
 |---|---|
+| `nodetool tablestats` compression ratio | **0.0732** on a `pq` table — previously reported nothing at all |
 | `sstable dump-data` | 4 partitions, 20 000 rows — the whole dataset |
 | `sstable dump-statistics` / `dump-index` / `dump-summary` | parse and emit |
 | `sstable validate` | `errors: 0, valid: true` |
@@ -897,6 +898,22 @@ sstable on a live node rather than reasoned about:
 
 Exit status alone was not taken as evidence: every row above was checked for substantive output,
 because a tool that silently does nothing also returns zero.
+
+**Compression ratio, added 2026-08-19.** A `pq` sstable has no `CompressionInfo` component —
+Parquet compresses inside the file — and `sstable::get_compression_ratio()` looked only there, so
+it returned the "not recorded" sentinel for every Parquet table. `nodetool` and the REST API
+therefore showed *no* ratio for a table that has a perfectly good one to report.
+
+The writer now records it from the Parquet footer: numerator the file it wrote, denominator the sum
+of the column chunks' uncompressed sizes, which is the serialised volume before the codec. The
+accessor falls back to the statistics value when `CompressionInfo` is absent; formats that record
+nothing still leave the sentinel, so nothing else changes.
+
+Measured **0.0732** on the three-column time series through the REST API. Worth noting that
+§10.1f-raw independently measured the same table at **7.1 %** of its raw SSTable volume by an
+entirely separate route — reloading with compression disabled. Two different denominators (Parquet
+chunk sizes versus Scylla's uncompressed serialisation) agreeing to within 0.2 points is good
+evidence both are right.
 
 **What is still missing:**
 
