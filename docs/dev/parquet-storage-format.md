@@ -883,6 +883,21 @@ genuinely large. Observing those end to end needs a >256 MiB dataset on this hos
 also why C6's estimator is covered by a unit test against a real sstable
 (`test_c6_parquet_gain_is_measured_over_real_data`) rather than through the compaction path.
 
+**Operational surface, verified end to end 2026-08-18.** All of it exercised against a real `pq`
+sstable on a live node rather than reasoned about:
+
+| Operation | Result |
+|---|---|
+| `sstable dump-data` | 4 partitions, 20 000 rows — the whole dataset |
+| `sstable dump-statistics` / `dump-index` / `dump-summary` | parse and emit |
+| `sstable validate` | `errors: 0, valid: true` |
+| `sstable validate-checksums` | `has_checksums`, `has_digest`, `valid` — the digest and CRC the writer emits are verified, not merely present |
+| `nodetool upgradesstables` | converts `me` → `pq` |
+| `nodetool scrub` (validate mode) | passes; all 4 000 rows still readable afterwards |
+
+Exit status alone was not taken as evidence: every row above was checked for substantive output,
+because a tool that silently does nothing also returns zero.
+
 **What is still missing:**
 
 - **C7 has no data source, and this was investigated rather than assumed (2026-08-18).** The
@@ -913,8 +928,12 @@ also why C6's estimator is covered by a unit test against a real sstable
   120× case by accident.
 - **Flushes are never Parquet**, only compaction outputs. That matches §6 (the bottom tier is
   where the value is) but means a freshly flushed table stays native until it compacts.
-- **`nodetool upgradesstables` does not force convergence**; conversion happens on natural
-  compaction only.
+- ~~**`nodetool upgradesstables` does not force convergence.**~~ **Wrong — verified 2026-08-18:
+  it does.** A native table altered to `storage_format = 'parquet'` and then upgraded, with no
+  compaction triggered, came out as `pq`. The creator installed in `compact_sstables()` is shared
+  by the rewrite paths, so upgrade got convergence for free; this note predated that wiring and
+  was never rechecked. It matters operationally because `upgradesstables` is how an operator
+  forces a rewrite without waiting for natural compaction.
 - **The estimate is not cached.** One sample per converting compaction. Bounded, but a table
   that repeatedly fails C6 pays for the sample every time it reaches the bottom tier.
 

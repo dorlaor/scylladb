@@ -90,6 +90,17 @@ the symptom is silent: compaction simply stops choosing the converted files, and
 
 ---
 
+## Verified, not open — recorded so nobody re-investigates
+
+The operational surface works on `pq` sstables and was checked against a live node, not inferred:
+`dump-data` (full row count), `dump-statistics`, `dump-index`, `dump-summary`, `validate`
+(0 errors), `validate-checksums` (digest and CRC verified), `nodetool upgradesstables` (converts
+`me` → `pq`), and `nodetool scrub` in validate mode (passes, rows still readable). The design
+doc's claim that `upgradesstables` does not force convergence was stale — it does, because the
+sstable creator is shared by the rewrite paths.
+
+---
+
 ## Format gaps
 
 ### 5. `DELTA_BYTE_ARRAY` is unimplemented
