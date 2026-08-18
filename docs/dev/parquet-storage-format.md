@@ -1756,24 +1756,42 @@ scripts now wait for the sstable set to stop changing and require exactly one ss
 recording anything; §10.1f-prod already recorded that count as 1 for all seven datasets, which is
 why it was unaffected.
 
-**Answered 2026-08-18: the rule is not needed, because `row_group_rows` has no effect on a wide
-table.** `sstable_parquet_perf_test` gained `PQ_PERF_EXTRA_COLS` and `PQ_PERF_RG_ROWS`, and on a
-195-value-column schema (~199 leaves, 100 000 rows) the output is **byte-identical** at 5 000 and
-50 000 rows per group — 14 743 560 both times. The reason is `row_group_buffer_bytes`: the 64 MiB
-budget is charged against *shredder memory*, a wide row costs far more of it than a narrow one, so
-on a wide table the byte budget cuts long before any plausible row count does. The row knob is
-already dead there, exactly as it was dead everywhere before the default moved.
+**Answered 2026-08-18, and the first version of this answer was wrong.** It said the row knob has
+no effect on a wide table, generalising from one synthetic schema. The guarded sweep on the real
+Backblaze table then showed it does:
 
-So Backblaze's 18.6-point penalty in §10.1f-prod is **not** caused by the 5 000-row default. It is
-caused by the byte budget, which already scales inversely with width — and in the direction that
-costs size. Scaling `row_group_rows` by leaf count would change nothing until the byte budget is
-raised too, which is a memory-safety knob (R-13) and not one to raise casually. **Open question 15
-is therefore withdrawn as posed**; what remains is whether `row_group_buffer_bytes` should be
-per-shape, which is a different and harder question because it trades against OOM rather than
-against latency.
+| `row_group_rows` | pq bytes | Ratio |
+|---:|---:|---:|
+| 5 000 (default) | 20 803 872 | 95.0 % |
+| 20 000 | 19 908 060 | 91.0 % |
+| 50 000 | 19 908 060 | 91.0 % |
+| 200 000 | 19 908 060 | 91.0 % |
 
-On the narrow schema the knob does work, and it confirms the default. Measured at 3 000 random
-point reads:
+**The correct statement is that the effective row-group size is
+`min(row_group_rows, whatever the byte budget allows)`, and which term binds depends on how much
+shredder memory a row costs — which is a property of row *density*, not of column count.** Two wide
+tables land on opposite sides of it:
+
+- **Backblaze**, 197 columns but overwhelmingly empty, so a row is cheap in shredder memory. The
+  byte budget allows somewhere between 5 000 and 20 000 rows, so 5 000 binds and raising it changes
+  the file — until the budget takes over, which is why 20 000, 50 000 and 200 000 are identical.
+- **The perf-test wide schema**, 195 *populated* int columns, so a row is expensive. The budget
+  allows fewer than 5 000 rows, so the row count never binds and 5 000 and 50 000 produce
+  byte-identical output (14 743 560 both times).
+
+That decomposes Backblaze's export-to-production gap. Against the guarded native baseline of
+21 887 401: one row group would be ~78 %, the byte budget alone takes it to **91 %**, and the
+5 000-row default takes it the rest of the way to **95 %**. So roughly **a quarter of the penalty is
+the row default and three quarters is the byte budget** — and the byte budget is a memory-safety
+knob (R-13), not a tuning dial.
+
+**So open question 15 is reframed rather than withdrawn.** Scaling `row_group_rows` by leaf count
+would buy about 4 points on a sparse wide table and nothing at all on a dense one, because on the
+dense one it is not the binding constraint. The question worth pursuing is whether
+`row_group_buffer_bytes` should vary by shape, which is harder: it trades against OOM rather than
+against latency, and the same 64 MiB means very different row counts across the corpus.
+
+The narrow-table result stands and settles the default. Measured at 3 000 random point reads:
 
 | `row_group_rows` | point mean | scan memory | pq bytes |
 |---:|---:|---:|---:|
@@ -3052,7 +3070,14 @@ native format** — and 2.1 ms / 61x with numeric dictionaries off.
 14. **Deriving `pq_writer_config` from the table.** `parquet::make_writer` uses defaults
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
-15. **`row_group_rows` should scale inversely with leaf count.** A single default cannot suit
+15. **Should `row_group_buffer_bytes` vary by shape?** (Reframed 2026-08-18 — the original
+   form, "`row_group_rows` should scale inversely with leaf count", is answered in §10.1f-rg: it
+   buys ~4 points on a sparse wide table and nothing on a dense one, because there the byte budget
+   binds first.) The effective row-group size is `min(row_group_rows, what 64 MiB of shredder
+   memory allows)`, and the second term varies enormously across the corpus because it depends on
+   row density. The hard part is that this budget exists to stop a shard OOMing (R-13), so it
+   cannot simply be raised for size. Superseded rationale follows.
+   **`row_group_rows` should scale inversely with leaf count.** A single default cannot suit
    both ends of the corpus. Every row group writes a column-chunk header plus statistics per
    leaf, so at the 5 000-row default a 300 000-row table has 60 row groups and pays that fixed
    cost 11 940 times on a 199-leaf table against 420 times on a 7-leaf one. Measured
