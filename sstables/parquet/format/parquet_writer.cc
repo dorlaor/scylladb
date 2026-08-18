@@ -179,7 +179,8 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             dict.num_distinct * _opt.dictionary_min_repeat < present.size()) {
             use_dict = true;
         }
-    } else if (_opt.use_dictionary && !hinted && spec.type != phys_type::byte_array) {
+    } else if (_opt.use_dictionary && _opt.numeric_dictionary && !hinted &&
+               spec.type != phys_type::byte_array) {
         // Numerics get a dictionary too, on the same terms.
         //
         // Measured on a time-series table (design doc 10.1g): leaving these on PLAIN

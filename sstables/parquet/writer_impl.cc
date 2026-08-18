@@ -246,6 +246,25 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
             }
         } else if (k == COMPRESSION_LEVEL) {
             _cfg.wopt.zstd_level = int(parse_count(k, v, 1, 22));
+        } else if (k == DICTIONARY) {
+            // Which columns may be dictionary-encoded. 'text' is the default: strings
+            // benefit and numerics cost more point-read latency than they save disk
+            // (+10.5% for -3.9%, see writer_options::numeric_dictionary). 'all' is for a
+            // bottom tier that is scanned rather than point-read.
+            if (v == "text") {
+                _cfg.wopt.use_dictionary = true;
+                _cfg.wopt.numeric_dictionary = false;
+            } else if (v == "all") {
+                _cfg.wopt.use_dictionary = true;
+                _cfg.wopt.numeric_dictionary = true;
+            } else if (v == "none") {
+                _cfg.wopt.use_dictionary = false;
+                _cfg.wopt.numeric_dictionary = false;
+            } else {
+                throw exceptions::configuration_exception(
+                        seastar::format("Unsupported 'dictionary' value '{}' in the 'parquet' "
+                                        "option; supported: text, all, none", v));
+            }
         } else if (k == METADATA_FOLDING) {
             if (v == "auto" || v == "row") {
                 _cfg.level = folding_level::row_folded;
@@ -284,6 +303,11 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
     }
     if (_cfg.wopt.zstd_level != def.wopt.zstd_level) {
         m[COMPRESSION_LEVEL] = seastar::format("{}", _cfg.wopt.zstd_level);
+    }
+    if (_cfg.wopt.use_dictionary != def.wopt.use_dictionary ||
+        _cfg.wopt.numeric_dictionary != def.wopt.numeric_dictionary) {
+        m[DICTIONARY] = !_cfg.wopt.use_dictionary ? "none"
+                      : (_cfg.wopt.numeric_dictionary ? "all" : "text");
     }
     if (_cfg.level != def.level) {
         // The user-facing vocabulary, not to_string()'s internal "L0"/"L1"/"L2". These

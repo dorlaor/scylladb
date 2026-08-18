@@ -48,6 +48,15 @@ struct writer_options {
     // 2836 us. 8192 keeps almost all of the compression for most of the speed.
     size_t  page_values = 8192;
     bool    use_dictionary = true;
+    // Dictionary-encode *numeric* columns too, not just byte_array ones.
+    //
+    // Off by default. Measured on a 20k-partition table over 10 000 random point reads,
+    // three runs each and 0.3% spread: it costs +10.5% point-read latency (p50 1 977 ->
+    // 2 185 us) and buys 3.9% of the file here, 10.9% on a numeric time-series table.
+    // Point-read latency is this format's weakest metric and disk is its strongest, so
+    // spending the former to improve the latter is the wrong direction by default.
+    // Worth turning on for a bottom tier that is scanned and never point-read.
+    bool    numeric_dictionary = false;
     size_t  dictionary_max_bytes = 1u << 20;
     // Minimum average repeats per distinct value before a dictionary is used.
     size_t  dictionary_min_repeat = 8;

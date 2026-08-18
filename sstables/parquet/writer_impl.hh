@@ -77,6 +77,7 @@ public:
     static constexpr const char* COMPRESSION            = "compression";
     static constexpr const char* COMPRESSION_LEVEL      = "compression_level";
     static constexpr const char* METADATA_FOLDING       = "metadata_folding";
+    static constexpr const char* DICTIONARY            = "dictionary";
 
     // Guard rails. The lower bound on rows is not arbitrary: below ~1 000 rows the
     // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --

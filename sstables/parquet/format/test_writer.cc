@@ -53,15 +53,15 @@ void jstr(std::ostream& o, const std::string& s) {
 
 int emit(const std::string& dir) {
     std::vector<fixture> fx = {
-        {"w_plain_nonull",  {codec::zstd, 3, 20000, false, 1u<<20, true}, 50000, false, false},
-        {"w_plain_nulls",   {codec::zstd, 3, 20000, false, 1u<<20, true}, 50000, true,  false},
-        {"w_dict_nulls",    {codec::zstd, 3, 20000, true,  1u<<20, true}, 50000, true,  false},
-        {"w_delta_ts",      {codec::zstd, 3, 20000, true,  1u<<20, true}, 50000, true,  true},
-        {"w_uncompressed",  {codec::uncompressed, 0, 8192, true, 1u<<20, true}, 20000, true, true},
-        {"w_multipage",     {codec::zstd, 3, 1000,  false, 1u<<20, true}, 20000, true,  false},
-        {"w_tiny",          {codec::zstd, 3, 20000, true,  1u<<20, true}, 7,     true,  false},
-        {"w_dict_single",   {codec::zstd, 3, 20000, true,  1u<<20, true}, 30000, true,  false, 1},
-        {"w_dict_two",      {codec::zstd, 3, 20000, true,  1u<<20, true}, 30000, true,  false, 2},
+        {"w_plain_nonull",  {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = false, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 50000, false, false},
+        {"w_plain_nulls",   {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = false, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 50000, true,  false},
+        {"w_dict_nulls",    {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = true, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 50000, true,  false},
+        {"w_delta_ts",      {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = true, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 50000, true,  true},
+        {"w_uncompressed",  {.compression = codec::uncompressed, .zstd_level = 0, .page_values = 8192, .use_dictionary = true, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 20000, true, true},
+        {"w_multipage",     {.compression = codec::zstd, .zstd_level = 3, .page_values = 1000, .use_dictionary = false, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 20000, true,  false},
+        {"w_tiny",          {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = true, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 7,     true,  false},
+        {"w_dict_single",   {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = true, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 30000, true,  false, 1},
+        {"w_dict_two",      {.compression = codec::zstd, .zstd_level = 3, .page_values = 20000, .use_dictionary = true, .dictionary_max_bytes = 1u<<20, .write_statistics = true}, 30000, true,  false, 2},
     };
 
     std::ofstream man(dir + "/manifest.json");

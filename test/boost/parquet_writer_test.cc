@@ -363,6 +363,14 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
         BOOST_REQUIRE_EQUAL(p.config().wopt.page_values, 4096u);
         BOOST_REQUIRE(p.config().wopt.compression == pq::format::codec::uncompressed);
         BOOST_REQUIRE(p.config().level == pq::folding_level::verbatim);
+        // Numeric dictionaries are off by default and reachable via 'all'.
+        BOOST_REQUIRE(!p.config().wopt.numeric_dictionary);
+        pp all{{{pp::DICTIONARY, "all"}}};
+        BOOST_REQUIRE(all.config().wopt.numeric_dictionary);
+        BOOST_REQUIRE_EQUAL(all.to_map().at(pp::DICTIONARY), "all");
+        pp none{{{pp::DICTIONARY, "none"}}};
+        BOOST_REQUIRE(!none.config().wopt.use_dictionary);
+        BOOST_REQUIRE_EQUAL(none.to_map().at(pp::DICTIONARY), "none");
 
         // Round-trips through the map form, which is how it is persisted.
         auto m = p.to_map();
@@ -391,6 +399,7 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
     rejects({{pp::COMPRESSION_LEVEL, "99"}});
     // L3 discards write times and TTLs: it is export-only and must not be reachable
     // as a storage setting.
+    rejects({{pp::DICTIONARY, "yes"}});
     rejects({{pp::METADATA_FOLDING, "logical"}});
     rejects({{pp::METADATA_FOLDING, "yes"}});
 }
