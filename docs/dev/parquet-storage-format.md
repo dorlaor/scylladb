@@ -2822,6 +2822,48 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
+### 10.4g Where the point read actually goes: 71 % is a fixed floor
+
+Two knob fixes in a row (§10.4c, §10.4f) and a real implementation change (dictionary paging)
+took p50 from 1 915 us to 782 us. This decomposes what is left, so that further work goes where
+the time is rather than where the last win was.
+
+**Method.** A two-point linear fit on the page-size sweep — `T = F + k x page_values`, taking the
+5 000 and 2 048 points — then checked against a third point that did not inform it:
+
+| | fit | measured |
+|---|---:|---:|
+| decode slope `k` | 0.114 us/value | — |
+| fixed floor `F` | 586 us | — |
+| p50 at 512 values | 645 us | 680 us |
+
+Within 5 % at a point the fit did not see, which is about as much as a two-point fit earns.
+
+**So at the current default: ~586 us fixed, ~234 us decode. 71 % of a point read is work that
+does not scale with page size at all.** That is the number to attack, and it also means page and
+row-group tuning is now exhausted — both act only on the 29 %.
+
+**It is not footer parse.** The obvious candidate was the footer, which is rebuilt per reader and
+grows with row-group count. Tested directly by varying row groups at a fixed 2 048-value page, so
+decode volume is held constant while the footer shrinks 20-fold:
+
+| `row_group_rows` | point p50 | scan memory |
+|---:|---:|---:|
+| 5 000 | 776 us | 5 612 kB |
+| 20 000 | 731 us | 19 900 kB |
+| 100 000 | 722 us | 20 676 kB |
+
+**7 % across a 20x change in footer size**, bought with 3.6x the scan memory. Footer parse is real
+but small, and this also re-confirms 5 000 as the right row-group default: the alternative spends
+most of the memory budget for almost nothing.
+
+**What the 586 us must therefore be**, none of it yet measured individually: the partition-index
+lookup that turns a key into a row ordinal, per-reader construction of the schema mapping, the
+OffsetIndex read for each projected column, and then a seek plus page-header parse per column
+chunk. The native format does the whole point read in 26-36 us, so **the fixed floor alone is ~19x
+native**. Attributing it needs instrumentation inside the reader rather than another external
+sweep, and that is the honest next step — every cheap external experiment is now spent.
+
 ### 10.4e Point-read cost is linear in leaf count — ~90 us per leaf
 
 Measured to choose C5's ceiling. One batch, one pinned core, 1 000 random point reads per
