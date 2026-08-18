@@ -178,9 +178,24 @@ best.
 runs of the identical command produced lz4 sizes of 59.4, 64.5 and 67.5 MB at identical row and
 column counts, and this batch produced a 171.5 % outlier against 95.8 % and 95.9 % from two other
 runs at this setting. lz4 is deterministic for fixed input, so the instability is in the loader,
-not in the writer. The two agreeing figures are used and the deck says so. **Worth fixing before
-Backblaze is quoted again** — it is the corpus's worst case, so it carries more argumentative
-weight than any other row.
+not in the writer. The two agreeing figures are used and the deck says so. **Diagnosed 2026-08-18, and the deck figure is sound.** Three hypotheses were tested and two were
+wrong:
+
+1. *The loader is nondeterministic.* **No.** Run twice in one process and fingerprinted, the table
+   is byte-identical: same 197 columns, same 300 000 rows, same value hash.
+2. *An unsettled compaction is being double-counted.* **No.** Two runs that differed by 13.8 % on
+   lz4 each had exactly **one** sstable. (A settle-and-report guard was added to `measure()`
+   anyway, and the sstable count is now printed on every size line, because a byte total alone
+   hides this.)
+3. *`table_dir()` returns the wrong directory.* **Yes.** It was
+   `list(DATA_DIR.glob(...))[0]` — arbitrary glob order. A dropped table's directory can linger,
+   so the harness could measure a previous run's leftovers. Now sorted by mtime, newest first.
+
+**The `pq` figures were never affected**, which is the confirmation: `measure_native_vs_pq.sh` has
+picked the newest directory and asserted a single sstable since the same bug was found there, and
+its Backblaze `pq` figure is **20 803 872 in every run** — three independent runs, byte-identical
+— while the harness's own logged lines moved. So the deck's 95.8 % stands, and what was unstable
+was the reporting path rather than the format.
 
 ### 12. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
