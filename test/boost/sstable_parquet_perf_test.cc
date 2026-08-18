@@ -71,6 +71,13 @@ schema_ptr perf_schema() {
     for (int i = 0, n = extra_cols(); i < n; ++i) {
         b.with_column(to_bytes(extra_col_name(i)), int32_type);
     }
+    // Row-group size, via the same per-table property an operator would set. Needed
+    // because the size cost of a small row group scales with leaf count while the
+    // latency benefit does not obviously do so, and open question 15 turns on whether
+    // one default can serve both shapes.
+    if (const char* e = std::getenv("PQ_PERF_RG_ROWS")) {
+        b.set_parquet_options({{"row_group_rows", sstring(e)}});
+    }
     return b.build();
 }
 

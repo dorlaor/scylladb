@@ -1756,7 +1756,47 @@ scripts now wait for the sstable set to stop changing and require exactly one ss
 recording anything; §10.1f-prod already recorded that count as 1 for all seven datasets, which is
 why it was unaffected.
 
-**So the rule is not yet decided.** What the narrow arm shows is that the size cost of a small
+**Answered 2026-08-18: the rule is not needed, because `row_group_rows` has no effect on a wide
+table.** `sstable_parquet_perf_test` gained `PQ_PERF_EXTRA_COLS` and `PQ_PERF_RG_ROWS`, and on a
+195-value-column schema (~199 leaves, 100 000 rows) the output is **byte-identical** at 5 000 and
+50 000 rows per group — 14 743 560 both times. The reason is `row_group_buffer_bytes`: the 64 MiB
+budget is charged against *shredder memory*, a wide row costs far more of it than a narrow one, so
+on a wide table the byte budget cuts long before any plausible row count does. The row knob is
+already dead there, exactly as it was dead everywhere before the default moved.
+
+So Backblaze's 18.6-point penalty in §10.1f-prod is **not** caused by the 5 000-row default. It is
+caused by the byte budget, which already scales inversely with width — and in the direction that
+costs size. Scaling `row_group_rows` by leaf count would change nothing until the byte budget is
+raised too, which is a memory-safety knob (R-13) and not one to raise casually. **Open question 15
+is therefore withdrawn as posed**; what remains is whether `row_group_buffer_bytes` should be
+per-shape, which is a different and harder question because it trades against OOM rather than
+against latency.
+
+On the narrow schema the knob does work, and it confirms the default. Measured at 3 000 random
+point reads:
+
+| `row_group_rows` | point mean | scan memory | pq bytes |
+|---:|---:|---:|---:|
+| 5 000 (default) | 1 258 us | 5 548 kB | 1 269 816 |
+| 20 000 | 1 784 us | 19 900 kB | 1 235 425 |
+| 50 000 | 2 233 us | 20 676 kB | 1 230 121 |
+
+Going to 20 000 costs **42 % of point-read latency and 3.6x the scan memory to save 2.7 % of
+size**. That is a bad trade in the direction this format needs, so 5 000 stays.
+
+**A far more consequential result came out of the wide run.** On the 199-leaf schema, `pq` point
+reads cost **22-32 ms against the native format's 0.15-0.27 ms — 85x to 120x**, and scan memory is
+61.5 MB against 256 kB. (The two wide runs disagree on absolute latency, 31.9 ms and 22.3 ms, and
+the *native* numbers moved by the same factor, so the machine was differently loaded; only the
+byte equality is deterministic and only the order of magnitude of the ratio should be read.) This
+is much worse than the 38x measured on the narrow schema, and the mechanism is obvious once
+stated: a point read has to locate and decode a page in **every** column chunk it projects, so the
+cost scales with width, while the row format reads one contiguous row. **The practical conclusion
+is a scope limit, not a tuning problem: wide Parquet tables must not be on a point-read path.**
+That is what C7 exists to express (§6.3), and it is now the criterion with the strongest measured
+justification and still no data source.
+
+**Superseded framing below.** What the narrow arm shows is that the size cost of a small
 row group is small when leaves are few, which is consistent with the leaf-count hypothesis but
 does not establish the exponent. The wide arm has to be re-run under the new guard, and the
 latency side is still unmeasured at any width — `sstable_parquet_perf_test` now takes
