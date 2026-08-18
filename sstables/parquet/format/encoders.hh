@@ -168,9 +168,27 @@ inline void encode_delta_binary_packed(std::vector<uint8_t>& out,
 // The index stream is prefixed with a single bit-width byte, per the spec.
 struct dict_result {
     std::vector<uint8_t> dictionary_page;   // PLAIN encoded distinct values
-    std::vector<uint8_t> index_page;        // bit-width byte + RLE hybrid
+    std::vector<uint8_t> index_page;        // bit-width byte + RLE hybrid, whole chunk
     size_t num_distinct = 0;
+    // The raw indices, retained so the chunk can be split into several data pages. The
+    // dictionary stays per column chunk -- that is what Parquet specifies -- but each data
+    // page carries its own RLE stream over a slice of these. Without them the chunk had to
+    // be emitted as one page, which meant a point read decoded every row in the row group
+    // to return one (design doc 10.4f).
+    std::vector<uint64_t> indices;
+    uint8_t bit_width = 1;
 };
+
+// One data page's worth of dictionary indices: the bit-width byte Parquet requires at the
+// head of an RLE_DICTIONARY page body, then the hybrid stream for this slice only.
+inline std::vector<uint8_t> encode_dict_index_page(std::span<const uint64_t> idx, uint8_t bw) {
+    std::vector<uint8_t> out;
+    out.push_back(bw);
+    rle_encoder enc(bw);
+    enc.encode(idx);
+    out.insert(out.end(), enc.bytes().begin(), enc.bytes().end());
+    return out;
+}
 
 inline dict_result encode_dictionary_byte_array(std::span<const std::string> vals) {
     dict_result r;
@@ -202,10 +220,9 @@ inline dict_result encode_dictionary_byte_array(std::span<const std::string> val
     // the file would not be externally readable -- which is the whole point of
     // the format. Cost is one bit per value in a case that compresses away.
     if (bw == 0) { bw = 1; }
-    r.index_page.push_back(bw);
-    rle_encoder enc(bw);
-    enc.encode(idx);
-    r.index_page.insert(r.index_page.end(), enc.bytes().begin(), enc.bytes().end());
+    r.bit_width = bw;
+    r.index_page = encode_dict_index_page(idx, bw);
+    r.indices = std::move(idx);
     return r;
 }
 
@@ -242,10 +259,9 @@ inline dict_result encode_dictionary_fixed(std::span<const T> vals) {
     for (const T& v : distinct) { put_le(r.dictionary_page, &v, sizeof(T)); }
     uint8_t bw = bit_width_for(r.num_distinct ? r.num_distinct - 1 : 0);
     if (bw == 0) { bw = 1; }        // see encode_dictionary_byte_array
-    r.index_page.push_back(bw);
-    rle_encoder enc(bw);
-    enc.encode(idx);
-    r.index_page.insert(r.index_page.end(), enc.bytes().begin(), enc.bytes().end());
+    r.bit_width = bw;
+    r.index_page = encode_dict_index_page(idx, bw);
+    r.indices = std::move(idx);
     return r;
 }
 

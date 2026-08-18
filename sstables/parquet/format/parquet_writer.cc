@@ -258,12 +258,15 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     }
 
     // ---- data pages
-    // The dictionary index stream was produced for the whole chunk, so when the
-    // dictionary is in use the chunk is emitted as a single page. Splitting it
-    // would require re-running the index encoder per page; not worth it here,
-    // and noted as a follow-up.
-    const size_t page_sz = use_dict ? n : _opt.page_values;
+    // Dictionary-encoded chunks are paged like any other. The dictionary page itself stays
+    // per chunk, which is what Parquet specifies; each data page carries its own RLE stream
+    // over its slice of the retained indices. Before this the chunk was emitted whole
+    // because the index stream had been encoded once for all of it, so a point read on a
+    // dictionary column decoded every row in the row group to return one -- and dictionary
+    // columns are exactly the low-cardinality ones this format is best at (10.4f).
+    const size_t page_sz = _opt.page_values;
     bool first_data_page = true;
+    size_t dict_cursor = 0;      // present values already emitted, for slicing dict.indices
     int64_t rows_written = 0;
     size_t val_cursor = 0;   // next present value, for repeated columns   // first_row_index of the next page
 
@@ -314,7 +317,11 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         std::vector<uint8_t> body;
         encoding used = encoding::plain;
         if (use_dict) {
-            body = dict.index_page;
+            // Indices are per *present* value, so the slice is tracked by a running count
+            // of present values rather than by slot -- nulls occupy a slot and no index.
+            body = encode_dict_index_page(
+                    std::span<const uint64_t>(dict.indices.data() + dict_cursor, page_present),
+                    dict.bit_width);
             used = encoding::rle_dictionary;
         } else {
             switch (spec.type) {
@@ -433,6 +440,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             out_meta.cm.encodings.push_back(used);
         }
         val_cursor += page_present;
+        dict_cursor += page_present;
         off = stop;
     }
 

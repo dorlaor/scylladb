@@ -2796,11 +2796,31 @@ it is now **820 us** — **2.3x** — for about 14 % of size in total. Neither c
 machinery, only noticing that a configured value could not reach the code. Against the native
 format the gap narrows from 62x to roughly 29x on this schema.
 
-**A ceiling on this result.** Dictionary-encoded chunks are still emitted as a single page
-regardless of `page_values`, because the dictionary index stream is produced for the whole chunk
-(`parquet_writer.cc`). The perf schema has two text columns that are dictionary-encoded, so the
-1.41x above is achieved *despite* those columns not being paged at all. Splitting them means
-re-running the index encoder per page, and it is now the largest remaining point-read lever.
+**Dictionary chunks now page too, and the result is instructive for being small.** They used to
+be emitted whole whatever `page_values` said, because the index stream was encoded once for the
+chunk. `dict_result` now retains the raw indices and each data page carries its own RLE stream
+over its slice; the dictionary page itself stays per chunk, which is what Parquet specifies.
+
+Measured at the 2 048 default: **p50 820 -> 782 us, 4.7 %, for +0.15 % size.** Much less than the
+1.41x that paging the *plain* columns bought, and the gap says something about where point-read
+time actually goes: **it is dominated by per-column-chunk fixed work -- footer parse, offset index
+lookup, page location -- rather than by how many values get decoded.** Halving decode volume on
+two of five value columns moved the total by 5 %. That is also why pushing to 512 rows per page
+buys only a further 13 % of latency for 17.8 % of size, and why the ~90 us per column in §10.4e
+should be read as mostly locating, not decoding.
+
+So the value of this change is less the 5 % than the pathology it removes: the old behaviour was
+unbounded in the row-group size. At the 5 000-row default a dictionary chunk was 5 000 values
+against a 2 048-value page, a factor of 2.4; a table configured with 100 000-row row groups had
+dictionary columns decoding 100 000 values per point read while its plain columns decoded 2 048.
+The asymmetry scaled with a knob, which is the kind of thing that looks fine in a benchmark and
+bites in production.
+
+**Verified at value level, not just structurally.** A mis-sliced index stream produces a file that
+parses cleanly and yields *wrong values*, so parsing is not evidence. The checks that matter:
+`sstable_parquet_test` writes mutations through and compares them back; the nine interop fixtures
+are re-read by pyarrow with every row group fully decoded rather than only their metadata
+inspected; and the streamed-vs-buffered images remain byte-identical.
 
 ### 10.4e Point-read cost is linear in leaf count — ~90 us per leaf
 
