@@ -63,6 +63,25 @@ struct tiering_inputs {
     std::optional<bool> point_read_dominated;
 };
 
+// The parts the compaction layer must supply because only it can know them.
+//
+// Lives in this header rather than tiering_context.hh so that
+// compaction_descriptor can carry one: this file has no Scylla dependencies at
+// all, so including it from the compaction layer costs nothing.
+struct compaction_context {
+    // C1. Only the strategy knows its own tiering, so it says so rather than
+    // this code guessing from a level number that means different things to
+    // ICS, LCS and STCS.
+    bool bottom_tier = false;
+    // C4. The compaction code already computes this while estimating output size.
+    double estimated_droppable_tombstone_ratio = 0.0;
+    // C6. Filled from the estimator; unset means "not measured", which the
+    // policy treats as a rejection.
+    std::optional<double> predicted_gain;
+    // C7, adaptive mode only.
+    std::optional<bool> point_read_dominated;
+};
+
 enum class tiering_verdict { use_parquet, use_native };
 
 // Why, in words, so the decision can be logged and explained to an operator

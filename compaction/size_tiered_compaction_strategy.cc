@@ -245,13 +245,17 @@ size_tiered_compaction_strategy::get_sstables_for_compaction(compaction_group_vi
 
     if (is_any_bucket_interesting(buckets, min_threshold)) {
         std::vector<sstables::shared_sstable> most_interesting = most_interesting_bucket(std::move(buckets), min_threshold, max_threshold);
-        co_return compaction_descriptor(std::move(most_interesting));
+        auto desc = compaction_descriptor(std::move(most_interesting));
+        desc.parquet_ctx.bottom_tier = inputs_are_bottom_tier(desc.sstables, candidates);
+        co_return desc;
     }
 
     // If we are not enforcing min_threshold explicitly, try any pair of SStables in the same tier.
     if (!table_s.compaction_enforce_min_threshold() && is_any_bucket_interesting(buckets, 2)) {
         std::vector<sstables::shared_sstable> most_interesting = most_interesting_bucket(std::move(buckets), 2, max_threshold);
-        co_return compaction_descriptor(std::move(most_interesting));
+        auto desc = compaction_descriptor(std::move(most_interesting));
+        desc.parquet_ctx.bottom_tier = inputs_are_bottom_tier(desc.sstables, candidates);
+        co_return desc;
     }
 
     if (!table_s.tombstone_gc_enabled()) {

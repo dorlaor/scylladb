@@ -356,12 +356,16 @@ incremental_compaction_strategy::get_sstables_for_compaction(compaction_group_vi
 
     if (is_any_bucket_interesting(buckets, min_threshold)) {
         std::vector<sstables::frozen_sstable_run> most_interesting = most_interesting_bucket(std::move(buckets), min_threshold, max_threshold);
-        co_return compaction_descriptor(runs_to_sstables(std::move(most_interesting)), 0, _fragment_size);
+        auto desc = compaction_descriptor(runs_to_sstables(std::move(most_interesting)), 0, _fragment_size);
+        desc.parquet_ctx.bottom_tier = inputs_are_bottom_tier(desc.sstables, runs_to_sstables(candidates));
+        co_return desc;
     }
     // If we are not enforcing min_threshold explicitly, try any pair of sstable runs in the same tier.
     if (!t.compaction_enforce_min_threshold() && is_any_bucket_interesting(buckets, 2)) {
         std::vector<sstables::frozen_sstable_run> most_interesting = most_interesting_bucket(std::move(buckets), 2, max_threshold);
-        co_return compaction_descriptor(runs_to_sstables(std::move(most_interesting)), 0, _fragment_size);
+        auto desc = compaction_descriptor(runs_to_sstables(std::move(most_interesting)), 0, _fragment_size);
+        desc.parquet_ctx.bottom_tier = inputs_are_bottom_tier(desc.sstables, runs_to_sstables(candidates));
+        co_return desc;
     }
 
     // The cross-tier behavior is only triggered once we're done with all the pending same-tier compaction to

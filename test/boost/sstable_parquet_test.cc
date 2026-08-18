@@ -28,6 +28,7 @@
 
 #include "test/lib/simple_schema.hh"
 #include "test/lib/sstable_test_env.hh"
+#include "sstables/parquet/gain_estimator.hh"
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/mutation_reader_assertions.hh"
@@ -1212,5 +1213,40 @@ SEASTAR_THREAD_TEST_CASE(test_pq_corpus_shaped_schema) {
                                 want_v1[i].partition().clustered_rows().calculate_size());
             assert_that(got_v1[i]).is_equal_to(want_v1[i]);
         }
+    }).get();
+}
+
+// C6 of the tiering decision: the gain must be *measured* with the real writer over
+// real data, and it must fail closed. Both halves are asserted here, because the
+// failure mode that matters is a bad estimate silently converting a table.
+SEASTAR_THREAD_TEST_CASE(test_c6_parquet_gain_is_measured_over_real_data) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        // A native sstable, which is what the estimator sees in a hybrid table:
+        // the question it answers is "what would this become as Parquet".
+        auto sst = make_sstable_containing(env.make_sstable(s), make_muts(s, 40, 250)).get();
+
+        auto gain = sstables::parquet::estimate_parquet_gain(
+                s, env.make_reader_permit(), {sst}, sstables::parquet::pq_writer_config{}).get();
+        BOOST_REQUIRE(gain.has_value());
+        BOOST_TEST_MESSAGE(seastar::format("measured gain: {:.3f} on {} on-disk bytes",
+                                           *gain, sst->ondisk_data_size()));
+        // A ratio, so bounded; and repetitive test data should not come out larger.
+        BOOST_REQUIRE_GT(*gain, 0.0);
+        BOOST_REQUIRE_LT(*gain, 1.0);
+
+        // Deterministic: the same sample must yield the same answer, or the tiering
+        // decision would flap between compactions.
+        auto again = sstables::parquet::estimate_parquet_gain(
+                s, env.make_reader_permit(), {sst}, sstables::parquet::pq_writer_config{}).get();
+        BOOST_REQUIRE(again.has_value());
+        BOOST_REQUIRE_EQUAL(*gain, *again);
+
+        // Nothing to measure must read as "unknown", never as a gain. The policy
+        // turns an unset gain into a rejection, so this is what keeps an
+        // unmeasurable table in the native format.
+        auto none = sstables::parquet::estimate_parquet_gain(
+                s, env.make_reader_permit(), {}, sstables::parquet::pq_writer_config{}).get();
+        BOOST_REQUIRE(!none.has_value());
     }).get();
 }

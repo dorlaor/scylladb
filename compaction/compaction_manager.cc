@@ -31,6 +31,8 @@
 #include "tombstone_gc-internals.hh"
 #include <cmath>
 #include "utils/labels.hh"
+#include "sstables/parquet/tiering_context.hh"
+#include "sstables/parquet/gain_estimator.hh"
 
 static logging::logger cmlog("compaction_manager");
 using namespace std::chrono_literals;
@@ -411,21 +413,49 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
     if (can_purge) {
         descriptor.enable_garbage_collection(co_await sstable_set_for_tombstone_gc(t));
     }
-    descriptor.creator = [&t] (shard_id) {
+    // Output format (design doc sections 6.3 and 6.4). Decided here rather than
+    // inside the creator because the creator is synchronous and C6 -- the only
+    // criterion that is measured rather than derived -- needs to read data.
+    bool write_parquet = false;
+    switch (t.schema()->storage_format()) {
+    case storage_format_type::sstable:
+        break;
+    case storage_format_type::parquet:
+        // An explicit opt-in is taken at face value. C1-C7 exist to make the
+        // automatic choice; overruling an operator who named the format would make
+        // the property mean nothing. Converting back is symmetric: set the property
+        // to 'sstable' and the next compaction falls through to the branch above.
+        write_parquet = true;
+        break;
+    case storage_format_type::hybrid: {
+        auto ctx = descriptor.parquet_ctx;
+        // Two evaluations of the same policy. The first supplies a fake passing gain
+        // so that only C1-C5 are exercised: there is no point sampling data for a
+        // candidate that is in the wrong tier or too small, and the sample is by far
+        // the most expensive part of this decision.
+        auto probe = ctx;
+        probe.predicted_gain = 1.0;
+        if (sstables::parquet::decide_output_format(descriptor.sstables, *t.schema(), probe).parquet()) {
+            ctx.predicted_gain = co_await sstables::parquet::estimate_parquet_gain(
+                    t.schema(), t.make_compaction_reader_permit(), descriptor.sstables,
+                    sstables::parquet::parquet_parameters(t.schema()->parquet_options()).config());
+        }
+        const auto decision = sstables::parquet::decide_output_format(
+                descriptor.sstables, *t.schema(), ctx);
+        write_parquet = decision.parquet();
+        // Always logged, both ways. An operator who set 'hybrid' and sees nothing
+        // convert has no other way to find out which criterion said no.
+        cmlog.info("{}.{}: hybrid storage_format chose {} for this compaction: {}",
+                   t.schema()->ks_name(), t.schema()->cf_name(),
+                   write_parquet ? "parquet" : "native", decision.reason);
+        break;
+    }
+    }
+
+    descriptor.creator = [&t, write_parquet] (shard_id) {
         // All compaction types going through this path will work on normal input sstables only.
         // Off-strategy, for example, waits until the sstables move out of staging state.
-        //
-        // A table that has explicitly opted into Parquet converts here. This is what makes
-        // `storage_format = 'parquet'` mean something rather than merely being recorded, and
-        // it converts back the same way: set the property to 'sstable' and the next
-        // compaction falls through to the preferred native version.
-        //
-        // Only the explicit case is handled. 'hybrid' has to consult
-        // parquet::decide_output_format(), which needs a compaction_context carrying the
-        // tier -- knowledge the strategy has and the descriptor does not carry yet. That
-        // also means the C1-C7 eligibility and gain checks are *not* applied on this path;
-        // an explicit opt-in is taken at face value. See design doc 6.4.
-        if (t.schema()->storage_format() == storage_format_type::parquet) {
+        if (write_parquet) {
             return t.make_sstable(sstables::sstable_state::normal,
                                   sstables::sstable_version_types::pq);
         }

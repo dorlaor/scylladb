@@ -37,6 +37,7 @@ target_sources(sstables
     parquet/reader.cc
     parquet/tiering_policy.cc
     parquet/tiering_context.cc
+    parquet/gain_estimator.cc
     parquet/format/parquet_reader.cc
     writer.cc)
 target_include_directories(sstables

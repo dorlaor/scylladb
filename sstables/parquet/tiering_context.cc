@@ -48,10 +48,15 @@ tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& 
     // Sum of input sizes is an upper bound on the output: compaction only ever
     // removes data. Overestimating here is the safe direction -- it can only let
     // a marginal candidate through C2, and C6 still has to agree.
+    //
+    // ondisk_data_size(), not data_size(): C2 is a threshold on how big the
+    // resulting file is, and data_size() reports the data component's
+    // *uncompressed* length, which on a Zstd-with-dictionary table runs several
+    // times larger.
     uint64_t bytes = 0;
     int64_t newest = std::numeric_limits<int64_t>::min();
     for (const auto& sst : inputs) {
-        bytes += sst->data_size();
+        bytes += sst->ondisk_data_size();
         newest = std::max(newest, sst->get_stats_metadata().max_timestamp);
     }
     in.estimated_output_bytes = bytes;

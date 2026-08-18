@@ -39,9 +39,25 @@ logging::logger compaction_strategy_logger("CompactionStrategy");
 
 using timestamp_type = api::timestamp_type;
 
+bool compaction_strategy_impl::inputs_are_bottom_tier(const std::vector<sstables::shared_sstable>& inputs,
+        const std::vector<sstables::shared_sstable>& candidates) {
+    if (inputs.empty() || candidates.empty()) {
+        return false;
+    }
+    const auto biggest = std::ranges::max(candidates | std::views::transform(
+            [] (const sstables::shared_sstable& sst) { return sst->data_size(); }));
+    return std::ranges::any_of(inputs, [biggest] (const sstables::shared_sstable& sst) {
+        return sst->data_size() >= biggest;
+    });
+}
+
 compaction_descriptor compaction_strategy_impl::make_major_compaction_job(std::vector<sstables::shared_sstable> candidates, int level, uint64_t max_sstable_bytes) {
     // run major compaction in maintenance priority
-    return compaction_descriptor(std::move(candidates), level, max_sstable_bytes, sstables::run_id::create_random_id(), compaction_type_options::make_major());
+    auto desc = compaction_descriptor(std::move(candidates), level, max_sstable_bytes, sstables::run_id::create_random_id(), compaction_type_options::make_major());
+    // A major compaction merges the whole table into one output, so nothing larger
+    // can follow it: C1 holds unconditionally, whatever the strategy.
+    desc.parquet_ctx.bottom_tier = true;
+    return desc;
 }
 
 std::vector<compaction_descriptor> compaction_strategy_impl::get_cleanup_compaction_jobs(compaction_group_view& table_s, std::vector<sstables::shared_sstable> candidates) const {
