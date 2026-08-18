@@ -30,7 +30,7 @@ tiering_inputs good() {
     tiering_inputs in;
     in.bottom_tier = true;
     in.schema_eligible = true;
-    in.estimated_leaf_columns = 110;   // ClickBench's width: admitted, and saves 40 %
+    in.column_count = 105;             // ClickBench's width: admitted, and saves 40 %
     in.predicted_gain = 0.42;
     return in;
 }
@@ -76,8 +76,8 @@ int main() {
     // 200 leaves, the width at which point reads measured 134x native (design doc
     // 10.4e) and the default ceiling of 128 exists to refuse. Was 5 000, which no CQL
     // table can reach -- it proved the comparison worked without pinning a real boundary.
-    { auto in = good(); in.estimated_leaf_columns = 200;
-      expect_reject(in, "C5 too many leaves", "leaf columns"); }
+    { auto in = good(); in.column_count = 197;
+      expect_reject(in, "C5 too many leaves", "columns"); }
 
     // C6 -- the load-bearing criterion. Unmeasured must be a rejection, not an
     // optimistic guess: that is the whole point of it existing.

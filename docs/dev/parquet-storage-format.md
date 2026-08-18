@@ -972,7 +972,20 @@ encode: a bottom-tier output that is then tombstone-GC'd gets re-evaluated by th
 the rewrite, so the error is self-correcting.
 
 
-**C5 — Schema eligibility.** Folded leaf count within `parquet_max_leaf_columns`. As of
+**C5 — Schema eligibility and width, in columns.** Bounded on **CQL columns**, not Parquet
+leaves. That is a correction of units, not a change of value: §10.4e's latency curve was
+parameterised by columns all along — its schema is pk + ck + 5 values + N extra — and labelling
+that axis "leaves" was sloppy.
+
+The substantive reason is that a leaf count cannot be known from a schema. The old
+`estimated_leaf_columns()` returned `columns + 3` and read **13** for the NOAA ISD-Lite table
+that `parquet-export` reports **20** leaves for, because per-column deletion and TTL leaves
+materialise in L1 only when cells actually carry them. The leaf count is data-dependent. With C2,
+C4 and C7 gone this criterion is one of three, and a load-bearing criterion should not rest on a
+quantity that is guessed — especially one that guessed 35 % low, which would have let a table
+of ~195 real leaves through a ceiling meant to stop it.
+
+**C5 — the original wording follows.** Folded leaf count within `parquet_max_leaf_columns`. As of
 2026-08-17 nothing else is ineligible: counters and non-frozen collections are both
 representable, and every other type falls back to an opaque blob column. The gate is kept
 as the place a future encoding gap belongs — see §11 item 11.

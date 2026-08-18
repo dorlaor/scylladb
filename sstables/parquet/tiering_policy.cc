@@ -33,15 +33,15 @@ tiering_decision evaluate_tiering(const tiering_inputs& in,
     }
 
     // C5 -- schema, and width. The width bound stands in for C7: a point read decodes a page
-    // in every column chunk it projects, so its cost is linear in leaf count (~90 us each),
+    // in every column chunk it projects, so its cost is linear in column count (~90 us each),
     // and past the ceiling a table is too slow to point-read as Parquet however well it
     // compresses.
     if (!in.schema_eligible) {
         return decline("schema is not eligible (counters or unsupported types)");
     }
-    if (in.estimated_leaf_columns > th.max_leaf_columns) {
-        return decline(fmt::format("{} leaf columns exceeds the {} limit",
-                                   in.estimated_leaf_columns, th.max_leaf_columns));
+    if (in.column_count > th.max_columns) {
+        return decline(fmt::format("{} columns exceeds the {} limit",
+                                   in.column_count, th.max_columns));
     }
 
     // C6 -- the load-bearing one, and the only one that reads data. An unmeasured table is
@@ -56,8 +56,8 @@ tiering_decision evaluate_tiering(const tiering_inputs& in,
     }
 
     return {tiering_verdict::use_parquet,
-            fmt::format("bottom tier, {} leaves, predicted gain {:.3f}",
-                        in.estimated_leaf_columns, *in.predicted_gain)};
+            fmt::format("bottom tier, {} columns, predicted gain {:.3f}",
+                        in.column_count, *in.predicted_gain)};
 }
 
 } // namespace sstables::parquet

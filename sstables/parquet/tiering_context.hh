@@ -30,9 +30,10 @@ namespace sstables::parquet {
 // handle yet.
 bool schema_is_parquet_eligible(const ::schema&);
 
-// Number of Parquet leaves the schema will produce after row-folding: one per
-// column, plus __ts, plus the two sparse exception leaves in the worst case.
-size_t estimated_leaf_columns(const ::schema&);
+// CQL columns, which is what C5 bounds. Deliberately not the Parquet leaf count: that is
+// data-dependent (per-column deletion and TTL leaves materialise only when cells carry them),
+// so it cannot be derived from a schema, and a criterion should not rest on a guess.
+size_t column_count(const ::schema&);
 
 tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& inputs,
                                    const ::schema&,

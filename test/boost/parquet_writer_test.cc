@@ -435,8 +435,9 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_schema_eligibility) {
         .build();
     BOOST_REQUIRE(pq::schema_is_parquet_eligible(*with_counter));
 
-    // pk + ck + 4 regular + __ts + 2 sparse exception leaves
-    BOOST_REQUIRE_EQUAL(pq::estimated_leaf_columns(*make_test_schema()), 9u);
+    // pk + ck + 4 regular. Exactly the schema's own count -- the Parquet leaf count is
+    // data-dependent and deliberately not what C5 bounds (see tiering_policy.hh).
+    BOOST_REQUIRE_EQUAL(pq::column_count(*make_test_schema()), 6u);
 }
 
 SEASTAR_THREAD_TEST_CASE(test_parquet_storage_format_gates_conversion) {
@@ -472,9 +473,9 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_storage_format_gates_conversion) {
     auto wide = ctx;
     auto d4 = pq::evaluate_tiering([&] {
         auto in = pq::make_tiering_inputs({}, *opted, wide);
-        in.estimated_leaf_columns = 500;
+        in.column_count = 500;
         return in;
     }());
     BOOST_REQUIRE(!d4.parquet());
-    BOOST_REQUIRE(d4.reason.find("leaf columns") != std::string::npos);
+    BOOST_REQUIRE(d4.reason.find("columns") != std::string::npos);
 }

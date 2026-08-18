@@ -60,23 +60,25 @@ namespace sstables::parquet {
 // Every threshold is a per-table knob (design doc section 8.3). Defaults are the
 // ones argued for there.
 struct tiering_thresholds {
-    // C5. Was 2000, i.e. effectively unbounded -- no CQL table reaches it, so the
-    // criterion never fired. Now derived from a latency budget, because a Parquet point
-    // read costs a page locate-and-decode in *every* column chunk it projects, and that
-    // cost is linear in leaf count at ~90 us per leaf (design doc 10.4e): 10 leaves is
-    // 1.15 ms, 200 leaves is 18.3 ms, against 26-136 us for the native format.
+    // C5, the width bound. Expressed in **CQL columns**, not Parquet leaves, and that is a
+    // correction rather than a loosening: the latency curve in 10.4e was parameterised by
+    // columns all along -- its schema was pk + ck + 5 values + N extra -- and calling that
+    // axis "leaves" was sloppy labelling on my part.
     //
-    // 128 leaves is a p50 point read of roughly 11.5 ms. It admits every dataset in the
-    // corpus that saves meaningfully -- ClickBench at 110 leaves saves 40 % -- and
-    // excludes the one that does not: Backblaze at 200 leaves saves 4 % and point-reads
-    // at 134x. So on this corpus the criterion costs nothing it should not cost.
+    // Columns are also the only version of this the caller can know exactly.
+    // estimated_leaf_columns() returned `columns + 3`, which measured 13 on a table the
+    // exporter reports 20 leaves for: per-column deletion and TTL leaves materialise in L1
+    // whenever cells carry them, so the true leaf count is data-dependent and not a function
+    // of the schema at all. A criterion cannot be load-bearing on a quantity that is
+    // guessed, and since C2, C4 and C7 went this one is one of three.
     //
-    // This is a stand-in for C7, which is the criterion that ought to make this call and
-    // cannot, because Scylla has no counter distinguishing point reads from scans (6.2a).
-    // Refusing on width alone is strictly cruder: it declines a wide table that is only
-    // ever scanned, and that is the case where Parquet is fastest. That is the trade until
-    // the read path can say otherwise.
-    size_t   max_leaf_columns   = 128;
+    // 128 columns is a point-read p50 of roughly 11.5 ms at the measured ~90 us per column.
+    // Admits every dataset in the corpus that saves meaningfully -- ClickBench at 105 columns
+    // saves 40 % -- and excludes Backblaze at 197, which saves 4 % and point-reads at 134x.
+    //
+    // Stands in for C7, which cannot be evaluated at all (6.2a). Cruder: it declines a wide
+    // table that is only ever scanned, which is where Parquet is fastest.
+    size_t   max_columns   = 128;
     double   min_gain_ratio     = 0.15;           // C6: >= 15 % saved
 };
 
@@ -89,7 +91,7 @@ struct tiering_inputs {
     bool bottom_tier = false;
     // C5
     bool   schema_eligible = true;      // no counters, no unsupported types
-    size_t estimated_leaf_columns = 0;  // after folding
+    size_t column_count = 0;            // CQL columns, which the schema knows exactly
     // C6: measured, not guessed. Fraction saved vs the table's current
     // compressor, e.g. 0.42 for "42 % smaller". Unset means not measured yet.
     std::optional<double> predicted_gain;

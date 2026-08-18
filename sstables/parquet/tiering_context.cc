@@ -28,10 +28,12 @@ bool schema_is_parquet_eligible(const ::schema&) {
     return true;
 }
 
-size_t estimated_leaf_columns(const ::schema& s) {
-    // One leaf per column, plus the folded __ts, plus the two sparse exception
-    // leaves that appear as soon as any cell timestamp diverges.
-    return s.all_columns().size() + 3;
+// Exact, unlike the leaf count it replaces. The number of Parquet *leaves* a table produces
+// is data-dependent -- per-column deletion and TTL leaves appear in L1 only when cells carry
+// them, which is why the old `columns + 3` estimate read 13 for a table the exporter reports
+// 20 leaves for. C5 is bounded on columns instead, which the schema states outright.
+size_t column_count(const ::schema& s) {
+    return s.all_columns().size();
 }
 
 tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& inputs,
@@ -41,7 +43,7 @@ tiering_inputs make_tiering_inputs(const std::vector<sstables::shared_sstable>& 
     in.bottom_tier = ctx.bottom_tier;
     in.predicted_gain = ctx.predicted_gain;
     in.schema_eligible = schema_is_parquet_eligible(s);
-    in.estimated_leaf_columns = estimated_leaf_columns(s);
+    in.column_count = column_count(s);
 
 
     return in;
