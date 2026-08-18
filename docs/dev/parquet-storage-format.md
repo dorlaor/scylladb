@@ -820,6 +820,24 @@ returns "unknown", which the policy treats as a rejection — **failing to measu
 a reason to convert.** `sstable_parquet_test/test_c6_parquet_gain_is_measured_over_real_data`
 asserts all of that, including determinism, so the decision cannot flap between compactions.
 
+**Observed running, 2026-08-18.** A 2 000-row table created `WITH storage_format='hybrid'` on a
+live node, then flushed and major-compacted. The node logged one decision per compaction:
+
+```
+pqlab.hybrid_probe: hybrid storage_format chose native for this compaction:
+    output 2079 B is below the 268435456 B minimum
+```
+
+Three compactions, three decisions, and the output stayed at version `me`. So the switch runs,
+the policy is consulted per compaction, the criterion that settled it is named with the actual
+numbers, and nothing converted — which is the correct answer for a 2 kB output.
+
+**A limit of that verification worth stating:** C2's 256 MiB floor rejects before any later
+criterion is reached, so a hybrid table cannot exercise C5, C6 or the estimator until it is
+genuinely large. Observing those end to end needs a >256 MiB dataset on this host, which is
+also why C6's estimator is covered by a unit test against a real sstable
+(`test_c6_parquet_gain_is_measured_over_real_data`) rather than through the compaction path.
+
 **What is still missing:**
 
 - **C7 has no data source, and this was investigated rather than assumed (2026-08-18).** The
