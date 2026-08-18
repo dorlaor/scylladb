@@ -169,10 +169,12 @@ round-trip test. Small in lines, large in blast radius.
 
 ## Housekeeping
 
-### 11. Decks — done at v2.5 (2026-08-18)
-Three-criteria policy, eight datasets at the shipped defaults, the three-column ISD variant, and
-a slide deriving delta encoding of timestamps from the encoder. Version appears in the filename
-as well as the title slide.
+### 11. Decks — done at v2.6 (2026-08-19)
+Three-criteria policy, eight datasets at the shipped defaults, the three-column ISD variant, a
+slide deriving delta encoding of timestamps from the encoder, and a slide decomposing the win
+against the **uncompressed** baseline — which is the one a reader is most likely to push back on,
+since it shows Scylla's own compressor doing the larger share on six of seven datasets. Version
+appears in the filename as well as the title slide.
 
 **Backblaze: resolved, and the lesson is about measurement, not the format.** Its ratio appeared
 to swing between 95.4 % and 263.9 %, and it was withheld from v2.4 on that basis. The cause was
