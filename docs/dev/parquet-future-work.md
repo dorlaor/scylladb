@@ -117,10 +117,19 @@ round-trip test. Small in lines, large in blast radius.
 
 ## Housekeeping
 
-### 11. Decks describe seven criteria
-`~/pq-lab/deck_data.py` and the generators still present C1–C7. v2.1 was published before the trim
-to three. Bump to v2.2 when refreshed; the version lives in `~/pq-lab/deck_version.py` and is
-shared by all four generators so they cannot disagree.
+### 11. Decks — done at v2.2 (2026-08-18)
+Refreshed to the three-criteria policy, all eight datasets at current defaults, a new
+three-column ISD variant, and a slide explaining delta encoding of timestamps. The version now
+appears in the **filename** as well as the title slide, so a copy sitting in someone's Downloads
+folder can be identified without opening it.
+
+**Regression found while doing it, and it needs a decision.** The `page_values = 2048` default
+(§10.4f) was chosen on a +6.3 % size cost measured on the perf schema. On the real corpus it costs
+**9–17 %**: ISD-Lite 50.9 % → 59.4 %, NYC TLC 56.8 % → 64.5 %, ClickBench 60.2 % → 65.6 %, and
+**Backblaze 95.9 % → 111.7 %, i.e. from a marginal win to a net loss**. The 1.41× point-read win
+is real but it was priced on one schema. Either revert `page_values` to a size-optimal value and
+give back the latency, or keep it and accept that Parquet loses outright on sparse wide telemetry.
+Not decided here because read-path work is paused; it is a one-line default change either way.
 
 ### 12. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
