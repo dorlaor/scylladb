@@ -1709,13 +1709,36 @@ count: `__ts` plus the two sparse-exception leaves, and one leaf per element for
 size of the win varies by a factor of three and a half, and the ordering is not the ordering
 of table width — D12 has ten CQL columns and wins most; D2 has 197 and wins second least.
 
-**What changed against the earlier mixed table, and why.** Three rows got *worse*. That is
-expected and deliberate: since those figures were taken, the writer stopped dictionary-encoding
-numeric columns by default and started cutting row groups at the configured size instead of
-emitting one row group per dataset. Both trade size for point-read latency, which is this
-format's weakest metric (§10.4c, §10.4d). The numbers below are the price.
+**Two limits on this table, established 2026-08-18 by re-running it.**
 
-- **D2 Backblaze, 50.6 % → 77.3 %.** Mostly the baseline, not us: the *SSTable* fell
+- **It measures single-row-group files, not what Scylla writes to disk.**
+  `scylla sstable parquet-export` accumulates the whole sstable in the shredder and calls
+  `fragment_shredder::to_parquet()`, which emits one row group for everything. The
+  row-group cutting that the storage writer does lives in `pq_writer_impl`, which the export
+  path never enters. Re-running the whole corpus after changing the `row_group_rows` default
+  from 1 000 000 to 5 000 produced **byte-identical Parquet figures**, which is how this was
+  found. Production files are larger by the cutting cost, measured at **+7.4 %** on the
+  perf-test dataset (§10.4c). So every ratio here is optimistic by roughly that much, and the
+  fix is to measure a real `pq` sstable — see below.
+- **Backblaze is not reproducible.** Two runs of `harness.py backblaze realistic --rows 300000`
+  gave SSTable baselines of 22 256 160 and 32 114 511 — a 44 % spread on nominally the same
+  data — and Parquet leaf counts of 199 and 394. The loader samples its rows without a seed, so
+  each run draws a different 300 000 and, because the 195 SMART columns are mostly empty, a
+  different set of *present* columns. On the denser sample Parquet came out at 208 % of the
+  baseline, i.e. it lost outright. Neither Backblaze number should be quoted until the sampler
+  is seeded; the row is kept in the table because the qualitative point (sparse wide telemetry
+  is Parquet's weakest case against a trained dictionary) survives either sample.
+
+**What changed against the earlier mixed table, and why.** Four rows got *worse*, and the cause
+is **numeric dictionaries defaulting off**, not row-group cutting as first written here — the
+export path never cut, as established above. Turning numeric dictionaries off costs size on
+exactly the numeric-heavy datasets that moved most (D5 all-numeric +38 %, D12 all-numeric +12 %,
+D1 +3.7 %), which is the same effect measured at 10.9 % on a numeric time-series table when the
+default was chosen. It buys 10.5 % of point-read latency, which is the trade the format needs
+(§10.4d).
+
+- **D2 Backblaze, 50.6 % → 77.3 %,** and see the reproducibility warning above. Mostly the
+  baseline, not us: the *SSTable* fell
   32 671 140 → 22 256 160, a 32 % improvement, while our Parquet output grew 16 547 521 →
   17 213 883 (+4 %). The trained-dictionary baseline got much better at sparse wide
   telemetry — 195 mostly-empty SMART columns give the dictionary an enormous amount of
@@ -1729,7 +1752,8 @@ format's weakest metric (§10.4c, §10.4d). The numbers below are the price.
   own 18 % growth is not fully attributed and predates this run.
 - **D1 ClickBench, 47.9 % → 50.1 %,** and **D12, 41.8 % → 46.9 %.** Baselines essentially
   unchanged (27 327 989 → 27 103 967; 3 706 438 → 3 707 948); ours grew 3.7 % and 12 %
-  respectively, entirely from row-group cutting and numeric dictionaries.
+  respectively, from numeric dictionaries defaulting off. Both are reproducible to within
+  0.6 % across two runs (D1 13 588 131 twice; D12 1 737 372 / 1 736 838).
 - **D9 GitHub 72.3 % → 67.1 %, D10 HackerNews 91.8 % → 80.7 %, D11 pageviews 93.0 % → 85.0 %.**
   These three were the pyarrow rows, and our writer beats pyarrow on all of them — by 5, 11
   and 8 points — for the reason §10.1g gives: we delta-encode the clustering key and hint
@@ -1760,6 +1784,14 @@ low-cardinality columns win big at any width; near-unique text does not win at a
 This spread is also the argument for measuring C6 rather than predicting it (§6.3): no
 formula over column counts and type widths orders these seven correctly, so the tiering
 decision samples the real data with the real writer instead.
+
+**The measurement this table should be replaced by.** Now that `storage_format` converts on
+compaction (§6.2a), the faithful method needs no export tool at all: load into a table, read the
+native `-Data.db`, `ALTER TABLE ... WITH storage_format = 'parquet'`, major-compact, read the `pq`
+`-Data.db`. That compares production output against production output, includes row-group cutting
+and every other storage-path decision by construction, and cannot drift from what the server does
+because it *is* what the server does. It also needs the Backblaze sampler seeded first, or the
+baseline it compares against will keep moving.
 
 ### 10.1g D12 in detail — and a writer bug it exposed
 
