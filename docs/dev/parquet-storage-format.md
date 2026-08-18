@@ -928,6 +928,21 @@ because a tool that silently does nothing also returns zero.
   120× case by accident.
 - **Flushes are never Parquet**, only compaction outputs. That matches §6 (the bottom tier is
   where the value is) but means a freshly flushed table stays native until it compacts.
+- **Streaming now honours the format, fixed 2026-08-18.** `table::make_streaming_sstable_for_write()`
+  and `make_streaming_staging_sstable()` created sstables without consulting `storage_format`, so
+  everything arriving by stream — repair, bootstrap, decommission, and `nodetool refresh`, which in
+  load-and-stream mode re-streams a snapshot's partitions rather than adopting its files — landed
+  as native on a table declared `'parquet'`. Data was intact; the format silently regressed until
+  natural compaction happened to convert it.
+
+  Found by round-tripping a snapshot: snapshot a `pq` table, truncate, refresh. The rows came back
+  correct and the sstables came back as `me`. Verified fixed by re-running the same round trip —
+  5 000 rows, spot check correct, versions `pq`.
+
+  Only the **explicit** setting is honoured there. `'hybrid'` keeps the native format for streamed
+  data on purpose: it has just arrived, so it is not bottom-tier and C1 would decline it anyway.
+  Writing Parquet for data that is about to be compacted again is the specific thing the tiering
+  policy exists to prevent.
 - ~~**`nodetool upgradesstables` does not force convergence.**~~ **Wrong — verified 2026-08-18:
   it does.** A native table altered to `storage_format = 'parquet'` and then upgraded, with no
   compaction triggered, came out as `pq`. The creator installed in `compact_sstables()` is shared

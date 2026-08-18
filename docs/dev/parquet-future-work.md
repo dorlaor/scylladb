@@ -99,6 +99,14 @@ The operational surface works on `pq` sstables and was checked against a live no
 doc's claim that `upgradesstables` does not force convergence was stale — it does, because the
 sstable creator is shared by the rewrite paths.
 
+**Snapshot and restore round-trip works, and finding out exposed a real bug.** Snapshot captures
+`pq` sstables; truncate-and-refresh returns every row. But `refresh` in load-and-stream mode
+re-streams the partitions rather than adopting the files, and the streaming creators in
+`replica/table.cc` did not consult `storage_format` — so repair, bootstrap, decommission and
+refresh all wrote **native** sstables into a table declared `'parquet'`. Fixed and re-verified by
+the same round trip. `'hybrid'` still streams native by design, since streamed data is not
+bottom-tier.
+
 ---
 
 ## Format gaps

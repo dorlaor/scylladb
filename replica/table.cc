@@ -284,14 +284,37 @@ table::make_mutation_reader(schema_ptr s,
     return rd;
 }
 
+// Everything that arrives by streaming lands here: repair, bootstrap, decommission, and
+// `nodetool refresh` in load-and-stream mode, which re-streams a snapshot's partitions rather
+// than adopting its files. Without consulting storage_format these wrote the preferred *native*
+// version, so a table declared 'parquet' silently accumulated `me` sstables -- data intact, but
+// the format regressed until natural compaction happened to convert it. Found by snapshotting a
+// pq table, truncating, and refreshing: the rows came back correctly and the sstables came back
+// as `me`.
+//
+// Only the explicit setting is honoured. 'hybrid' deliberately keeps the native format here:
+// streamed data is freshly arrived rather than bottom-tier, so C1 would decline it anyway
+// (design doc 6.3), and writing Parquet for data about to be compacted again is the one thing
+// the tiering policy exists to avoid.
+static std::optional<sstables::sstable_version_types> streaming_version_for(const ::schema& s) {
+    if (s.storage_format() == storage_format_type::parquet) {
+        return sstables::sstable_version_types::pq;
+    }
+    return std::nullopt;
+}
+
 sstables::shared_sstable table::make_streaming_sstable_for_write() {
-    auto newtab = make_sstable(sstables::sstable_state::normal);
+    auto v = streaming_version_for(*schema());
+    auto newtab = v ? make_sstable(sstables::sstable_state::normal, *v)
+                    : make_sstable(sstables::sstable_state::normal);
     tlogger.debug("Created sstable for streaming: ks={}, cf={}", schema()->ks_name(), schema()->cf_name());
     return newtab;
 }
 
 sstables::shared_sstable table::make_streaming_staging_sstable() {
-    auto newtab = make_sstable(sstables::sstable_state::staging);
+    auto v = streaming_version_for(*schema());
+    auto newtab = v ? make_sstable(sstables::sstable_state::staging, *v)
+                    : make_sstable(sstables::sstable_state::staging);
     tlogger.debug("Created staging sstable for streaming: ks={}, cf={}", schema()->ks_name(), schema()->cf_name());
     return newtab;
 }
