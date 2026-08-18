@@ -191,7 +191,21 @@ wrong:
    `list(DATA_DIR.glob(...))[0]` — arbitrary glob order. A dropped table's directory can linger,
    so the harness could measure a previous run's leftovers. Now sorted by mtime, newest first.
 
-**The `pq` figures were never affected**, which is the confirmation: `measure_native_vs_pq.sh` has
+**Verified 2026-08-18, and the conclusion inverted.** Two runs after the `table_dir()` fix put lz4
+at 67 531 875 and 67 549 648 — stable to **0.03 %**, so the fix works. But it also showed that the
+59 351 983 figure which had "reproduced exactly" across earlier runs was itself the fossil:
+reproducible precisely because it was the *same stale directory* every time. Reproducibility was
+evidence of the bug, not of correctness.
+
+**Backblaze is now withheld from the deck (v2.4).** The same two guarded runs gave **95.4 %** and
+**263.9 %** on the headline ratio, with lz4 identical between them — so the input data is the same
+and the variance is downstream of it and still unexplained. Four hypotheses have now been tested
+and eliminated: loader nondeterminism (fingerprinted identical in-process), double-counted
+sstables (exactly one, asserted), stale directory (fixed, verified), and swallowed insert errors
+(retries plus a distinct-key assertion). Whatever remains is in the conversion or measurement of
+that one table. Seven datasets are published and the omission is stated on the slide.
+
+**Superseded reasoning below.** The `pq` figures were thought unaffected, which is the confirmation: `measure_native_vs_pq.sh` has
 picked the newest directory and asserted a single sstable since the same bug was found there, and
 its Backblaze `pq` figure is **20 803 872 in every run** — three independent runs, byte-identical
 — while the harness's own logged lines moved. So the deck's 95.8 % stands, and what was unstable
