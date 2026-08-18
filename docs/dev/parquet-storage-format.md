@@ -1914,6 +1914,52 @@ layout has redundancy left to exploit. Reported as measured rather than tidied.
    The format keeps `scylla.folding_level` as its only private metadata and stays
    openable by pyarrow, which `test/boost/sstable_parquet_test.cc` asserts.
 
+### 10.1f-raw Against uncompressed: how much is layout and how much is the compressor
+
+Every ratio in this document compares Parquet against a **trained-dictionary** SSTable, which is
+the right adversary but a hard one. Adding the uncompressed baseline — `sstable_compression: ''`,
+no LZ4, no dictionary — gives the raw serialised volume of the mutation model and separates two
+questions that the single ratio conflates: how much smaller Parquet is than *storing the data at
+all*, and how much of that Scylla's own compressor already achieves.
+
+| Dataset | Raw (uncompressed) | Native (Zstd+dicts) | Parquet (`pq`) | `pq` / raw | native / raw | `pq` / native |
+|---|---:|---:|---:|---:|---:|---:|
+| ISD-Lite, 3 cols | 6 845 109 | 1 428 318 | 483 767 | **7.1 %** | 20.9 % | 33.9 % |
+| ClickBench | 178 778 924 | 27 196 714 | 16 271 864 | **9.1 %** | 15.2 % | 59.8 % |
+| NYC TLC | 33 163 066 | 6 316 348 | 3 589 983 | 10.8 % | 19.0 % | 56.8 % |
+| GitHub Archive | 197 382 026 | 34 139 871 | 23 306 561 | 11.8 % | 17.3 % | 68.3 % |
+| ISD-Lite | 14 801 542 | 3 705 650 | 1 888 666 | 12.8 % | 25.0 % | 51.0 % |
+| Wikipedia pageviews | 10 184 539 | 2 568 339 | 2 300 769 | 22.6 % | 25.2 % | 89.6 % |
+| HackerNews | 47 449 722 | 23 112 165 | 19 028 904 | 40.1 % | 48.7 % | 82.3 % |
+
+**Parquet stores the corpus in 7–40 % of its raw volume**, i.e. it saves 60–93 % against writing
+the data uncompressed. That is the number to quote to someone who has not enabled compression, and
+it is a much larger number than any ratio elsewhere in this document.
+
+**But the interesting column is `native / raw`.** Scylla's trained dictionary already reaches
+15–49 % of raw on its own. So on ClickBench the honest decomposition is: the compressor does
+178.8 MB → 27.2 MB, and the columnar layout does 27.2 MB → 16.3 MB. **Most of the total win is
+compression that Scylla already has**; Parquet's marginal contribution is real but it is the
+smaller half everywhere except the narrow numeric tables.
+
+**The two ends of the corpus say it most clearly.** On the three-column time series the layout
+takes 20.9 % down to 7.1 % — it nearly triples what the compressor achieved, because delta-encoded
+timestamps and a dictionary-coded station key are things a block compressor cannot see (§10.1g).
+On HackerNews it takes 48.7 % to 40.1 %, barely moving, because near-unique text has no structure
+for either mechanism to exploit and the two are competing for the same redundancy.
+
+**Method.** `sstable_compression: ''` disables compression entirely; the harness measures it first
+in its codec sweep so it is the reference point rather than an afterthought. Uncompressed figures
+are the `-Data.db` size of the same table, same rows, rewritten with compression off, read through
+`live_table_dir.py` like every other figure here.
+
+**Backblaze is excluded from the table above**, and this run is why: it produced raw 242 357 583,
+native 32 504 461 and `pq` 84 538 396 — 260.1 % of native. Its `pq` output has been observed in
+two clearly separated states, ~20.8 MB and ~84.5 MB, across runs of the identical command, and the
+directory-selection fixes did not remove the split. Whatever causes it is in the conversion of
+that one table rather than in the measurement, and until it is understood its figures are not
+quotable. See parquet-future-work.md.
+
 ### 10.1f-prod The corpus as ScyllaDB actually writes it (2026-08-18)
 
 **This is the table to quote.** No export tool anywhere in the path

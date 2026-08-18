@@ -189,6 +189,20 @@ to swing between 95.4 % and 263.9 %, and it was withheld from v2.4 on that basis
 Under the id lookup, two consecutive runs give lz4 **byte-identical** at 59 351 983 and pq
 **byte-identical** at 20 803 872, ratio 95.8 % / 95.9 %. Backblaze is restored at 95.8 %.
 
+**Reopened 2026-08-19: the split is real and is in the conversion, not the measurement.** With the
+id-based lookup in place, a corpus run produced raw 242 357 583, native 32 504 461 and `pq`
+84 538 396 — 260.1 % of native — where other runs give `pq` 20 803 872 at 95.8 %. Two clearly
+separated states, ~20.8 MB and ~84.5 MB, from the identical command. The measurement path is now
+exonerated by construction, so the cause is upstream of it.
+
+The best remaining lead is the writer's **leaf set**: with no row-group cut it uses the *derived*
+set, and after a cut it must use the *conservative* one, which on a 197-column sparse table has
+been observed at 394 leaves against 199. Whether a cut happens depends on the shredder's memory
+estimate crossing `row_group_buffer_bytes`, which is close to the threshold for this table — so a
+small variation flips the leaf set and, plausibly, the file size. A forced-path experiment gave
++22.7 % rather than 4x, but it ran through the old mtime lookup and needs redoing under the id
+lookup before it means anything. **Do that before anything else here.**
+
 **Two conclusions I published and then had to withdraw**, worth recording because both were
 confidently argued from a broken selector: that the stable 59 351 983 was a fossil (it was the
 correct value), and that the format produced 4× swings on this table (it never did). A figure
