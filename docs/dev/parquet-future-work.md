@@ -149,67 +149,34 @@ round-trip test. Small in lines, large in blast radius.
 
 ## Housekeeping
 
-### 11. Decks — done at v2.2 (2026-08-18)
-Refreshed to the three-criteria policy, all eight datasets at current defaults, a new
-three-column ISD variant, and a slide explaining delta encoding of timestamps. The version now
-appears in the **filename** as well as the title slide, so a copy sitting in someone's Downloads
-folder can be identified without opening it.
+### 11. Decks — done at v2.5 (2026-08-18)
+Three-criteria policy, eight datasets at the shipped defaults, the three-column ISD variant, and
+a slide deriving delta encoding of timestamps from the encoder. Version appears in the filename
+as well as the title slide.
 
-**Regression found while doing it — now resolved, see below.** Original note kept for the record: The `page_values = 2048` default
-(§10.4f) was chosen on a +6.3 % size cost measured on the perf schema. On the real corpus it costs
-**9–17 %**: ISD-Lite 50.9 % → 59.4 %, NYC TLC 56.8 % → 64.5 %, ClickBench 60.2 % → 65.6 %, and
-**Backblaze 95.9 % → 111.7 %, i.e. from a marginal win to a net loss**. The 1.41× point-read win
-is real but it was priced on one schema. Either revert `page_values` to a size-optimal value and
-give back the latency, or keep it and accept that Parquet loses outright on sparse wide telemetry.
-**Resolved 2026-08-18: reverted to 8 192.** Isolating `page_rows` on current code put the real
-cost at **+16.7 %** on both a narrow numeric and a wide sparse table — 2.5× what the perf schema
-predicted — against a 1.65× point read that leaves the format 20–33× slower than the row format
-regardless. Disk is what Parquet is for. §10.4m has the numbers; the corpus figures in the v2.2
-deck were measured at 2 048 and are therefore pessimistic by about that much, **Re-measured at 8 192 and
-published as v2.3.** The revert reproduced the pre-regression figures exactly — ISD-Lite 50.9 %,
-ClickBench 60.0 %, NYC TLC 56.9 %, GitHub 68.1 % — which is the cleanest possible confirmation
-that `page_values` was the whole of it.
+**Backblaze: resolved, and the lesson is about measurement, not the format.** Its ratio appeared
+to swing between 95.4 % and 263.9 %, and it was withheld from v2.4 on that basis. The cause was
+**directory selection**, through three successive wrong answers:
 
-**New best case: the three-column ISD variant at 33.8 %, i.e. 66.2 % saved.** At 2 048 it read
-42.7 %, so the revert is worth nearly nine points on the dataset that shows the format at its
-best.
+1. `list(glob(...))[0]` — arbitrary order.
+2. Newest by **mtime** — worse, and the one that produced the wild readings. *Removing files from
+   a directory updates that directory's mtime*, so a table being dropped gets a fresh timestamp
+   and beats the newly-created one. The pipeline measured the dying directory.
+3. **Resolved from the table's id** in `system_schema.tables` — exact, since Scylla names the
+   directory `<table>-<id without dashes>`. Now in `live_table_dir.py`, shared by every
+   measurement script.
 
-**Backblaze is not reproducible and is the one figure in the deck not from that batch.** Three
-runs of the identical command produced lz4 sizes of 59.4, 64.5 and 67.5 MB at identical row and
-column counts, and this batch produced a 171.5 % outlier against 95.8 % and 95.9 % from two other
-runs at this setting. lz4 is deterministic for fixed input, so the instability is in the loader,
-not in the writer. The two agreeing figures are used and the deck says so. **Diagnosed 2026-08-18, and the deck figure is sound.** Three hypotheses were tested and two were
-wrong:
+Under the id lookup, two consecutive runs give lz4 **byte-identical** at 59 351 983 and pq
+**byte-identical** at 20 803 872, ratio 95.8 % / 95.9 %. Backblaze is restored at 95.8 %.
 
-1. *The loader is nondeterministic.* **No.** Run twice in one process and fingerprinted, the table
-   is byte-identical: same 197 columns, same 300 000 rows, same value hash.
-2. *An unsettled compaction is being double-counted.* **No.** Two runs that differed by 13.8 % on
-   lz4 each had exactly **one** sstable. (A settle-and-report guard was added to `measure()`
-   anyway, and the sstable count is now printed on every size line, because a byte total alone
-   hides this.)
-3. *`table_dir()` returns the wrong directory.* **Yes.** It was
-   `list(DATA_DIR.glob(...))[0]` — arbitrary glob order. A dropped table's directory can linger,
-   so the harness could measure a previous run's leftovers. Now sorted by mtime, newest first.
+**Two conclusions I published and then had to withdraw**, worth recording because both were
+confidently argued from a broken selector: that the stable 59 351 983 was a fossil (it was the
+correct value), and that the format produced 4× swings on this table (it never did). A figure
+that repeats is not thereby trustworthy, and neither is a figure that varies — both need the
+selector checked first.
 
-**Verified 2026-08-18, and the conclusion inverted.** Two runs after the `table_dir()` fix put lz4
-at 67 531 875 and 67 549 648 — stable to **0.03 %**, so the fix works. But it also showed that the
-59 351 983 figure which had "reproduced exactly" across earlier runs was itself the fossil:
-reproducible precisely because it was the *same stale directory* every time. Reproducibility was
-evidence of the bug, not of correctness.
-
-**Backblaze is now withheld from the deck (v2.4).** The same two guarded runs gave **95.4 %** and
-**263.9 %** on the headline ratio, with lz4 identical between them — so the input data is the same
-and the variance is downstream of it and still unexplained. Four hypotheses have now been tested
-and eliminated: loader nondeterminism (fingerprinted identical in-process), double-counted
-sstables (exactly one, asserted), stale directory (fixed, verified), and swallowed insert errors
-(retries plus a distinct-key assertion). Whatever remains is in the conversion or measurement of
-that one table. Seven datasets are published and the omission is stated on the slide.
-
-**Superseded reasoning below.** The `pq` figures were thought unaffected, which is the confirmation: `measure_native_vs_pq.sh` has
-picked the newest directory and asserted a single sstable since the same bug was found there, and
-its Backblaze `pq` figure is **20 803 872 in every run** — three independent runs, byte-identical
-— while the harness's own logged lines moved. So the deck's 95.8 % stands, and what was unstable
-was the reporting path rather than the format.
+**Unverified as a result:** the row-group-cut leaf-set experiment (+22.7 % for a cut, 69.1 → 84.7
+MB) ran through its own mtime-based lookup and should be redone before it is cited.
 
 ### 12. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
