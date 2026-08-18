@@ -2572,6 +2572,13 @@ compaction_manager::maybe_split_new_sstable(sstables::shared_sstable sst, compac
         // NOTE: preserves the sstable state, since we want the output to be on the same state as the original.
         // For example, if base table has views, it's important that sstable produced by repair will be
         // in the staging state.
+        //
+        // The format is preserved for the same reason the state is: a split rewrites data that is
+        // already in place, so producing native output from a `pq` input would be a silent
+        // downgrade of a table that asked for Parquet.
+        if (t.schema()->storage_format() == storage_format_type::parquet) {
+            return t.make_sstable(sst->state(), sstables::sstable_version_types::pq);
+        }
         return t.make_sstable(sst->state());
     };
     desc.replacer = [&] (compaction_completion_desc d) {

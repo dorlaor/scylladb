@@ -403,6 +403,18 @@ future<> table_populator::process_subdir(sharded<sstables::sstable_directory>& d
     // format than the one we see then we use that.
     auto sst_version = co_await highest_version_seen(directory, sstables::oldest_writable_sstable_format);
     _version_for_reshaping = _global_table->get_sstables_manager().get_safe_sstable_version_for_rewrites(sst_version);
+
+    // get_safe_sstable_version_for_rewrites() picks among the *native* versions from config and
+    // knows nothing about `pq`, so reshard and reshape on load would silently rewrite a Parquet
+    // table's sstables as native. Same class of bug as the streaming creators (see
+    // table::make_streaming_sstable_for_write): a write path that does not go through compaction
+    // and therefore never consulted storage_format.
+    //
+    // Explicit opt-in only, matching everywhere else. 'hybrid' keeps the native choice here
+    // because reshaping happens on load, where nothing is known about tiering yet.
+    if (_global_table->schema()->storage_format() == storage_format_type::parquet) {
+        _version_for_reshaping = sstables::sstable_version_types::pq;
+    }
 }
 
 sstables::shared_sstable make_sstable(replica::table& table, sstables::sstable_state state, sstables::generation_type generation, sstables::sstable_version_types v) {

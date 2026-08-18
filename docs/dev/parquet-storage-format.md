@@ -943,6 +943,23 @@ because a tool that silently does nothing also returns zero.
   data on purpose: it has just arrived, so it is not bottom-tier and C1 would decline it anyway.
   Writing Parquet for data that is about to be compacted again is the specific thing the tiering
   policy exists to prevent.
+- **Every other write path that bypasses compaction, audited 2026-08-18.** The streaming bug was a
+  class, not an instance: any path that creates an sstable *without* going through
+  `compact_sstables()` never consulted `storage_format`. All of them enumerated by grepping for
+  creator assignments rather than by recall:
+
+  | Path | Before | Now |
+  |---|---|---|
+  | streaming / repair / bootstrap / refresh | native | honours `'parquet'` |
+  | reshard and reshape on load | native, via `get_safe_sstable_version_for_rewrites()` which only knows native versions | honours `'parquet'` |
+  | split compaction | native, via `make_sstable(sst->state())` | honours `'parquet'` |
+  | sstable-directory rewrite | already correct — uses `desc.version`, so it preserves the source | unchanged |
+  | memtable flush | native | unchanged, **deliberately** — see above |
+
+  The pattern worth carrying forward: `compact_sstables()` was the only place anyone thought to
+  wire the format, because it is the only place that *chooses* a format. The paths that merely
+  *rewrite* data all defaulted to the node's preferred native version, and each was a silent
+  downgrade of a table that had asked for Parquet.
 - ~~**`nodetool upgradesstables` does not force convergence.**~~ **Wrong — verified 2026-08-18:
   it does.** A native table altered to `storage_format = 'parquet'` and then upgraded, with no
   compaction triggered, came out as `pq`. The creator installed in `compact_sstables()` is shared
