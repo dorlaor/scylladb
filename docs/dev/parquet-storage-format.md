@@ -820,6 +820,15 @@ returns "unknown", which the policy treats as a rejection — **failing to measu
 a reason to convert.** `sstable_parquet_test/test_c6_parquet_gain_is_measured_over_real_data`
 asserts all of that, including determinism, so the decision cannot flap between compactions.
 
+**A precondition on every measurement from now on.** `~/pq-lab/ensure_fresh_node.sh` compares
+the running node's process start time against `build/dev/scylla`'s mtime and restarts it if the
+binary is newer; the three measurement scripts abort if it cannot guarantee a fresh node.
+Replacing a binary does not replace a running process, and this cost real time three times in
+this project — most expensively when the corrected C2 threshold appeared to do nothing because
+the node still held the old one and logged the stale value back. A harness that can silently
+describe code no longer in the tree is worse than no harness. Verified in both directions: it
+reports a fresh node, and after `touch`ing the binary it detects staleness and restarts.
+
 **Observed running, 2026-08-18.** A 2 000-row table created `WITH storage_format='hybrid'` on a
 live node, then flushed and major-compacted. The node logged one decision per compaction:
 
