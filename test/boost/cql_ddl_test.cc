@@ -178,4 +178,46 @@ SEASTAR_TEST_CASE(test_storage_format_converts_on_compaction) {
     });
 }
 
+// Every write path that creates an sstable *without* going through compaction has to honour
+// storage_format, and four of them did not. Streaming, reshape, reshard and split all defaulted
+// to the node's preferred native version, so a table declared 'parquet' silently accumulated
+// native sstables. All four were found by grepping for creator assignments; none was caught by a
+// test, which is what this case is for.
+//
+// The streaming creator is the one reachable from a single-node cql_test_env, and it is also the
+// one an operator hits most often -- repair, bootstrap and `nodetool refresh` in load-and-stream
+// mode all go through it.
+SEASTAR_TEST_CASE(test_storage_format_honoured_by_streaming_writes) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.strm (pk int PRIMARY KEY, v int) "
+                      "WITH storage_format = 'parquet'").get();
+        auto& t = e.local_db().find_column_family("ks", "strm");
+
+        // The creator the streaming path uses, asked directly. Going through an actual repair
+        // needs a second node; the contract being asserted is the creator's, and calling it is
+        // the honest unit of that.
+        auto sst = t.make_streaming_sstable_for_write();
+        BOOST_REQUIRE(sst->get_version() == sstables::sstable_version_types::pq);
+
+        auto staging = t.make_streaming_staging_sstable();
+        BOOST_REQUIRE(staging->get_version() == sstables::sstable_version_types::pq);
+        // Staging is about view building, and must not be lost to the format change.
+        BOOST_REQUIRE(staging->state() == sstables::sstable_state::staging);
+
+        // A table that has not opted in must be untouched: the fix honours an explicit
+        // 'parquet' only, and 'hybrid' deliberately streams native because streamed data has
+        // just arrived and is not bottom-tier.
+        e.execute_cql("CREATE TABLE ks.strm_plain (pk int PRIMARY KEY, v int)").get();
+        auto& p = e.local_db().find_column_family("ks", "strm_plain");
+        BOOST_REQUIRE(p.make_streaming_sstable_for_write()->get_version()
+                      != sstables::sstable_version_types::pq);
+
+        e.execute_cql("CREATE TABLE ks.strm_hybrid (pk int PRIMARY KEY, v int) "
+                      "WITH storage_format = 'hybrid'").get();
+        auto& h = e.local_db().find_column_family("ks", "strm_hybrid");
+        BOOST_REQUIRE(h.make_streaming_sstable_for_write()->get_version()
+                      != sstables::sstable_version_types::pq);
+    });
+}
+
 BOOST_AUTO_TEST_SUITE_END()
