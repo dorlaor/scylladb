@@ -30,6 +30,7 @@
 #include "test/lib/sstable_test_env.hh"
 #include "test/lib/sstable_utils.hh"
 
+#include <map>
 #include "schema/schema_builder.hh"
 #include "sstables/sstables.hh"
 #include "mutation/mutation.hh"
@@ -75,8 +76,18 @@ schema_ptr perf_schema() {
     // because the size cost of a small row group scales with leaf count while the
     // latency benefit does not obviously do so, and open question 15 turns on whether
     // one default can serve both shapes.
+    std::map<sstring, sstring> opts;
     if (const char* e = std::getenv("PQ_PERF_RG_ROWS")) {
-        b.set_parquet_options({{"row_group_rows", sstring(e)}});
+        opts["row_group_rows"] = sstring(e);
+    }
+    // Page size. Worth a knob because it stopped being reachable: the writer uses
+    // min(page_values, row group size), and with row groups cut at 5 000 rows the 8 192
+    // default never binds -- so every point read decodes a whole row group's page.
+    if (const char* e = std::getenv("PQ_PERF_PAGE_ROWS")) {
+        opts["page_rows"] = sstring(e);
+    }
+    if (!opts.empty()) {
+        b.set_parquet_options(std::move(opts));
     }
     return b.build();
 }

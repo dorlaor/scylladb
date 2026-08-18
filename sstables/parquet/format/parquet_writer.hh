@@ -43,11 +43,24 @@ struct page_location {
 struct writer_options {
     codec   compression = codec::zstd;
     int     zstd_level = 3;
-    // Values per data page. Measured trade-off (design doc 10.4): a point read
-    // decodes whole pages, so smaller pages cost size and buy latency --
-    // 1024 -> +7.8 % bytes / 1728 us, 8192 -> +1.9 % / 2151 us, 20000 -> base /
-    // 2836 us. 8192 keeps almost all of the compression for most of the speed.
-    size_t  page_values = 8192;
+    // Values per data page. The writer uses min(page_values, row group size), so this only
+    // bites when it is smaller than the row group -- and at 8 192 against row groups cut at
+    // 5 000 rows (design doc 10.4c) it never did. It was dead in exactly the way
+    // `row_group_rows` was dead before that change: a knob whose value could not reach the
+    // code.
+    //
+    // Re-swept at the current row-group default, 3 000 random point reads (10.4f):
+    //
+    //   page_rows   point p50    size
+    //     8 192      1 158 us    base      (i.e. one page per row group)
+    //     2 048        820 us    +6.3 %
+    //     1 024        839 us    +11.8 %
+    //       256        731 us    +54.9 %
+    //
+    // 2 048 dominates 1 024 -- faster and smaller -- and buys **1.41x on point-read p50 for
+    // 6.3 % of size**, with scan time and scan memory flat. 256 spends 55 % of the file for a
+    // further 12 % of latency, which is the wrong side of the curve.
+    size_t  page_values = 2048;
     bool    use_dictionary = true;
     // Dictionary-encode *numeric* columns too, not just byte_array ones.
     //

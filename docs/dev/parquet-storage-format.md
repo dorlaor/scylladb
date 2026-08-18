@@ -2769,6 +2769,39 @@ size ratio is better than the 0.51–0.96× measured on real datasets (§10.1, �
 generated values repeat more than real ones. The *timing* ratios are the point of this
 table, not the size.
 
+### 10.4f Page size was dead too — and it is worth 1.41x
+
+The writer emits `min(page_values, row group size)` values per page. With `page_values` at 8 192
+and row groups cut at 5 000 rows (§10.4c), the page bound never bound: every data page covered a
+whole row group, so a point read decoded 5 000 values to return one row. The same defect as
+`row_group_rows` before it was changed — a knob whose value could not reach the code — and it went
+unnoticed because fixing the *other* one is what made this one dead.
+
+Re-swept at the current row-group default, 3 000 random point reads, one pinned core:
+
+| `page_rows` | point p50 | point mean | size | Δ size |
+|---:|---:|---:|---:|---:|
+| 8 192 (one page per row group) | 1 158 us | 1 213 us | 1 269 816 | base |
+| **2 048** | **820 us** | **903 us** | 1 349 691 | **+6.3 %** |
+| 1 024 | 839 us | 832 us | 1 419 666 | +11.8 % |
+| 256 | 731 us | 790 us | 1 967 652 | +54.9 % |
+
+**2 048 dominates 1 024** — faster p50 and 5.5 points smaller — so the curve is not monotone in the
+way one would assume, and 1 024 would have been the wrong pick from theory alone. Scan time
+(136-139 ms) and scan memory (~5.6 MB) are flat across the sweep, so this is size against
+point-read latency and nothing else. **Default is now 2 048.**
+
+**Two dead knobs, compounding.** Point-read p50 was 1 915 us with both at their shipped values;
+it is now **820 us** — **2.3x** — for about 14 % of size in total. Neither change required new
+machinery, only noticing that a configured value could not reach the code. Against the native
+format the gap narrows from 62x to roughly 29x on this schema.
+
+**A ceiling on this result.** Dictionary-encoded chunks are still emitted as a single page
+regardless of `page_values`, because the dictionary index stream is produced for the whole chunk
+(`parquet_writer.cc`). The perf schema has two text columns that are dictionary-encoded, so the
+1.41x above is achieved *despite* those columns not being paged at all. Splitting them means
+re-running the index encoder per page, and it is now the largest remaining point-read lever.
+
 ### 10.4e Point-read cost is linear in leaf count — ~90 us per leaf
 
 Measured to choose C5's ceiling. One batch, one pinned core, 1 000 random point reads per
