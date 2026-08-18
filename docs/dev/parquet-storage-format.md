@@ -542,6 +542,8 @@ the main new resource risk and must be designed for, not discovered.
 - Classic Parquet advice (128 MB – 1 GB, sized to an HDFS block) is **wrong for
   Scylla**. Concurrent compactions × shards × row group bytes is the memory bill.
   Proposed default: **64 MiB** uncompressed, with `row_group_rows` default 1 000 000.
+  (Superseded — `row_group_rows` shipped at 1 000 000 and was moved to **5 000** on
+  2026-08-18 once the read cost of a large row group was swept; §10.4c.)
 - Buffering is charged against a dedicated semaphore
   (`parquet_writer_memory_budget`, default a small fraction of shard memory) so that
   compaction back-pressures rather than OOMs.
@@ -591,7 +593,9 @@ budget on its own:
 - `row_group_rows = 1 000 000` is roughly **50× too large** for the current row model: a
   64 MiB shredder budget is about **37 000 rows**. The byte budget would trip first every
   time, which is exactly why §5.5 says "whichever trips first" — the row count is a backstop,
-  not the operative limit.
+  not the operative limit. **Acted on 2026-08-18:** the default is now 5 000, which makes the
+  row count operative and the byte budget the backstop — the sound way round, since the row
+  count is what read cost depends on (§10.4c).
 
 **This also bears on point-read latency.** One row group per sstable means one dictionary page
 per column covering the entire sstable, and a dictionary must be decompressed in full before a
@@ -623,9 +627,11 @@ only cuts a row group slightly early. Validated against measured RSS rather than
 
 The RSS slope is **1 814 B/row** (the intercept is a ≈62 MiB fixed baseline); the estimator
 says **1 887 B/row**. So it is **4 % conservative** — accurate enough to budget on, and wrong
-in the safe direction. At a 64 MiB budget that is **≈35 600 rows per row group**, against the
-declared `row_group_rows` default of 1 000 000, confirming which of the two limits is
-operative.
+in the safe direction. At a 64 MiB budget that is **≈35 600 rows per row group**. When this was
+written the declared `row_group_rows` default was 1 000 000, so the byte budget was the operative
+limit and the row count a dead letter. §10.4c moved the default to **5 000**, which reverses that:
+5 000 rows is about 9 MB of shredder buffer, well under the budget, so the row count now cuts and
+the byte budget is what it should be — a safety net against a pathological partition.
 
 `test_parquet_buffered_bytes_accounting` pins the properties the budget depends on — it counts
 heap and not just the struct, it scales with rows, every row path feeds it including range
@@ -2380,9 +2386,36 @@ size. Scan memory matters as much as latency here: `pq` sits at ~21 MB against t
 **Write and scan throughput are flat across the whole sweep** (546-630 ms and 123-139 ms, noise).
 So this is not a throughput trade at all -- only size against latency and memory.
 
-**Recommended default: 5 000-10 000 rows.** At 5 000 the point read is 2.1x faster and scan memory
-3.9x smaller for +10 % size; at 10 000, 1.7x and 1.9x for +5.5 %. Either is a better bargain than
-caching, and neither adds a cached component or a line of new state.
+**Default changed to 5 000 rows on 2026-08-18.** At 5 000 the point read is 2.1x faster and scan
+memory 3.9x smaller for +10 % size; at 10 000, 1.7x and 1.9x for +5.5 %. Either is a better bargain
+than caching, and neither adds a cached component or a line of new state. 5 000 was chosen because
+it is the measured point rather than an interpolated one, and because going further costs
+disproportionately: 1 000 rows buys another 14 % of latency for another 26 % of size.
+
+**Confirmed against the real binary at the new default** (`sstable_parquet_perf_test`,
+`PQ_PERF_POINTS=10000`, single shard, one core pinned) — the sweep above used 2 000 reads, so this
+re-runs it at the corrected 10 000-read standard of 10.4b:
+
+| Metric | old default (byte-cut, ~35 600 rows) | new default (5 000 rows) | change |
+|---|---:|---:|---|
+| point p50 | 1 915 us | **1 157 us** | 1.65x faster |
+| point mean | 1 967 us | **1 213 us** | 1.62x faster |
+| point p95 | — | 1 479 us | — |
+| scan memory | 20 160 kB | **5 556 kB** | 3.6x smaller |
+| file size | 1 182 530 | 1 269 816 | +7.4 % |
+| scan time | 136 ms | 129 ms | 1.05x faster |
+| write time | 605 ms | 614 ms | flat |
+
+The sweep predicted p50 1 121 us, scan memory 5 620 kB and size 1 271 504 at this setting; the
+binary produced 1 157 us, 5 556 kB and 1 269 816. Within 3 %, 1 % and 0.1 % — so the sweep was
+measuring what it claimed to measure.
+
+**Two secondary results worth recording.** Against the native format on the same data, `pq` is now
+**0.82x scan time and 0.96x write time** — Parquet reads a full scan *faster* than the row format
+and writes it no slower, at 0.318x the size. And the point-read gap narrowed from ~62x to **38.4x
+mean / 41.4x p50**. The p99 ratio is only 6.5x, because the native format's p99 (239 us) is eight
+times its own p50 while Parquet's (1 551 us) is 1.3x — the columnar path is far more predictable,
+it is just uniformly slower.
 
 **A consequence worth stating:** with `row_group_rows` at 5 000, a row group holds about 9 MB of
 shredder buffer, far under the 64 MiB budget -- so the row count becomes the operative limit and

@@ -353,12 +353,17 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
 
     // Accepted values reach the config.
     {
-        pp p{{{pp::ROW_GROUP_ROWS, "5000"},
+        // 7500 rather than the default, so the round-trip below actually proves
+        // something: to_map() records only what differs from the default, so a test
+        // that sets the default value would assert against an absent key. It used to
+        // set 5 000, which stopped being a non-default when 10.4c's sweep moved the
+        // default there.
+        pp p{{{pp::ROW_GROUP_ROWS, "7500"},
               {pp::ROW_GROUP_BUFFER_BYTES, "32MiB"},
               {pp::PAGE_ROWS, "4096"},
               {pp::COMPRESSION, "none"},
               {pp::METADATA_FOLDING, "verbatim"}}};
-        BOOST_REQUIRE_EQUAL(p.config().row_group_rows, 5000u);
+        BOOST_REQUIRE_EQUAL(p.config().row_group_rows, 7500u);
         BOOST_REQUIRE_EQUAL(p.config().row_group_buffer_bytes, 32u * 1024 * 1024);
         BOOST_REQUIRE_EQUAL(p.config().wopt.page_values, 4096u);
         BOOST_REQUIRE(p.config().wopt.compression == pq::format::codec::uncompressed);
@@ -374,9 +379,9 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
 
         // Round-trips through the map form, which is how it is persisted.
         auto m = p.to_map();
-        BOOST_REQUIRE_EQUAL(m[pp::ROW_GROUP_ROWS], "5000");
+        BOOST_REQUIRE_EQUAL(m[pp::ROW_GROUP_ROWS], "7500");
         pp again{m};
-        BOOST_REQUIRE_EQUAL(again.config().row_group_rows, 5000u);
+        BOOST_REQUIRE_EQUAL(again.config().row_group_rows, 7500u);
         BOOST_REQUIRE_EQUAL(again.config().wopt.page_values, 4096u);
         BOOST_REQUIRE(again.config().level == pq::folding_level::verbatim);
     }

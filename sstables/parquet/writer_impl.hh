@@ -50,11 +50,24 @@ struct pq_writer_config {
     // to stop a shard running out of memory (R-13), so it is charged against
     // fragment_shredder::buffered_bytes(), which errs ~4% high on purpose.
     //
-    // `row_group_rows` is the read-granularity knob and currently a backstop, because at
-    // ~1.9 kB/row the byte budget fires roughly 28x sooner. The two serve different
-    // people: bytes protects the shard, rows tunes point-read and scan cost. Both are
-    // exposed for that reason -- see design doc 5.5a and 8.2.
-    size_t row_group_rows         = 1'000'000;
+    // `row_group_rows` is the read-granularity knob, and at 5 000 it is the one that
+    // actually cuts: a row group is then about 9 MB of shredder buffer, far under the
+    // byte budget, which reverts to being purely a safety net against a pathological
+    // partition. That is the right division of labour -- bytes protects the shard, rows
+    // tunes read cost -- and it is the opposite of the original default, where the byte
+    // budget did all the cutting at an incidental ~35 600 rows.
+    //
+    // 5 000 comes from the sweep in design doc 10.4c (20 000 partitions x 5 rows, 2 000
+    // random point reads): against one row group per file it is **2.1x lower point-read
+    // latency and 3.9x less scan memory for +10 % size**, with write and scan throughput
+    // flat across the whole sweep. Point-read latency and resident memory are this
+    // format's two weakest metrics and disk is its strongest, so spending disk on both is
+    // the right direction -- and it buys more than a cache would, without adding a cached
+    // component or a line of new state.
+    //
+    // Going further costs disproportionately: 1 000 rows buys another 14 % of latency for
+    // another 26 % of size. Per-table override via the `parquet` property (5.5a, 8.2).
+    size_t row_group_rows         = 5'000;
     size_t row_group_buffer_bytes = 64u << 20;
 };
 
