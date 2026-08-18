@@ -832,6 +832,25 @@ Three compactions, three decisions, and the output stayed at version `me`. So th
 the policy is consulted per compaction, the criterion that settled it is named with the actual
 numbers, and nothing converted — which is the correct answer for a 2 kB output.
 
+**Converted, and the C6 estimator checked against its own outcome (2026-08-18).** With C2's
+floor corrected (§10.1f-c2), a 300 000-row NOAA ISD-Lite table set to `'hybrid'` and
+major-compacted traversed the whole chain and converted:
+
+```
+pqlab.isd_realistic: hybrid storage_format chose parquet for this compaction:
+    bottom tier, 3713670 B, garbage 0.000, predicted gain 0.540
+```
+
+The output is a single `pq` sstable of 1 802 231 B. Every criterion is accounted for: C1 by
+"bottom tier" (a major compaction), C2 by 3.7 MB against the 256 KiB floor, C4 by a garbage
+fraction of 0.000, C5 silently by 20 leaves against the ceiling of 128, and C6 by a gain the
+estimator **measured on the real data rather than guessed**.
+
+**The estimator predicted 0.540 and the conversion delivered 0.515** — 1 802 231 of 3 713 670 B,
+so 51.5 % saved against 54.0 % predicted. Off by 2.5 points, under 5 % in relative terms, and in
+the optimistic direction. That is the strongest available check on C6: not a unit test against a
+fixture but the estimate compared with what the writer then actually produced from the same data.
+
 **C2's floor is measured per compaction output, not per table, and that makes it far harder to
 reach than table size suggests.** A 298 MB wide table was loaded specifically to get past it. The
 major compaction produced four outputs of 13-26 MB, each of which C2 declined:
