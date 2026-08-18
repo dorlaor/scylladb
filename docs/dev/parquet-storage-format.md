@@ -2579,9 +2579,9 @@ bytes, which would make every format look alike.
 |---|---:|---:|---:|---|---|
 | Write | 580 ms | 609 ms | **1.05×** | ≥ −10 % | **yes** |
 | Full scan | 143 ms | 136 ms | **0.95×** | ≥ parity | **yes** — faster |
-| Point read | 38.8 µs | 2 421 µs | **62×** | ≤ 1.2× | **no** |
+| Point read | 26–136 µs | 1.15–18.3 ms | **44–134×** | ≤ 1.2× | **no** |
 | Data size | 3 994 586 B | 1 275 614 B | **0.32×** | — | — |
-| Peak scan memory | 256 kB | 15 552 kB | 61× | bounded | **yes** — see below |
+| Peak scan memory | 256 kB | 5 548 kB | 22× | bounded | **yes** — see below |
 
 **R-13 (bounded memory) holds on the read path.** Peak *scan* memory against sstable size,
 same schema. The **write** path is a different story and is not bounded at all — see §5.5a:
@@ -2651,10 +2651,17 @@ on whether a table is scanned or probed.
 
 #### The target still missed
 
-Point reads are 62× native against a ≤1.2× target. What remains is inherent to columnar
-layout rather than to this implementation: a point read touches *k* column chunks, and for
-each one it pays a page decode and, where a dictionary is used, a dictionary-page
-decompress — against a row format that reads one contiguous row. Closing the rest of the
+**This row cannot honestly be a single number, and reporting it as one was itself a defect.**
+The point-read ratio is linear in leaf count at ~90 µs per leaf (§10.4e): 44× on a 10-leaf table
+and 134× on a 200-leaf one. Earlier revisions of this table quoted 55×, then 62×, then 78×,
+each time from one schema and one row-group setting, and each time as though it were a property
+of the format. It is a property of the format *and the table*.
+
+The mechanism is inherent to columnar layout rather than to this implementation: a point read
+touches *k* column chunks, and for each one it pays a page decode and, where a dictionary is
+used, a dictionary-page decompress — against a row format that reads one contiguous row. That
+is why the cost tracks *k* so cleanly, and why no amount of caching changes the slope, only the
+intercept. The row-group default (§10.4c) bought 1.65× of the intercept. Closing the rest of the
 gap means caching decoded dictionary and page state across reads, which is what
 parquet-cpp and arrow-rs do and what Scylla's cache tracker exists for; that is a caching
 change, not a format change. Until then the honest statement is 2.4 ms against 39 µs, and
