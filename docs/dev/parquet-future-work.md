@@ -57,6 +57,38 @@ queueing, cap the batch; do not return to serial.
 
 ---
 
+## Size accounting: `pq` sstables report a different unit — **open, and it affects core compaction**
+
+`sstable::data_size()` returns the *uncompressed* data length when a `CompressionInfo` component
+exists, and the file size otherwise. A `pq` sstable has no `CompressionInfo` — Parquet compresses
+internally — so for it `data_size() == ondisk_data_size()`, while a native compressed sstable
+reports several times more than it occupies. `get_compression_ratio()` likewise returns
+`NO_COMPRESSION_RATIO` for `pq`.
+
+**Fixed in this project's own code:** C1's bottom-tier rule compared `data_size()` across
+candidates, which in a hybrid table — where both formats are present by definition — compared
+mixed units. The same data reports several times smaller once converted, so a `pq` sstable would
+never be judged "the largest" and C1 would read false for a bucket that is genuinely the bottom
+tier. Now uses `ondisk_data_size()`. The gain estimator and `make_tiering_inputs()` already did.
+
+**Not fixed, and not this project's code to change lightly:** `size_tiered_compaction_strategy`
+buckets on `data_size()` (`size_tiered_compaction_strategy.cc:133`, `:173`). In a hybrid table a
+converted sstable's reported size drops by the compression factor, so it can fall out of the size
+bucket it belongs to and stop being compacted with its peers. ICS inherits the same bucketing.
+
+Three ways out, none obviously right:
+1. Have `pq` populate an uncompressed length so `data_size()` means the same thing for both. It
+   is computable — the shredder knows its buffered volume — but it means synthesising a
+   `CompressionInfo`-like value for a file that has no Scylla compression.
+2. Change the size-tiered strategies to bucket on `ondisk_data_size()`. Correct in principle and a
+   behaviour change for every existing cluster, so not a Parquet decision.
+3. Accept it and document that hybrid tables should use a strategy that does not bucket by size.
+
+**Whichever is chosen, it should be decided before hybrid mode is used on anything real**, because
+the symptom is silent: compaction simply stops choosing the converted files, and nothing errors.
+
+---
+
 ## Format gaps
 
 ### 5. `DELTA_BYTE_ARRAY` is unimplemented

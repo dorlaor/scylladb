@@ -44,10 +44,16 @@ bool compaction_strategy_impl::inputs_are_bottom_tier(const std::vector<sstables
     if (inputs.empty() || candidates.empty()) {
         return false;
     }
+    // ondisk_data_size(), not data_size(). For a compressed native sstable data_size() is the
+    // *uncompressed* length; for a `pq` sstable, which has no CompressionInfo component because
+    // Parquet compresses internally, it is the file size. Comparing the two mixes units, and in
+    // a hybrid table both formats are present by definition: the same data reports several times
+    // smaller once converted, so a pq sstable would never be judged "the largest" and C1 would
+    // read false for a bucket that is genuinely the bottom tier.
     const auto biggest = std::ranges::max(candidates | std::views::transform(
-            [] (const sstables::shared_sstable& sst) { return sst->data_size(); }));
+            [] (const sstables::shared_sstable& sst) { return sst->ondisk_data_size(); }));
     return std::ranges::any_of(inputs, [biggest] (const sstables::shared_sstable& sst) {
-        return sst->data_size() >= biggest;
+        return sst->ondisk_data_size() >= biggest;
     });
 }
 
