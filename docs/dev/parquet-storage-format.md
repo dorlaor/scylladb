@@ -1359,8 +1359,8 @@ interop (7 fixtures), real V2 level decode vs. writer statistics (684 pages), fu
 (12 714 mutations, 0 crashes).
 **Not done:** page index emission, column/offset index, bloom filters, DELTA_BYTE_ARRAY,
 per-page dictionary index splitting (a dictionary-encoded chunk is currently one page),
-and the seastar-native I/O layer. The writer *can* stream its output as of 2026-08-18
-(`set_sink()`), but the sstable write path does not use it yet — see below.
+and the seastar-native I/O layer proper. The writer streams its output into the Data
+component as of 2026-08-18 (`set_sink()`), so peak write memory is no longer O(output).
 
 **Quantified, 2026-08-18.** `check_image_accumulates()` in `format/test_writer.cc` writes eight
 row groups and measures the buffer against the finished file: **45 103 B of 45 701 B, or 99 %**.
@@ -1396,11 +1396,29 @@ emitting the nine interop fixtures and reading them back with pyarrow, including
 group's `data_page_offset` — the structure most likely to be wrong if a position were computed
 relative to the buffer.
 
-**Still to do: the storage path does not use it yet.** `pq_writer_impl` calls `finish()` and
-receives the whole image (`writer_impl.cc`), so an sstable write still materialises the output.
-Wiring it means giving the sstable's data-file output stream to `set_sink()`, which is a change
-on the Scylla side rather than in the format layer, and the format layer no longer stands in the
-way of it.
+**Storage path wired the same day.** `pq_writer_impl` gives its `_data_writer` to `set_sink()`
+at the first row-group cut, so row groups go into the Data component as they are produced and
+`finish()` returns nothing. Two details made this safe rather than delicate:
+
+- **Nothing downstream depends on where the data lands.** The Parquet index is by *row ordinal*
+  rather than by data-file offset (§5.4, option A), so `finish_open_partition()` and the index
+  bookkeeping can keep running after the bytes are already out. Had the index been offset-based,
+  this ordering would not have worked.
+- **The non-streaming paths are untouched and still needed.** The unit-test sink wants the
+  finished image in one piece, and the no-cut path — where the whole sstable fitted the row-group
+  budget — still materialises, which costs at most one row group by construction.
+
+**Verified on a real conversion.** A 300 000-row NOAA ISD-Lite table converted through the
+server produced a `pq` sstable of **1 802 231 B — the same byte count as the buffered path
+produced before this change**. The native baseline differed between the two runs (3 611 320 vs
+3 713 670, dictionary training is not bit-deterministic), which makes the identical Parquet
+output the stronger result: the Parquet side is a function of the rows, and streaming did not
+perturb it.
+
+What is verified and what is not: correctness end to end, and the memory bound at unit level
+(98 % buffered against 19 % streamed, §7.2 above). The node's resident-memory saving during a
+large compaction is *not* directly measured — that needs RSS sampling against a multi-gigabyte
+conversion, which this host does not have the disk for.
 
 **Why this was not a small change.** `parquet_file_writer` computes every offset it
 records — page locations, column-chunk starts, the OffsetIndex and the footer's own pointers —

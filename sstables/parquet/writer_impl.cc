@@ -700,6 +700,25 @@ void pq_writer_impl::cut_row_group() {
                 format::parquet_file_writer::nested_schema{_ms->tree, std::move(hints)},
                 _pcfg.wopt);
         _pq->add_key_value("scylla.folding_level", to_string(_ms->level));
+
+        // Stream straight into the Data component instead of accumulating the file.
+        // Without this, peak write memory is the whole output -- ~253 MB for a 256 MB
+        // bottom-tier sstable, per concurrent compaction per shard (design doc 7.2).
+        //
+        // Only on the real sstable path. `_sink` is the unit-test route, which wants the
+        // finished image handed back in one piece, and there is no _data_writer at all in
+        // that case.
+        //
+        // Safe to write here even though finish_open_partition() and the index bookkeeping
+        // run later: the Parquet index is by *row ordinal*, not by data-file offset
+        // (section 5.4, option A), so nothing downstream depends on where the data lands.
+        if (_data_writer && !_sink) {
+            _streaming = true;
+            _pq->set_sink([this] (std::span<const uint8_t> bytes) {
+                _data_writer->write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                _pos += bytes.size();
+            });
+        }
     }
     auto data = shred(*_ms, _shredder.columns(), _shredder.rows());
     _pq->add_row_group(data);
@@ -810,11 +829,15 @@ void pq_writer_impl::consume_end_of_stream() {
     std::vector<uint8_t> img;
     if (_pq) {
         cut_row_group();            // the tail
-        img = _pq->finish();
+        img = _pq->finish();        // empty when streaming: already in the Data component
     } else {
+        // No cut ever happened, so the whole sstable fitted the row-group budget and the
+        // image is bounded by it. Materialising here costs at most one row group.
         img = _shredder.to_parquet_for_storage(_pcfg);
     }
-    _pos = img.size();
+    if (!_streaming) {
+        _pos = img.size();          // streaming keeps _pos as it goes
+    }
 
     // A sink is the unit-test path: it lets the whole fragment -> Parquet route be
     // driven without constructing an sstable.
@@ -827,7 +850,9 @@ void pq_writer_impl::consume_end_of_stream() {
     // in a seastar thread (mx::writer relies on the same), so blocking here is
     // allowed.
     finish_open_partition();
-    _data_writer->write(reinterpret_cast<const char*>(img.data()), img.size());
+    if (!_streaming) {
+        _data_writer->write(reinterpret_cast<const char*>(img.data()), img.size());
+    }
     _data_writer->close();
     _sst.write_digest(_data_writer->full_checksum());
     _sst.write_crc(_data_writer->finalize_checksum());

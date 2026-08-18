@@ -194,6 +194,9 @@ private:
     encoding_stats    _enc_stats;
     sink_type         _sink;
     uint64_t          _pos = 0;
+    // True once the file writer is streaming into _data_writer, in which case
+    // consume_end_of_stream must not write the image again -- finish() returns nothing.
+    bool              _streaming = false;
 
     // Partition index. Entries carry a *row ordinal*, not a byte offset -- see
     // design doc 5.4 option A. The reader turns that ordinal into a page via the
