@@ -4184,14 +4184,32 @@ know where its bytes land; it was every path that assumes a local file — the s
 (`sstables/storage.cc` refuses to change the state and generation of one), which is how the local
 path moves sstables out of `upload/`.
 
-**One thing this exposes, and it is not resolved.** On object storage the key is
+**One thing this exposes, and it is now traced rather than left open.** On object storage the key is
 `sstables/<uuid>/Data.db` — the sstable *version is not in the object name*, where locally it is the
-`pq-` filename prefix. §10.9's downgrade safety rests on exactly that prefix: an older node aborts at
-startup because it cannot parse an unknown version in a filename. On object storage there is no such
-filename, so the version must come from elsewhere and the abort may not happen the same way. **The
-downgrade procedure in §10.9 is verified for local storage only.** Whether an older node refuses or
-silently mis-reads an object-storage `pq` sstable is an open question and a blocking one for anyone
-running both features together.
+`pq-` filename prefix. §10.9's downgrade safety rests on that prefix, so the obvious worry was that
+object storage has no equivalent and an older node might silently mis-read rather than refuse.
+
+Traced through the code, the outcome is the same by a different route. The version lives in the
+`version` column of `system.sstables_registry`, and `system_keyspace::sstables_registry_list()` parses
+it with the **same** `sstables::version_from_string()` that the filename path uses — which throws
+`std::out_of_range("Unknown sstable version")` rather than returning a default. That throw is raised
+inside the registry scan during `table_populator::start()`, and `distributed_loader` logs the failure
+and **rethrows everything except `compaction_stopped_exception`**, so population fails rather than
+continuing with a partial file list. An older node should therefore refuse to start on either storage
+type.
+
+**Read, not observed, and the distinction matters.** The local case was verified by planting a file
+with an unknown version prefix and watching the node exit. The object-storage case cannot be provoked
+the same way: the registry is not reachable through CQL (`unconfigured table sstables_registry`), so
+there is nowhere to plant a bogus version without writing to a system table directly.
+`sstable_parquet_test/test_unknown_sstable_version_is_rejected` now pins the shared primitive — every
+known version round-trips, and `zz`, `pqq`, `p`, `""` and `PQ` all throw — because if that ever
+started returning a default instead of throwing, **both** paths would degrade from "refuses to start"
+to "silently mis-reads", which is the difference between a safe downgrade and data loss.
+
+What would settle it end to end: an error-injection point in the registry scan, or a build with `pq`
+removed from `version_string` reading a bucket written by this one. Until then §10.9's procedure is
+observed for local storage and reasoned for object storage.
 
 ### 10.5 Decision log
 

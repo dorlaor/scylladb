@@ -1503,3 +1503,36 @@ SEASTAR_THREAD_TEST_CASE(test_twcs_hybrid_is_parquet_for_the_whole_table) {
     BOOST_REQUIRE(!unconditional(build(storage_format_type::sstable, ct::time_window)));
     BOOST_REQUIRE(!unconditional(build(storage_format_type::sstable, ct::incremental)));
 }
+
+// An unknown sstable version must be an error, not a silently skipped file.
+//
+// This is the primitive that two different downgrade-safety paths rest on, which is why it is worth a
+// test of its own rather than being left implicit:
+//
+//   * **Local storage** puts the version in the filename, so `parse_path()` fails on an unrecognised
+//     prefix and `sstable_directory` turns that into a malformed-sstable exception that aborts boot.
+//     Observed directly: a file with an unknown version prefix planted in a live table directory made
+//     the node exit with "malformed sstable error (aborting): invalid version" (design doc 10.9).
+//   * **Object storage** has no filename -- the key is `sstables/<uuid>/Data.db` -- so the version
+//     comes from the `version` column of `system.sstables_registry`, and
+//     `system_keyspace::sstables_registry_list()` calls the same `version_from_string()` while
+//     scanning it. That throw propagates through `table_populator::start()`, which logs and rethrows
+//     everything except `compaction_stopped_exception`, so population fails.
+//
+// The end-to-end object-storage case has *not* been observed: the registry is not queryable through
+// CQL ("unconfigured table sstables_registry"), so a bogus version cannot be planted the way the
+// local file could be. What is asserted here is the shared primitive -- if this ever started
+// returning a default instead of throwing, both paths would degrade from "refuses to start" to
+// "silently mis-reads", and that is the difference between a safe downgrade and data loss.
+SEASTAR_THREAD_TEST_CASE(test_unknown_sstable_version_is_rejected) {
+    // Every version this build knows must round-trip, `pq` included -- otherwise the negative case
+    // below could pass simply because the map is empty.
+    for (const char* v : {"ka", "la", "mc", "md", "me", "ms", "mt", "pq"}) {
+        auto parsed = sstables::version_from_string(v);
+        BOOST_REQUIRE_EQUAL(fmt::to_string(parsed), std::string(v));
+    }
+    // And anything else throws. "zz" stands in for what `pq` looks like to a binary that predates it.
+    for (const char* bad : {"zz", "pqq", "p", "", "PQ"}) {
+        BOOST_REQUIRE_THROW(sstables::version_from_string(bad), std::out_of_range);
+    }
+}
