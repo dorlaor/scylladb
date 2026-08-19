@@ -24,6 +24,7 @@
 
 #include <seastar/testing/thread_test_case.hh>
 #include <seastar/core/memory.hh>
+#include <seastar/core/format.hh>
 
 #include <algorithm>
 #include <cstdlib>
@@ -214,7 +215,25 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
     sstables::test_env::do_with_async([] (sstables::test_env& env) {
         auto s = perf_schema();
 
-        const int n_part = 20'000;
+        // Sized for CI by default, and scaled up by env var for measurement.
+        //
+        // This test is enrolled in the standard boost suite (configure.py), so it runs on every
+        // CI invocation -- and at the sizes every figure in section 10.4 was measured with
+        // (20 000 partitions, 10 000 point reads) it is minutes of runtime for numbers nobody
+        // reads on a shared runner. It asserts nothing about latency, so it cannot fail on a
+        // loaded machine; it can only be slow. Small default, big when asked:
+        //
+        //   PQ_PERF_PARTITIONS=20000 PQ_PERF_POINTS=10000 ./sstable_parquet_perf_test -c1 -m2G
+        //
+        // which is what width_curve.sh and any figure quoted in section 10.4 must use. The
+        // small default is a smoke test of both writers and the point-read path; it is not a
+        // measurement, and its numbers should not be quoted.
+        const int n_part = [] {
+            if (const char* e = std::getenv("PQ_PERF_PARTITIONS")) {
+                return int(std::max(1L, std::atol(e)));
+            }
+            return 2'000;
+        }();
         const int n_rows = 5;
         auto muts = gen(s, n_part, n_rows);
 
@@ -231,7 +250,7 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
             if (const char* e = std::getenv("PQ_PERF_POINTS")) {
                 return size_t(std::max(1L, std::atol(e)));
             }
-            return size_t(10000);
+            return size_t(1000);   // see PQ_PERF_PARTITIONS above
         }();
         std::vector<size_t> point_idx(muts.size());
         for (size_t i = 0; i < muts.size(); ++i) { point_idx[i] = i; }
@@ -327,9 +346,23 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_scan_memory_scaling) {
             (n_part == 4'000 ? small_peak : large_peak) = peak;
         }
         if (small_peak > 0) {
+            const double growth = double(large_peak) / double(small_peak);
             std::printf("  8x the rows cost %.2fx the peak scan memory "
-                        "(bounded would be ~1x)\n\n",
-                        double(large_peak) / double(small_peak));
+                        "(bounded would be ~1x)\n\n", growth);
+            // R-13 is a requirement, so assert it rather than print it. This block measured the
+            // ratio and then discarded it, which means a reader that started materialising the
+            // whole file would have gone green and simply printed 8.0x -- exactly the regression
+            // the test exists to catch.
+            //
+            // The bound is 3x, not 1.5x. A bounded reader is ~1x, but "peak allocated during the
+            // scan" also picks up per-partition churn and allocator granularity at two quite
+            // different file sizes, so the floor is noisy at these sizes. 3x is comfortably above
+            // that noise and far below the ~8x that tracking the file would produce, which is the
+            // only failure mode worth catching here.
+            BOOST_REQUIRE_MESSAGE(growth < 3.0,
+                    seastar::format("R-13: peak scan memory grew {:.2f}x for 8x the rows "
+                                    "({} -> {} bytes); a bounded reader is ~1x, so the reader is "
+                                    "materialising the sstable", growth, small_peak, large_peak));
         }
     }).get();
 }
