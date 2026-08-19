@@ -29,6 +29,7 @@
 #include "sstables/shared_sstable.hh"
 #include "sstables/sstable_set.hh"
 #include "sstables/sstables.hh"
+#include "sstables/parquet/tiering_context.hh"
 #include "sstables/sstables_manager.hh"
 #include "db/schema_tables.hh"
 #include "db/snapshot/manifest.hh"
@@ -292,12 +293,16 @@ table::make_mutation_reader(schema_ptr s,
 // pq table, truncating, and refreshing: the rows came back correctly and the sstables came back
 // as `me`.
 //
-// Only the explicit setting is honoured. 'hybrid' deliberately keeps the native format here:
-// streamed data is freshly arrived rather than bottom-tier, so C1 would decline it anyway
-// (design doc 6.3), and writing Parquet for data about to be compacted again is the one thing
-// the tiering policy exists to avoid.
+// 'hybrid' on a size-tiered table keeps the native format here: streamed data is freshly arrived
+// rather than bottom-tier, so C1 would decline it anyway (design doc 6.3), and writing Parquet for
+// data about to be compacted again is the one thing the tiering policy exists to avoid.
+//
+// 'hybrid' on a TWCS table does not: there, hybrid means parquet outright, because TWCS has no
+// rewritten levels for the policy to protect (design doc 6.4). Both cases come from
+// writes_parquet_unconditionally() rather than being decided here, so that streaming, flush and
+// compaction cannot drift apart.
 static std::optional<sstables::sstable_version_types> streaming_version_for(const ::schema& s) {
-    if (s.storage_format() == storage_format_type::parquet) {
+    if (sstables::parquet::writes_parquet_unconditionally(s)) {
         return sstables::sstable_version_types::pq;
     }
     return std::nullopt;
@@ -515,8 +520,28 @@ static bool belongs_to_other_shard(const std::vector<shard_id>& shards) {
     return shards.size() != size_t(belongs_to_current_shard(shards));
 }
 
+// The version-less overload, used by memtable flush among others.
+//
+// It used to return the preferred *native* version unconditionally, so a table declared 'parquet'
+// flushed native sstables and relied on a later compaction to convert them. That is fine on a
+// size-tiered strategy, where everything gets recompacted anyway -- and it is not fine on TWCS.
+//
+// Measured (`~/pq-lab/twcs_converge.py`, design doc 10.7): a TWCS table with 3 M rows over 25 daily
+// windows, left entirely to automatic compaction, settled at **21 native sstables against 5
+// Parquet** and stayed there. The reason is structural rather than a timing artefact: TWCS's
+// per-window major needs two sstables in the window and its size-tiered fallback needs
+// `min_compaction_threshold`, so a closed window holding exactly *one* sstable is terminal -- there
+// is nothing to merge, compaction correctly never runs again, and the file keeps whatever format it
+// was flushed in. Under a write-side-conversion design that means never Parquet.
+//
+// So a table that writes Parquet unconditionally flushes Parquet. That is what makes "the whole
+// table is Parquet" true without operator action, and it removes a native-to-Parquet rewrite of
+// every flush as a side effect.
 sstables::shared_sstable table::make_sstable(sstables::sstable_state state) {
     auto& sstm = get_sstables_manager();
+    if (sstables::parquet::writes_parquet_unconditionally(*_schema)) {
+        return make_sstable(state, sstables::sstable_version_types::pq);
+    }
     return make_sstable(state, sstm.get_preferred_sstable_version());
 }
 

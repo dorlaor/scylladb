@@ -428,6 +428,22 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
         write_parquet = true;
         break;
     case storage_format_type::hybrid: {
+        // TWCS makes the hybrid decision unnecessary rather than merely easy. The criteria exist to
+        // keep Parquet out of the levels that get rewritten -- re-encoding and recompressing a
+        // Parquet run is the expensive thing this format does -- and TWCS has no such levels: a
+        // window is compacted and then closed. So under TWCS, hybrid means the same thing as
+        // 'parquet', and the whole table is Parquet (design doc 6.4).
+        //
+        // Skipping the policy also skips C6's data sample, which is by far the most expensive part
+        // of the decision. It also skips the check that catches a schema Parquet stores *worse*
+        // than the row format; `storage_format = 'sstable'` is the escape hatch for that.
+        if (sstables::parquet::writes_parquet_unconditionally(*t.schema())) {
+            write_parquet = true;
+            cmlog.debug("{}.{}: hybrid storage_format resolves to parquet unconditionally under {}",
+                        t.schema()->ks_name(), t.schema()->cf_name(),
+                        compaction::compaction_strategy::name(t.schema()->compaction_strategy()));
+            break;
+        }
         auto ctx = descriptor.parquet_ctx;
         // Two evaluations of the same policy. The first supplies a fake passing gain
         // so that only C1-C5 are exercised: there is no point sampling data for a
@@ -450,6 +466,31 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
                    write_parquet ? "parquet" : "native", decision.reason);
         break;
     }
+    }
+
+    // Only ICS and TWCS are in scope for the Parquet format (design doc section 6.4): ICS because
+    // run fragmentation bounds the rewrite unit that Parquet makes expensive, TWCS because a closed
+    // window answers C1 exactly and never needs rewriting at all. STCS and LCS will produce correct
+    // Parquet -- nothing here is format-specific -- but neither is measured or validated, and STCS
+    // in particular rewrites a whole size tier, which is the access pattern this format handles
+    // worst. Say so once rather than either refusing (the output would be correct) or staying quiet
+    // (the operator would have no way to learn they are outside what was tested).
+    if (write_parquet) {
+        switch (t.schema()->compaction_strategy()) {
+        case compaction::compaction_strategy_type::incremental:
+        case compaction::compaction_strategy_type::time_window:
+            break;
+        default:
+            static thread_local seastar::logger::rate_limit unsupported_strategy_rl{std::chrono::minutes(10)};
+            cmlog.log(log_level::warn, unsupported_strategy_rl,
+                      "{}.{}: writing Parquet under {} compaction. Only IncrementalCompactionStrategy "
+                      "and TimeWindowCompactionStrategy are supported for the parquet storage format; "
+                      "TWCS is recommended when the clustering key is a timestamp. The output is "
+                      "valid, but this combination is not validated.",
+                      t.schema()->ks_name(), t.schema()->cf_name(),
+                      compaction::compaction_strategy::name(t.schema()->compaction_strategy()));
+            break;
+        }
     }
 
     descriptor.creator = [&t, write_parquet] (shard_id) {

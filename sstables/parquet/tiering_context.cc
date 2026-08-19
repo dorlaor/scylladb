@@ -28,6 +28,23 @@ bool schema_is_parquet_eligible(const ::schema&) {
     return true;
 }
 
+// The rule, in one place. Compaction, memtable flush and streaming all ask this; if any of them
+// answered differently the table would never converge -- flushes would keep adding files in a
+// format that compaction keeps converting, or the reverse.
+bool writes_parquet_unconditionally(const ::schema& s) {
+    switch (s.storage_format()) {
+    case storage_format_type::parquet:
+        return true;
+    case storage_format_type::hybrid:
+        // TWCS has no rewritten levels for hybrid tiering to protect, so hybrid means parquet
+        // there. See the header for the trade this makes.
+        return s.compaction_strategy() == compaction::compaction_strategy_type::time_window;
+    case storage_format_type::sstable:
+        return false;
+    }
+    return false;
+}
+
 // Exact, unlike the leaf count it replaces. The number of Parquet *leaves* a table produces
 // is data-dependent -- per-column deletion and TTL leaves appear in L1 only when cells carry
 // them, which is why the old `columns + 3` estimate read 13 for a table the exporter reports
