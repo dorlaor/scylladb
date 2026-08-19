@@ -300,42 +300,35 @@ which term binds depends on row *density*, not column count (§10.1f-rg). On den
 byte budget binds and the row count is inert. Harder than it looks: this budget exists to stop a
 shard OOMing (R-13), so it cannot simply be raised for size.
 
-### 10. C7: instrumentation landed, criterion still unjustified — and the old note was wrong
+### 10. ~~C7, the read-pattern gate~~ — dropped 2026-08-19, not deferred
 
-**The note this replaces claimed "no counter separates point reads from scans". That is false**, and it
-took one look at the metrics endpoint to disprove: `scylla_sstables_single_partition_reads`,
-`scylla_sstables_range_partition_reads` and `scylla_cql_select_partition_range_scan` all already exist
-and all already make the distinction. What is actually missing is **attribution to a table** — every
-one of them is per shard, and C7 is a per-table decision. A much narrower gap than the note described,
-and worth correcting because the note would have sent someone off to build what already exists.
+The criterion: refuse converting a table to Parquet when it is mostly point-read, however well it
+would compress. Removed from the policy 2026-08-18 because nothing could answer "is this table
+point-read dominated"; **now removed as a requirement too**, and the order of events is the point.
 
-**Landed:** `single_partition_reads` and `range_scan_reads` on `replica::table`'s stats, incremented in
-`table::query()` — the last place that still knows which kind of query it is, before the partition
-ranges are consumed. A read counts as a point read when *every* range it was given is singular, because
-a coordinator may batch several named partitions into one call and that is still N lookups rather than
-a sweep.
+The input problem was solved first. Per-table `single_partition_reads` and `range_scan_reads` counters
+are landed and verified across five query shapes (§10.14), so "there is no data source" stopped being
+true. Also worth recording: the old claim that *no* counter separated point reads from scans was too
+strong — `scylla_sstables_single_partition_reads`, `scylla_sstables_range_partition_reads` and
+`scylla_cql_select_partition_range_scan` all already did, per shard. The real gap was per-table
+attribution, and it is closed.
 
-Verified rather than assumed (`c7_counters.py`): single-partition SELECT and point-row SELECT move only
-the point counter, full scans and token-range scans move only the scan counter, and `IN` over two
-partitions moves the point counter by two — the unit is table-level query invocations, not CQL
-statements, which is the right granularity for a read-mix ratio. Also note `live_scanned` remains an
-unpopulated stub; nothing here uses it.
+And the criterion was dropped anyway, because having the input is not evidence that it decides better
+than what is already there. **C5's column ceiling is the answer rather than a stand-in**: past 128
+columns a table is too slow to point-read as Parquet whatever it saves, derived from the ~90 µs per
+leaf measurement. Its known error is a false *negative* — declining a wide table that is only ever
+scanned, the case Parquet is fastest at. C7 would fix that and add a false positive of its own, since
+read mix is measured over a window and a table's mix changes, so it would convert on last week's
+traffic. A conservative error that leaves data in the row format beats an optimistic one that rewrites
+a table into the wrong format for its present workload.
 
-Two traps hit while doing it, both recorded because they cost real time:
-- `table::set_metrics()` has **two** parallel `add_group("column_family")` registrations, and the
-  per-keyspace one is gated on `enable_keyspace_column_family_metrics`, which is **off by default**. A
-  counter registered only there is invisible on a stock node. The tell was that `memtable_switch`, in
-  the same block, was equally absent while `memtable_partition_hits` — registered in both — appeared.
-- `read_latency_count` moving proved the increment site was executing, which is what ruled out the
-  increment and pointed at registration. Worth remembering as a way to bisect a missing metric.
+**What an operator does instead:** `storage_format = 'parquet'` is taken at face value and bypasses the
+criteria, so a wide scan-only table is one `ALTER` away from conversion by someone who knows what the
+policy cannot. The new counters exist to inform that judgement. A person saying "this table is only
+scanned" is better evidence than a window of counter samples.
 
-**Still not justified as a criterion, and deliberately not added.** The standing rule is that a
-criterion arrives with a measurement rather than a rationale. The measurement C7 needs is whether the
-read mix identifies tables that C5's column ceiling gets wrong in *either* direction — a wide
-scan-only table that C5 refuses and should not, or a narrow point-read-heavy table that C5 admits and
-should not. The second half of that is a point-read latency measurement, which is out of scope for now
-by instruction. So the counters are landed as telemetry, C5 remains the stand-in, and C7 stays open
-with a precise statement of what would settle it rather than a vague one.
+The counters stay regardless of C7: per-table read shape is useful telemetry on its own, and it is what
+makes the manual decision above an informed one.
 
 ---
 

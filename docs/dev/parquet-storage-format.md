@@ -981,32 +981,24 @@ evidence both are right.
 
 **What is still missing:**
 
-- **C7 has no data source, and this was investigated rather than assumed (2026-08-18).** The
-  criterion and its tests exist and `tiering_mode::adaptive` consults it, but nothing can answer
-  "is this table point-read dominated". What was checked:
+- **C7's missing data source: investigated 2026-08-18, solved 2026-08-19, criterion dropped anyway.**
+  The original finding was that nothing could answer "is this table point-read dominated":
+  `replica::table_stats` had no counter separating single-partition reads from range scans (`reads` is
+  a latency histogram over all reads — the count is there, the shape is not), and `live_scanned`, the
+  obvious proxy, is **exposed through the REST API and `nodetool tablehistograms` and incremented
+  nowhere in the tree**, so a proxy built on it would have silently reported zero — "not point-read
+  dominated" — and converted exactly the tables the criterion existed to protect.
 
-  - `replica::table_stats` has no counter separating single-partition reads from range scans.
-    `reads` is a latency histogram over all reads; the count is there, the shape is not.
-  - The counter that would have served is `live_scanned` — rows touched per read, which is a
-    sound proxy, since a point read resolves one partition and a scan touches many. It is
-    **exposed through the REST API and `nodetool tablehistograms` and never incremented
-    anywhere in the tree**: a Cassandra-compatibility stub with no write site. A proxy built on
-    it would have silently reported zero.
-  - `'auto'` is still rejected by CQL, so adaptive mode has no caller either way.
+  Two corrections since. First, the sweeping form of that claim was wrong: `scylla_sstables_single_partition_reads`,
+  `scylla_sstables_range_partition_reads` and `scylla_cql_select_partition_range_scan` all exist and
+  all make the distinction — they are merely per *shard*, where a per-table decision needs per-table
+  numbers. Second, that gap has since been closed: `single_partition_reads` and `range_scan_reads` are
+  now per-table counters (§10.14). `live_scanned` remains an unpopulated stub and nothing uses it.
 
-  So C7 costs **new read-path instrumentation**, not plumbing: two counters incremented where
-  single-partition and range queries enter `replica::table`, exposed through
-  `compaction_group_view`, plus a `storage_format = 'auto'` enum value with its persistence and
-  round-trip test. That is small in lines and large in blast radius — it puts a compaction
-  heuristic's accounting on the read path.
-
-  **Worth reconsidering on the strength of §10.1f-rg.** C7 was previously the least consequential
-  criterion; the 85–120× point-read penalty measured on a 199-leaf table makes it the
-  best-justified one. A wide table on a point-read path should be refused conversion however well
-  it compresses, and no other criterion expresses that. An interim measure that needs no
-  instrumentation: refuse conversion above a leaf-count threshold outright, which C5 already has
-  the shape for — that trades a false negative on wide scan-only tables for never hitting the
-  120× case by accident.
+  So the instrumentation objection no longer applies, and **C7 was still dropped** — see §6.3. Having
+  the input is not the same as having evidence that the criterion decides better than C5's column
+  ceiling, and the standing rule is that a criterion arrives with a measurement rather than a
+  rationale.
 - **Flushes are never Parquet**, only compaction outputs. That matches §6 (the bottom tier is
   where the value is) but means a freshly flushed table stays native until it compacts.
 - **Streaming now honours the format, fixed 2026-08-18.** `table::make_streaming_sstable_for_write()`
@@ -1133,15 +1125,32 @@ measure.** Implemented in `sstables/parquet/gain_estimator.cc`; see §6.2a for h
 and §10.1f for why no formula would do — the corpus spans 0.47× to 0.85× with the same
 folding and the same codec.
 
-**C7 — Removed from the policy 2026-08-18, kept as a design note.** A read-pattern gate is the
-right idea and cannot be evaluated: Scylla has no counter separating point reads from scans, and
-`live_scanned`, which would have served, is an unpopulated Cassandra-compatibility stub (§6.2a).
-Leaving it in the policy meant carrying a branch that could never fire, plus a whole
-`tiering_mode` enum whose `adaptive` value existed only to reach it. **C5's leaf ceiling is the
-stand-in**, and unlike C7 it is derived from measurement: point-read cost is linear in leaf count
-at ~90 µs each, so past 128 leaves a table is too slow to point-read as Parquet however well it
-compresses (§10.4e). Cruder than C7 — it declines a wide table that is only ever scanned, which
-is the case where Parquet is *fastest* — and that is the trade until the read path can answer.
+**C7 — dropped, 2026-08-19. Not deferred: dropped.** A read-pattern gate — refuse conversion when a
+table is mostly point-read, however well it would compress — was removed from the policy on
+2026-08-18 because nothing could answer "is this table point-read dominated". It is now removed as a
+*requirement* as well, and the reasoning is worth stating because the input problem was subsequently
+solved and the criterion still did not earn its place.
+
+Per-table `single_partition_reads` and `range_scan_reads` counters exist (§10.14), so the original
+objection no longer holds. What does not exist is a measurement showing the criterion would decide
+better than what is already there. **C5's column ceiling is the answer, not a stand-in**: point-read
+cost is linear in leaf count at ~90 µs each, so past 128 columns a table is too slow to point-read as
+Parquet however well it compresses (§10.4e), and that is derived from measurement rather than from a
+guess about workloads.
+
+C5's known error is a false *negative* — it declines a wide table that is only ever scanned, the case
+where Parquet is fastest. C7 would fix that, and would introduce a false positive of its own: read
+mix is measured over a window and a table's mix changes, so a criterion built on it converts on last
+week's traffic. Between a conservative error that leaves data in the row format and an optimistic one
+that rewrites a table into the wrong format for its present workload, the conservative error is the
+one to keep.
+
+**What replaces it for an operator who knows their workload is scan-only.** `storage_format =
+'parquet'` is taken at face value and overrides the criteria entirely (§6.2a) — so a wide scan-only
+table is one `ALTER` away from being converted, deliberately, by someone who knows something the
+policy cannot. The counters are there to inform that judgement. An automatic criterion is not needed
+to reach the same outcome, and an operator saying "this table is scanned" is better evidence than a
+window of counter samples.
 
 
 
@@ -2410,8 +2419,9 @@ is much worse than the 38x measured on the narrow schema, and the mechanism is o
 stated: a point read has to locate and decode a page in **every** column chunk it projects, so the
 cost scales with width, while the row format reads one contiguous row. **The practical conclusion
 is a scope limit, not a tuning problem: wide Parquet tables must not be on a point-read path.**
-That is what C7 exists to express (§6.3), and it is now the criterion with the strongest measured
-justification and still no data source.
+C5's column ceiling is what enforces it (§6.3). The read-pattern criterion that would have expressed
+it directly, C7, was dropped rather than built: the counters it needed now exist, and it still could
+not be shown to decide better than the ceiling.
 
 **Superseded framing below.** What the narrow arm shows is that the size cost of a small
 row group is small when leaves are few, which is consistent with the leaf-count hypothesis but
@@ -3225,9 +3235,12 @@ parquet-cpp and arrow-rs do and what Scylla's cache tracker exists for; that is 
 change, not a format change. Until then the honest statement is 2.4 ms against 39 µs, and
 §4's promise of p99 ≤ 1.2× does not hold for cold point reads.
 
-This is also the strongest argument for the hybrid design in §5.6: point-read-heavy tables
-stay on SSTables, and criterion C7 already refuses conversion when a table is
-point-read-dominated.
+This is also the strongest argument for the hybrid design in §5.6: point-read-heavy tables should
+stay on SSTables. Note that **nothing refuses them automatically** — an earlier version of this
+paragraph claimed criterion C7 did, which was never true after C7 left the policy and is not true
+now that it has been dropped outright (§6.3). What enforces the scope limit is C5's column ceiling,
+which catches wide tables and not narrow point-read-heavy ones; for those, the protection is that
+`'hybrid'` on an ICS table still has to pass C6, and that an operator can set `'sstable'`.
 
 Threats to validity: single shard, warm page cache, one synthetic schema, and the 0.32×
 size ratio is better than the 0.34–0.96× measured on real datasets (§10.1, §10.1f-prod) because
@@ -3589,12 +3602,14 @@ latency. `max_leaf_columns` is therefore now derived from a budget rather than p
 corpus it admits everything that saves meaningfully (ClickBench, 110 leaves, 40 % saved) and
 excludes only Backblaze (200 leaves, 4 % saved, 134x point reads).
 
-**What this is really standing in for.** C5 is a schema-eligibility gate; the criterion that
-ought to refuse a wide table is C7, and C7 cannot be evaluated because Scylla has no counter
-separating point reads from scans (§6.2a). Refusing on width alone is strictly cruder — it
-declines a wide table that is only ever scanned, and a scan is the case where Parquet is
-*fastest* (0.82x the native format, §10.4c). That false negative is the price of not
-instrumenting the read path, and it is worth paying at 134x.
+**What this is really standing in for.** C5 refuses on width, where the property that actually
+matters is access pattern. When this was written the read path could not answer, so the width proxy
+was all there was; per-table point-read and scan counters now exist (§10.14) and the proxy was kept
+anyway, because nothing showed a read-mix criterion deciding better (§6.3). Refusing on width alone
+is cruder — it declines a wide table that is only ever scanned, and a scan is where Parquet is
+*fastest* (0.82x the native format, §10.4c). That false negative is now a deliberate choice rather
+than a limitation: it errs towards leaving data in the row format, and at 134x on the worst shape
+that is the error to prefer. An operator who knows better sets `storage_format = 'parquet'`.
 
 ### 10.4c Row-group size is the cheap lever — swept 2026-08-17
 
@@ -4792,7 +4807,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done** | Specified in §10.9, and the behaviour it rests on is observed: an older node *aborts at startup* on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
 | `DELTA_BYTE_ARRAY` | open | Unimplemented; text falls back to dictionary or plain. |
-| C7 / point-read awareness | open | Cannot be evaluated — no counter separates point reads from scans. C5's column ceiling is the stand-in. |
+
 
 **The honest summary.** The functionality is built and, where the claim is behavioural, verified on a
 running node rather than only in a unit test. What is left is narrower than it was: one measurement
