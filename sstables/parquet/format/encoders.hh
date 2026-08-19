@@ -163,6 +163,60 @@ inline void encode_delta_binary_packed(std::vector<uint8_t>& out,
     delta_binary_packed_encoder(out).encode(vals);
 }
 
+// ---------------------------------------------------------------- DELTA_LENGTH_BYTE_ARRAY
+// Lengths as one DELTA_BINARY_PACKED block, then every value's bytes concatenated. Useful on its own
+// for values with no shared prefixes but similar lengths, and it is also the second half of
+// DELTA_BYTE_ARRAY below.
+inline void encode_delta_length_byte_array(std::vector<uint8_t>& out,
+                                           std::span<const std::string> vals) {
+    std::vector<int64_t> lens;
+    lens.reserve(vals.size());
+    for (const auto& s : vals) { lens.push_back(int64_t(s.size())); }
+    encode_delta_binary_packed(out, lens);
+    for (const auto& s : vals) { out.insert(out.end(), s.begin(), s.end()); }
+}
+
+// ---------------------------------------------------------------- DELTA_BYTE_ARRAY
+// Incremental (front-coded) encoding: each value stores how many leading bytes it shares with the
+// value *before it*, then only the remaining suffix.
+//
+// Layout, per the spec: DELTA_BINARY_PACKED prefix lengths, then a whole
+// DELTA_LENGTH_BYTE_ARRAY of the suffixes -- i.e. DELTA_BINARY_PACKED suffix lengths followed by the
+// concatenated suffix bytes. Three independent streams, each of which compresses well on its own,
+// which is why this beats PLAIN even after zstd.
+//
+// It wins where adjacent values share a leading run, and in an SSTable that is the common case rather
+// than a lucky one: rows arrive in clustering order, so a text clustering key is *sorted* within a row
+// group. "st00042"/"st00043" share six of seven bytes; URLs sharing a host share the whole authority;
+// timestamps rendered as text share everything but the last digits. Where there is no shared prefix
+// the prefix stream is all zeroes, which delta-packs to nothing, so the downside is bounded at
+// roughly the length stream -- cheaper than PLAIN's fixed 4 bytes per value.
+//
+// Deliberately not the default. A dictionary is better whenever values repeat (it stores each
+// distinct value once, where this stores every occurrence), and the writer already prefers a
+// dictionary when the repeat ratio justifies it. This is for the case a dictionary handles badly:
+// many distinct values that happen to be ordered.
+inline void encode_delta_byte_array(std::vector<uint8_t>& out,
+                                     std::span<const std::string> vals) {
+    std::vector<int64_t> prefixes;
+    std::vector<std::string> suffixes;
+    prefixes.reserve(vals.size());
+    suffixes.reserve(vals.size());
+    std::string_view prev;
+    for (const auto& s : vals) {
+        // The shared prefix is capped by both strings' lengths; the spec allows any value the
+        // decoder can honour, and the longest common prefix is what makes it worth doing.
+        size_t max_share = std::min(prev.size(), s.size());
+        size_t k = 0;
+        while (k < max_share && prev[k] == s[k]) { ++k; }
+        prefixes.push_back(int64_t(k));
+        suffixes.emplace_back(s.substr(k));
+        prev = std::string_view(s);
+    }
+    encode_delta_binary_packed(out, prefixes);
+    encode_delta_length_byte_array(out, suffixes);
+}
+
 // ---------------------------------------------------------------- RLE_DICTIONARY
 // Returns the dictionary (as PLAIN-encoded values) and the index stream.
 // The index stream is prefixed with a single bit-width byte, per the spec.

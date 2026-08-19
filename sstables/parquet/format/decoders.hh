@@ -143,7 +143,11 @@ inline std::vector<T> decode_rle_dictionary(std::span<const uint8_t> page,
 }
 
 // ---------------------------------------------------------------- DELTA_BINARY_PACKED
-inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> in, size_t count) {
+// `consumed`, when given, receives the number of input bytes this block occupied. DELTA_BYTE_ARRAY
+// needs it: its three streams are concatenated with no length prefixes, so the only way to find where
+// the suffix data begins is to know where the preceding stream ended.
+inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> in, size_t count,
+                                                      size_t* consumed = nullptr) {
     size_t p = 0;
     auto uvarint = [&] () -> uint64_t {
         uint64_t v = 0; int shift = 0;
@@ -170,7 +174,20 @@ inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> 
 
     std::vector<int64_t> out;
     out.reserve(count);
-    if (total == 0) { return out; }
+    if (total == 0) {
+        // The first value is part of the *header*, not of the data, so it is present even when the
+        // block holds no values -- the spec's header is <block size> <miniblocks> <count> <first
+        // value> and every writer emits all four. Returning without consuming it left the stream
+        // positioned one varint early.
+        //
+        // Harmless while a delta block was always the whole page body, which is why it survived: the
+        // leftover byte was simply never read. DELTA_BYTE_ARRAY is the first encoding here to
+        // concatenate two delta blocks with no length prefix between them, so the second block
+        // started parsing at the stray varint and failed with "bad delta header".
+        zigzag();
+        if (consumed) { *consumed = p; }
+        return out;
+    }
 
     int64_t prev = zigzag();
     out.push_back(prev);
@@ -212,6 +229,55 @@ inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> 
             }
             p += need;
         }
+    }
+    if (consumed) { *consumed = p; }
+    return out;
+}
+
+// ---------------------------------------------------------------- DELTA_LENGTH_BYTE_ARRAY
+// A DELTA_BINARY_PACKED block of lengths, then the values' bytes back to back.
+inline std::vector<std::string> decode_delta_length_byte_array(std::span<const uint8_t> in,
+                                                              size_t count) {
+    size_t used = 0;
+    auto lens = decode_delta_binary_packed(in, count, &used);
+    std::vector<std::string> out;
+    out.reserve(lens.size());
+    size_t p = used;
+    for (int64_t L : lens) {
+        if (L < 0) { throw decode_error("negative length in delta_length_byte_array"); }
+        if (p + size_t(L) > in.size()) { throw decode_error("truncated delta_length_byte_array"); }
+        out.emplace_back(reinterpret_cast<const char*>(in.data() + p), size_t(L));
+        p += size_t(L);
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------- DELTA_BYTE_ARRAY
+// Prefix lengths, then a whole DELTA_LENGTH_BYTE_ARRAY of suffixes. Each value is the first
+// `prefix` bytes of the value before it, followed by its own suffix -- so decoding is strictly
+// sequential and a corrupt prefix length is not recoverable, which is why it is range-checked
+// against the previous value rather than trusted.
+inline std::vector<std::string> decode_delta_byte_array(std::span<const uint8_t> in, size_t count) {
+    size_t used = 0;
+    auto prefixes = decode_delta_binary_packed(in, count, &used);
+    auto suffixes = decode_delta_length_byte_array(in.subspan(used), count);
+    if (suffixes.size() != prefixes.size()) {
+        throw decode_error("delta_byte_array: prefix and suffix counts differ");
+    }
+    std::vector<std::string> out;
+    out.reserve(prefixes.size());
+    std::string prev;
+    for (size_t i = 0; i < prefixes.size(); ++i) {
+        const int64_t k = prefixes[i];
+        if (k < 0 || size_t(k) > prev.size()) {
+            throw decode_error("delta_byte_array: prefix length exceeds the previous value");
+        }
+        std::string v;
+        v.reserve(size_t(k) + suffixes[i].size());
+        v.assign(prev, 0, size_t(k));
+        v.append(suffixes[i]);
+        out.push_back(v);
+        prev = std::move(v);
     }
     return out;
 }

@@ -384,7 +384,16 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                         }
                         if (max_rep == 0 || !has_def || col.def_levels[off + i] == max_def) { ++vi; }
                     }
-                encode_plain_byte_array(body, present);
+                if (spec.preferred && *spec.preferred == encoding::delta_byte_array) {
+                    encode_delta_byte_array(body, present);
+                    used = encoding::delta_byte_array;
+                } else if (spec.preferred
+                           && *spec.preferred == encoding::delta_length_byte_array) {
+                    encode_delta_length_byte_array(body, present);
+                    used = encoding::delta_length_byte_array;
+                } else {
+                    encode_plain_byte_array(body, present);
+                }
                 break;
             }
             default:

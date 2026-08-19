@@ -90,9 +90,17 @@ void append_values(column_data& cd, phys_type pt, encoding enc,
         break;
     }
     case phys_type::byte_array: {
-        auto v = (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary)
-               ? decode_rle_dictionary_views(body, dict_ba, n)
-               : decode_plain_byte_array(body, n);
+        std::vector<std::string> v;
+        if (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary) {
+            auto views = decode_rle_dictionary_views(body, dict_ba, n);
+            v.assign(views.begin(), views.end());
+        } else if (enc == encoding::delta_byte_array) {
+            v = decode_delta_byte_array(body, n);
+        } else if (enc == encoding::delta_length_byte_array) {
+            v = decode_delta_length_byte_array(body, n);
+        } else {
+            v = decode_plain_byte_array(body, n);
+        }
         cd.str.insert(cd.str.end(), v.begin(), v.end());
         break;
     }

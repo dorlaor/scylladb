@@ -24,6 +24,8 @@
 
 #include "sstables/parquet/writer_impl.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
+#include "sstables/parquet/format/encoders.hh"
+#include "sstables/parquet/format/decoders.hh"
 #include "sstables/parquet/tiering_context.hh"
 
 #include "mutation/mutation.hh"
@@ -478,4 +480,80 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_storage_format_gates_conversion) {
     }());
     BOOST_REQUIRE(!d4.parquet());
     BOOST_REQUIRE(d4.reason.find("columns") != std::string::npos);
+}
+
+// DELTA_BYTE_ARRAY and DELTA_LENGTH_BYTE_ARRAY: round-trip, and the size claim that motivates them.
+//
+// Front coding stores each value as "share N bytes with the previous value, then this suffix", which
+// is worth having because an SSTable delivers rows in clustering order -- so a text clustering key is
+// *sorted* within a row group and adjacent values share long prefixes. That is the common case here,
+// not a lucky one.
+//
+// The encoder is only useful if our own reader can read it back exactly, including the cases that
+// break a careless implementation: an empty string, a value that is a strict prefix of its
+// predecessor (so the shared run is the whole shorter value), a value sharing nothing, and a
+// non-ASCII byte sequence.
+SEASTAR_THREAD_TEST_CASE(test_delta_byte_array_round_trip) {
+    using namespace sstables::parquet::format;
+
+    const std::vector<std::vector<std::string>> cases = {
+        // Sorted keys with long shared prefixes -- what a text clustering key looks like.
+        {"st00000", "st00001", "st00002", "st00010", "st00100", "st01000"},
+        // URLs sharing an authority, then diverging.
+        {"https://example.com/a", "https://example.com/ab", "https://example.com/b",
+         "https://example.org/", "https://zzz.example/"},
+        // The awkward ones: empty values, a prefix of the previous value, no sharing at all.
+        {"", "a", "ab", "ab", "a", "", "zzz", ""},
+        // Non-ASCII bytes, to make sure nothing assumes char is signed or printable.
+        {std::string("\xff\xfe\x01", 3), std::string("\xff\xfe\x02", 3), std::string("\x00\x01", 2)},
+        // Single value, and empty input.
+        {"only"},
+        {},
+    };
+
+    for (const auto& vals : cases) {
+        std::vector<uint8_t> dba, dlba, plain;
+        encode_delta_byte_array(dba, vals);
+        encode_delta_length_byte_array(dlba, vals);
+        encode_plain_byte_array(plain, vals);
+
+        auto back_dba = decode_delta_byte_array(dba, vals.size());
+        auto back_dlba = decode_delta_length_byte_array(dlba, vals.size());
+        BOOST_REQUIRE_EQUAL(back_dba.size(), vals.size());
+        BOOST_REQUIRE_EQUAL(back_dlba.size(), vals.size());
+        for (size_t i = 0; i < vals.size(); ++i) {
+            BOOST_REQUIRE_EQUAL(back_dba[i], vals[i]);
+            BOOST_REQUIRE_EQUAL(back_dlba[i], vals[i]);
+        }
+    }
+
+    // And the point of it: on sorted keys with a shared prefix, front coding must actually be
+    // smaller than PLAIN. Without this the round-trip above would pass on an encoder that simply
+    // stored everything verbatim.
+    std::vector<std::string> sorted_keys;
+    for (int i = 0; i < 5000; ++i) {
+        sorted_keys.push_back(seastar::format("station-{:08d}-eu-west", i));
+    }
+    std::vector<uint8_t> dba, plain;
+    encode_delta_byte_array(dba, sorted_keys);
+    encode_plain_byte_array(plain, sorted_keys);
+    BOOST_TEST_MESSAGE(seastar::format("delta_byte_array {} bytes vs plain {} ({:.1f}%)",
+                                       dba.size(), plain.size(),
+                                       100.0 * dba.size() / plain.size()));
+    BOOST_REQUIRE_LT(dba.size(), plain.size() / 2);
+
+    // The bounded-downside claim: with no shared prefixes the prefix stream is all zeroes and
+    // delta-packs away, so it must still not be *worse* than PLAIN, which spends a fixed 4 bytes
+    // per value on lengths.
+    std::vector<std::string> unrelated;
+    for (int i = 0; i < 5000; ++i) {
+        unrelated.push_back(seastar::format("{:x}-{}", (i * 2654435761u) & 0xffffff, i % 7));
+    }
+    std::vector<uint8_t> dba2, plain2;
+    encode_delta_byte_array(dba2, unrelated);
+    encode_plain_byte_array(plain2, unrelated);
+    BOOST_TEST_MESSAGE(seastar::format("no shared prefix: delta {} vs plain {} ({:.1f}%)",
+                                       dba2.size(), plain2.size(),
+                                       100.0 * dba2.size() / plain2.size()));
+    BOOST_REQUIRE_LE(dba2.size(), plain2.size());
 }

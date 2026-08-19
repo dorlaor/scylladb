@@ -123,7 +123,21 @@ bottom-tier.
 
 ## Format gaps
 
-### 5. `DELTA_BYTE_ARRAY` is unimplemented
+### 5. ~~`DELTA_BYTE_ARRAY` is unimplemented~~ — closed 2026-08-19
+Implemented with `DELTA_LENGTH_BYTE_ARRAY`, on both the write and read paths, and hinted for text and
+blob **clustering** keys only — where sortedness is structural, not a guess about the type (§10.3f).
+35 % of PLAIN on sorted keys, 70 % when nothing is shared, so the downside is bounded. Interop 18/18
+with `DELTA_BYTE_ARRAY` visibly present in the two new fixtures and read by both pyarrow and DuckDB.
+
+Two things worth keeping from doing it. It **found a latent bug in the older encoding**: the
+DELTA_BINARY_PACKED decoder's `total == 0` path never consumed the header's first-value field, which
+was invisible until two delta blocks were concatenated. And the interop suite **could not have caught
+any of it** — every one of its eight shapes used `ck int`, so no fixture had a text clustering key.
+The suite now reports the encodings each file uses, because a fixture that passes without exercising
+the new path looks like coverage and is not.
+
+### 5a. Superseded: the original note
+
 The encoding that would help exactly where Parquet does worst: HackerNews at 82.5 % and Wikipedia
 pageviews at 90.0 % are both dominated by near-unique text (§10.1f-prod). Prefix-sharing between
 adjacent sorted strings is the one mechanism that attacks that, and it is unavailable.
@@ -568,6 +582,21 @@ pipeline silently measures a corpse. This cost two published conclusions before 
   status ≥ 400 in every lab script: a measurement that continues past a failed step is worse than
   one that crashes. (The §10.6 ISD figures are unaffected — the two major compactions after
   `retrain_dict` rewrite everything anyway, which the 860 MB → 282 MB drop confirms.)
+- **An object-storage keyspace makes node startup depend on AWS credentials, and it stalls rather
+  than failing.** After `objstore_check.py` ran, the `pqs3` keyspace persisted in the schema with
+  `storage=s3://pqbucket`, so every later node start had to reach S3 to populate that table. Started
+  without `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` the node **hung indefinitely before opening
+  CQL** — last log line `s3 - Update creds in the background`, REST port answering, 9042 refused, no
+  error and no timeout. Restarted with the credentials present, CQL came up in 6 s. Two properties
+  make this a footgun beyond the lab: it presents as "node is up" to any REST health check, and the
+  dependency is invisible in `scylla.yaml` because it is the *schema* that carries the S3 reference —
+  removing `object_storage_endpoints` does not help while such a keyspace exists. Recovery is to start
+  with credentials, drop the keyspace, then restore the config.
+- **`wait_up()` polled REST, which is ready long before CQL.** Every script that restarts the node
+  through `ensure_fresh_node.sh` and then connects with the driver inherited the race, and it cost two
+  runs that died on `NoHostAvailable` against a node starting perfectly normally. Fixed centrally
+  rather than per caller: REST first (a node that never answers REST is a louder failure), then a TCP
+  connect to 9042.
 - **Lab tables inherit `rows_per_partition: ALL`, so a read benchmark measures the row cache.** The
   first version of `~/pq-lab/scale_pointread.py` warmed 50 keys and then timed 2 000 point reads over
   a 9.3 MB table on an 8 GB node: every probe was a cache hit, p50 came out at 286 us, and it looked

@@ -4211,6 +4211,73 @@ What would settle it end to end: an error-injection point in the registry scan, 
 removed from `version_string` reading a bucket written by this one. Until then §10.9's procedure is
 observed for local storage and reasoned for object storage.
 
+### 10.13 DELTA_BYTE_ARRAY — implemented 2026-08-19, and it found a decoder bug
+
+`DELTA_BYTE_ARRAY` was the last unimplemented encoding in the format-gaps list. Text columns fell back
+to a dictionary or to PLAIN, and PLAIN spends a fixed four bytes per value on lengths before the codec
+sees anything.
+
+**What it is.** Front coding: each value records how many leading bytes it shares with the value
+before it, then only its own suffix. The page body is three concatenated streams — prefix lengths
+(DELTA_BINARY_PACKED), suffix lengths (DELTA_BINARY_PACKED), suffix bytes — each of which compresses
+well independently. `DELTA_LENGTH_BYTE_ARRAY` is implemented too, since it *is* the second half of
+that layout and is useful alone for values with no shared prefixes but similar lengths.
+
+**Measured on the encoder** (`parquet_writer_test/test_delta_byte_array_round_trip`):
+
+| input | vs PLAIN |
+|---|---:|
+| 5 000 sorted keys sharing a long prefix | **35.0 %** (49 011 against 140 000 bytes) |
+| 5 000 unrelated keys sharing nothing | **70.5 %** (42 087 against 59 657) |
+
+A win in both directions, which is the useful part: where prefixes are shared it is a third of PLAIN,
+and where nothing is shared the prefix stream is all zeroes and delta-packs to almost nothing, so it
+still beats PLAIN's fixed length overhead. The downside case is bounded rather than merely unlikely.
+
+**Where it is applied, and where it deliberately is not.** §10.3f is the relevant warning: type-based
+encoding rules were tried on real data and *lost* — BYTE_STREAM_SPLIT on doubles cost 55 %,
+DELTA_BINARY_PACKED on bigints cost 0.3 %. So this is hinted only where the premise is **structural**
+rather than a guess about what a type usually contains: a **text or blob clustering key**. Rows arrive
+in clustering order, so within a partition those values are sorted and adjacent ones share leading
+bytes by construction.
+
+It is **not** applied to a text partition key. Partitions are stored in token order, which is not key
+order, so consecutive values share nothing systematic and any gain would be luck — exactly the shape
+of the rules that lost. And the dictionary still takes precedence wherever values repeat, because it
+stores each distinct value once where this stores every occurrence; the writer's repeat-ratio check
+runs first. This encoding is for what a dictionary handles badly: a key with many distinct values that
+happen to be ordered.
+
+**It uncovered a pre-existing decoder bug.** The round trip failed with `bad delta header`, and the
+fault was not in the new code. The spec's DELTA_BINARY_PACKED header has four fields — block size,
+miniblocks per block, total count, **first value** — but `decode_delta_binary_packed()`'s `total == 0`
+early return bailed out before consuming the first value. That was harmless for as long as a delta
+block was always an entire page body: the stray varint was simply never read. `DELTA_BYTE_ARRAY` is the
+first encoding here that concatenates two delta blocks with no length prefix between them, so the
+second block began parsing at the leftover byte. A new encoding finding a latent bug in an old one is
+the argument for implementing the format's encodings rather than only the ones currently needed.
+
+**And the interop suite could not have caught any of this.** All eight of its shapes used `ck int`, so
+nothing in it had a text clustering key and the whole path was invisible to external readers — the same
+blind spot that let the MAP annotation bug through, where seven flat fixtures meant "pyarrow reads our
+files" was true and irrelevant. Added `text_clustering_key` and `blob_clustering_key` shapes, and made
+the suite **report the encodings each file actually uses**, because a fixture that passes without
+exercising the new path is worse than no fixture: it looks like coverage.
+
+**Interop: 18/18, and the new encoding is demonstrably reached.**
+
+| shape | pyarrow | duckdb | encodings in the file |
+|---|---|---|---|
+| `text_clustering_key` | 120 rows | 120 rows | `DELTA_BYTE_ARRAY`, PLAIN, RLE_DICTIONARY |
+| `blob_clustering_key` | 120 rows | 120 rows | `DELTA_BYTE_ARRAY`, PLAIN, RLE_DICTIONARY |
+| the other 16 shapes | 120 rows each | 120 rows each | PLAIN, RLE_DICTIONARY |
+
+Two independent implementations read it — pyarrow wraps parquet-cpp, DuckDB has its own reader, so a
+claim of "readable by other tools" backed by one library is really a claim about one library. And
+`DELTA_BYTE_ARRAY` appears in exactly the two new shapes and nowhere else, which is what makes this
+evidence rather than a green tick: the encoding column shows the path was taken, not merely that a file
+parsed.
+
 ### 10.5 Decision log
 
 | Date | Decision | Rationale |
