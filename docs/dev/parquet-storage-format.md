@@ -4238,16 +4238,33 @@ before it, then only its own suffix. The page body is three concatenated streams
 well independently. `DELTA_LENGTH_BYTE_ARRAY` is implemented too, since it *is* the second half of
 that layout and is useful alone for values with no shared prefixes but similar lengths.
 
-**Measured on the encoder** (`parquet_writer_test/test_delta_byte_array_round_trip`):
+**Measured, and the only figure that counts is the compressed one**
+(`parquet_writer_test/test_delta_byte_array_after_compression`). The encoder-level numbers are
+reported alongside because the gap between the two columns is the whole point — §10.3f's failure was
+an encoding that looked obviously right before zstd and cost 55 % after it.
 
-| input | vs PLAIN |
-|---|---:|
-| 5 000 sorted keys sharing a long prefix | **35.0 %** (49 011 against 140 000 bytes) |
-| 5 000 unrelated keys sharing nothing | **70.5 %** (42 087 against 59 657) |
+| input | raw vs PLAIN | **zstd vs PLAIN** |
+|---|---:|---:|
+| sorted keys with a long shared prefix | 35.0 % | **5.7 %** |
+| monotonic numeric ids | 17.2 % | **7.2 %** |
+| **real GitHub `event_id`, in clustering order** | 37.8 % | **73.5 %** |
+| sorted UUID-like keys (minimal sharing) | 78.1 % | **85.7 %** |
+| *unsorted* random strings | 70.7 % | **121.8 % — loses** |
 
-A win in both directions, which is the useful part: where prefixes are shared it is a third of PLAIN,
-and where nothing is shared the prefix stream is all zeroes and delta-packs to almost nothing, so it
-still beats PLAIN's fixed length overhead. The downside case is bounded rather than merely unlikely.
+**The last row corrects a claim this section previously made.** "The downside is bounded because it
+still beats PLAIN" was measured before compression and is false after it: on unsorted input front
+coding is **22 % worse** than PLAIN, because splitting values into prefix and suffix streams destroys
+the byte patterns zstd was already exploiting. That is the same mechanism that sank BYTE_STREAM_SPLIT
+on doubles, and it means the encoding is not safe to apply on the strength of a type alone.
+
+**It is safe on the strength of order, which is why the hint is restricted to clustering keys.** Every
+sorted case above wins after compression, including the adversarial one — sorted UUID-like values
+share only one or two characters and still come out at 85.7 %. The single losing case is unsorted
+input, and a clustering key is sorted by construction.
+
+That also settles a decision made earlier on structural grounds: text *partition* keys were excluded
+because token order is not key order. Measured, that exclusion is worth about 22 % on such a column —
+applying the hint there would have made those files bigger.
 
 **Where it is applied, and where it deliberately is not.** §10.3f is the relevant warning: type-based
 encoding rules were tried on real data and *lost* — BYTE_STREAM_SPLIT on doubles cost 55 %,

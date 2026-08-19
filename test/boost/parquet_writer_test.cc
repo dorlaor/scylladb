@@ -16,6 +16,8 @@
 // column_definition are translated correctly.
 
 #include <algorithm>
+#include <fstream>
+#include <zstd.h>
 #include <map>
 #include <boost/test/unit_test.hpp>
 
@@ -556,4 +558,91 @@ SEASTAR_THREAD_TEST_CASE(test_delta_byte_array_round_trip) {
                                        dba2.size(), plain2.size(),
                                        100.0 * dba2.size() / plain2.size()));
     BOOST_REQUIRE_LE(dba2.size(), plain2.size());
+}
+
+// Does front coding survive the block compressor? The question §10.3f exists to ask.
+//
+// The encoder-level numbers (35 % of PLAIN on sorted keys) are measured *before* compression, and
+// this project has already been caught by exactly that gap: BYTE_STREAM_SPLIT on doubles looked
+// obviously right and cost 55 % once zstd ran, because transposing destroyed the whole-value
+// repetition zstd was already exploiting. So the only figure that decides whether DELTA_BYTE_ARRAY
+// earns its place is the compressed one.
+//
+// Driven by real data when it is available: /tmp/gh_event_ids.txt holds the GitHub Archive
+// `event_id` column in clustering order, which is the *one* text clustering key in the whole
+// seven-dataset corpus -- every other dataset clusters on bigint, timestamp or int. Its adjacent
+// values share 6.25 of 11 characters on average. Without the file the test falls back to synthetic
+// data of the same shape so it still runs in CI.
+SEASTAR_THREAD_TEST_CASE(test_delta_byte_array_after_compression) {
+    using namespace sstables::parquet::format;
+
+    // zstd directly: the writer's own compress() lives in an anonymous namespace, and level 3 is
+    // what writer_options defaults to, so this matches what a real page would get.
+    auto zstd_size = [] (const std::vector<uint8_t>& body) {
+        const size_t bound = ZSTD_compressBound(body.size());
+        std::vector<uint8_t> out(bound);
+        const size_t n = ZSTD_compress(out.data(), bound, body.data(), body.size(), 3);
+        BOOST_REQUIRE(!ZSTD_isError(n));
+        return n;
+    };
+
+    auto report = [&] (const char* label, const std::vector<std::string>& vals) {
+        std::vector<uint8_t> plain, delta;
+        encode_plain_byte_array(plain, vals);
+        encode_delta_byte_array(delta, vals);
+        const size_t pz = zstd_size(plain), dz = zstd_size(delta);
+        BOOST_TEST_MESSAGE(seastar::format(
+                "{:<22} n={} | raw plain {} delta {} ({:.1f}%) | zstd plain {} delta {} ({:.1f}%)",
+                label, vals.size(), plain.size(), delta.size(),
+                100.0 * delta.size() / plain.size(), pz, dz, 100.0 * dz / pz));
+        return double(dz) / double(pz);
+    };
+
+    std::vector<std::string> real;
+    {
+        std::ifstream f("/tmp/gh_event_ids.txt");
+        std::string line;
+        while (std::getline(f, line)) {
+            if (!line.empty()) { real.push_back(line); }
+        }
+    }
+    if (!real.empty()) {
+        const double ratio = report("github event_id", real);
+        // No assertion on the exact figure -- it is data-dependent -- but a regression to *worse
+        // than PLAIN after compression* would mean the hint is actively harmful and should be
+        // reverted, so that is worth failing on.
+        BOOST_REQUIRE_LT(ratio, 1.0);
+    } else {
+        BOOST_TEST_MESSAGE("/tmp/gh_event_ids.txt absent; synthetic shapes only");
+    }
+
+    // Monotonic numeric ids of the same shape as the real column, for CI.
+    std::vector<std::string> ids;
+    for (int i = 0; i < 180000; ++i) {
+        ids.push_back(seastar::format("{}", 34502000000LL + i * 7));
+    }
+    report("synthetic ids", ids);
+
+    // The two ends of the range, for context.
+    std::vector<std::string> sorted_keys, unrelated;
+    for (int i = 0; i < 100000; ++i) {
+        sorted_keys.push_back(seastar::format("station-{:08d}-eu-west", i));
+        unrelated.push_back(seastar::format("{:x}", (i * 2654435761u) & 0xffffffff));
+    }
+    report("sorted keys", sorted_keys);
+    report("unrelated", unrelated);
+
+    // The case that decides whether the hint is safe to apply by type. A clustering key is *sorted*,
+    // but sorted is not the same as sharing a prefix: sorted UUIDs or hashes share one or two
+    // characters out of 36, so they look like the "unrelated" row above -- where front coding *loses*
+    // after compression, because splitting values into prefix/suffix streams destroys the byte
+    // patterns zstd was exploiting. This is the BYTE_STREAM_SPLIT failure of §10.3f in another guise.
+    std::vector<std::string> sorted_uuids;
+    for (int i = 0; i < 100000; ++i) {
+        const uint64_t h = 0x9e3779b97f4a7c15ull * uint64_t(i + 1);
+        sorted_uuids.push_back(seastar::format("{:016x}-{:04x}-{:04x}", h, (h >> 13) & 0xffff,
+                                               (h >> 29) & 0xffff));
+    }
+    std::sort(sorted_uuids.begin(), sorted_uuids.end());
+    report("sorted uuid-like", sorted_uuids);
 }
