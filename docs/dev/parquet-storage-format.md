@@ -5000,6 +5000,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Point-read latency | known, structural | 20–33× the row format; 71 % is a fixed floor. The footer cache that would help is specified, not built. Parquet is for scanned data. |
 | Production-scale re-measurement | **blocking** | Every latency figure is from a 200–300 k-row sstable. Footer parse is 4.32 µs per row group, so an 8 000-group file pays ~34 ms — this **reorders** §10.4 rather than merely scaling it. |
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
+| Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | open | Fixed and unit-tested, never measured at scale. Applies to ICS under `'hybrid'` and to any table mid-`ALTER`. |
 | Backblaze 4× anomaly | open | One dataset's Parquet size swung 4× in batch runs only; four hypotheses eliminated, cause unknown. |
 | Encryption at rest | **design question, not absent** | Two separate things, and the earlier "not applicable" answer conflated them. (a) *Scylla's* encryption at rest: no such code in this tree, so the interaction cannot be tested here. (b) *Parquet Modular Encryption*: a *standard format feature* (parquet-format 2.7+, AES_GCM_V1 / AES_GCM_CTR_V1, per-column keys, encrypted or plaintext footer) that this writer does not emit. The design question is which layer should encrypt: storage-layer EaR would make the file opaque to every external reader and forfeit the interoperability that motivates the format, whereas Modular Encryption keeps the file a Parquet file and lets a reader with the key decrypt only the columns it is entitled to. See §8.2b for how a per-column property would express the key mapping. |
@@ -5010,9 +5011,8 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 
 **The honest summary.** The functionality is built and, where the claim is behavioural, verified on a
 running node rather than only in a unit test. What is left is narrower than it was: one measurement
-that could change a conclusion (production-scale read path), one that could change two corpus rows
-(the dictionary re-measurement), one accepted trade (no gain check under TWCS), and one open
-interaction — downgrade safety on object storage, where the version is not in the object name.
+that could change a conclusion (production-scale read path), one accepted trade (no gain check under
+TWCS), and one open interaction — downgrade safety on object storage, where the version is not in the object name.
 Encryption at rest is a design question rather than missing work: Scylla's own EaR is not in this
 tree, and Parquet's Modular Encryption is a format feature this writer does not emit -- and choosing
 between them is a decision about whether an encrypted file should still be readable by other tools.
