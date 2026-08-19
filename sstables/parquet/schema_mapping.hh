@@ -82,6 +82,12 @@ struct cql_column {
     // single leaf (design doc 5.2); frozen ones are already opaque blobs and
     // travel as ordinary BYTE_ARRAY values.
     bool        multi_cell = false;
+    // A counter column. It shares the non-frozen-collection shape -- one map element per replica
+    // shard -- so `multi_cell` is true for it too, and nothing downstream could previously tell
+    // the two apart. The distinction matters because a counter's element *values* are not opaque
+    // blobs: they are two big-endian int64s, the shard's value and its logical clock, and an
+    // external reader has no way to know that from the schema alone.
+    bool        counter = false;
 };
 
 // A cell as the storage layer sees it: a value plus its own metadata. Key
@@ -400,6 +406,11 @@ std::vector<row> reassemble(const mapped_schema& ms,
                             size_t nrows);
 
 // Convenience: schema + shred + write a complete Parquet file.
+// Declares the counter convention in the footer for any counter columns present. Exposed so the
+// storage writer, which drives the file writer itself rather than going through write_rows(),
+// emits the same metadata.
+void add_counter_metadata(format::parquet_file_writer&, const std::vector<cql_column>&);
+
 std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 const std::vector<row>& rows,
                                 folding_level level,

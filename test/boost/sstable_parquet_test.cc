@@ -1280,3 +1280,60 @@ SEASTAR_THREAD_TEST_CASE(test_pq_records_a_compression_ratio) {
         BOOST_REQUIRE_GT(on_disk / ratio, on_disk);   // implied uncompressed size is larger
     }).get();
 }
+
+// A counter column's map values are two big-endian int64s, not an opaque blob, and the Parquet
+// schema cannot say so without a group inside the MAP value -- a third level of Dremel nesting,
+// which is a schema change and not yet done. Until then the footer declares the convention, so a
+// reader is not required to know it in advance. This pins that declaration.
+SEASTAR_THREAD_TEST_CASE(test_pq_declares_the_counter_convention) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        // Counter and non-counter columns cannot coexist in one table -- Scylla rejects it -- so
+        // the positive and negative cases need separate schemas.
+        auto ctr = schema_builder(1, "ks", "ctr")
+                .with_column("pk", utf8_type, column_kind::partition_key)
+                .with_column("ck", int32_type, column_kind::clustering_key)
+                .with_column("hits", counter_type)
+                .build();
+
+        const auto cols = sstables::parquet::columns_of(*ctr);
+        auto hits = std::ranges::find_if(cols, [] (const auto& c) { return c.name == "hits"; });
+        BOOST_REQUIRE(hits != cols.end());
+        // The flag the declaration depends on. A counter is multi_cell like a collection, and
+        // before this nothing downstream could tell the two apart.
+        BOOST_REQUIRE(hits->counter);
+        BOOST_REQUIRE(hits->multi_cell);
+
+        // A written file carries the declaration.
+        utils::chunked_vector<mutation> muts;
+        auto pk = partition_key::from_single_value(*ctr, utf8_type->decompose(sstring("p")));
+        mutation m(ctr, pk);
+        // A row marker, not an empty partition: make_sstable_containing has nothing to write for
+        // a partition with no content. The declaration under test is a property of the schema, so
+        // the row does not need a counter cell in it -- the counter round-trip is covered by the
+        // conformance cases.
+        auto ck = clustering_key::from_single_value(*ctr, int32_type->decompose(1));
+        m.partition().apply_insert(*ctr, ck, api::timestamp_type(1000));
+        muts.push_back(std::move(m));
+        auto sst = make_sstable_containing(
+                env.make_sstable(ctr, sstable_version_types::pq), std::move(muts)).get();
+
+        const auto len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+        auto md = sstables::parquet::format::parse_footer(
+                std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf.get()), buf.size()));
+        auto kv = [&] (const char* k) -> std::optional<std::string> {
+            for (const auto& p : md.key_value_metadata) { if (p.key == k) { return p.value; } }
+            return std::nullopt;
+        };
+        auto names = kv("scylla.counter_columns");
+        BOOST_REQUIRE(names.has_value());
+        BOOST_REQUIRE_EQUAL(*names, "hits");
+        auto enc = kv("scylla.counter_encoding");
+        BOOST_REQUIRE(enc.has_value());
+        BOOST_REQUIRE(enc->find("logical_clock") != std::string::npos);
+
+        // And a table with no counters says nothing, rather than emitting an empty key.
+        const auto plain_cols = sstables::parquet::columns_of(*pq_schema());
+        BOOST_REQUIRE(std::ranges::none_of(plain_cols, [] (const auto& c) { return c.counter; }));
+    }).get();
+}

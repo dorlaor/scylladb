@@ -1003,6 +1003,30 @@ std::vector<row> reassemble(const mapped_schema& ms,
     return out;
 }
 
+// Counter columns share the collection shape, so their element values are two big-endian int64s
+// rather than an opaque blob, and nothing in the Parquet schema says so. Proper `value` and
+// `clock` leaves would need a group inside the MAP value -- a third level of Dremel nesting -- and
+// that is a schema change, not a data change (design doc 5.2). Until then the file at least
+// *declares* the convention instead of requiring a reader to know it: the column names go in the
+// footer's key-value metadata alongside a description of the packing.
+//
+// This is a lesser fix than typed leaves and is not a substitute for them. What it buys is that
+// someone opening the file with parquet-tools can find out what those sixteen bytes are.
+void add_counter_metadata(parquet_file_writer& w, const std::vector<cql_column>& cols) {
+    std::string names;
+    for (const auto& c : cols) {
+        if (!c.counter) { continue; }
+        if (!names.empty()) { names += ','; }
+        names += c.name;
+    }
+    if (names.empty()) { return; }
+    w.add_key_value("scylla.counter_columns", names);
+    w.add_key_value("scylla.counter_encoding",
+                    "map<shard_id, packed>; shard_id = 16 bytes, two big-endian int64 "
+                    "(UUID msb, lsb); packed = 16 bytes, two big-endian int64 (value, "
+                    "logical_clock)");
+}
+
 std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 const std::vector<row>& rows,
                                 folding_level level,
@@ -1021,6 +1045,7 @@ std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
     if (ms.uniform_ts) {
         w.add_key_value("scylla.uniform_timestamp", std::to_string(*ms.uniform_ts));
     }
+    add_counter_metadata(w, cols);
     w.add_row_group(data);
     return w.finish();
 }

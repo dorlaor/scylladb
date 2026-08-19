@@ -3614,6 +3614,18 @@ native format** — and 2.1 ms / 61x with numeric dictionaries off.
     requires them ordered by id, and although our writer emits them already ordered, relying
     on that would make the reader depend on an invariant it does not enforce.
 
+    **Partly addressed 2026-08-19: the file now declares the convention.** `cql_column` gained a
+    `counter` flag — until then nothing downstream could distinguish a counter from a collection,
+    since both are `multi_cell` — and the footer carries `scylla.counter_columns` naming them plus
+    `scylla.counter_encoding` describing the packing: 16-byte shard id as two big-endian int64s
+    (UUID msb, lsb), 16-byte value as two big-endian int64s (value, logical_clock). Emitted on both
+    write paths, and pinned by `sstable_parquet_test/test_pq_declares_the_counter_convention`.
+
+    **This is a lesser fix than typed leaves and does not replace them.** What it buys is that
+    someone opening the file with `parquet-tools` can discover what those sixteen bytes are instead
+    of having to already know. What it does not buy is a reader being able to *interpret* them
+    without special-casing Scylla.
+
     The honest cost of reusing the collection shape: **a counter column is not
     self-describing to an external reader.** It appears as `map<blob, blob>` where the value
     blob is two packed integers, rather than as a group with named `value` and `clock`

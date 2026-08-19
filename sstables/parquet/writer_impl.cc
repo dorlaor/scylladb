@@ -169,6 +169,7 @@ std::vector<cql_column> columns_of(const ::schema& s) {
     for (const auto& c : s.regular_columns()) {
         cql_column col{c.name_as_text(), cql_type_of(*c.type), column_kind::regular};
         col.multi_cell = !c.is_atomic() || c.is_counter();
+        col.counter = c.is_counter();
         cols.push_back(std::move(col));
     }
     // Static columns ride along as ordinary value columns, appended after the
@@ -700,6 +701,7 @@ void pq_writer_impl::cut_row_group() {
                 format::parquet_file_writer::nested_schema{_ms->tree, std::move(hints)},
                 _pcfg.wopt);
         _pq->add_key_value("scylla.folding_level", to_string(_ms->level));
+        add_counter_metadata(*_pq, _shredder.columns());
 
         // Stream straight into the Data component instead of accumulating the file.
         // Without this, peak write memory is the whole output -- ~253 MB for a 256 MB
