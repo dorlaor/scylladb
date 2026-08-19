@@ -116,13 +116,25 @@ The encoding that would help exactly where Parquet does worst: HackerNews at 82.
 pageviews at 90.0 % are both dominated by near-unique text (§10.1f-prod). Prefix-sharing between
 adjacent sorted strings is the one mechanism that attacks that, and it is unavailable.
 
-### 6. Counter shard leaves are not self-describing
-A counter cell's shards are written as one element per shard, but the leaf carries no marker
-saying so, which makes the encoding readable only by something that already knows the convention.
+### 6. Counter shard leaves are not *typed* — partly addressed 2026-08-19
+The file now **declares** the convention: `scylla.counter_columns` names them and
+`scylla.counter_encoding` describes the packing, on both write paths, pinned by
+`sstable_parquet_test/test_pq_declares_the_counter_convention`. So a reader can discover what the
+sixteen bytes are instead of having to know.
 
-### 7. Statistics metadata is thinly fed
-`metadata_collector` gets keys, min/max components and `column_stats`. Compaction and tombstone GC
-read more than that. Correctness-adjacent rather than cosmetic, and untested at present.
+What remains is making them *typed*: a group inside the MAP value with named `value` and `clock`
+leaves, so an external reader can interpret them without special-casing Scylla. That is a third
+level of Dremel nesting and a schema change, and it is the last remaining functional gap in the
+format itself.
+
+### 7. ~~Statistics metadata is thinly fed~~ — closed 2026-08-19
+Investigated and largely a false alarm. `update_live_row_marker_timestamp` *is* fed (an earlier
+grep here only matched the `_collector.` prefix, and the writer calls it through `_c_stats`), so
+`pq` never hits the `on_internal_error_noexcept` path in `get_max_purgeable_timestamp`. The one
+real gap was `add_compression_ratio`, now fixed: the writer records it from the Parquet footer and
+`sstable::get_compression_ratio()` falls back to the statistics value when there is no
+`CompressionInfo` component. Measured 0.0732 through the REST API, corroborated to within 0.2
+points by the independent raw measurement in §10.1f-raw.
 
 ---
 

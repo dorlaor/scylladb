@@ -889,6 +889,10 @@ sstable on a live node rather than reasoned about:
 | Operation | Result |
 |---|---|
 | `nodetool tablestats` compression ratio | **0.0732** on a `pq` table — previously reported nothing at all |
+| `ALTER TABLE ... ADD` over existing `pq` sstables | new column reads as `null` from files written before it existed |
+| writing the new column, then compacting old and new together | all 3 000 rows correct; pre-ALTER rows keep `null`, post-ALTER rows keep their values |
+| `ALTER TABLE ... DROP` | dropped column disappears, remaining columns intact |
+| reading a **mixed `me` + `pq`** sstable set | correct throughout — 18 files of both versions during the checks above |
 | `sstable dump-data` | 4 partitions, 20 000 rows — the whole dataset |
 | `sstable dump-statistics` / `dump-index` / `dump-summary` | parse and emit |
 | `sstable validate` | `errors: 0, valid: true` |
@@ -898,6 +902,18 @@ sstable on a live node rather than reasoned about:
 
 Exit status alone was not taken as evidence: every row above was checked for substantive output,
 because a tool that silently does nothing also returns zero.
+
+**Schema evolution, verified 2026-08-19.** A Parquet file fixes its schema when it is written, so
+a table that gains a column afterwards has sstables with fewer leaves than the schema now declares.
+That resolves correctly: the reader maps by column rather than by position, so a column added after
+a file was written reads as `null` from that file, and a later compaction that merges pre- and
+post-`ALTER` sstables preserves both. `DROP` behaves symmetrically.
+
+**The incidental result is the more valuable one.** Those reads happened against a *mixed* sstable
+set — 18 files, some `me` and some `pq`, because flushes stay native and only compaction converts.
+§6.2 claims reads are format-agnostic; this is the first time that has actually been exercised
+rather than asserted, and it is the property the whole convergence design rests on. A table
+mid-conversion is the normal state, not an edge case.
 
 **Compression ratio, added 2026-08-19.** A `pq` sstable has no `CompressionInfo` component —
 Parquet compresses inside the file — and `sstable::get_compression_ratio()` looked only there, so
