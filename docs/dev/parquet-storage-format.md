@@ -4861,7 +4861,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Area | State |
 |---|---|
 | Format integration | `pq` enrolled in the writable version set, TOC/index/filter components kept, `data_size()` semantics settled. Round-trips static rows, range tombstones, multi-cell collections, counters. |
-| Format control | `storage_format` per-table property: validated, persisted, in `DESCRIBE`, acted on by compaction, with a `parquet = {...}` parameter map. Converting *back* is tested, not only forward. |
+| Format control | `storage_format` per-table property: validated, persisted, in `DESCRIBE`, acted on by compaction, with a `parquet = {...}` parameter map. Converting *back* is tested, not only forward. Per-column encodings are settable as CQL enums (§8.2b), rejected at DDL time when they cannot apply, and cancellable with `auto`. |
 | Hybrid tiering | Policy wired into `compaction_manager`. C1 bottom tier, C5 column ceiling, C6 measured gain over real data. Every decision logged with the deciding criterion. C6 fails closed. |
 | TWCS is all Parquet | Under TWCS, `'hybrid'` ≡ `'parquet'`; verified live against an ICS control (§6.3). |
 | Automatic convergence | Flushes write Parquet where the table writes Parquet unconditionally (§10.7). |
@@ -4880,11 +4880,10 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Mixed-format bucketing at scale | open | Fixed and unit-tested, never measured at scale. Applies to ICS under `'hybrid'` and to any table mid-`ALTER`. |
 | Backblaze 4× anomaly | open | One dataset's Parquet size swung 4× in batch runs only; four hypotheses eliminated, cause unknown. |
-| Encryption at rest | **not applicable to this tree** | There is no encryption-at-rest code in this repository at all — no `ee/` directory, no such symbols. The interaction is a design question for a build that has the feature, not work that can be done or tested here. |
+| Encryption at rest | **design question, not absent** | Two separate things, and the earlier "not applicable" answer conflated them. (a) *Scylla's* encryption at rest: no such code in this tree, so the interaction cannot be tested here. (b) *Parquet Modular Encryption*: a *standard format feature* (parquet-format 2.7+, AES_GCM_V1 / AES_GCM_CTR_V1, per-column keys, encrypted or plaintext footer) that this writer does not emit. The design question is which layer should encrypt: storage-layer EaR would make the file opaque to every external reader and forfeit the interoperability that motivates the format, whereas Modular Encryption keeps the file a Parquet file and lets a reader with the key decrypt only the columns it is entitled to. See §8.2b for how a per-column property would express the key mapping. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. Open sub-question: the object key has no version prefix, so §10.9's downgrade safety is verified for local storage only. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done** | Specified in §10.9, and the behaviour it rests on is observed: an older node *aborts at startup* on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
-| `DELTA_BYTE_ARRAY` | open | Unimplemented; text falls back to dictionary or plain. |
 
 
 **The honest summary.** The functionality is built and, where the claim is behavioural, verified on a
@@ -4892,8 +4891,11 @@ running node rather than only in a unit test. What is left is narrower than it w
 that could change a conclusion (production-scale read path), one that could change two corpus rows
 (the dictionary re-measurement), one accepted trade (no gain check under TWCS), and one open
 interaction — downgrade safety on object storage, where the version is not in the object name.
-Encryption at rest is not a gap in this tree; the code does not exist here. Object storage,
-maintenance tooling and the downgrade procedure for local storage are done and verified.
+Encryption at rest is a design question rather than missing work: Scylla's own EaR is not in this
+tree, and Parquet's Modular Encryption is a format feature this writer does not emit -- and choosing
+between them is a decision about whether an encrypted file should still be readable by other tools.
+Object storage, maintenance tooling and the downgrade procedure for local storage are done and
+verified.
 
 ## 12. References
 
