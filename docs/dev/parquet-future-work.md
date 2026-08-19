@@ -58,35 +58,47 @@ queueing, cap the batch; do not return to serial.
 
 ---
 
-## Size accounting: `pq` sstables report a different unit — **open, and it affects core compaction**
+## Size accounting: `pq` sstables report a different unit — **closed 2026-08-19**
 
 `sstable::data_size()` returns the *uncompressed* data length when a `CompressionInfo` component
 exists, and the file size otherwise. A `pq` sstable has no `CompressionInfo` — Parquet compresses
 internally — so for it `data_size() == ondisk_data_size()`, while a native compressed sstable
-reports several times more than it occupies. `get_compression_ratio()` likewise returns
-`NO_COMPRESSION_RATIO` for `pq`.
+reports several times more than it occupies. `get_compression_ratio()` likewise returned
+`NO_COMPRESSION_RATIO` for `pq`, and now falls back to the statistics value.
 
-**Fixed in this project's own code:** C1's bottom-tier rule compared `data_size()` across
-candidates, which in a hybrid table — where both formats are present by definition — compared
-mixed units. The same data reports several times smaller once converted, so a `pq` sstable would
-never be judged "the largest" and C1 would read false for a bucket that is genuinely the bottom
-tier. Now uses `ondisk_data_size()`. The gain estimator and `make_tiering_inputs()` already did.
+**C1's bottom-tier rule** compared `data_size()` across candidates, which in a hybrid table —
+where both formats are present by definition — compared mixed units. The same data reports several
+times smaller once converted, so a `pq` sstable would never be judged "the largest" and C1 would
+read false for a bucket that is genuinely the bottom tier. Uses `ondisk_data_size()`. The gain
+estimator and `make_tiering_inputs()` already did.
 
-**Not fixed, and not this project's code to change lightly:** `size_tiered_compaction_strategy`
-buckets on `data_size()` (`size_tiered_compaction_strategy.cc:133`, `:173`). In a hybrid table a
-converted sstable's reported size drops by the compression factor, so it can fall out of the size
-bucket it belongs to and stop being compacted with its peers. ICS inherits the same bucketing.
+**Size-tiered bucketing**, the part that was open: `size_tiered_compaction_strategy` and
+`incremental_compaction_strategy` bucket on `data_size()`, so a converted sstable's reported size
+drops by the compression factor and it buckets several tiers below its true peer — scheduling
+repeated rewrites of the format that is most expensive to rewrite. This is in the path for both
+in-scope strategies, ICS directly and TWCS through its per-window size-tiered fallback.
 
-Three ways out, none obviously right:
-1. Have `pq` populate an uncompressed length so `data_size()` means the same thing for both. It
-   is computable — the shredder knows its buffered volume — but it means synthesising a
-   `CompressionInfo`-like value for a file that has no Scylla compression.
-2. Change the size-tiered strategies to bucket on `ondisk_data_size()`. Correct in principle and a
-   behaviour change for every existing cluster, so not a Parquet decision.
-3. Accept it and document that hybrid tables should use a strategy that does not bucket by size.
+Resolved by making the unit a property of the *candidate set* rather than of the format:
 
-**Whichever is chosen, it should be decided before hybrid mode is used on anything real**, because
-the symptom is silent: compaction simply stops choosing the converted files, and nothing errors.
+- An all-native set keeps using `data_size()`. Every entry there uses the same convention, so the
+  ratios bucketing is built on are self-consistent and the inconsistency is invisible. **No
+  existing cluster's bucketing changes** — which is what made option 2 below unacceptable as a
+  blanket change.
+- A mixed set uses `ondisk_data_size()`, the one measure that means the same thing for both.
+
+`mixed_formats()` + `bucketing_size()` in each of the two strategy files;
+`sstables::sstable_run::ondisk_data_size()` added for the run-level case. The rejected
+alternatives, for the record: (1) synthesise an uncompressed length for `pq` so `data_size()`
+means one thing — computable, but it fabricates a `CompressionInfo`-like value for a file with no
+Scylla compression; (2) move all bucketing to `ondisk_data_size()` — correct in principle, a
+behaviour change for every existing cluster, and not a Parquet decision to make; (3) document that
+hybrid tables should avoid size-bucketing strategies — which rules out both supported strategies.
+
+Untested at scale: the runs in §10.6 convert everything in one major compaction, so no measurement
+yet exercises a genuinely mixed candidate set through bucketing. That is the natural next scale
+test. (An earlier version of this note claimed a TWCS active window is permanently mixed, because
+flushes were native. Since §10.7 they are not: a TWCS table is Parquet end to end. The mixed case is
+ICS under `'hybrid'`, and any table mid-`ALTER` — real, but transient rather than steady-state.)
 
 ---
 
@@ -141,6 +153,103 @@ C4 and C7 were removed. The pattern: three of the four were thresholds nobody ha
 the fourth could not be evaluated at all. **Any proposal to add a criterion should come with a
 measurement, not a rationale.**
 
+### Convergence is a write-path property, not a compaction property — closed 2026-08-19
+Recorded because the reasoning that got it wrong was plausible.
+
+A TWCS table left entirely to automatic compaction settled at **21 native sstables against 5
+Parquet** and stayed there (§10.7). A closed TWCS window holding one sstable is terminal — the
+per-window major needs two and the size-tiered fallback needs `min_compaction_threshold` — so it
+keeps the format it was flushed in, permanently. Every earlier conversion test used an
+operator-triggered rewrite and so could not see this.
+
+Fixed by making `table::make_sstable(state)` consult `writes_parquet_unconditionally()`, so flushes
+write Parquet on a table that writes Parquet unconditionally. Parquet flushes are also ~10x smaller
+than the native flush of the same rows (0.8 MB against 7.8 MB on the test corpus), so this removes
+write volume as well as a rewrite.
+
+**The lesson worth keeping:** "which format does compaction choose" and "what format is the table
+in" are different questions, and only the second one matters to an operator. Any future format
+decision needs a test that calls no compaction endpoint at all.
+
+### Downgrade procedure — written 2026-08-19, was "not started"
+§10.9. The load-bearing fact is observed, not reasoned: an older node meeting an sstable version it
+does not recognise **aborts during the directory scan** rather than skipping the file. Verified by
+planting a file with an unknown version prefix in a live table directory and restarting the node,
+which exited with `malformed sstable error (aborting): invalid version`.
+
+Downgrade is therefore safe but strictly manual: `ALTER` back to `'sstable'`, `nodetool
+upgradesstables -a` on **every** node, verify per node through
+`GET /column_family/storage_format/{ks:table}` until each reports `converged: native`, then downgrade.
+Two things a plan must not miss: TWCS tables on `'hybrid'` are Parquet even though the property does
+not say `'parquet'`, and **snapshots taken while the table was Parquet still contain `pq` files**, so
+the backup retention window is part of the downgrade window.
+
+Still open in this area: nothing blocks the procedure, but it is undertested — there is no automated
+test that drives a full cluster-wide un-conversion and verifies every node. The per-table direction is
+covered by `cql_ddl_test/test_storage_format_converts_on_compaction`.
+
+### Two test-harness faults from converting the loaders — fixed 2026-08-19
+Both were found by re-running the converted tests rather than trusting the conversion, and both
+produced confident wrong verdicts rather than errors.
+
+- **A fixture outlived its bookkeeping.** `cluster_parquet_check.py` had a warm-up row (one CL=ALL
+  insert, to let the cluster settle before the Python loader fired 20 000 concurrent writes). latte
+  made it unnecessary — it has its own retries and the load takes seconds — so the row went, and
+  `EXPECTED = ROWS + 1` stayed. Four checks then reported `300 000 vs 300 001` against a table that
+  was perfectly correct. **Delete a fixture and its arithmetic in the same edit.**
+- **The multi-node check only worked once.** Its last step bootstraps a fourth node, and that node
+  *stays* joined. A second run therefore saw four nodes, failed "cluster formed" (which expected two
+  peers), and passed the bootstrap check trivially against sstables n4 already had — a PASS that
+  meant nothing. It now decommissions n4 and wipes its data at the start, which both makes the run
+  repeatable and exercises decommission (legal from four nodes to three, unlike three to two — §10.8).
+
+**A test that only works the first time is worse than no test**, because the second run's green is
+indistinguishable from a real pass.
+
+### Multi-node: first coverage, 2026-08-19
+`~/pq-lab/cluster_setup.sh` brings up three nodes (distinct loopback addresses, own data dirs, own
+API ports, `GossipingPropertyFileSnitch` in one rack) and `~/pq-lab/cluster_parquet_check.py` runs
+the replication and streaming checks that single-node work cannot reach. **9/9 pass** — see §10.8 for
+the numbers and for the three test-design errors that each produced a confident wrong answer
+(decommission is impossible at RF=3 on three nodes; a single tablet makes the bootstrap test
+vacuous; joining and receiving data are minutes apart, not seconds).
+
+Two environment notes for anyone re-running it: `GossipingPropertyFileSnitch` opens
+`conf/cassandra-rackdc.properties` relative to the **process working directory**, not the options
+file, so the unit needs `WorkingDirectory` set or the node exits at startup; and `repair_async`
+returns 403 on this cluster's keyspaces, where `/storage_service/tablets/repair` is the endpoint that
+works.
+
+### Strategy scope: ICS and TWCS only — settled 2026-08-19
+Not a to-do; recorded so it does not get re-litigated. **STCS is out of scope for this project**
+and no measurement, test or benchmark may use it. The supported set is:
+
+- **TWCS** for any schema with a time-based clustering key — the recommended default for time
+  series, and the shape Parquet wins hardest on (NOAA ISD-Lite hourly observations, 46.8 % of the
+  SSTable at 300 k rows and 43.2 % at 16 M). **A TWCS table is entirely Parquet**: `'hybrid'` and
+  `'parquet'` are the same setting there, and the criteria are not evaluated at all.
+- **ICS** for everything else. This is the only strategy hybrid tiering applies to.
+
+The criteria exist to keep Parquet out of levels that get rewritten, and TWCS has none — a window is
+compacted once and then closed. `writes_parquet_unconditionally()` is the single home for the rule,
+consulted by compaction, flush and streaming alike so they cannot disagree.
+
+**What this gives up:** C6 is what catches a schema Parquet stores worse than the row format, and
+under TWCS it no longer runs. The 197-column sparse-telemetry dataset measures at 208 % of its
+SSTable; on TWCS + `'hybrid'` it will now convert and roughly double its disk. `storage_format =
+'sstable'` is the only protection. Deliberate: TWCS tables are overwhelmingly time series, the shape
+that wins most, and the decision is now free rather than costing a data sample per compaction.
+
+An earlier design evaluated C1 under TWCS via `newest_bucket()`'s "is this window still the last
+active one" — exact, where ICS's size rule is a proxy. It was implemented, tested, and then removed
+when the rule above made it unread. Recorded so it is not re-added as a missing feature.
+
+STCS still compiles with the size-tier rule, because ICS shares that code. That is not support:
+writing Parquet under any strategy other than ICS or TWCS logs a rate-limited warning from
+`compaction_manager` naming the strategy. It does not refuse, because the output is valid — the
+point is that an operator should not have to read a design document to find out they are outside
+what was tested.
+
 ### 8. C2's replacement should gate on rows, not bytes
 C2 was removed as subsumed by C6, but if a size floor is ever wanted again it must be a row count:
 four row groups is 126 kB at 6.3 B/row and 1.4 MB at 69 B/row, so no byte threshold suits both.
@@ -177,7 +286,113 @@ round-trip test. Small in lines, large in blast radius.
 
 ## Housekeeping
 
-### 11. Decks — done at v2.7 (2026-08-19)
+### The dictionary baseline was never controlled — cause found 2026-08-19, re-measurement open
+Full account in §10.11. Short version: the `sstable_dict_autotrainer` ticks in the background and
+publishes a new dictionary whenever its validation sample says it is better. Production default is
+900 s; the lab node was set to **10 s**. An 858 MB table's dictionary phase runs 2–4 minutes, so
+12–24 ticks fire *inside one measurement* and whichever dictionary is live at the final major
+compaction sets the bytes. Two runs of the same 16.2 M rows measured 281 861 328 and 316 320 823 —
+**12.2 % apart** — while uncompressed size differed 0.20 %.
+
+The 316 M value reproduces to 0.1 % across three independent re-measurements; the 281 M value has not
+reproduced once. **The published figure is the outlier.**
+
+The near-miss worth remembering: sample variance in training was measured first and came out at
+**0.65 %** over five retrains, which looked like it exonerated the dictionary. It did not — that test
+ran on a 67 MB table where each round took ~14 s, so hardly any autotrainer ticks intervened. A
+stability test has to run at the size of the thing it is meant to characterise.
+
+**Fixed for measurement:** autotrainer tick and retrain period are now 86 400 s in
+`~/pq-lab/node/conf/scylla.yaml` (old values in `scylla.yaml.bak`), so only explicit `retrain_dict`
+calls move the dictionary.
+
+**Resolved for ISD, and the ratio survived.** Re-measured with the autotrainer off: dict 272 528 828
+(−3.3 % vs published), parquet 116 495 610 (−4.2 %), both stable across repeats — Parquet byte-identical
+across two rewrites. `parquet / dict` = **0.427** against the 0.432 on record, a 1.2 % move that is
+inside the noise. Both sides of the ratio were inflated by similar factors, so the headline claim
+holds even though both absolute figures moved several percent.
+
+**The absolute figures are what moved, and both of them.** Parquet's size drifts between runs too
+(121.7 M → 126.9 M → 116.5 M), tracking the internal layout of whatever inputs the compaction had.
+Quote absolute bytes only from a deterministic-config run.
+
+**Still open:** re-measure the §10.1 corpus the same way. The ISD result suggests the *ratios* there
+are probably sound, but the two rows near parity — Backblaze 95.8 %, Wikipedia pageviews 89.6 % — are
+close enough that a few percent on either side decides whether Parquet wins at all, and they have
+never been measured under a controlled dictionary.
+
+**And a process note that cost a wrong published claim for ten minutes:** the first recomputation
+paired the new deterministic dictionary figure with the *old* Parquet figure and reported a 3.4-point
+regression (0.466) that did not exist. Both sides of a ratio must come from the same configuration.
+
+### Load generator: latte, and the three ways a loader swap lies — 2026-08-19
+§10.10. The scale tests were client-bound: the Python driver did 11 376 rows/s while the node used
+54 % of one core. latte (Rust, Rune workloads) does 58 000–75 000 rows/s at `-t 4` and moves the
+bottleneck to Scylla; the 6 M-row run went from 10.6 min to 3.7 min, and a 40 M-row production-scale
+run becomes ~18 min instead of ~75.
+
+**The rule this established: a loader swap is not done until it reproduces the figures it replaces.**
+It reproduces them now — uncompressed byte-identical, Parquet within 593 bytes of 29 MB — and it took
+three corrections to get there, none of which announced itself:
+
+1. payload length (short note vs a 130-character sentence): 3.7x size error;
+2. modulo instead of a PRNG for a numeric column: over-compressible;
+3. **the mutation timestamp** (monotonic counter vs derived from data): 40 % error in the Parquet
+   figure and only 2.1 % in the uncompressed one, because L1 folding stores a per-row `__ts` and
+   fixed-width timestamps hide the difference until something compresses them.
+
+Each was caught by comparing against an already-published number. A new workload that has no figure
+to reproduce should be treated as unvalidated.
+
+**Do not use latte where rows must contain NULLs.** Rune `None` binds `CqlValue::Empty`, a live
+zero-length cell, not a deletion — verified through `writetime()`. Nor can a workload hold a corpus:
+`fs::read_lines` is rejected in const context and `Context` has no settable field. The NOAA ISD load
+is therefore a six-way sharded Python loader, and `harness.py` stays as it is.
+
+### 11. Decks — one combined deck at v2.8 (2026-08-19)
+
+**The two decks are now one.** `make_combined_deck.py` (HTML) and `make_combined_pptx.py` (PPTX)
+emit a single artifact: status slides, a GA-readiness section, then the dataset deep-dive as an
+appendix. Build with `~/pq-lab/build_decks.sh`. There were four artifacts for something that was
+always sent as one thing, with two title slides, two version stamps and two independent page-number
+sequences.
+
+The four original generators are kept and still build standalone, because the combined builders
+import them for their slide content — so a slide added to `make_pptx.py` appears in the combined
+deck on the next build, and nothing had to be copied.
+
+Two mechanics worth knowing before editing them:
+
+- **PPTX**: both builders draw into one shared `Presentation` (`deck_prs.py`), because python-pptx
+  cannot reliably copy finished slides between files. Slide order is therefore *import order*. Page
+  numbers are rewritten at the end against the real total — each builder had numbered its own slides
+  against its own count.
+- **HTML**: the two stylesheets share fourteen selectors (`.note`, `.sub`, `.good`, `.bar`, `body`,
+  `h2`, `code`, …), so concatenating them silently restyles both halves. The combined builder renders
+  the dataset deck through its own `render()` and then **scopes** the result — every selector
+  prefixed with `.ds-appendix`, its `:root` variable block rehung on that class. Operating on
+  rendered output means the dataset CSS is never hand-edited and the dataset deck stays
+  independently buildable.
+
+**GA content is data, not prose in a generator** (`GA_DONE` / `GA_GAPS` in `deck_data.py`), for the
+same reason `HEADLINE_FACTS` is: the two decks once shipped 93 % and 92 % for the same figure.
+
+
+
+**v2.8** adds the "Does it hold at scale?" slide (§10.6: the three-way raw/dict/parquet ratios at GB
+scale under TWCS) to both the HTML and the PPTX, from a shared `SCALE` block in `deck_data.py` so
+they cannot disagree. Two divergences between the generators were found and fixed while doing it,
+both the same class of bug this entry is about:
+
+- **The PPTX numbered 14 of its 16 slides.** Two slides had been added after the page numbering was
+  written and never got a `pagenum()` call, so the deck said "of 14" while holding 16. Numbering is
+  now derived from the slide count rather than written per slide.
+- **The two decks ordered the same content differently.** The "layout vs compressor" slide sat at
+  position 3 in the HTML and 11 in the PPTX, so the size story appeared before the performance
+  section in one and after it in the other. The PPTX now follows the HTML: show the ratio, decompose
+  it, then show it holding at scale.
+
+
 
 **Prose drifts even when the numbers are regenerated, and that is the recurring failure here.** The
 generators recompute every table from `deck_data.py`, so figures are always current — but the
@@ -257,6 +472,20 @@ selector checked first.
 **Unverified as a result:** the row-group-cut leaf-set experiment (+22.7 % for a cut, 69.1 → 84.7
 MB) ran through its own mtime-based lookup and should be redone before it is cited.
 
+### CI hygiene, done 2026-08-19
+Both fixed; recorded because both were invisible failures rather than loud ones.
+
+- **`sstable_parquet_perf_test` ran its full measurement workload in CI.** It is enrolled in the
+  standard boost suite (`configure.py`), so every CI invocation was paying for 20 000 partitions
+  and 10 000 point reads to print numbers nobody reads. Defaults are now 2 000 / 1 000; the
+  measurement sizes come from `PQ_PERF_PARTITIONS` / `PQ_PERF_POINTS`, which anything quoting a
+  §10.4 figure must set. The small default is a smoke test, not a measurement.
+- **R-13 was measured and thrown away.** `perf_pq_scan_memory_scaling` computed peak scan memory
+  at 4 000 and 32 000 partitions, printed the ratio, and asserted nothing — so a reader that
+  started materialising the whole sstable would have printed `8.00x` and passed. Now
+  `BOOST_REQUIRE(growth < 3.0)`. The bound is loose on purpose: a bounded reader is ~1x, but peak
+  allocation at two file sizes is noisy, and the only failure mode worth catching is the ~8x one.
+
 ### 12. Run `interop_shapes.py` after any change to the schema mapping
 It builds a table per shape the format emits — flat scalars, all three non-frozen collection kinds,
 frozen collections, statics, TTL, counters, and a collection at each folding level — converts each,
@@ -307,3 +536,22 @@ pipeline silently measures a corpse. This cost two published conclusions before 
 - The lab keyspace needs `NetworkTopologyStrategy`; `SimpleStrategy` is rejected on this node.
 - `sstable_compaction_test` segfaults after ~68 cases in this environment. Verified identical on a
   stashed baseline, so pre-existing.
+- **`keyspace_upgrade_sstables` is GET-only**, where `keyspace_flush`, `keyspace_compaction` and
+  `retrain_dict` are POST. A POST to it returns 404. The lab helper used to swallow the status, so
+  the call was a silent no-op and the script continued as if the sstables had been rewritten — it
+  produced a false FAIL on the first run of `twcs_hybrid_check.py`. `api()` now raises on any
+  status ≥ 400 in every lab script: a measurement that continues past a failed step is worse than
+  one that crashes. (The §10.6 ISD figures are unaffected — the two major compactions after
+  `retrain_dict` rewrite everything anyway, which the 860 MB → 282 MB drop confirms.)
+- **Lab tables inherit `rows_per_partition: ALL`, so a read benchmark measures the row cache.** The
+  first version of `~/pq-lab/scale_pointread.py` warmed 50 keys and then timed 2 000 point reads over
+  a 9.3 MB table on an 8 GB node: every probe was a cache hit, p50 came out at 286 us, and it looked
+  like it had refuted the footer-parse prediction of §10.4j. With
+  `caching = {'keys':'NONE','rows_per_partition':'NONE'}` the same table reads at **973 us** — the
+  cache was hiding 3.4x of the cost. Any read measurement that means to reach an sstable must disable
+  caching explicitly, and should carry a native control in the same run so a rising number cannot be
+  mistaken for machine drift.
+- **The rewrite and compaction REST calls are asynchronous.** A "wait until the file set stops
+  changing" loop polled twice before the work started, saw no change, and reported success. Any such
+  wait must require an observed change first — `settle(expect_change_from=...)` — so that a no-op
+  reads as a timeout rather than as a result.
