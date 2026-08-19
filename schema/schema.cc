@@ -1255,6 +1255,16 @@ fragmented_ostringstream& schema::schema_properties(const schema_describe_helper
     if (storage_engine() != storage_engine_type::normal) {
         os << "\n    AND storage_engine = '" << storage_engine_type_to_sstring(storage_engine()) << "'";
     }
+    // Emitted verbatim rather than through parquet_parameters::to_map(). The stored map is what the
+    // user wrote and was already validated at CREATE/ALTER time, so echoing it keeps DESCRIBE
+    // reproducible without pulling the sstables writer into schema.cc. Without this the per-column
+    // `encoding.<col>` settings -- and every other parquet sub-option -- were absent from DESCRIBE,
+    // so a table recreated from its own description silently lost them.
+    if (!parquet_options().empty()) {
+        os << "\n    AND parquet = {";
+        map_as_cql_param(os, parquet_options());
+        os << "}";
+    }
 
     if (has_tablet_options()) {
         os << "\n    AND tablets = {";

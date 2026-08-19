@@ -64,7 +64,7 @@ mkdir -p $DATA/wout && /tmp/pq_write_t emit $DATA/wout >/dev/null && \
   python3 $S/writer_interop.py $DATA/wout || FAIL=1
 echo; echo "### 6. folding round-trip (losslessness) ###";     /tmp/pq_shred_t roundtrip || FAIL=1
 echo; echo "### 7. divergence cost curve ###";                 /tmp/pq_shred_t cost || FAIL=1
-echo; echo "### 8. hybrid tiering policy (C1-C7) ###";         /tmp/pq_tier_t || FAIL=1
+echo; echo "### 8. hybrid tiering policy (C1, C5, C6) ###";         /tmp/pq_tier_t || FAIL=1
 echo; echo "### 9. file round-trip: rows -> parquet -> rows ###"; /tmp/pq_shred_t filetrip || FAIL=1
 echo; echo "### 10. OffsetIndex: row -> page lookup ###"
 /tmp/pq_oi_t $DATA/wout/*.parquet || FAIL=1

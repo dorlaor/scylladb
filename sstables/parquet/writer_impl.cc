@@ -38,6 +38,8 @@ namespace {
 // read them straight out of the cell without going through deserialize().
 // Anything not handled here keeps its serialised form and travels as an opaque
 // BYTE_ARRAY, which is lossless but gives up type-specific encoding.
+} // namespace
+
 cql_type cql_type_of(const abstract_type& t) {
     if (&t == int32_type.get())                            { return cql_type::int32; }
     if (&t == long_type.get())                             { return cql_type::bigint; }
@@ -46,6 +48,8 @@ cql_type cql_type_of(const abstract_type& t) {
     if (&t == utf8_type.get() || &t == ascii_type.get())   { return cql_type::text; }
     return cql_type::blob;
 }
+
+namespace {
 
 int64_t be64(const bytes_view& b) {
     uint64_t v = 0;
@@ -224,6 +228,80 @@ size_t parse_bytes(const sstring& key, const sstring& v, size_t lo, size_t hi) {
 
 } // namespace
 
+namespace {
+
+// The CQL enum to Parquet's. `dictionary` becomes RLE_DICTIONARY, the only dictionary encoding this
+// writer emits -- PLAIN_DICTIONARY is the deprecated v1 spelling and nothing here produces it.
+format::encoding to_format_encoding(parquet_parameters::column_encoding e) {
+    using ce = parquet_parameters::column_encoding;
+    switch (e) {
+    case ce::plain:                   return format::encoding::plain;
+    case ce::dictionary:              return format::encoding::rle_dictionary;
+    case ce::delta_binary_packed:     return format::encoding::delta_binary_packed;
+    case ce::delta_byte_array:        return format::encoding::delta_byte_array;
+    case ce::delta_length_byte_array: return format::encoding::delta_length_byte_array;
+    case ce::byte_stream_split:       return format::encoding::byte_stream_split;
+    case ce::automatic:               break;
+    }
+    return format::encoding::plain;   // unreachable: 'auto' is filtered before this is called
+}
+
+} // namespace
+
+std::optional<parquet_parameters::column_encoding>
+parquet_parameters::parse_column_encoding(std::string_view v) {
+    using ce = column_encoding;
+    // 'dictionary' rather than 'rle_dictionary': the Parquet name is an implementation detail of the
+    // index stream, and 'plain_dictionary' is the deprecated v1 spelling. One name for the concept.
+    if (v == "auto")                    { return ce::automatic; }
+    if (v == "plain")                   { return ce::plain; }
+    if (v == "dictionary")              { return ce::dictionary; }
+    if (v == "delta_binary_packed")     { return ce::delta_binary_packed; }
+    if (v == "delta_byte_array")        { return ce::delta_byte_array; }
+    if (v == "delta_length_byte_array") { return ce::delta_length_byte_array; }
+    if (v == "byte_stream_split")       { return ce::byte_stream_split; }
+    return std::nullopt;
+}
+
+const char* parquet_parameters::to_string(column_encoding e) {
+    using ce = column_encoding;
+    switch (e) {
+    case ce::automatic:               return "auto";
+    case ce::plain:                   return "plain";
+    case ce::dictionary:              return "dictionary";
+    case ce::delta_binary_packed:     return "delta_binary_packed";
+    case ce::delta_byte_array:        return "delta_byte_array";
+    case ce::delta_length_byte_array: return "delta_length_byte_array";
+    case ce::byte_stream_split:       return "byte_stream_split";
+    }
+    return "auto";
+}
+
+bool parquet_parameters::applies_to(column_encoding e, cql_type t) {
+    using ce = column_encoding;
+    // PLAIN, a dictionary and 'auto' are legal for every physical type. The rest are type-specific,
+    // and rejecting the mismatch at DDL time is the whole point: an encoding the writer would have to
+    // ignore is a setting that lies, and one it would have to fail on is an outage.
+    switch (e) {
+    case ce::automatic:
+    case ce::plain:
+    case ce::dictionary:
+        return true;
+    case ce::delta_binary_packed:
+        // Integer deltas. Timestamps are int64 underneath, which is what makes them the best case.
+        return t == cql_type::int32 || t == cql_type::bigint || t == cql_type::timestamp;
+    case ce::delta_byte_array:
+    case ce::delta_length_byte_array:
+        return t == cql_type::text || t == cql_type::blob;
+    case ce::byte_stream_split:
+        // Measured to *cost* 55 % on real doubles (design doc 10.3f). Accepted because a column
+        // whose values do not repeat can still benefit, and refusing a legal Parquet encoding on the
+        // strength of one corpus would be overreach -- but it is never chosen automatically.
+        return t == cql_type::dbl;
+    }
+    return false;
+}
+
 parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
     for (const auto& [k, v] : opts) {
         if (k == ROW_GROUP_ROWS) {
@@ -280,9 +358,33 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                         seastar::format("Unsupported 'metadata_folding' value '{}' in the 'parquet' "
                                "option; supported: auto, verbatim, row, uniform", v));
             }
+        } else if (k.size() > std::strlen(ENCODING_PREFIX)
+                   && k.compare(0, std::strlen(ENCODING_PREFIX), ENCODING_PREFIX) == 0) {
+            const sstring col = k.substr(std::strlen(ENCODING_PREFIX));
+            if (col.empty()) {
+                throw exceptions::configuration_exception(
+                        "The 'encoding.' sub-option needs a column name, e.g. 'encoding.my_col'");
+            }
+            auto enc = parse_column_encoding(v);
+            if (!enc) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "Unsupported '{}' value '{}' in the 'parquet' option; supported: "
+                        "auto, plain, dictionary, delta_binary_packed, delta_byte_array, "
+                        "delta_length_byte_array, byte_stream_split", k, v));
+            }
+            _column_encodings.emplace(col, *enc);
+            // Translated once, here, so the writer and the mapping only ever deal in Parquet's own
+            // enum. `auto` records the user's intent for DESCRIBE but contributes no hint, which is
+            // what makes 'auto' the way to cancel an override in an ALTER.
+            if (*enc != column_encoding::automatic) {
+                _cfg.column_encodings[std::string(col)] = to_format_encoding(*enc);
+            }
         } else {
             throw exceptions::configuration_exception(
-                    seastar::format("Unknown sub-option '{}' for the 'parquet' option", k));
+                    seastar::format("Unknown sub-option '{}' for the 'parquet' option; supported: "
+                                    "row_group_rows, row_group_buffer_bytes, page_rows, compression, "
+                                    "compression_level, metadata_folding, dictionary, and "
+                                    "'encoding.<column>'", k));
         }
     }
 }
@@ -320,6 +422,12 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
         case folding_level::uniform:    m[METADATA_FOLDING] = "uniform";  break;
         default: break;   // L3 is export-only and unreachable as a stored setting
         }
+    }
+    // Overrides are round-tripped verbatim, and unlike the scalar options they are *not* elided when
+    // they equal the default: an explicit 'auto' is how a user cancels an override in an ALTER, and
+    // dropping it from DESCRIBE would make the schema unreproducible.
+    for (const auto& [col, enc] : _column_encodings) {
+        m[sstring(ENCODING_PREFIX) + col] = to_string(enc);
     }
     return m;
 }
@@ -524,7 +632,14 @@ void fragment_shredder::end_partition() {
 }
 
 std::vector<uint8_t> fragment_shredder::to_parquet(const pq_writer_config& cfg) const {
-    return write_rows(_cols, _rows, cfg.level, cfg.wopt, cfg.exc);
+    // The per-column overrides have to be handed over here too. There are two ways an sstable
+    // gets written -- cut_row_group() when it outgrows the row-group budget, and this one-shot
+    // path when the whole thing fits a single row group -- and for a while only the first passed
+    // the overrides on. The effect was that `encoding.<col>` worked on large tables and did
+    // nothing on small ones, which reads as an intermittent bug rather than a missing argument:
+    // raising row_group_rows made it "start working" only because it forced a cut. Any per-column
+    // writer setting added later has to travel down both paths for the same reason.
+    return write_rows(_cols, _rows, cfg.level, cfg.wopt, cfg.exc, cfg.column_encodings);
 }
 
 std::vector<uint8_t> fragment_shredder::to_parquet_for_storage(const pq_writer_config& cfg) const {
@@ -688,7 +803,7 @@ void pq_writer_impl::cut_row_group() {
         // prefix of the way through the rows, so it has to cover every case a later row
         // might need rather than only what these rows use.
         _ms.emplace(map_schema(_shredder.columns(), _pcfg.level, _shredder.rows(),
-                               _pcfg.exc, leaf_set::conservative));
+                               _pcfg.exc, leaf_set::conservative, _pcfg.column_encodings));
         if (!folding_is_lossless(_ms->level)) {
             throw std::invalid_argument(
                     std::string("folding level ") + to_string(_ms->level) +

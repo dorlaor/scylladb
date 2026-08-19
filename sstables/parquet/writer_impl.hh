@@ -40,6 +40,9 @@ struct pq_writer_config {
     folding_level      level = folding_level::row_folded;
     exception_encoding exc   = exception_encoding::sparse;
     format::writer_options wopt{};
+    // Per-column encodings an operator asked for, already translated from the CQL enum to the
+    // Parquet one. Empty for every table that does not set them, which is the common case.
+    std::map<std::string, format::encoding> column_encodings{};
     // A row group is cut when either limit trips.
     //
     // `row_group_buffer_bytes` is **buffered shredder memory**, not encoded output, and
@@ -82,6 +85,11 @@ struct pq_writer_config {
 // recognised-looking option is worse than rejecting it -- a user who sets
 // `compression: 'gzip'` and gets zstd has been lied to -- so anything the writer
 // cannot honour is an error with the supported set named.
+// The CQL type as the writer sees it. Anything it does not special-case travels as an opaque
+// BYTE_ARRAY, which is why this returns `blob` rather than failing: a blob column genuinely supports
+// the byte_array encodings, so an override naming one is legitimate.
+cql_type cql_type_of(const abstract_type&);
+
 class parquet_parameters {
 public:
     static constexpr const char* ROW_GROUP_ROWS         = "row_group_rows";
@@ -91,6 +99,19 @@ public:
     static constexpr const char* COMPRESSION_LEVEL      = "compression_level";
     static constexpr const char* METADATA_FOLDING       = "metadata_folding";
     static constexpr const char* DICTIONARY            = "dictionary";
+    // Per-column encoding override: `parquet = {'encoding.<column>': '<enum>'}`.
+    //
+    // The writer's own choice is two-stage -- the schema proposes a hint from the column's kind and
+    // type, and the data decides whether a dictionary beats it -- and both stages are deliberately
+    // conservative. This is the escape hatch for the cases they get wrong, of which there are known
+    // ones: a *wide scan-only* table wants encodings tuned for size at the cost of point-read
+    // latency, and a text partition key that happens to be sorted in token order would benefit from
+    // front coding that the structural rule refuses to apply (§10.13).
+    //
+    // A prefix rather than a nested map because a CQL table property is map<text,text>; there is no
+    // nesting to be had. The column name is taken verbatim, so a quoted CQL identifier keeps its
+    // case.
+    static constexpr const char* ENCODING_PREFIX        = "encoding.";
 
     // Guard rails. The lower bound on rows is not arbitrary: below ~1 000 rows the
     // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --
@@ -109,8 +130,23 @@ public:
 
     const pq_writer_config& config() const { return _cfg; }
 
+    // Every value the enum accepts, in the order the error message lists them. `auto` means "let the
+    // writer decide", which is the default and the only way to spell "undo an override" in an ALTER.
+    enum class column_encoding {
+        automatic, plain, dictionary, delta_binary_packed, delta_byte_array,
+        delta_length_byte_array, byte_stream_split,
+    };
+    static std::optional<column_encoding> parse_column_encoding(std::string_view);
+    static const char* to_string(column_encoding);
+    // Which encodings are legal for a physical type. Checked at DDL time rather than at write time,
+    // because a write-time rejection would take the table down on a setting that looked accepted.
+    static bool applies_to(column_encoding, cql_type);
+
+    const std::map<sstring, column_encoding>& column_encodings() const { return _column_encodings; }
+
 private:
     pq_writer_config _cfg;
+    std::map<sstring, column_encoding> _column_encodings;
 };
 
 // Builds the layer-2 column description for a Scylla schema. Exposed because

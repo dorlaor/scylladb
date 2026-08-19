@@ -125,6 +125,68 @@ SEASTAR_TEST_CASE(test_parquet_table_property) {
     });
 }
 
+// The per-column `encoding.<col>` sub-option, end to end through CQL.
+//
+// The interesting cases are the rejections. An encoding that does not apply to a column's type
+// cannot be honoured, and there is no good way to fail later: silently ignoring it is a setting
+// that lies, and failing at write time takes the table down long after the DDL was accepted. So
+// both a wrong type and a misspelled column name have to be configuration errors here.
+//
+// `auto` is checked too, because it is the only way to *undo* an override -- an ALTER replaces
+// the whole map, but an operator scripting a change wants to name the column and cancel it.
+SEASTAR_TEST_CASE(test_parquet_per_column_encoding_property) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.pqe (pk int, ck text, v text, w double, "
+                      "PRIMARY KEY ((pk), ck)) WITH parquet = "
+                      "{'encoding.v': 'delta_byte_array', 'encoding.w': 'byte_stream_split'}")
+                .get();
+        {
+            auto s = e.local_db().find_schema("ks", "pqe");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("encoding.v"), "delta_byte_array");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("encoding.w"), "byte_stream_split");
+        }
+
+        // Every rejection is for a different reason: an encoding that is not a member of the
+        // enum, two that do not apply to the column's type, a column the table does not have,
+        // and a missing column name.
+        for (const char* bad : {
+                "{'encoding.v': 'delta_magic'}",
+                "{'encoding.v': 'delta_binary_packed'}",
+                "{'encoding.v': 'byte_stream_split'}",
+                "{'encoding.nosuch': 'plain'}",
+                "{'encoding.': 'plain'}"}) {
+            BOOST_REQUIRE_THROW(
+                    e.execute_cql(seastar::format(
+                            "ALTER TABLE ks.pqe WITH parquet = {}", bad)).get(),
+                    exceptions::configuration_exception);
+        }
+
+        // The rejected ALTERs must have changed nothing.
+        {
+            auto s = e.local_db().find_schema("ks", "pqe");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("encoding.v"), "delta_byte_array");
+        }
+
+        // A clustering key is a legitimate target, and delta_binary_packed applies to an int.
+        e.execute_cql("ALTER TABLE ks.pqe WITH parquet = {'encoding.ck': 'delta_byte_array'}")
+                .get();
+        {
+            auto s = e.local_db().find_schema("ks", "pqe");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("encoding.ck"), "delta_byte_array");
+            // The replaced map must not have kept the old entries.
+            BOOST_REQUIRE(!s->parquet_options().contains("encoding.v"));
+        }
+
+        // `auto` is accepted and stored, so DESCRIBE keeps showing an explicit cancellation
+        // rather than the setting vanishing from the schema.
+        e.execute_cql("ALTER TABLE ks.pqe WITH parquet = {'encoding.ck': 'auto'}").get();
+        {
+            auto s = e.local_db().find_schema("ks", "pqe");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("encoding.ck"), "auto");
+        }
+    });
+}
+
 // storage_format actually converts on compaction, in both directions.
 //
 // The property has been parsed, validated and persisted for a while, but nothing acted on

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <zstd.h>
 #include <map>
+#include <set>
 #include <boost/test/unit_test.hpp>
 
 #include "test/lib/scylla_test_case.hh"
@@ -268,6 +269,106 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_key_encoding_and_timestamp_unit) {
                             int32_t(pq::format::converted::timestamp_millis));
     }
     BOOST_REQUIRE(saw_ts_col);
+}
+
+// An operator's per-column encoding override (`parquet = {'encoding.<col>': ...}`) has to reach
+// the file on *both* write paths.
+//
+// There are two, and they are chosen by size rather than by anything the operator can see:
+// cut_row_group() drives the file writer directly once an sstable outgrows the row-group budget,
+// and write_rows() emits it in one shot when the whole thing fits a single row group. Only the
+// first passed the overrides on. The symptom was not "the option does nothing" but something far
+// more misleading -- the option worked on big tables and silently did nothing on small ones, so
+// raising row_group_rows appeared to *enable* it when all it did was force a cut.
+//
+// Both paths are exercised here against the same data for that reason. Asserting through only one
+// of them is what let the gap exist in the first place.
+SEASTAR_THREAD_TEST_CASE(test_parquet_per_column_encoding_override) {
+    auto s = schema_builder(1u, "pqks", "pqenc")
+        .with_column("pk", utf8_type, ::column_kind::partition_key)
+        .with_column("ck", int32_type, ::column_kind::clustering_key)
+        .with_column("v", utf8_type)
+        .with_column("w", double_type)
+        .build();
+
+    // A helper so the two paths see byte-identical input.
+    auto fill = [&] (pq::fragment_shredder& shredder) {
+        const auto pk = partition_key::from_single_value(*s, utf8_type->decompose(sstring("p1")));
+        shredder.new_partition(dht::decorate_key(*s, pk));
+        for (int i = 0; i < 600; ++i) {
+            auto ck = clustering_key::from_single_value(*s, int32_type->decompose(int32_t(i)));
+            ::row cells;
+            const column_definition& vdef = *s->get_column_definition(to_bytes("v"));
+            const column_definition& wdef = *s->get_column_definition(to_bytes("w"));
+            // Distinct and sorted, so the dictionary's cardinality test rejects it and the
+            // column falls through to whatever the override asks for.
+            cells.apply(vdef, atomic_cell::make_live(
+                    *vdef.type, 1700000000000000,
+                    utf8_type->decompose(format("value-{:08d}", i))));
+            cells.apply(wdef, atomic_cell::make_live(
+                    *wdef.type, 1700000000000000, double_type->decompose(double(i) * 1.5)));
+            clustering_row cr(std::move(ck), row_tombstone{}, row_marker(1700000000000000),
+                              std::move(cells));
+            shredder.add_clustering_row(cr);
+        }
+    };
+
+    auto encodings_of = [] (const std::vector<uint8_t>& img, const sstring& col) {
+        auto md = pq::format::parse_footer(img);
+        std::set<pq::format::encoding> out;
+        for (const auto& rg : md.row_groups) {
+            for (const auto& cc : rg.columns) {
+                if (!cc.meta || cc.meta->path_in_schema.empty()) { continue; }
+                if (cc.meta->path_in_schema.back() != col) { continue; }
+                out.insert(cc.meta->encodings.begin(), cc.meta->encodings.end());
+            }
+        }
+        return out;
+    };
+
+    // Without an override both columns are PLAIN -- the baseline the assertions below move away
+    // from, so a test that passed for the wrong reason would show up here.
+    {
+        pq::fragment_shredder shredder(*s);
+        fill(shredder);
+        pq::pq_writer_config cfg;
+        const auto img = shredder.to_parquet(cfg);
+        BOOST_REQUIRE(encodings_of(img, "v").contains(pq::format::encoding::plain));
+        BOOST_REQUIRE(!encodings_of(img, "v").contains(pq::format::encoding::delta_byte_array));
+        BOOST_REQUIRE(!encodings_of(img, "w").contains(
+                pq::format::encoding::byte_stream_split));
+    }
+
+    // The one-shot path: one row group, which is the case that was broken.
+    {
+        pq::fragment_shredder shredder(*s);
+        fill(shredder);
+        pq::pq_writer_config cfg;
+        cfg.column_encodings["v"] = pq::format::encoding::delta_byte_array;
+        cfg.column_encodings["w"] = pq::format::encoding::byte_stream_split;
+        const auto img = shredder.to_parquet(cfg);
+        const auto md = pq::format::parse_footer(img);
+        BOOST_REQUIRE_EQUAL(md.row_groups.size(), 1u);
+        BOOST_REQUIRE_MESSAGE(
+                encodings_of(img, "v").contains(pq::format::encoding::delta_byte_array),
+                "override dropped on the single-row-group path");
+        BOOST_REQUIRE_MESSAGE(
+                encodings_of(img, "w").contains(pq::format::encoding::byte_stream_split),
+                "override dropped on the single-row-group path");
+    }
+
+    // A forced dictionary has to beat the repeat-ratio heuristic: the column is 600 distinct
+    // values in 600 rows, which the heuristic rejects. Naming the encoding overrides it.
+    {
+        pq::fragment_shredder shredder(*s);
+        fill(shredder);
+        pq::pq_writer_config cfg;
+        cfg.column_encodings["v"] = pq::format::encoding::rle_dictionary;
+        const auto img = shredder.to_parquet(cfg);
+        BOOST_REQUIRE_MESSAGE(
+                encodings_of(img, "v").contains(pq::format::encoding::rle_dictionary),
+                "an explicitly requested dictionary was refused by the cardinality heuristic");
+    }
 }
 
 // The write-side memory budget's accounting (R-13, design doc 5.5a).
@@ -645,4 +746,30 @@ SEASTAR_THREAD_TEST_CASE(test_delta_byte_array_after_compression) {
     }
     std::sort(sorted_uuids.begin(), sorted_uuids.end());
     report("sorted uuid-like", sorted_uuids);
+
+    // The regression risk the hint introduces, which is not about compression at all.
+    //
+    // In parquet_writer.cc an explicit encoding hint wins *outright*: `!hinted` guards both
+    // dictionary paths, so hinting a column suppresses the dictionary for it entirely. That is
+    // deliberate for a monotonic numeric key, where a dictionary would be chosen on cardinality and
+    // lose the delta encoding. But a text clustering key can just as easily be low cardinality --
+    // a weekday, a category, a status -- and there the dictionary stores each distinct value once
+    // where front coding stores every occurrence. So the comparison that decides whether the hint
+    // is safe for byte_array is delta against *dictionary*, not against PLAIN.
+    std::vector<std::string> low_card;
+    const char* days[] = {"friday", "monday", "saturday", "sunday", "thursday", "tuesday", "wednesday"};
+    for (int i = 0; i < 100000; ++i) { low_card.push_back(days[i % 7]); }
+    std::sort(low_card.begin(), low_card.end());          // clustering order
+    {
+        std::vector<uint8_t> delta, plain;
+        encode_delta_byte_array(delta, low_card);
+        encode_plain_byte_array(plain, low_card);
+        auto d = encode_dictionary_byte_array(low_card);
+        std::vector<uint8_t> dict_total = d.dictionary_page;
+        dict_total.insert(dict_total.end(), d.index_page.begin(), d.index_page.end());
+        const size_t dz = zstd_size(delta), pz = zstd_size(plain), kz = zstd_size(dict_total);
+        BOOST_TEST_MESSAGE(seastar::format(
+                "low-cardinality sorted text: zstd plain {} dict {} delta {} "
+                "-- delta/dict = {:.1f}%", pz, kz, dz, 100.0 * dz / kz));
+    }
 }

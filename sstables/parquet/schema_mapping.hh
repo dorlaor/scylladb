@@ -380,16 +380,26 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
 // The single schema builder. Both map_schema (write side) and
 // recover_mapped_schema (read side) go through this, so there is exactly one
 // definition of the leaf layout.
+// `encoding_overrides` maps a *CQL column name* to the encoding an operator asked for through
+// `parquet = {'encoding.<column>': ...}`. It is consulted after the structural rules below and wins
+// over them, because the operator knows things the schema cannot: that a table is scan-only, or that
+// a partition key happens to be ordered. Names that match no column are impossible here -- the DDL
+// layer rejects those (cf_prop_defs::apply_to_builder) -- so an unmatched entry is simply inert.
+//
+// Only leaves that correspond to a CQL column can be overridden. The synthetic leaves (`__ts`,
+// deletion and TTL columns) keep their own encodings, since they are not something a user names.
 mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                                   folding_level requested,
                                   const schema_flags&,
-                                  exception_encoding = exception_encoding::sparse);
+                                  exception_encoding = exception_encoding::sparse,
+                                  const std::map<std::string, format::encoding>& encoding_overrides = {});
 
 mapped_schema map_schema(const std::vector<cql_column>& cols,
                          folding_level requested,
                          const std::vector<row>& rows,
                          exception_encoding = exception_encoding::sparse,
-                         leaf_set = leaf_set::derived);
+                         leaf_set = leaf_set::derived,
+                         const std::map<std::string, format::encoding>& encoding_overrides = {});
 
 // Rebuild the mapped_schema of a file we did not write, from its footer. The
 // folding level comes from the scylla.folding_level key/value entry; which
@@ -422,6 +432,8 @@ std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 const std::vector<row>& rows,
                                 folding_level level,
                                 writer_options opt = {},
-                                exception_encoding = exception_encoding::sparse);
+                                exception_encoding = exception_encoding::sparse,
+                                const std::map<std::string, format::encoding>&
+                                        encoding_overrides = {});
 
 } // namespace sstables::parquet

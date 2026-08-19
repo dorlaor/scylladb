@@ -421,7 +421,7 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
     case storage_format_type::sstable:
         break;
     case storage_format_type::parquet:
-        // An explicit opt-in is taken at face value. C1-C7 exist to make the
+        // An explicit opt-in is taken at face value. The criteria exist to make the
         // automatic choice; overruling an operator who named the format would make
         // the property mean nothing. Converting back is symmetric: set the property
         // to 'sstable' and the next compaction falls through to the branch above.

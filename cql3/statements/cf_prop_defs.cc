@@ -9,6 +9,7 @@
  */
 
 #include "cql3/statements/cf_prop_defs.hh"
+#include "cql3/column_identifier.hh"
 #include "cql3/statements/property_definitions.hh"
 #include "cql3/statements/request_validations.hh"
 #include "data_dictionary/data_dictionary.hh"
@@ -212,6 +213,9 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
         // sub-options, out-of-range values, and anything the writer cannot honour, so a
         // bad value is a configuration error here rather than a surprise at write time.
         if (auto opts = get_map(KW_PARQUET)) {
+            // Names, values and ranges. Whether an `encoding.<column>` override *applies to that
+            // column's type* is checked in apply_to_builder(), which is the first point that knows
+            // the columns; validate() sees only the keyspace.
             (void) sstables::parquet::parquet_parameters{*opts};
         }
     }
@@ -437,6 +441,31 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
     }
 
     if (auto opts = get_map(KW_PARQUET)) {
+        // An `encoding.<column>` override names a column and an encoding, and only some encodings
+        // apply to a given type: DELTA_BINARY_PACKED on text, or BYTE_STREAM_SPLIT on anything but a
+        // double, cannot be honoured. Both failure modes are bad in different ways -- an encoding the
+        // writer silently ignores is a setting that lies, and one it fails on takes the table down
+        // long after the DDL was accepted -- so it is rejected here, where the columns are known.
+        //
+        // A misspelled column name is caught for the same reason: left alone it would be inert, and
+        // an inert performance setting is one nobody notices is doing nothing.
+        const sstables::parquet::parquet_parameters pp{*opts};
+        for (const auto& [col, enc] : pp.column_encodings()) {
+            const cql3::column_identifier id{col, true};
+            if (!builder.has_column(id)) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "The 'parquet' option sets an encoding for column '{}', which this table does "
+                        "not have", col));
+            }
+            const auto& cdef = builder.find_column(id);
+            const auto ct = sstables::parquet::cql_type_of(*cdef.type);
+            if (!sstables::parquet::parquet_parameters::applies_to(enc, ct)) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "Encoding '{}' does not apply to column '{}' of type {}",
+                        sstables::parquet::parquet_parameters::to_string(enc), col,
+                        cdef.type->name()));
+            }
+        }
         builder.set_parquet_options(*opts);
     }
     if (has_property(KW_STORAGE_FORMAT)) {

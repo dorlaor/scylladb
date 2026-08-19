@@ -1394,9 +1394,9 @@ Two deliberate departures from the original specification:
   and rejects `lz4`, `snappy` and `gzip`, because the writer emits only those two. An
   option that silently ignores what it cannot do is worse than one that refuses -- a user
   who sets `gzip` and gets zstd has been told something untrue about their data. Likewise
-  `dictionary`, `dictionary_page_max_bytes`, `encoding_overrides`, `write_page_index`,
-  `statistics_level`, `bloom_filter_columns` and `writer_version` are **not** accepted
-  yet; each would be a lie until implemented.
+  `dictionary_page_max_bytes`, `write_page_index`, `statistics_level`, `bloom_filter_columns`
+  and `writer_version` are **not** accepted yet; each would be a lie until implemented.
+  (`dictionary` and the per-column encoding overrides *are* accepted -- see §8.2b.)
 - **`metadata_folding` cannot select L3.** L3 discards write times and TTLs; it is
   export-only, and `to_parquet_for_storage()` refuses it. Accepting it as a table property
   would offer silent data loss as a configuration option.
@@ -1425,6 +1425,67 @@ parser accepts `"verbatim"`/`"row"`/`"uniform"`. The property therefore did not 
 persistence -- write it, read it back, and validation rejected your own output. Serialisation
 now uses the user-facing vocabulary. Worth recording because it is invisible to any test that
 only parses, and it would have shipped as "ALTER works but the table breaks on restart".
+
+### 8.2b Per-column encodings
+
+An operator can name the encoding for a single column, as an enum, in the same map:
+
+```cql
+ALTER TABLE ks.t WITH parquet = {
+    'encoding.reading'  : 'byte_stream_split',
+    'encoding.sensor'   : 'dictionary',
+    'encoding.path'     : 'delta_byte_array'
+};
+```
+
+The accepted values are `auto`, `plain`, `dictionary`, `delta_binary_packed`,
+`delta_byte_array`, `delta_length_byte_array` and `byte_stream_split` -- the encodings the
+writer can actually emit, and nothing else. `auto` means "no override", and it is stored rather
+than dropped: an `ALTER` replaces the whole map, so an operator scripting a change needs a way to
+name a column and cancel its override, and a `DESCRIBE` that silently omitted the cancellation
+would not reproduce the table.
+
+Three things are rejected at DDL time rather than at write time:
+
+- an encoding that is not in the enum;
+- an encoding that does not apply to the column's type (`delta_binary_packed` on `text`,
+  `byte_stream_split` on anything that is not a `double`);
+- a column the table does not have.
+
+The last one matters as much as the others. Left alone a misspelled column name is inert, and an
+inert performance setting is one nobody notices is doing nothing. All three are checked in
+`cf_prop_defs::apply_to_builder()`, which is the first point where both the option map and the
+column definitions are in scope.
+
+**How an override interacts with the automatic choice.** The schema mapping proposes a hint from
+structure -- `DELTA_BINARY_PACKED` for `bigint`/`timestamp` keys, `DELTA_BYTE_ARRAY` for `text`
+and `blob` clustering keys -- and the writer then decides the dictionary on its own cardinality
+and size tests. An override replaces the structural hint. It does not replace the dictionary's
+*size* cap, which is not a heuristic: a dictionary page larger than the budget cannot be held.
+It does replace the dictionary's repeat-ratio test, because that test is a heuristic about when a
+dictionary pays and someone naming `dictionary` has overridden the heuristic deliberately.
+
+**The bug this shipped with, because the shape of it will recur.** An sstable is written by one of
+two paths, chosen by size and invisible to the operator: `cut_row_group()` drives the file writer
+directly once the sstable outgrows the row-group budget, and `write_rows()` emits it in one shot
+when the whole thing fits a single row group. Only the first passed the overrides through. The
+symptom was not "the option does nothing" -- it was worse than that. The option worked on large
+tables and silently did nothing on small ones, so raising `row_group_rows` appeared to *enable*
+it, when all that did was force a cut. Two hours went into chasing a non-existent dependency on
+the scalar options before the second write path was noticed.
+
+This is the second time hints have been dropped on one path and not the other; §10.1g records the
+first, where the nested writer ignored them entirely and every column went out PLAIN. The lesson
+is specific enough to state as a rule: **a per-column writer setting has to be asserted on both
+write paths, because which one runs is a function of data size.** The regression test in
+`test/boost/parquet_writer_test.cc` drives the same rows through both.
+
+**`DESCRIBE` had never emitted the property at all.** Independently of the above, `parquet = {...}`
+was missing from `schema::get_create_statement()`, so no parquet setting -- scalar or per-column --
+survived a table recreated from its own description. `to_map()` carried a comment explaining that
+overrides are deliberately not elided from `DESCRIBE`, which had been true of `to_map()` and false
+of `DESCRIBE` for as long as the property had existed. It is emitted now, and the lab check
+recreates a table from its own `DESCRIBE` output and re-verifies the encoding in the file.
 
 ### 8.2a Original specification (for reference)
 

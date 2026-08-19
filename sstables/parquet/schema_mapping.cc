@@ -266,7 +266,8 @@ static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
 mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                                   folding_level requested,
                                   const schema_flags& flags,
-                                  exception_encoding exc) {
+                                  exception_encoding exc,
+                                  const std::map<std::string, format::encoding>& encoding_overrides) {
     mapped_schema ms;
     ms.level = requested;
     ms.exc_encoding = exc;
@@ -328,6 +329,9 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                    && (cols[i].type == cql_type::text || cols[i].type == cql_type::blob)) {
             hint = encoding::delta_byte_array;
         }
+        if (auto it = encoding_overrides.find(cols[i].name); it != encoding_overrides.end()) {
+            hint = it->second;
+        }
         ms.columns.push_back(column_spec{cols[i].name, phys_of(cols[i].type),
                                          repetition::required, converted_of(cols[i].type), hint});
     }
@@ -378,8 +382,16 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
             }
             continue;
         }
+        // Regular columns default to PLAIN (see the note above on why type-based rules lost), but an
+        // operator override applies here too -- this is the case it is most useful for, since a
+        // scan-only table may want front coding or a forced dictionary on a payload column that the
+        // structural rules deliberately leave alone.
+        std::optional<encoding> reg_hint;
+        if (auto it = encoding_overrides.find(c.name); it != encoding_overrides.end()) {
+            reg_hint = it->second;
+        }
         ms.columns.push_back(column_spec{c.name, phys_of(c.type), repetition::optional,
-                                         converted_of(c.type), std::nullopt});
+                                         converted_of(c.type), reg_hint});
     }
 
     for (size_t k = 0; k < reg_idx.size(); ++k) {
@@ -551,8 +563,9 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
                          folding_level requested,
                          const std::vector<row>& rows,
                          exception_encoding exc,
-                         leaf_set ls) {
-    return build_mapped_schema(cols, requested, scan_rows(cols, rows, ls), exc);
+                         leaf_set ls,
+                         const std::map<std::string, format::encoding>& encoding_overrides) {
+    return build_mapped_schema(cols, requested, scan_rows(cols, rows, ls), exc, encoding_overrides);
 }
 
 mapped_schema recover_mapped_schema(const file_metadata& fm,
@@ -1120,8 +1133,10 @@ std::vector<uint8_t> write_rows(const std::vector<cql_column>& cols,
                                 const std::vector<row>& rows,
                                 folding_level level,
                                 writer_options opt,
-                                exception_encoding exc) {
-    auto ms = map_schema(cols, level, rows, exc);
+                                exception_encoding exc,
+                                const std::map<std::string, format::encoding>&
+                                        encoding_overrides) {
+    auto ms = map_schema(cols, level, rows, exc, leaf_set::derived, encoding_overrides);
     auto data = shred(ms, cols, rows);
     // The encoding hints have to be handed over separately: the tree cannot carry
     // them. ms.columns is in leaf order -- build_tree() asserts that and writes the

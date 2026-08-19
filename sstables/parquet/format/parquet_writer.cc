@@ -160,12 +160,29 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     // ---- decide encoding
     bool use_dict = false;
     dict_result dict;
-    // An explicit encoding hint wins outright. Otherwise a monotonic key column would
-    // qualify for a dictionary on cardinality alone and lose its delta encoding: on a
-    // time-series table that is the difference between 37 kB and 528 kB for the
-    // clustering key.
+    // An explicit encoding hint wins outright -- with one exception. Otherwise a monotonic key
+    // column would qualify for a dictionary on cardinality alone and lose its delta encoding: on a
+    // time-series table that is the difference between 37 kB and 528 kB for the clustering key.
+    //
+    // The exception is the front-coding hints on byte_array. Those are applied to text and blob
+    // *clustering* keys on the strength of sortedness, and a sorted key can just as easily be low
+    // cardinality -- a weekday, a category, a status. There a dictionary stores each distinct value
+    // once where front coding stores every occurrence, and letting the hint win costs **3.5x**:
+    // measured on 100 000 sorted weekday strings, zstd gives dictionary 99 bytes against delta 349
+    // (and PLAIN 192). So for those hints the dictionary is evaluated first and the hint applies only
+    // if the dictionary's own cardinality test rejects it -- which is precisely the case the hint is
+    // for, a key with many distinct values that happen to be ordered.
     const bool hinted = spec.preferred.has_value();
-    if (_opt.use_dictionary && !hinted && spec.type == phys_type::byte_array && !col.str.empty()) {
+    const bool hint_yields_to_dict = hinted
+            && (*spec.preferred == encoding::delta_byte_array
+                || *spec.preferred == encoding::delta_length_byte_array);
+    // An explicit request for a dictionary -- only reachable through the per-column CQL override --
+    // skips the repeat-ratio test. That test is a heuristic about when a dictionary pays, and someone
+    // naming the encoding has overridden the heuristic on purpose. The *size* cap still applies,
+    // because it is not a heuristic: a dictionary larger than the budget cannot be held.
+    const bool hint_forces_dict = hinted && *spec.preferred == encoding::rle_dictionary;
+    if (_opt.use_dictionary && (!hinted || hint_yields_to_dict || hint_forces_dict)
+        && spec.type == phys_type::byte_array && !col.str.empty()) {
         // Only the present values go into the dictionary.
         // Values are dense per slot only when the column does not repeat; a
         // repeated one supplies present values only, so walk a value cursor
@@ -187,11 +204,13 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         // 10.4) while saving almost nothing, because zstd already finds those
         // repeats. 8x keeps the low-cardinality columns a dictionary is for.
         if (dict.dictionary_page.size() <= _opt.dictionary_max_bytes &&
-            dict.num_distinct * _opt.dictionary_min_repeat < present.size()) {
+            (hint_forces_dict
+             || dict.num_distinct * _opt.dictionary_min_repeat < present.size())) {
             use_dict = true;
         }
-    } else if (_opt.use_dictionary && _opt.numeric_dictionary && !hinted &&
-               spec.type != phys_type::byte_array) {
+    } else if (_opt.use_dictionary && (!hinted || hint_forces_dict)
+               && (_opt.numeric_dictionary || hint_forces_dict)
+               && spec.type != phys_type::byte_array) {
         // Numerics get a dictionary too, on the same terms.
         //
         // Measured on a time-series table (design doc 10.1g): leaving these on PLAIN
@@ -204,7 +223,8 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             using V = typename std::decay_t<decltype(values)>::value_type;
             dict = encode_dictionary_fixed(std::span<const V>(values));
             if (dict.dictionary_page.size() <= _opt.dictionary_max_bytes &&
-                dict.num_distinct * _opt.dictionary_min_repeat < values.size()) {
+                (hint_forces_dict
+                 || dict.num_distinct * _opt.dictionary_min_repeat < values.size())) {
                 use_dict = true;
             }
         };
