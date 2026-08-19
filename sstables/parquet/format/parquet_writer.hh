@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -100,6 +101,20 @@ struct writer_options {
         bool                       store_aad_prefix = false;
         // Opaque to us: whatever a reader's key-management needs in order to find the key again.
         std::optional<std::string> key_metadata;
+
+        // Per-column keys, by leaf name. A column listed here is encrypted with its own key
+        // instead of the footer key, and its ColumnMetaData moves out of the (footer-key
+        // encrypted) footer into ColumnChunk.encrypted_column_metadata -- so a reader holding
+        // only the footer key sees that the column exists and nothing else about it.
+        //
+        // This is what makes "encrypt the PII columns" expressible: give an analytics reader the
+        // footer key and the keys for the columns it may see, and the rest of the file stays shut
+        // to it while remaining a valid Parquet file.
+        struct column_key {
+            encryption_key             key;
+            std::optional<std::string> key_metadata;
+        };
+        std::map<std::string, column_key> column_keys{};
     };
     encryption_options encryption{};
 };
@@ -210,7 +225,11 @@ class parquet_file_writer {
     // takes the module type and ordinals rather than knowing them.
     size_t emit_module(std::span<const uint8_t> plain, module_type,
                        int row_group = -1, int column = -1, int page = -1,
-                       bool ctr_body = false);
+                       bool ctr_body = false, const encryption_key* key = nullptr);
+    // The key protecting one leaf: its own if it has one, otherwise the footer key.
+    const encryption_key& key_for_column(const std::string& leaf_name) const;
+    const writer_options::encryption_options::column_key*
+            column_key_for(const std::string& leaf_name) const;
     // Size the envelope will occupy, needed because a page header has to state its own
     // compressed size before the body is encrypted.
     size_t envelope_size(size_t plain_len, bool ctr_body) const {

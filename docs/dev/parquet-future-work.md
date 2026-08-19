@@ -215,9 +215,18 @@ interoperability that is the whole argument for Parquet. Built and verified end 
 — see storage-format §10.17. AES_GCM_V1 and AES_GCM_CTR_V1, encrypted footer, keys named by id and
 resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key.
 
-Still open within it: per-column keys are *read* but not written (the writer encrypts every column
-with the footer key), plaintext-footer mode, key rotation, and any KMS integration. The key file is
-exactly as strong as its permissions.
+Still open within it:
+
+- **Per-column keys are written but not interoperable.** The writer emits them and our reader
+  round-trips them; pyarrow with the footer key alone correctly reads the footer-key column and
+  cannot touch the column-key one (which is the partial access the feature is for), but pyarrow
+  *with* the column key still fails to decrypt it. Our reader handles parquet-cpp's own per-column
+  files, so the bug is on our write side. Ruled out: the AAD ordinals and module type, which key
+  encrypts the column metadata, and the envelope layout. Next suspects: `RowGroup.ordinal`, which
+  we never emit, and the `ColumnChunk` field 3/8/9 presence rules. Not exposed through CQL until
+  this closes.
+- Plaintext-footer mode, key rotation, and any KMS integration. The key file is exactly as strong
+  as its permissions.
 
 ### Downgrade procedure — written 2026-08-19, was "not started"
 §10.9. The load-bearing fact is observed, not reasoned: an older node meeting an sstable version it

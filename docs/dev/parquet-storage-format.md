@@ -4649,10 +4649,35 @@ reads the same raw files with the key** (2 000 rows across 4 files, values exact
 refuse to open without it. The format layer is covered from both directions in
 `sstables/parquet/run_tests.sh` suites 19 and 20.
 
-**What is not built.** Per-column keys are read but not written -- the reader handles
-`ColumnCryptoMetaData` and encrypted column metadata, including files that leave some columns in
-the clear, but the writer encrypts every column with the footer key. Also absent: plaintext-footer
-mode, key rotation, and any KMS integration. The key file is exactly as strong as its permissions.
+**Per-column keys: written, and not yet interoperable.** The writer now takes a key per column,
+encrypts that column's pages, dictionary page and OffsetIndex under it, emits
+`EncryptionWithColumnKey` in `ColumnCryptoMetaData`, and moves the `ColumnMetaData` out of the
+footer into `ColumnChunk.encrypted_column_metadata`. Verified from three directions:
+
+- our reader round-trips it, values exact, and refuses a wrong column key;
+- with the footer key alone, our reader opens the file, reads the footer-key column, and sees the
+  other column as present-but-encrypted rather than as a malformed footer;
+- **pyarrow, given the footer key alone, reads the footer-key column and cannot touch the
+  column-key one** -- which is the partial access the feature exists for, working through a stock
+  reader.
+
+But pyarrow given *both* keys still cannot decrypt the column-key column: `Failed decryption
+finalization`. Our reader can, and our reader also decrypts parquet-cpp's own per-column files
+(§ suite 19), so **the divergence is on our write side and is not yet found.** Ruled out so far: the
+AAD module type and ordinals (the conformance test decrypts parquet-cpp's `encrypted_column_metadata`
+with exactly the AAD our writer builds), which key encrypts the column metadata (the column's, not
+the footer's, again from parquet-cpp's file), and the envelope layout (the 4-byte length prefix is
+included, same as ours). Next suspects are `RowGroup.ordinal`, which our writer does not emit at all,
+and the field order or presence rules around `ColumnChunk` fields 3/8/9.
+
+**So per-column keys are not exposed through CQL.** A property that produced files only Scylla could
+read would defeat the reason for encrypting inside the format, and shipping it as an option while
+that is true would be the "setting that lies" failure mode this codebase keeps refusing elsewhere.
+The interop suite prints the gap on every run rather than asserting it, and says what to change when
+it closes.
+
+**Also absent**: plaintext-footer mode, key rotation, and any KMS integration. The key file is
+exactly as strong as its permissions.
 
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 

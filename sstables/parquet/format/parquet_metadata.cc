@@ -395,6 +395,11 @@ void materialise_row_group(file_metadata& m, size_t rg, std::span<const uint8_t>
     }
 }
 
+column_metadata parse_column_metadata_blob(std::span<const uint8_t> blob, limits lim) {
+    compact_reader r(blob, lim);
+    return parse_column_metadata(r);
+}
+
 file_metadata parse_file_metadata(std::span<const uint8_t> blob, limits lim, semantic_check chk,
                                   metadata_mode mode) {
     compact_reader r(blob, lim);

@@ -234,6 +234,11 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 
         if (c >= in.size()) { throw decode_error("missing column input"); }
         const auto& ci = in[c];
+        // Under per-column encryption each chunk may be under a different key, so this is
+        // resolved per column rather than once for the file.
+        const std::string leaf_name = cm.path_in_schema.empty() ? std::string()
+                                                                : cm.path_in_schema.back();
+        const encryption_key* ckey = crypto ? &crypto->key_for(leaf_name) : nullptr;
 
         // The dictionary page, when it is supplied separately. A caller that
         // hands over the whole chunk leaves `dict` empty and lets the page walk
@@ -249,14 +254,14 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
             std::span<const uint8_t> dbody;
             if (crypto) {
                 dhdr_plain = decrypt_module(
-                        ci.dict, crypto->key,
+                        ci.dict, *ckey,
                         build_aad(crypto->aad_prefix, crypto->aad_file_unique,
                                   module_type::dictionary_page_header, int(rg_index), int(c)),
                         &dconsumed, crypto->algo, false);
                 size_t dummy = 0;
                 dph = parse_page_header(dhdr_plain, dummy);
                 dbody_plain = decrypt_module(
-                        ci.dict.subspan(dconsumed), crypto->key,
+                        ci.dict.subspan(dconsumed), *ckey,
                         build_aad(crypto->aad_prefix, crypto->aad_file_unique,
                                   module_type::dictionary_page, int(rg_index), int(c)),
                         nullptr, crypto->algo, crypto->algo == cipher::aes_gcm_ctr_v1);
@@ -305,7 +310,7 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                 bool as_data = true;
                 try {
                     hdr_plain = decrypt_module(
-                            image.subspan(size_t(off)), crypto->key,
+                            image.subspan(size_t(off)), *ckey,
                             build_aad(crypto->aad_prefix, crypto->aad_file_unique,
                                       module_type::data_page_header, int(rg_index),
                                       int(c), page_ordinal),
@@ -313,7 +318,7 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                 } catch (const std::exception&) {
                     as_data = false;
                     hdr_plain = decrypt_module(
-                            image.subspan(size_t(off)), crypto->key,
+                            image.subspan(size_t(off)), *ckey,
                             build_aad(crypto->aad_prefix, crypto->aad_file_unique,
                                       module_type::dictionary_page_header, int(rg_index),
                                       int(c)),
@@ -326,7 +331,7 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                     throw decode_error("page body extends past EOF");
                 }
                 body_plain = decrypt_module(
-                        image.subspan(size_t(body_at)), crypto->key,
+                        image.subspan(size_t(body_at)), *ckey,
                         build_aad(crypto->aad_prefix, crypto->aad_file_unique,
                                   as_data ? module_type::data_page : module_type::dictionary_page,
                                   int(rg_index), int(c),
@@ -480,7 +485,9 @@ std::vector<column_data> read_file(std::span<const uint8_t> image) {
 }
 
 encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const encryption_key& key,
-                                        std::string_view aad_prefix, limits lim) {
+                                        std::string_view aad_prefix,
+                                        const std::map<std::string, encryption_key>& column_keys,
+                                        limits lim) {
     if (!has_encrypted_footer(image) || image.size() < 8) {
         throw decode_error("not an encrypted-footer Parquet file (no PARE magic)");
     }
@@ -510,6 +517,28 @@ encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const en
     auto aad = build_aad(out.crypto.aad_prefix, out.crypto.aad_file_unique, module_type::footer);
     auto plain = decrypt_module(tail.subspan(consumed), key, aad, nullptr, fcm.algo, false);
     out.md = parse_file_metadata(plain, lim);
+    out.crypto.column_keys = column_keys;
+    // Fill in the metadata of any column encrypted under a key we were given. Columns whose key
+    // we lack keep `meta` empty, which is a legitimate state the parser now tolerates -- the file
+    // is readable, that column is not.
+    for (size_t g = 0; g < out.md.row_groups.size(); ++g) {
+        auto& rg = out.md.row_groups[g];
+        for (size_t c = 0; c < rg.columns.size(); ++c) {
+            auto& ch = rg.columns[c];
+            if (ch.meta || !ch.encrypted_column_metadata || !ch.crypto_metadata) { continue; }
+            const auto& path = ch.crypto_metadata->path_in_schema;
+            if (path.empty()) { continue; }
+            auto it = column_keys.find(path.back());
+            if (it == column_keys.end()) { continue; }
+            auto caad = build_aad(out.crypto.aad_prefix, out.crypto.aad_file_unique,
+                                  module_type::column_metadata, int(g), int(c));
+            auto blob = std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(ch.encrypted_column_metadata->data()),
+                    ch.encrypted_column_metadata->size());
+            auto cm = decrypt_module(blob, it->second, caad, nullptr, out.crypto.algo, false);
+            ch.meta = parse_column_metadata_blob(cm, lim);
+        }
+    }
     return out;
 }
 

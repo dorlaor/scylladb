@@ -315,10 +315,11 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
                                      int32_t(dict.num_distinct));
         size_t on_disk_hdr = hdr.size(), on_disk_body = comp.size();
         if (encrypting()) {
+            const auto& ckey = key_for_column(spec.name);
             on_disk_hdr = emit_module(hdr, module_type::dictionary_page_header,
-                                      int(_rgs.size()), column_ordinal);
+                                      int(_rgs.size()), column_ordinal, -1, false, &ckey);
             on_disk_body = emit_module(comp, module_type::dictionary_page,
-                                       int(_rgs.size()), column_ordinal, -1, ctr_body);
+                                       int(_rgs.size()), column_ordinal, -1, ctr_body, &ckey);
         } else {
             _buf.insert(_buf.end(), hdr.begin(), hdr.end());
             _buf.insert(_buf.end(), comp.begin(), comp.end());
@@ -520,8 +521,10 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         rows_written += int64_t(page_rows);
         size_t hdr_on_disk = hdr.size();
         if (encrypting()) {
+            const auto& ckey = key_for_column(spec.name);
             hdr_on_disk = emit_module(hdr, module_type::data_page_header,
-                                      int(_rgs.size()), column_ordinal, int(page_ordinal));
+                                      int(_rgs.size()), column_ordinal, int(page_ordinal),
+                                      false, &ckey);
             // Spec order inside the body: repetition levels, definition levels, then values.
             std::vector<uint8_t> body;
             body.reserve(body_plain);
@@ -529,7 +532,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             body.insert(body.end(), def_bytes.begin(), def_bytes.end());
             body.insert(body.end(), comp.begin(), comp.end());
             emit_module(body, module_type::data_page, int(_rgs.size()), column_ordinal,
-                        int(page_ordinal), ctr_body);
+                        int(page_ordinal), ctr_body, &ckey);
         } else {
             _buf.insert(_buf.end(), hdr.begin(), hdr.end());
             // Spec order: repetition levels first, then definition levels.
@@ -612,8 +615,11 @@ void parquet_file_writer::write_page_indexes() {
                 // The OffsetIndex is a module too (type 7, no page ordinal). Leaving it in the
                 // clear would leak the page layout -- row counts and sizes per page -- of an
                 // otherwise encrypted column, and readers expect it encrypted when the file is.
+                const auto& ckey = key_for_column(
+                        ch.cm.path_in_schema.empty() ? std::string() : ch.cm.path_in_schema.back());
                 const size_t n = emit_module(blob, module_type::offset_index,
-                                             int(&rg - _rgs.data()), int(&ch - rg.chunks.data()));
+                                             int(&rg - _rgs.data()), int(&ch - rg.chunks.data()),
+                                             -1, false, &ckey);
                 ch.offset_index_length = int32_t(n);
             } else {
                 ch.offset_index_length = int32_t(blob.size());
@@ -647,43 +653,83 @@ void parquet_file_writer::write_footer() {
         for (const auto& rg : _rgs) {
             compact_writer::elem_scope e(w);
             w.field_list(1, ctype::strct, rg.chunks.size());
+            size_t chunk_ordinal = 0;
             for (const auto& ch : rg.chunks) {
                 compact_writer::elem_scope ce(w);
                 w.field_i64(2, ch.first_page_offset);       // file_offset
-                w.field_struct(3);
+                // ColumnMetaData is serialised standalone so it can go either inline (field 3) or
+                // encrypted under the column's own key (field 9). A separately-serialised struct
+                // starts its own field-id delta sequence, which is exactly what a nested struct
+                // needs, so the bytes splice in unchanged.
+                std::vector<uint8_t> cmbuf;
                 {
-                    compact_writer::elem_scope cm(w);
+                    compact_writer cw(cmbuf);
+                    compact_writer::struct_scope cm(cw);
                     const auto& m = ch.cm;
-                    w.field_i32(1, int32_t(m.type));
-                    w.field_list(2, ctype::i32, m.encodings.size());
-                    for (auto en : m.encodings) { w.zigzag(int32_t(en)); }
-                    w.field_list(3, ctype::binary, m.path_in_schema.size());
-                    for (const auto& p : m.path_in_schema) { w.uvarint(p.size()); w.raw(p.data(), p.size()); }
-                    w.field_i32(4, int32_t(m.compression));
-                    w.field_i64(5, m.num_values);
-                    w.field_i64(6, m.total_uncompressed_size);
-                    w.field_i64(7, m.total_compressed_size);
-                    w.field_i64(9, m.data_page_offset);
-                    if (m.dictionary_page_offset) { w.field_i64(11, *m.dictionary_page_offset); }
-                    if (m.stats && m.stats->null_count) {
-                        w.field_struct(12);
-                        compact_writer::elem_scope st(w);
-                        w.field_i64(3, *m.stats->null_count);
+                    cw.field_i32(1, int32_t(m.type));
+                    cw.field_list(2, ctype::i32, m.encodings.size());
+                    for (auto en : m.encodings) { cw.zigzag(int32_t(en)); }
+                    cw.field_list(3, ctype::binary, m.path_in_schema.size());
+                    for (const auto& p : m.path_in_schema) {
+                        cw.uvarint(p.size()); cw.raw(p.data(), p.size());
                     }
+                    cw.field_i32(4, int32_t(m.compression));
+                    cw.field_i64(5, m.num_values);
+                    cw.field_i64(6, m.total_uncompressed_size);
+                    cw.field_i64(7, m.total_compressed_size);
+                    cw.field_i64(9, m.data_page_offset);
+                    if (m.dictionary_page_offset) { cw.field_i64(11, *m.dictionary_page_offset); }
+                    if (m.stats && m.stats->null_count) {
+                        cw.field_struct(12);
+                        compact_writer::elem_scope st(cw);
+                        cw.field_i64(3, *m.stats->null_count);
+                    }
+                }
+                const std::string leaf = ch.cm.path_in_schema.empty()
+                                       ? std::string() : ch.cm.path_in_schema.back();
+                const auto* ck = encrypting() ? column_key_for(leaf) : nullptr;
+                if (!ck) {
+                    w.field(3, ctype::strct);
+                    w.raw(cmbuf.data(), cmbuf.size());
                 }
                 // ColumnChunk.offset_index_offset / _length come after meta_data
                 // because Thrift field ids must be written in ascending order.
                 if (ch.offset_index_offset) { w.field_i64(4, *ch.offset_index_offset); }
                 if (ch.offset_index_length) { w.field_i32(5, *ch.offset_index_length); }
                 if (encrypting()) {
-                    // ColumnCryptoMetaData = ENCRYPTION_WITH_FOOTER_KEY, an empty struct. Every
-                    // column shares the footer key here; per-column keys would put
-                    // EncryptionWithColumnKey in field 2 and move this metadata into field 9.
+                    // ColumnCryptoMetaData: field 1 is ENCRYPTION_WITH_FOOTER_KEY, an empty
+                    // struct; field 2 is ENCRYPTION_WITH_COLUMN_KEY, which names the column and
+                    // carries whatever the reader needs to find that column's key.
                     w.field_struct(8);
-                    compact_writer::elem_scope cc(w);
-                    w.field_struct(1);
-                    compact_writer::elem_scope ek(w);
+                    {
+                        compact_writer::elem_scope cc(w);
+                        if (!ck) {
+                            w.field_struct(1);
+                            compact_writer::elem_scope ek(w);
+                        } else {
+                            w.field_struct(2);
+                            compact_writer::elem_scope ek(w);
+                            w.field_list(1, ctype::binary, ch.cm.path_in_schema.size());
+                            for (const auto& p : ch.cm.path_in_schema) {
+                                w.uvarint(p.size()); w.raw(p.data(), p.size());
+                            }
+                            if (ck->key_metadata) { w.field_binary(2, *ck->key_metadata); }
+                        }
+                    }
+                    if (ck) {
+                        // The metadata itself, encrypted under the column key. A reader with only
+                        // the footer key can see that this column exists and nothing else -- not
+                        // its size, not its encodings, not where its pages are.
+                        std::vector<uint8_t> enc;
+                        const auto aad = build_aad(_opt.encryption.aad_prefix, _aad_file_unique,
+                                                   module_type::column_metadata,
+                                                   int(&rg - _rgs.data()), int(chunk_ordinal));
+                        encrypt_module(enc, cmbuf, ck->key, aad, _opt.encryption.algo, false);
+                        w.field_binary(9, std::string_view(
+                                reinterpret_cast<const char*>(enc.data()), enc.size()));
+                    }
                 }
+                ++chunk_ordinal;
             }
             w.field_i64(2, rg.total_byte_size);
             w.field_i64(3, rg.num_rows);
@@ -730,11 +776,23 @@ void parquet_file_writer::write_footer() {
 }
 
 size_t parquet_file_writer::emit_module(std::span<const uint8_t> plain, module_type mt,
-                                        int row_group, int column, int page, bool ctr_body) {
+                                        int row_group, int column, int page, bool ctr_body,
+                                        const encryption_key* key) {
     const auto aad = build_aad(_opt.encryption.aad_prefix, _aad_file_unique, mt,
                                row_group, column, page);
-    return encrypt_module(_buf, plain, _opt.encryption.footer_key, aad,
+    return encrypt_module(_buf, plain, key ? *key : _opt.encryption.footer_key, aad,
                           _opt.encryption.algo, ctr_body);
+}
+
+const writer_options::encryption_options::column_key*
+parquet_file_writer::column_key_for(const std::string& leaf_name) const {
+    auto it = _opt.encryption.column_keys.find(leaf_name);
+    return it == _opt.encryption.column_keys.end() ? nullptr : &it->second;
+}
+
+const encryption_key& parquet_file_writer::key_for_column(const std::string& leaf_name) const {
+    if (auto* ck = column_key_for(leaf_name)) { return ck->key; }
+    return _opt.encryption.footer_key;
 }
 
 std::vector<uint8_t> parquet_file_writer::finish() {

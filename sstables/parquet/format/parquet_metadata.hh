@@ -238,6 +238,12 @@ file_metadata parse_footer(std::span<const uint8_t> file_image, limits = {});
 
 // Parse a chunk's OffsetIndex from the file image, using the offsets the footer
 // recorded. Returns nullopt when the chunk carries no page index.
+// Parse a bare ColumnMetaData blob. Needed for per-column encryption: when a column has its own
+// key its metadata is not inline in the footer but sits encrypted in
+// ColumnChunk.encrypted_column_metadata, and a reader holding that key decrypts the bytes and
+// parses them on their own.
+column_metadata parse_column_metadata_blob(std::span<const uint8_t> blob, limits = {});
+
 // Parse a bare OffsetIndex blob (i.e. the bytes the footer points at, already
 // extracted). Lets a reader fetch just those bytes instead of holding the file.
 offset_index parse_offset_index_blob(std::span<const uint8_t> blob, limits = {});

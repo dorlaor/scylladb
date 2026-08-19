@@ -19,6 +19,7 @@
 #include "parquet_metadata.hh"
 #include "parquet_writer.hh"
 
+#include <map>
 #include <span>
 #include <vector>
 
@@ -28,10 +29,19 @@ namespace sstables::parquet::format {
 // FileCryptoMetaData declared. Passed as a pointer that defaults to null everywhere below, so an
 // unencrypted read is unchanged and an encrypted one is impossible to attempt by accident.
 struct read_crypto {
-    encryption_key key;
+    encryption_key key;                 // the footer key
     cipher         algo = cipher::aes_gcm_v1;
     std::string    aad_prefix;
     std::string    aad_file_unique;
+    // Keys for columns that have their own, by leaf name. A reader may legitimately hold some and
+    // not others -- that is the point of per-column keys -- so a column with no key here and no
+    // footer-key access simply cannot be decoded, and the reader has to say so rather than guess.
+    std::map<std::string, encryption_key> column_keys{};
+
+    const encryption_key& key_for(const std::string& leaf) const {
+        auto it = column_keys.find(leaf);
+        return it == column_keys.end() ? key : it->second;
+    }
 };
 
 // Open an encrypted-footer ("PARE") file: check the magic, read the plaintext
@@ -42,7 +52,10 @@ struct encrypted_footer {
     read_crypto   crypto;
 };
 encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const encryption_key&,
-                                        std::string_view aad_prefix = {}, limits = {});
+                                        std::string_view aad_prefix = {},
+                                        const std::map<std::string, encryption_key>&
+                                                column_keys = {},
+                                        limits = {});
 
 // Decode one row group into one column_data per leaf, in schema order.
 std::vector<column_data> read_row_group(std::span<const uint8_t> image,

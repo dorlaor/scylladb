@@ -16,6 +16,7 @@
 
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -115,6 +116,120 @@ static void write_file(const std::string& path, bool dict, cipher algo,
     }
 }
 
+// Per-column keys: `name` gets its own key, `id` stays under the footer key.
+//
+// The assertion that matters is the *partial* one -- a reader with the footer key alone must open
+// the file and read `id`, and must not be able to touch `name`. That is the shape a real
+// deployment wants ("encrypt the PII columns"), and it is the shape that would silently degrade
+// into "everything readable" if the column key were not actually being used.
+static std::string key_material(const char* id, bool footer) {
+    // parquet-java's key-material JSON, which is what pyarrow's KMS layer requires. See
+    // encryption_keys.hh for why the convention beats the minimal encoding. wrappedDEK is a
+    // placeholder: the KMS is asked for the key by masterKeyID.
+    return std::string("{\"keyMaterialType\":\"PKMT1\",\"internalStorage\":true,"
+                       "\"isFooterKey\":") + (footer ? "true" : "false")
+           + ",\"kmsInstanceID\":\"DEFAULT\",\"kmsInstanceURL\":\"DEFAULT\","
+             "\"masterKeyID\":\"" + id
+           + "\",\"wrappedDEK\":\"AAAAAAAAAAAAAAAAAAAAAA==\",\"doubleWrapping\":false}";
+}
+
+static void write_percolumn(const std::string& path, const std::string& footer_key_bytes,
+                            const std::string& col_key_bytes) {
+    std::vector<column_spec> schema;
+    schema.push_back(column_spec{"id", phys_type::int64, repetition::required});
+    schema.push_back(column_spec{"name", phys_type::byte_array, repetition::optional});
+
+    writer_options opt;
+    opt.compression = codec::zstd;
+    opt.use_dictionary = true;
+    opt.write_page_index = true;
+    opt.page_values = 40;
+    opt.encryption.enabled = true;
+    opt.encryption.footer_key = encryption_key{
+        std::vector<uint8_t>(footer_key_bytes.begin(), footer_key_bytes.end())};
+    opt.encryption.key_metadata = key_material("footerkey", true);
+    writer_options::encryption_options::column_key ck;
+    ck.key = encryption_key{std::vector<uint8_t>(col_key_bytes.begin(), col_key_bytes.end())};
+    ck.key_metadata = key_material("namekey", false);
+    opt.encryption.column_keys["name"] = ck;
+
+    parquet_file_writer w(schema, opt);
+    column_data ids, names;
+    for (int i = 0; i < N; ++i) {
+        ids.i64.push_back(int64_t(i));
+        names.def_levels.push_back(1);
+        names.str.push_back("g" + std::to_string(i % 4));
+    }
+    std::vector<column_data> cols{std::move(ids), std::move(names)};
+    w.add_row_group(cols);
+    auto img = w.finish();
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(img.data()), std::streamsize(img.size()));
+    std::cout << path << " " << img.size() << "\n";
+
+    const encryption_key fkey{std::vector<uint8_t>(footer_key_bytes.begin(),
+                                                   footer_key_bytes.end())};
+    const encryption_key ckey{std::vector<uint8_t>(col_key_bytes.begin(), col_key_bytes.end())};
+
+    // (a) footer key only: the file opens, `id` has metadata, `name` has none.
+    {
+        auto ef = parse_encrypted_footer(img, fkey);
+        const auto& chunks = ef.md.row_groups.at(0).columns;
+        const bool ok = chunks.size() == 2
+                  && chunks[0].meta.has_value()
+                  && !chunks[1].meta.has_value()
+                  && chunks[1].metadata_is_encrypted()
+                  && chunks[1].crypto_metadata
+                  && !chunks[1].crypto_metadata->with_footer_key
+                  && chunks[1].crypto_metadata->path_in_schema
+                         == std::vector<std::string>{"name"};
+        if (!ok) {
+            std::cout << "  PERCOL FAIL: the footer-key-only view is wrong\n";
+            ++self_failures;
+            return;
+        }
+    }
+    // (b) footer key plus the column key: both columns decode, values exact.
+    {
+        std::map<std::string, encryption_key> cks{{"name", ckey}};
+        auto ef = parse_encrypted_footer(img, fkey, {}, cks);
+        const auto& chunks = ef.md.row_groups.at(0).columns;
+        if (!chunks[1].meta.has_value()) {
+            std::cout << "  PERCOL FAIL: column metadata did not decrypt with the column key\n";
+            ++self_failures;
+            return;
+        }
+        auto back = read_row_group(img, ef.md, 0, &ef.crypto);
+        if (back.size() != 2 || back[0].i64.size() != size_t(N)
+            || back[1].str.size() != size_t(N)) {
+            std::cout << "  PERCOL FAIL: shape after decrypting both columns\n";
+            ++self_failures;
+            return;
+        }
+        for (int i = 0; i < N; ++i) {
+            if (back[0].i64[size_t(i)] != int64_t(i)
+                || back[1].str[size_t(i)] != ("g" + std::to_string(i % 4))) {
+                std::cout << "  PERCOL FAIL: value mismatch at " << i << "\n";
+                ++self_failures;
+                return;
+            }
+        }
+    }
+    // (c) a wrong column key must fail rather than return plausible bytes.
+    {
+        std::map<std::string, encryption_key> bad{
+                {"name", encryption_key{std::vector<uint8_t>(16, 0x11)}}};
+        bool refused = false;
+        try {
+            (void) parse_encrypted_footer(img, fkey, {}, bad);
+        } catch (const std::exception&) { refused = true; }
+        if (!refused) {
+            std::cout << "  PERCOL FAIL: a wrong column key was accepted\n";
+            ++self_failures;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : ".";
     const std::string key = "0123456789abcdef";
@@ -124,6 +239,7 @@ int main(int argc, char** argv) {
     // An AAD prefix, stored so a reader needs nothing out of band.
     write_file(dir + "/scylla_gcm_prefix.parquet", true,  cipher::aes_gcm_v1, key,
                "ks.tbl/generation-42", true);
+    write_percolumn(dir + "/scylla_percolumn.parquet", key, "fedcba9876543210");
     if (self_failures) {
         std::cout << "ENCRYPTED SELF-READ FAIL (" << self_failures << ")\n";
         return 1;
