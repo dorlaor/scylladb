@@ -773,6 +773,146 @@ SEASTAR_THREAD_TEST_CASE(test_pq_dead_cells_are_not_lost) {
     }).get();
 }
 
+// `metadata_folding = 'uniform'` is silently not honoured once an sstable cuts a row group.
+//
+// This started as a hunt for a bug that turned out not to be reachable, and the real finding is
+// the one worth pinning. L2 keeps a single timestamp in the footer instead of a per-row column,
+// and the reader requires that key. write_rows() -- the path taken when the whole sstable fits one
+// row group -- emits it; cut_row_group() did not. That looked like "any L2 table large enough to
+// cut is unreadable", which would have been serious.
+//
+// It is not, because the two paths differ in a second way that happens to cover the first: the
+// cutting path fixes its leaf set before it has seen all the rows, so it uses the *conservative*
+// set, which sets all_same_ts = false and turns on every optional metadata leaf. That breaks L2's
+// precondition, build_mapped_schema() falls the level back to L1, and no uniform timestamp is ever
+// needed.
+//
+// So the operator-visible behaviour is: the same table is L2 while it is small and L1 once it is
+// large, with nothing logged. That is not data loss -- L1 is lossless and the rows read back
+// exactly -- but it is a setting that stops applying at scale, and it belongs in a test rather
+// than in someone's afternoon. If a later change makes the cutting path able to reach L2, this
+// test fails and the footer-key guard in cut_row_group() is what keeps the file readable.
+SEASTAR_THREAD_TEST_CASE(test_pq_uniform_folding_falls_back_when_row_groups_are_cut) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto sb = schema_builder(1, "ks", "pq_l2rg")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("v_txt", utf8_type);
+        for (int i = 0; i < 7; ++i) {
+            sb.with_column(to_bytes(format("v{}", i)), int32_type);
+        }
+        sb.set_parquet_options({{"metadata_folding", "uniform"}});
+        auto s = sb.build();
+        const auto& vt = *s->get_column_definition(to_bytes("v_txt"));
+
+        // One timestamp for every cell and no markers, TTLs or deletions -- L2's precondition is
+        // satisfied by the *data*, so anything that stops it being used is the writer's choice
+        // rather than the input's.
+        constexpr int PARTS = 2500, ROWS = 24;
+        constexpr api::timestamp_type TS = 1700000000000000;
+        utils::chunked_vector<mutation> muts;
+        muts.reserve(PARTS);
+        for (int p = 0; p < PARTS; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:06d}", p))));
+            mutation m(s, pk);
+            for (int r = 0; r < ROWS; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.set_clustered_cell(ck, vt, atomic_cell::make_live(
+                        *utf8_type, TS, utf8_type->decompose(sstring(format("v{}", r % 40)))));
+                for (int i = 0; i < 7; ++i) {
+                    m.set_clustered_cell(ck, *s->get_column_definition(to_bytes(format("v{}", i))),
+                            atomic_cell::make_live(*int32_type, TS,
+                                                   int32_type->decompose(r * 3 + i)));
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+        auto expected = muts;
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        const uint64_t len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+        std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+        auto md = sstables::parquet::format::parse_footer(img);
+        // A single row group would make the whole test vacuous.
+        BOOST_REQUIRE_GT(md.row_groups.size(), 1u);
+
+        const std::string* lvl = md.kv("scylla.folding_level");
+        BOOST_REQUIRE(lvl);
+        BOOST_REQUIRE_EQUAL(*lvl, "L1");
+        // And the invariant that made this look dangerous: an L2 footer must carry its timestamp,
+        // an L1 footer has no business carrying one.
+        BOOST_REQUIRE(!md.kv("scylla.uniform_timestamp"));
+
+        // Whatever level it landed on, the data has to come back exactly -- the fallback is a
+        // size choice, not a correctness one.
+        auto got = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+    }).get();
+}
+
+// The same schema and data, small enough that no cut happens, does reach L2 -- which is what makes
+// the fallback above a difference between the two write paths rather than a property of the data.
+SEASTAR_THREAD_TEST_CASE(test_pq_uniform_folding_applies_without_a_cut) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto sb = schema_builder(1, "ks", "pq_l2small")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("v_txt", utf8_type);
+        sb.set_parquet_options({{"metadata_folding", "uniform"}});
+        auto s = sb.build();
+        const auto& vt = *s->get_column_definition(to_bytes("v_txt"));
+
+        constexpr api::timestamp_type TS = 1700000000000000;
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 20; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("key{:06d}", p))));
+            mutation m(s, pk);
+            for (int r = 0; r < 10; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.set_clustered_cell(ck, vt, atomic_cell::make_live(
+                        *utf8_type, TS, utf8_type->decompose(sstring(format("v{}", r)))));
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+        auto expected = muts;
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+        const uint64_t len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+        std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+        auto md = sstables::parquet::format::parse_footer(img);
+        BOOST_REQUIRE_EQUAL(md.row_groups.size(), 1u);
+
+        const std::string* lvl = md.kv("scylla.folding_level");
+        BOOST_REQUIRE(lvl);
+        BOOST_REQUIRE_EQUAL(*lvl, "L2");
+        const std::string* u = md.kv("scylla.uniform_timestamp");
+        BOOST_REQUIRE(u);
+        BOOST_REQUIRE_EQUAL(*u, std::to_string(TS));
+
+        auto got = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+    }).get();
+}
+
 // Row groups are cut when the write buffer exceeds its budget, and the result still
 // round-trips.
 //

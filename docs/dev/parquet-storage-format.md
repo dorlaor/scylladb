@@ -4414,6 +4414,81 @@ parsed.
 
 ---
 
+### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
+
+Two references above point here, so it gets its own section: `single_partition_reads` and
+`range_scan_reads`, per table, exposed on the `column_family` metrics group.
+
+They exist because C7 -- a read-pattern gate that would refuse conversion for a table taking mostly
+point reads -- could not be evaluated at all: Scylla had no per-table read-shape counter, only
+cluster-wide sstable-level ones that cannot attribute a read to a table. Building the counters
+removed that objection. **C7 was dropped anyway** (§6.3): having the input is not evidence that it
+decides better than C5's column ceiling, and a load-bearing criterion should not rest on an untested
+hypothesis about which reads matter.
+
+The counters stay, for two reasons that outlive the criterion. They are what an operator setting
+`storage_format` by hand actually needs -- the scope limit in §10.4 is "wide Parquet tables must not
+be on a point-read path", and this is the only way to see whether a table is on one. And they close a
+gap the doc had asserted was unclosable, which is worth having on record.
+
+Verified across five query shapes: a single-partition read, an `IN` over several partitions, a full
+range scan, a token-range scan, and a clustering slice within one partition. The classifier is
+structural rather than heuristic -- every partition range in the request is singular, or it is a scan
+-- so an `IN` counts as a point read and a one-partition slice does too, which matches what the
+metric is for.
+
+**One trap, worth stating because it cost a run.** The counters were first registered in the
+per-keyspace `column_family` metrics block, which is gated on
+`enable_keyspace_column_family_metrics` and off by default. The increment ran, the metric did not
+exist, and the diagnostic that separated the two was noticing that `read_latency_count` moved while
+`memtable_switch` -- registered in the same block -- was absent entirely. They are registered in both
+blocks now.
+
+### 10.15 `metadata_folding = 'uniform'` stops applying once an sstable cuts a row group
+
+Found while auditing for more instances of the two-write-paths gap in §8.2b, and it is a smaller
+finding than the one it was looking for -- but it is operator-visible, so it is written down.
+
+L2 (uniform folding) keeps a single write timestamp in the file footer instead of a per-row column.
+The reader requires that key: `mapped_schema_from_footer()` throws *"L2 file without
+scylla.uniform_timestamp"* without it. `write_rows()`, the path taken when an sstable fits one row
+group, emits it. `cut_row_group()` did not.
+
+That reads like "an L2 table large enough to cut a row group is written successfully and cannot be
+read back", which would be serious. **It is not reachable**, and the reason is a second difference
+between the same two paths. The cutting path has to fix its leaf set before it has seen all the
+rows, so it uses `leaf_set::conservative`, which sets `all_same_ts = false` and turns on every
+optional metadata leaf. That breaks L2's precondition, `build_mapped_schema()` falls the level back
+to L1, and no uniform timestamp is ever needed. The footer key was missing for a state that cannot
+occur.
+
+What is left is a real behaviour, just a milder one:
+
+| sstable | level actually used |
+|---|---|
+| fits one row group | **L2**, as asked |
+| cuts a row group | **L1**, silently |
+
+So the same table is uniform-folded while it is small and row-folded once it is large, with nothing
+logged either way. It is not data loss -- L1 is lossless, and both cases round-trip exactly -- but a
+setting that quietly stops applying at scale is the same species of problem as the encoding override
+that only worked on large tables, and it was found by looking for that species rather than by
+anything failing.
+
+Two tests pin it, and they only mean something as a pair: the same schema and the same uniform
+timestamp reach L2 without a cut and L1 with one. The footer-key guard is kept in
+`cut_row_group()` regardless, because the invariant "an L2 footer carries its timestamp" belongs
+next to the code that writes the footer, not next to the leaf-set logic three files away that makes
+it moot today. If a later change lets the cutting path reach L2, the guard is already there and the
+fallback test is what fails.
+
+**The cost of the fallback is unmeasured**, which is the honest state: §10.3 puts L2 at 13 % smaller
+than L1 on Backblaze's 197 columns and within 0.03 % on NYC TLC's 20, so the loss ranges from
+irrelevant to material depending on width -- and every table big enough to matter is a table big
+enough to cut. Either the conservative leaf set should be able to express L2, or the property should
+refuse `uniform` for tables that will cut. That is a design decision, not a bug fix, so it is
+recorded here rather than guessed at.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

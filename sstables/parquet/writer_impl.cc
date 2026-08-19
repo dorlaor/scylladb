@@ -816,6 +816,21 @@ void pq_writer_impl::cut_row_group() {
                 format::parquet_file_writer::nested_schema{_ms->tree, std::move(hints)},
                 _pcfg.wopt);
         _pq->add_key_value("scylla.folding_level", to_string(_ms->level));
+        // L2 keeps one timestamp for the whole file rather than a per-row column, so the value
+        // lives in the footer and the reader requires it -- mapped_schema_from_footer() throws
+        // "L2 file without scylla.uniform_timestamp" when it is missing. write_rows() emits it and
+        // this path did not.
+        //
+        // That asymmetry is currently unreachable rather than a live bug, and the reason is worth
+        // stating so nobody 'fixes' it by deleting this: the conservative leaf set this path uses
+        // sets all_same_ts = false and turns every optional metadata flag on, which breaks L2's
+        // precondition, so build_mapped_schema() falls the level back to L1 and never sets
+        // uniform_ts. The guard stays because the invariant it protects -- an L2 footer carries its
+        // timestamp -- belongs with the code that writes the footer, not with the leaf-set logic
+        // three files away that happens to make it moot today.
+        if (_ms->uniform_ts) {
+            _pq->add_key_value("scylla.uniform_timestamp", std::to_string(*_ms->uniform_ts));
+        }
         add_counter_metadata(*_pq, _shredder.columns());
 
         // Stream straight into the Data component instead of accumulating the file.
