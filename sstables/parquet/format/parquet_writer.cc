@@ -73,9 +73,32 @@ void write_dictionary_page_header(std::vector<uint8_t>& out,
 
 } // namespace
 
+namespace {
+
+// The leading magic tells a reader which envelope to expect at the tail: "PARE" means the footer
+// is encrypted and preceded by a FileCryptoMetaData, "PAR1" means it is not.
+const char* leading_magic(const writer_options& o) {
+    return o.encryption.enabled ? magic_encrypted : magic_plain;
+}
+
+} // namespace
+
 parquet_file_writer::parquet_file_writer(std::vector<column_spec> schema, writer_options opt)
         : _schema(std::move(schema)), _opt(opt) {
-    _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
+    {
+        const char* m = leading_magic(_opt);
+        _buf.insert(_buf.end(), m, m + 4);
+    }
+    if (_opt.encryption.enabled) {
+        if (!_opt.encryption.footer_key.valid()) {
+            throw std::runtime_error("writer: encryption enabled without a valid footer key");
+        }
+        // 8 bytes, per file. It is what stops a module from one file being replayed into
+        // another written under the same key.
+        std::string u(8, '\0');
+        random_bytes(std::span<uint8_t>(reinterpret_cast<uint8_t*>(u.data()), u.size()));
+        _aad_file_unique = std::move(u);
+    }
     // Synthesise the tree a flat schema implies, so footer emission has one path.
     schema_element root;
     root.name = "schema";
@@ -93,7 +116,20 @@ parquet_file_writer::parquet_file_writer(std::vector<column_spec> schema, writer
 
 parquet_file_writer::parquet_file_writer(nested_schema ns, writer_options opt)
         : _tree(std::move(ns.tree)), _opt(opt) {
-    _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
+    {
+        const char* m = leading_magic(_opt);
+        _buf.insert(_buf.end(), m, m + 4);
+    }
+    if (_opt.encryption.enabled) {
+        if (!_opt.encryption.footer_key.valid()) {
+            throw std::runtime_error("writer: encryption enabled without a valid footer key");
+        }
+        // 8 bytes, per file. It is what stops a module from one file being replayed into
+        // another written under the same key.
+        std::string u(8, '\0');
+        random_bytes(std::span<uint8_t>(reinterpret_cast<uint8_t*>(u.data()), u.size()));
+        _aad_file_unique = std::move(u);
+    }
     if (_tree.empty()) { throw std::runtime_error("writer: nested schema has no root"); }
 
     // Derive the leaves and their levels with the same walker the reader uses, so
@@ -138,7 +174,7 @@ void parquet_file_writer::drain() {
 }
 
 void parquet_file_writer::write_column_chunk(const column_spec& spec, const column_data& col,
-                                     chunk_meta& out_meta) {
+                                     chunk_meta& out_meta, int column_ordinal) {
     // Slots, not values. Parquet's ColumnMetaData.num_values counts level
     // entries, and for a repeated column there are more of those than values --
     // reporting the value count makes readers stop early with no error.
@@ -266,13 +302,29 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     if (use_dict) {
         out_meta.cm.dictionary_page_offset = pos();
         auto comp = compress(dict.dictionary_page, _opt.compression, _opt.zstd_level);
+        // A dictionary page is its own pair of modules and, unlike a data page, carries no page
+        // ordinal -- there is exactly one per chunk, so the AAD would have nothing to
+        // distinguish. Getting that wrong is invisible to our own reader and fatal to anyone
+        // else's, which is why the conformance test checks the ordinals against parquet-cpp.
+        const bool ctr_body = _opt.encryption.algo == cipher::aes_gcm_ctr_v1;
         std::vector<uint8_t> hdr;
         write_dictionary_page_header(hdr, int32_t(dict.dictionary_page.size()),
-                                     int32_t(comp.size()), int32_t(dict.num_distinct));
-        _buf.insert(_buf.end(), hdr.begin(), hdr.end());
-        _buf.insert(_buf.end(), comp.begin(), comp.end());
+                                     int32_t(encrypting()
+                                             ? envelope_size(comp.size(), ctr_body)
+                                             : comp.size()),
+                                     int32_t(dict.num_distinct));
+        size_t on_disk_hdr = hdr.size(), on_disk_body = comp.size();
+        if (encrypting()) {
+            on_disk_hdr = emit_module(hdr, module_type::dictionary_page_header,
+                                      int(_rgs.size()), column_ordinal);
+            on_disk_body = emit_module(comp, module_type::dictionary_page,
+                                       int(_rgs.size()), column_ordinal, -1, ctr_body);
+        } else {
+            _buf.insert(_buf.end(), hdr.begin(), hdr.end());
+            _buf.insert(_buf.end(), comp.begin(), comp.end());
+        }
         total_uncompressed += int64_t(dict.dictionary_page.size() + hdr.size());
-        total_compressed   += int64_t(comp.size() + hdr.size());
+        total_compressed   += int64_t(on_disk_body + on_disk_hdr);
         out_meta.cm.encodings.push_back(encoding::plain);
         out_meta.cm.encodings.push_back(encoding::rle_dictionary);
     }
@@ -286,6 +338,7 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
     // columns are exactly the low-cardinality ones this format is best at (10.4f).
     const size_t page_sz = _opt.page_values;
     bool first_data_page = true;
+    size_t page_ordinal = 0;     // per chunk, and part of every data page's AAD
     size_t dict_cursor = 0;      // present values already emitted, for slicing dict.indices
     int64_t rows_written = 0;
     size_t val_cursor = 0;   // next present value, for repeated columns   // first_row_index of the next page
@@ -437,8 +490,17 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
             }
         }
 
+        // Under encryption the page body -- levels *and* values, as one buffer -- becomes a
+        // single module, and `compressed_page_size` has to state the size of the resulting
+        // envelope rather than of the plaintext. Verified against parquet-cpp's own V2 output:
+        // uncompressed_page_size stays the plaintext length while compressed_page_size counts
+        // the 4-byte length prefix, the nonce, the ciphertext and the tag.
+        const bool ctr_body = _opt.encryption.algo == cipher::aes_gcm_ctr_v1;
+        const size_t body_plain = size_t(lvl_bytes + comp.size());
+        const int32_t on_disk = encrypting() ? int32_t(envelope_size(body_plain, ctr_body))
+                                             : compressed;
         std::vector<uint8_t> hdr;
-        write_data_page_v2_header(hdr, uncompressed, compressed,
+        write_data_page_v2_header(hdr, uncompressed, on_disk,
                                   int32_t(cnt), page_nulls, page_rows,
                                   used, int32_t(def_bytes.size()),
                                   int32_t(rep_bytes.size()),
@@ -452,17 +514,33 @@ void parquet_file_writer::write_column_chunk(const column_spec& spec, const colu
         // header + body -- that is what the spec means by "the page".
         out_meta.pages.push_back(page_location{
                 page_start,
-                int32_t(hdr.size()) + compressed,
+                int32_t(encrypting() ? int64_t(envelope_size(hdr.size(), false)) + on_disk
+                                     : int64_t(hdr.size()) + compressed),
                 int64_t(rows_written)});
         rows_written += int64_t(page_rows);
-        _buf.insert(_buf.end(), hdr.begin(), hdr.end());
-        // Spec order: repetition levels first, then definition levels.
-        _buf.insert(_buf.end(), rep_bytes.begin(), rep_bytes.end());
-        _buf.insert(_buf.end(), def_bytes.begin(), def_bytes.end());
-        _buf.insert(_buf.end(), comp.begin(), comp.end());
+        size_t hdr_on_disk = hdr.size();
+        if (encrypting()) {
+            hdr_on_disk = emit_module(hdr, module_type::data_page_header,
+                                      int(_rgs.size()), column_ordinal, int(page_ordinal));
+            // Spec order inside the body: repetition levels, definition levels, then values.
+            std::vector<uint8_t> body;
+            body.reserve(body_plain);
+            body.insert(body.end(), rep_bytes.begin(), rep_bytes.end());
+            body.insert(body.end(), def_bytes.begin(), def_bytes.end());
+            body.insert(body.end(), comp.begin(), comp.end());
+            emit_module(body, module_type::data_page, int(_rgs.size()), column_ordinal,
+                        int(page_ordinal), ctr_body);
+        } else {
+            _buf.insert(_buf.end(), hdr.begin(), hdr.end());
+            // Spec order: repetition levels first, then definition levels.
+            _buf.insert(_buf.end(), rep_bytes.begin(), rep_bytes.end());
+            _buf.insert(_buf.end(), def_bytes.begin(), def_bytes.end());
+            _buf.insert(_buf.end(), comp.begin(), comp.end());
+        }
+        ++page_ordinal;
 
         total_uncompressed += uncompressed + int64_t(hdr.size());
-        total_compressed   += compressed   + int64_t(hdr.size());
+        total_compressed   += on_disk      + int64_t(hdr_on_disk);
 
         if (std::find(out_meta.cm.encodings.begin(), out_meta.cm.encodings.end(), used)
             == out_meta.cm.encodings.end()) {
@@ -500,7 +578,7 @@ void parquet_file_writer::add_row_group(std::span<const column_data> cols) {
                                      std::to_string(rg.num_rows) + ")");
         }
         chunk_meta cmeta;
-        write_column_chunk(_schema[i], cols[i], cmeta);
+        write_column_chunk(_schema[i], cols[i], cmeta, int(i));
         rg.total_byte_size += cmeta.cm.total_uncompressed_size;
         rg.chunks.push_back(std::move(cmeta));
     }
@@ -530,8 +608,17 @@ void parquet_file_writer::write_page_indexes() {
                 }
             }
             ch.offset_index_offset = pos();
-            ch.offset_index_length = int32_t(blob.size());
-            _buf.insert(_buf.end(), blob.begin(), blob.end());
+            if (encrypting()) {
+                // The OffsetIndex is a module too (type 7, no page ordinal). Leaving it in the
+                // clear would leak the page layout -- row counts and sizes per page -- of an
+                // otherwise encrypted column, and readers expect it encrypted when the file is.
+                const size_t n = emit_module(blob, module_type::offset_index,
+                                             int(&rg - _rgs.data()), int(&ch - rg.chunks.data()));
+                ch.offset_index_length = int32_t(n);
+            } else {
+                ch.offset_index_length = int32_t(blob.size());
+                _buf.insert(_buf.end(), blob.begin(), blob.end());
+            }
         }
     }
 }
@@ -588,6 +675,15 @@ void parquet_file_writer::write_footer() {
                 // because Thrift field ids must be written in ascending order.
                 if (ch.offset_index_offset) { w.field_i64(4, *ch.offset_index_offset); }
                 if (ch.offset_index_length) { w.field_i32(5, *ch.offset_index_length); }
+                if (encrypting()) {
+                    // ColumnCryptoMetaData = ENCRYPTION_WITH_FOOTER_KEY, an empty struct. Every
+                    // column shares the footer key here; per-column keys would put
+                    // EncryptionWithColumnKey in field 2 and move this metadata into field 9.
+                    w.field_struct(8);
+                    compact_writer::elem_scope cc(w);
+                    w.field_struct(1);
+                    compact_writer::elem_scope ek(w);
+                }
             }
             w.field_i64(2, rg.total_byte_size);
             w.field_i64(3, rg.num_rows);
@@ -603,11 +699,42 @@ void parquet_file_writer::write_footer() {
         }
         w.field_binary(6, "scylladb-parquet (sstables/parquet/format)");
     }
-    _buf.insert(_buf.end(), meta.begin(), meta.end());
-    uint32_t len = uint32_t(meta.size());
-    const uint8_t* lp = reinterpret_cast<const uint8_t*>(&len);
+    if (!encrypting()) {
+        _buf.insert(_buf.end(), meta.begin(), meta.end());
+        uint32_t len = uint32_t(meta.size());
+        const uint8_t* lp = reinterpret_cast<const uint8_t*>(&len);
+        _buf.insert(_buf.end(), lp, lp + 4);
+        _buf.insert(_buf.end(), magic_plain, magic_plain + 4);
+        return;
+    }
+    // Encrypted-footer mode. The tail is
+    //     [FileCryptoMetaData, in the clear][encrypted FileMetaData][length of both][PARE]
+    // and the length covers *both* structures, not just the footer -- which is the one thing
+    // easy to get wrong here, and the reason the conformance test measures it against
+    // parquet-cpp's own output rather than trusting the arithmetic.
+    file_crypto_metadata fcm;
+    fcm.algo = _opt.encryption.algo;
+    fcm.aad_file_unique = _aad_file_unique;
+    if (_opt.encryption.store_aad_prefix) { fcm.aad_prefix = _opt.encryption.aad_prefix; }
+    fcm.supply_aad_prefix = !_opt.encryption.aad_prefix.empty()
+                            && !_opt.encryption.store_aad_prefix;
+    fcm.key_metadata = _opt.encryption.key_metadata;
+    const auto fcm_bytes = write_file_crypto_metadata(fcm);
+    const size_t region_start = _buf.size();
+    _buf.insert(_buf.end(), fcm_bytes.begin(), fcm_bytes.end());
+    emit_module(meta, module_type::footer);
+    uint32_t region = uint32_t(_buf.size() - region_start);
+    const uint8_t* lp = reinterpret_cast<const uint8_t*>(&region);
     _buf.insert(_buf.end(), lp, lp + 4);
-    _buf.insert(_buf.end(), {'P', 'A', 'R', '1'});
+    _buf.insert(_buf.end(), magic_encrypted, magic_encrypted + 4);
+}
+
+size_t parquet_file_writer::emit_module(std::span<const uint8_t> plain, module_type mt,
+                                        int row_group, int column, int page, bool ctr_body) {
+    const auto aad = build_aad(_opt.encryption.aad_prefix, _aad_file_unique, mt,
+                               row_group, column, page);
+    return encrypt_module(_buf, plain, _opt.encryption.footer_key, aad,
+                          _opt.encryption.algo, ctr_body);
 }
 
 std::vector<uint8_t> parquet_file_writer::finish() {

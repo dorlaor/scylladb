@@ -19,6 +19,7 @@
 // without invoking a codec.
 
 #include "parquet_metadata.hh"
+#include "encryption.hh"
 
 #include <cstdint>
 #include <functional>
@@ -79,6 +80,28 @@ struct writer_options {
     // Emit the OffsetIndex. Required for row-ordinal lookup, and it also
     // lets scan-side readers skip pages.
     bool    write_page_index = true;
+
+    // Parquet Modular Encryption. Off by default; when on, the file is written in
+    // encrypted-footer mode ("PARE") with every column encrypted under the footer key.
+    //
+    // Two consequences the caller has to know about. The output stops being byte-reproducible,
+    // because every module carries a fresh random nonce -- reusing one under a single key breaks
+    // AES-GCM outright, so this is not a knob. And the file is unreadable without the key: there
+    // is no "encrypted but degraded" read path, by design.
+    struct encryption_options {
+        bool                       enabled = false;
+        cipher                     algo = cipher::aes_gcm_v1;
+        encryption_key             footer_key;
+        // Bound into every module's AAD. An aad_prefix ties a file to its identity (a table, a
+        // generation) so a whole file cannot be swapped for another one written under the same
+        // key. `store_aad_prefix` writes it into the footer for readers that cannot reconstruct
+        // it; leaving it false means a reader must supply it out of band.
+        std::string                aad_prefix;
+        bool                       store_aad_prefix = false;
+        // Opaque to us: whatever a reader's key-management needs in order to find the key again.
+        std::optional<std::string> key_metadata;
+    };
+    encryption_options encryption{};
 };
 
 // One leaf column of a row group. Exactly one value vector is populated; which
@@ -178,7 +201,23 @@ class parquet_file_writer {
     // Hand everything buffered to the sink, if there is one, and advance the base.
     void drain();
 
-    void write_column_chunk(const column_spec&, const column_data&, chunk_meta&);
+    void write_column_chunk(const column_spec&, const column_data&, chunk_meta&,
+                            int column_ordinal);
+
+    bool encrypting() const { return _opt.encryption.enabled; }
+    // Appends `plain` to _buf as an encrypted module and returns the number of bytes written.
+    // Used for page headers, page bodies, offset indexes and the footer alike, which is why it
+    // takes the module type and ordinals rather than knowing them.
+    size_t emit_module(std::span<const uint8_t> plain, module_type,
+                       int row_group = -1, int column = -1, int page = -1,
+                       bool ctr_body = false);
+    // Size the envelope will occupy, needed because a page header has to state its own
+    // compressed size before the body is encrypted.
+    size_t envelope_size(size_t plain_len, bool ctr_body) const {
+        return length_prefix_len + nonce_len + plain_len
+               + ((ctr_body && _opt.encryption.algo == cipher::aes_gcm_ctr_v1) ? 0 : tag_len);
+    }
+    std::string _aad_file_unique;
     // Emitted after all row groups and before the footer, which is where the
     // spec puts it: the footer has to carry the offsets of these blobs.
     void write_page_indexes();

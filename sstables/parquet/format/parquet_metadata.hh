@@ -134,16 +134,36 @@ struct offset_index {
     }
 };
 
+// How a column chunk is encrypted, when it is. The union mirrors ColumnCryptoMetaData:
+// either the file's footer key protects this column too, or the column has its own key and the
+// footer names it only by opaque metadata (so a reader can be handed the keys for some columns
+// and not others -- the whole point of modular encryption).
+struct column_crypto_metadata {
+    bool                       with_footer_key = true;
+    std::vector<std::string>   path_in_schema;   // only for the column-key case
+    std::optional<std::string> key_metadata;
+};
+
 struct column_chunk {
     std::optional<std::string>     file_path;
     int64_t                        file_offset = 0;
+    // Absent when this chunk's metadata is encrypted under a key we were not given; the bytes
+    // are then in `encrypted_column_metadata` and a reader with the key fills `meta` in.
     std::optional<column_metadata> meta;
     std::optional<int64_t>         column_index_offset;
     std::optional<int32_t>         column_index_length;
     std::optional<int64_t>         offset_index_offset;
     std::optional<int32_t>         offset_index_length;
+    std::optional<column_crypto_metadata> crypto_metadata;
+    std::optional<std::string>     encrypted_column_metadata;
 
     bool has_page_index() const { return column_index_offset.has_value(); }
+    // True when the chunk describes itself as encrypted with a key other than the footer key,
+    // i.e. `meta` may legitimately be missing.
+    bool metadata_is_encrypted() const {
+        return encrypted_column_metadata.has_value()
+               || (crypto_metadata && !crypto_metadata->with_footer_key);
+    }
 };
 
 struct row_group {

@@ -23,10 +23,11 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined \
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined \
     -o /tmp/pq_lvl_t  $S/parquet_metadata.cc $S/page_header.cc $S/test_levels.cc || FAIL=1
 g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
-    -o /tmp/pq_write_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/test_writer.cc -lzstd || FAIL=1
+    -o /tmp/pq_write_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/encryption.cc \
+       $S/test_writer.cc -lzstd -lcrypto || FAIL=1
 g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -I. \
     -o /tmp/pq_nested_write_t $S/test_nested_write.cc $S/parquet_writer.cc \
-       $S/parquet_metadata.cc -lzstd || FAIL=1
+       $S/parquet_metadata.cc $S/encryption.cc -lzstd -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_nested_read_t $S/test_nested_read.cc $S/parquet_reader.cc \
        $S/parquet_metadata.cc $S/page_header.cc -lzstd -lsnappy || FAIL=1
@@ -37,12 +38,22 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
        $S/page_header.cc -lzstd -lsnappy || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_shred_t schema_mapping.cc $S/parquet_writer.cc $S/parquet_metadata.cc \
-       $S/page_header.cc $S/parquet_reader.cc test_shred.cc -lzstd -lsnappy || FAIL=1
+       $S/page_header.cc $S/parquet_reader.cc $S/encryption.cc test_shred.cc \
+       -lzstd -lsnappy -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I../.. \
     -o /tmp/pq_tier_t tiering_policy.cc test_tiering.cc -lfmt || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
     -o /tmp/pq_oi_t $S/test_offset_index.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
        $S/page_header.cc -lzstd -lsnappy || FAIL=1
+# Modular encryption. Two directions, and both are needed: the conformance test decrypts files
+# written by parquet-cpp, the writer test produces files for pyarrow to open. Either one alone
+# would only prove we agree with ourselves.
+g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
+    -o /tmp/pq_enc_t $S/encryption.cc $S/parquet_metadata.cc $S/test_encryption.cc \
+       -lcrypto || FAIL=1
+g++ -std=c++20 -O2 -Wall -Wextra -I. -I../.. \
+    -o /tmp/pq_encw_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/encryption.cc \
+       $S/page_header.cc $S/test_encrypt_write.cc -lzstd -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
     -o /tmp/pq_xread_t $S/test_crossread.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
        $S/page_header.cc -lzstd -lsnappy || FAIL=1
@@ -65,6 +76,20 @@ mkdir -p $DATA/wout && /tmp/pq_write_t emit $DATA/wout >/dev/null && \
 echo; echo "### 6. folding round-trip (losslessness) ###";     /tmp/pq_shred_t roundtrip || FAIL=1
 echo; echo "### 7. divergence cost curve ###";                 /tmp/pq_shred_t cost || FAIL=1
 echo; echo "### 8. hybrid tiering policy (C1, C5, C6) ###";         /tmp/pq_tier_t || FAIL=1
+echo; echo "### 19. modular encryption: decrypt parquet-cpp's files ###"
+if [ -d "$HOME/pq-lab/data/enc_ref" ]; then
+  /tmp/pq_enc_t "$HOME/pq-lab/data/enc_ref" || FAIL=1
+else
+  echo "SKIP -- no reference files; generate with pq-lab/data/enc_ref/gen.py"
+fi
+echo; echo "### 20. modular encryption: pyarrow reads what we write ###"
+ENCOUT=$(mktemp -d)
+if /tmp/pq_encw_t "$ENCOUT" >/dev/null; then
+  python3 "$S/test_encrypt_interop.py" "$ENCOUT" || FAIL=1
+else
+  echo "encrypted writer FAILED"; FAIL=1
+fi
+rm -rf "$ENCOUT"
 echo; echo "### 9. file round-trip: rows -> parquet -> rows ###"; /tmp/pq_shred_t filetrip || FAIL=1
 echo; echo "### 10. OffsetIndex: row -> page lookup ###"
 /tmp/pq_oi_t $DATA/wout/*.parquet || FAIL=1

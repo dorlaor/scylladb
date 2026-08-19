@@ -133,6 +133,44 @@ column_chunk parse_column_chunk(compact_reader& r) {
         case 5: c.offset_index_length = r.i32v(); break;
         case 6: c.column_index_offset = r.i64v(); break;
         case 7: c.column_index_length = r.i32v(); break;
+        // 8: ColumnCryptoMetaData, a union of EncryptionWithFooterKey (an empty struct) and
+        // EncryptionWithColumnKey { path_in_schema, key_metadata }. Reading it is what lets a
+        // reader tell "this column is encrypted with a key I was not given" from "this footer
+        // is malformed" -- two states that are otherwise identical from the outside.
+        case 8: {
+            column_crypto_metadata cm;
+            compact_reader::struct_scope cs(r);
+            for (;;) {
+                auto g = r.field_begin();
+                if (g.stop) { break; }
+                if (g.id == 1) {
+                    cm.with_footer_key = true;
+                    r.skip(g.type);            // EncryptionWithFooterKey carries nothing
+                } else if (g.id == 2) {
+                    cm.with_footer_key = false;
+                    compact_reader::struct_scope ks(r);
+                    for (;;) {
+                        auto h = r.field_begin();
+                        if (h.stop) { break; }
+                        if (h.id == 1 && h.type == ctype::list) {
+                            auto lh = r.list_begin();
+                            for (size_t i = 0; i < lh.size; ++i) {
+                                cm.path_in_schema.emplace_back(r.binary_v());
+                            }
+                        } else if (h.id == 2 && h.type == ctype::binary) {
+                            cm.key_metadata = std::string(r.binary_v());
+                        } else {
+                            r.skip(h.type);
+                        }
+                    }
+                } else {
+                    r.skip(g.type);
+                }
+            }
+            c.crypto_metadata = std::move(cm);
+            break;
+        }
+        case 9: c.encrypted_column_metadata = std::string(r.binary_v()); break;
         default: r.skip(f.type);
         }
     }
@@ -299,7 +337,16 @@ void validate(const file_metadata& m) {
                                " chunks but schema has " + std::to_string(leaves) + " leaves");
         }
         for (const auto& c : g.columns) {
-            if (!c.meta) { throw thrift_error("column chunk without metadata (encrypted?)"); }
+            // A chunk with no inline metadata is malformed *unless* it says its metadata is
+            // encrypted under a key we do not hold, which modular encryption makes a normal
+            // state rather than an error: the reader is expected to open the columns it has
+            // keys for and leave the rest alone.
+            if (!c.meta) {
+                if (!c.metadata_is_encrypted()) {
+                    throw thrift_error("column chunk without metadata");
+                }
+                continue;
+            }
             if (c.meta->num_values < 0 || c.meta->total_compressed_size < 0) {
                 throw thrift_error("negative column chunk size");
             }
@@ -336,7 +383,12 @@ void materialise_row_group(file_metadata& m, size_t rg, std::span<const uint8_t>
                            " chunks but schema has " + std::to_string(leaves) + " leaves");
     }
     for (const auto& c : g.columns) {
-        if (!c.meta) { throw thrift_error("column chunk without metadata (encrypted?)"); }
+        if (!c.meta) {
+            if (!c.metadata_is_encrypted()) {
+                throw thrift_error("column chunk without metadata");
+            }
+            continue;
+        }
         if (c.meta->num_values < 0 || c.meta->total_compressed_size < 0) {
             throw thrift_error("negative column chunk size");
         }
