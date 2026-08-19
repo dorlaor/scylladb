@@ -24,10 +24,31 @@
 
 namespace sstables::parquet::format {
 
+// Everything needed to open an encrypted file: the key, plus the AAD material the file's own
+// FileCryptoMetaData declared. Passed as a pointer that defaults to null everywhere below, so an
+// unencrypted read is unchanged and an encrypted one is impossible to attempt by accident.
+struct read_crypto {
+    encryption_key key;
+    cipher         algo = cipher::aes_gcm_v1;
+    std::string    aad_prefix;
+    std::string    aad_file_unique;
+};
+
+// Open an encrypted-footer ("PARE") file: check the magic, read the plaintext
+// FileCryptoMetaData, decrypt and parse the footer. `aad_prefix` is needed only when the writer
+// chose not to store it, which the returned crypto records either way.
+struct encrypted_footer {
+    file_metadata md;
+    read_crypto   crypto;
+};
+encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const encryption_key&,
+                                        std::string_view aad_prefix = {}, limits = {});
+
 // Decode one row group into one column_data per leaf, in schema order.
 std::vector<column_data> read_row_group(std::span<const uint8_t> image,
                                         const file_metadata&,
-                                        size_t row_group_index);
+                                        size_t row_group_index,
+                                        const read_crypto* = nullptr);
 
 // The bytes one leaf column needs for a ranged decode. Splitting the dictionary
 // page from the data pages is what lets a point read fetch two small extents per
@@ -44,7 +65,8 @@ struct column_input {
 // in schema order.
 std::vector<column_data> decode_columns(std::span<const column_input>,
                                         const file_metadata&, size_t row_group_index,
-                                        int64_t row_lo, int64_t row_hi);
+                                        int64_t row_lo, int64_t row_hi,
+                                        const read_crypto* = nullptr);
 
 // Decode rows [row_lo, row_hi) of one row group. `base_offset` is the file
 // offset that image[0] maps to, so the caller can hand over just the bytes that
@@ -53,9 +75,15 @@ std::vector<column_data> decode_columns(std::span<const column_input>,
 // makes a point read cost one page rather than one file.
 std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
                                         const file_metadata&, size_t row_group_index,
-                                        int64_t row_lo, int64_t row_hi);
+                                        int64_t row_lo, int64_t row_hi,
+                                        const read_crypto* = nullptr);
 
 // Convenience: parse the footer and decode row group 0.
 std::vector<column_data> read_file(std::span<const uint8_t> image);
+
+// Convenience for an encrypted file: parse the encrypted footer and decode row group 0.
+std::vector<column_data> read_encrypted_file(std::span<const uint8_t> image,
+                                             const encryption_key&,
+                                             std::string_view aad_prefix = {});
 
 } // namespace sstables::parquet::format

@@ -53,7 +53,8 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I.
        -lcrypto || FAIL=1
 g++ -std=c++20 -O2 -Wall -Wextra -I. -I../.. \
     -o /tmp/pq_encw_t $S/parquet_writer.cc $S/parquet_metadata.cc $S/encryption.cc \
-       $S/page_header.cc $S/test_encrypt_write.cc -lzstd -lcrypto || FAIL=1
+       $S/page_header.cc $S/parquet_reader.cc $S/test_encrypt_write.cc \
+       -lzstd -lsnappy -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
     -o /tmp/pq_xread_t $S/test_crossread.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
        $S/page_header.cc -lzstd -lsnappy || FAIL=1

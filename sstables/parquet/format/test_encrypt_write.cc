@@ -11,6 +11,7 @@
 // else).
 
 #include "parquet_writer.hh"
+#include "parquet_reader.hh"
 #include "encryption.hh"
 
 #include <cstring>
@@ -20,6 +21,9 @@
 #include <vector>
 
 using namespace sstables::parquet::format;
+
+static int self_failures = 0;
+static constexpr int N = 100;
 
 static void write_file(const std::string& path, bool dict, cipher algo,
                        const std::string& key_bytes, const std::string& aad_prefix,
@@ -55,7 +59,6 @@ static void write_file(const std::string& path, bool dict, cipher algo,
     w.add_key_value("scylla.test", "encrypted");
 
     column_data ids, names;
-    constexpr int N = 100;
     for (int i = 0; i < N; ++i) {
         ids.i64.push_back(int64_t(i));
         names.def_levels.push_back(1);
@@ -69,6 +72,47 @@ static void write_file(const std::string& path, bool dict, cipher algo,
     std::ofstream f(path, std::ios::binary);
     f.write(reinterpret_cast<const char*>(img.data()), std::streamsize(img.size()));
     std::cout << path << " " << img.size() << "\n";
+
+    // Read it back with our own reader before handing it to pyarrow. This catches the errors
+    // that are ours alone -- a page ordinal that advances on a dictionary page, an AAD built
+    // with the wrong module type -- and it does so with a specific message instead of pyarrow's
+    // generic decryption failure.
+    auto ef = parse_encrypted_footer(img, opt.encryption.footer_key, aad_prefix);
+    if (ef.md.num_rows != N) {
+        std::cout << "  SELF-READ FAIL: num_rows " << ef.md.num_rows << " != " << N << "\n";
+        ++self_failures;
+        return;
+    }
+    auto cols_back = read_row_group(img, ef.md, 0, &ef.crypto);
+    if (cols_back.size() != 2 || cols_back[0].i64.size() != size_t(N)) {
+        std::cout << "  SELF-READ FAIL: shape " << cols_back.size() << " x "
+                  << (cols_back.empty() ? 0 : cols_back[0].i64.size()) << "\n";
+        ++self_failures;
+        return;
+    }
+    for (int i = 0; i < N; ++i) {
+        if (cols_back[0].i64[size_t(i)] != int64_t(i)) {
+            std::cout << "  SELF-READ FAIL: id[" << i << "] = "
+                      << cols_back[0].i64[size_t(i)] << "\n";
+            ++self_failures;
+            return;
+        }
+    }
+    if (cols_back[1].str.size() != size_t(N)) {
+        std::cout << "  SELF-READ FAIL: name count " << cols_back[1].str.size() << "\n";
+        ++self_failures;
+        return;
+    }
+    // And the wrong key must fail rather than return plausible bytes.
+    bool refused = false;
+    try {
+        encryption_key wrong{std::vector<uint8_t>(16, 0x5a)};
+        (void) parse_encrypted_footer(img, wrong, aad_prefix);
+    } catch (const std::exception&) { refused = true; }
+    if (!refused) {
+        std::cout << "  SELF-READ FAIL: opened with the wrong key\n";
+        ++self_failures;
+    }
 }
 
 int main(int argc, char** argv) {
@@ -80,5 +124,10 @@ int main(int argc, char** argv) {
     // An AAD prefix, stored so a reader needs nothing out of band.
     write_file(dir + "/scylla_gcm_prefix.parquet", true,  cipher::aes_gcm_v1, key,
                "ks.tbl/generation-42", true);
+    if (self_failures) {
+        std::cout << "ENCRYPTED SELF-READ FAIL (" << self_failures << ")\n";
+        return 1;
+    }
+    std::cout << "ENCRYPTED SELF-READ PASS\n";
     return 0;
 }

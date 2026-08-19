@@ -196,7 +196,8 @@ void expand_nulls(column_data& cd, phys_type pt, size_t first, size_t count,
 // touch one page instead of one file.
 std::vector<column_data> decode_columns(std::span<const column_input> in,
                                         const file_metadata& md, size_t rg_index,
-                                        int64_t row_lo, int64_t row_hi) {
+                                        int64_t row_lo, int64_t row_hi,
+                                        const read_crypto* crypto) {
     if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
     const auto& rg = md.row_groups[rg_index];
     if (row_lo < 0) { row_lo = 0; }
@@ -239,11 +240,34 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
         // below find it, which is the same bytes either way.
         if (!ci.dict.empty()) {
             size_t dconsumed = 0;
-            auto dph = parse_page_header(ci.dict, dconsumed);
+            // Under encryption the header is its own module and has to be decrypted before it
+            // can be parsed; the dictionary page carries no page ordinal, there being one per
+            // chunk. `hdr_plain`/`body_plain` own the decrypted bytes for as long as the spans
+            // into them are used.
+            std::vector<uint8_t> dhdr_plain, dbody_plain;
+            page_header dph;
+            std::span<const uint8_t> dbody;
+            if (crypto) {
+                dhdr_plain = decrypt_module(
+                        ci.dict, crypto->key,
+                        build_aad(crypto->aad_prefix, crypto->aad_file_unique,
+                                  module_type::dictionary_page_header, int(rg_index), int(c)),
+                        &dconsumed, crypto->algo, false);
+                size_t dummy = 0;
+                dph = parse_page_header(dhdr_plain, dummy);
+                dbody_plain = decrypt_module(
+                        ci.dict.subspan(dconsumed), crypto->key,
+                        build_aad(crypto->aad_prefix, crypto->aad_file_unique,
+                                  module_type::dictionary_page, int(rg_index), int(c)),
+                        nullptr, crypto->algo, crypto->algo == cipher::aes_gcm_ctr_v1);
+                dbody = dbody_plain;
+            } else {
+                dph = parse_page_header(ci.dict, dconsumed);
+                dbody = ci.dict.subspan(dconsumed, size_t(dph.compressed_page_size));
+            }
             if (dph.type != page_type::dictionary_page || !dph.dict) {
                 throw decode_error("dictionary span does not start with a dictionary page");
             }
-            auto dbody = ci.dict.subspan(dconsumed, size_t(dph.compressed_page_size));
             auto raw = decompress(dbody, cm.compression, size_t(dph.uncompressed_page_size));
             const size_t n = size_t(dph.dict->num_values);
             switch (cm.type) {
@@ -266,16 +290,62 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
         // or not it is decoded. It starts wherever the supplied page run starts.
         int64_t row_at = ci.first_row;
         int64_t produced = 0;
+        // Page ordinal within the chunk, counted over *data* pages only -- a dictionary page
+        // has no ordinal, so it must not advance this or every AAD after it is wrong.
+        int page_ordinal = 0;
+        std::vector<uint8_t> hdr_plain, body_plain;
         while (off < end && row_at < row_hi) {
             size_t consumed = 0;
-            auto ph = parse_page_header(
-                    image.subspan(size_t(off), size_t(std::min<int64_t>(end - off, 64 * 1024))),
-                    consumed);
-            const int64_t body_at = off + int64_t(consumed);
-            if (body_at + ph.compressed_page_size > int64_t(image.size())) {
-                throw decode_error("page body extends past EOF");
+            page_header ph;
+            std::span<const uint8_t> body;
+            if (crypto) {
+                // The header module must be decrypted to learn what kind of page this is, and
+                // the module type in the AAD depends on that -- so try the data-page header
+                // first and fall back to the dictionary one, which is the only ambiguity.
+                bool as_data = true;
+                try {
+                    hdr_plain = decrypt_module(
+                            image.subspan(size_t(off)), crypto->key,
+                            build_aad(crypto->aad_prefix, crypto->aad_file_unique,
+                                      module_type::data_page_header, int(rg_index),
+                                      int(c), page_ordinal),
+                            &consumed, crypto->algo, false);
+                } catch (const std::exception&) {
+                    as_data = false;
+                    hdr_plain = decrypt_module(
+                            image.subspan(size_t(off)), crypto->key,
+                            build_aad(crypto->aad_prefix, crypto->aad_file_unique,
+                                      module_type::dictionary_page_header, int(rg_index),
+                                      int(c)),
+                            &consumed, crypto->algo, false);
+                }
+                size_t dummy = 0;
+                ph = parse_page_header(hdr_plain, dummy);
+                const int64_t body_at = off + int64_t(consumed);
+                if (body_at + ph.compressed_page_size > int64_t(image.size())) {
+                    throw decode_error("page body extends past EOF");
+                }
+                body_plain = decrypt_module(
+                        image.subspan(size_t(body_at)), crypto->key,
+                        build_aad(crypto->aad_prefix, crypto->aad_file_unique,
+                                  as_data ? module_type::data_page : module_type::dictionary_page,
+                                  int(rg_index), int(c),
+                                  as_data ? page_ordinal : -1),
+                        nullptr, crypto->algo, crypto->algo == cipher::aes_gcm_ctr_v1);
+                body = body_plain;
+                if (as_data) { ++page_ordinal; }
+            } else {
+                ph = parse_page_header(
+                        image.subspan(size_t(off),
+                                      size_t(std::min<int64_t>(end - off, 64 * 1024))),
+                        consumed);
+                const int64_t body_at = off + int64_t(consumed);
+                if (body_at + ph.compressed_page_size > int64_t(image.size())) {
+                    throw decode_error("page body extends past EOF");
+                }
+                body = image.subspan(size_t(body_at), size_t(ph.compressed_page_size));
             }
-            auto body = image.subspan(size_t(body_at), size_t(ph.compressed_page_size));
+            const int64_t body_at = off + int64_t(consumed);
 
             if (ph.type == page_type::dictionary_page) {
                 if (!ph.dict) { throw decode_error("dictionary page without header"); }
@@ -375,7 +445,8 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 
 std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
                                         const file_metadata& md, size_t rg_index,
-                                        int64_t row_lo, int64_t row_hi) {
+                                        int64_t row_lo, int64_t row_hi,
+                                        const read_crypto* crypto) {
     if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
     const auto& rg = md.row_groups[rg_index];
     std::vector<column_input> in(rg.columns.size());
@@ -391,20 +462,63 @@ std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t 
         in[c].pages = image.subspan(size_t(start), size_t(end - start));
         in[c].first_row = 0;
     }
-    return decode_columns(in, md, rg_index, row_lo, row_hi);
+    return decode_columns(in, md, rg_index, row_lo, row_hi, crypto);
 }
 
 std::vector<column_data> read_row_group(std::span<const uint8_t> image,
                                         const file_metadata& md,
-                                        size_t rg_index) {
+                                        size_t rg_index,
+                                        const read_crypto* crypto) {
     if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
-    return read_row_range(image, 0, md, rg_index, 0, md.row_groups[rg_index].num_rows);
+    return read_row_range(image, 0, md, rg_index, 0, md.row_groups[rg_index].num_rows, crypto);
 }
 
 std::vector<column_data> read_file(std::span<const uint8_t> image) {
     auto md = parse_footer(image);
     if (md.row_groups.empty()) { return {}; }
     return read_row_group(image, md, 0);
+}
+
+encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const encryption_key& key,
+                                        std::string_view aad_prefix, limits lim) {
+    if (!has_encrypted_footer(image) || image.size() < 8) {
+        throw decode_error("not an encrypted-footer Parquet file (no PARE magic)");
+    }
+    if (std::memcmp(image.data(), magic_encrypted, 4) != 0) {
+        throw decode_error("encrypted file without a leading PARE magic");
+    }
+    const uint8_t* t = image.data() + image.size() - 8;
+    const uint32_t region = uint32_t(t[0]) | (uint32_t(t[1]) << 8)
+                          | (uint32_t(t[2]) << 16) | (uint32_t(t[3]) << 24);
+    if (size_t(region) + 8 > image.size()) {
+        throw decode_error("encrypted footer region length out of range");
+    }
+    auto tail = image.subspan(image.size() - 8 - size_t(region), size_t(region));
+    size_t consumed = 0;
+    auto fcm = parse_file_crypto_metadata(tail, &consumed);
+    encrypted_footer out;
+    out.crypto.key = key;
+    out.crypto.algo = fcm.algo;
+    out.crypto.aad_file_unique = fcm.aad_file_unique;
+    // The writer either stored the prefix or told the reader to supply it. Preferring the stored
+    // one keeps a caller that passes a redundant prefix from silently producing a file it cannot
+    // read -- the failure would surface as an authentication error pages later.
+    out.crypto.aad_prefix = !fcm.aad_prefix.empty() ? fcm.aad_prefix : std::string(aad_prefix);
+    if (fcm.supply_aad_prefix && out.crypto.aad_prefix.empty()) {
+        throw decode_error("file requires an AAD prefix that was not supplied");
+    }
+    auto aad = build_aad(out.crypto.aad_prefix, out.crypto.aad_file_unique, module_type::footer);
+    auto plain = decrypt_module(tail.subspan(consumed), key, aad, nullptr, fcm.algo, false);
+    out.md = parse_file_metadata(plain, lim);
+    return out;
+}
+
+std::vector<column_data> read_encrypted_file(std::span<const uint8_t> image,
+                                             const encryption_key& key,
+                                             std::string_view aad_prefix) {
+    auto ef = parse_encrypted_footer(image, key, aad_prefix);
+    if (ef.md.row_groups.empty()) { return {}; }
+    return read_row_group(image, ef.md, 0, &ef.crypto);
 }
 
 } // namespace sstables::parquet::format
