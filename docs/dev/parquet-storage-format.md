@@ -4461,6 +4461,51 @@ So the deterministic baseline costs nothing in published figures, and §10.1f-pr
 numbers: both batch runs land in the anomalous regime (§10.17), so that row's 95.8 % rests on the
 standalone runs, not on these.
 
+### 10.18 The Backblaze 4x anomaly, localised — 2026-08-20
+
+Not solved, but no longer "cause unknown". Two claims in the previous write-up were wrong and the
+mechanism is now identified.
+
+**It is not batch-only.** §10.1f said the anomaly "has appeared only inside full-corpus batches and
+never in isolation". `out/bbv_A.tsv` is a standalone run with native 32 472 881 and pq 85 683 469 --
+so it happens in isolation too. Measured rate under one binary with the autotrainer disabled: **1 in
+7 standalone passes**, against **2 of 2 batch runs**. Batch context makes it much more likely
+without being necessary.
+
+**The two regimes are each internally deterministic**, which is what makes the split so odd:
+
+| | native | parquet | ratio | row groups | rows/group | synthetic `__*` leaves |
+|---|---:|---:|---:|---:|---:|---:|
+| normal (6 of 7 passes) | ~21.8 M | **20 803 872** (byte-identical every time) | 95 % | 60 | 5 000 | 2 695 885 (14.9 %) |
+| anomalous (1 of 7) | ~32.3 M | 84 196 292 | 261 % | 163 | 1 840 | **60 102 010 (78.4 %)** |
+
+**The mechanism is the per-cell metadata channel, not row-group overhead.** That was the obvious
+hypothesis -- 604 leaves at ~225 B of metadata per leaf per row group would explain 84 MB at ~600
+row groups -- and it is wrong. The file has 163 row groups, and the growth is in the data: all **407
+synthetic leaves** grow together, from ~6.6 kB each to ~148 kB each, 22x. `__ts` itself barely moves
+(2.01 M → 1.89 M). The row groups are cut *earlier* because the rows are bigger, so that is a
+consequence rather than the cause.
+
+Those 407 leaves are the deletion and timestamp-exception channels for 195 mostly-null columns. The
+dataset is bound with every column present and NULL for a missing reading, which writes a cell
+tombstone per null -- roughly 58 M of them across 300 000 rows. At about a byte each that is
+~58 MB, which is the 60 MB observed almost exactly. So the anomalous file is the one that **stores
+the tombstone metadata**, and the normal one is the one where it has collapsed. Native moving with
+it (21.8 → 32.3 M) fits: the row format stores the same tombstones.
+
+**What is still unknown is why it collapses**, and the load is deterministic -- the same rows, the
+same 197 columns, the same `USING TIMESTAMP` per row, and `pq_bytes` byte-identical across normal
+passes. So something downstream sometimes drops or folds that metadata and sometimes does not.
+`gc_grace_seconds` is the default 10 days while the mutation timestamps are back-dated to 2023,
+which makes purge eligibility worth looking at first, but a tombstone's `local_deletion_time` is
+wall-clock at write time, so on the face of it none of them should be purgeable. That is the next
+thing to check, and the check is cheap: compare cell timestamps and deletion times between a normal
+and an anomalous file directly, rather than inferring from sizes.
+
+**No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
+runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
+re-measurement for exactly this reason.
+
 ### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
 
 The readiness table used to call this "not applicable to this tree", which conflated two things.
@@ -5073,7 +5118,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | open | Fixed and unit-tested, never measured at scale. Applies to ICS under `'hybrid'` and to any table mid-`ALTER`. |
-| Backblaze 4× anomaly | open | One dataset's Parquet size swung 4× in batch runs only; four hypotheses eliminated, cause unknown. |
+| Backblaze 4× anomaly | **localised, not solved** | Mechanism found (§10.18): the per-cell tombstone/exception channel is sometimes stored (60 MB across 407 synthetic leaves) and sometimes collapsed (2.7 MB). Not batch-only as previously claimed -- 1 in 7 standalone passes, 2 of 2 batch runs. Why it collapses is open. No published figure depends on it. |
 | Encryption at rest | **done for Parquet Modular Encryption** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys named by id and resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key. Scylla's *own* storage-layer EaR still does not exist in this tree; per-column keys are read but not written. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. Open sub-question: the object key has no version prefix, so §10.9's downgrade safety is verified for local storage only. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
