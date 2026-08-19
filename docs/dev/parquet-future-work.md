@@ -178,6 +178,19 @@ round-trip test. Small in lines, large in blast radius.
 ## Housekeeping
 
 ### 11. Decks — done at v2.7 (2026-08-19)
+
+**Prose drifts even when the numbers are regenerated, and that is the recurring failure here.** The
+generators recompute every table from `deck_data.py`, so figures are always current — but the
+sentences *around* them are literals and do not move. Four claims have now been found stale this way
+and each was written correctly against an earlier corpus:
+
+- "half the disk is a property of **wide tables**" — falsified by the three-column variant
+- "the three that win have 20–197 columns" — same
+- "disk usage on **five** real datasets" — there are eight
+- "on three of **five** realistic schemas … at **scan parity**" — eight, and scan is 0.82×, faster
+
+**When adding a dataset or changing a default, re-read the prose, not just the tables.** A grep for
+stale figures does not catch "five datasets" or "wide tables", because those are words.
 Three-criteria policy, eight datasets at the shipped defaults, the three-column ISD variant, a
 slide deriving delta encoding of timestamps from the encoder, a slide decomposing the win against
 the **uncompressed** baseline, and the corrected L2 story — which is the one a reader is most likely to push back on,
