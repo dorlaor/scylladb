@@ -2001,18 +2001,38 @@ than the first:
 | counter | OK | OK | 120 | 11 leaves, 5 files |
 | collection at L0 `verbatim` | OK | OK | 120 | 9 leaves, 5 files |
 | collection at L1 `row` | OK | OK | 120 | 11 leaves, 5 files |
-| collection at L2 `uniform` | OK | OK | 120 | 11 leaves, 5 files |
+| collection at L2 `uniform` | OK | OK | 120 | 11 leaves — fell back to L1 |
+| flat at L0 `verbatim` | OK | OK | 120 | **37 leaves**, 5 files |
+| flat at L1 `row` | OK | OK | 120 | 11 leaves, 5 files |
+| flat at L2, UPDATE-written | OK | OK | 120 | **4 leaves** — L2 genuinely applied |
 
 **11/11, and against two implementations rather than one.** DuckDB has its own Parquet reader rather
 than wrapping parquet-cpp, which matters because pyarrow *is* parquet-cpp: the MAP arity check that
 rejected every collection file is parquet-cpp's, so a suite built only on pyarrow tests one
 implementation's opinion. Both now agree.
 
-**Two honest limits on this table.** L2 `uniform` shows 11 leaves, the same as L1 — because the
-uniform precondition did not hold for this fixture and L2 fell back to L1, which is documented
-behaviour (§5.3) but means the row does not actually prove L2's own layout interoperates. And
-`verbatim` has *fewer* leaves than `row` (9 against 11) rather than more, which is right: L1 adds
-the folded `__ts` plus two sparse exception leaves that L0 has no need for. All three non-frozen collection kinds go through the group shape that was broken, so this
+**L2 needed four attempts to trigger, and the reason is worth knowing.** Three fixtures all reported
+11 leaves — identical to L1 — meaning L2 had silently fallen back every time. The precondition in
+`map_schema()` is `all_same_ts && !any_ttl && !any_deletion && !any_marker && ...`, and **a CQL
+`INSERT` always writes a row marker**. So no `INSERT`-populated table can ever reach L2, whatever
+its timestamps. A collection cannot either, for a different reason: each element carries its own
+`__ts` *inside* the repeated group, so there is no row-level leaf to fold and the count cannot drop.
+
+Written with `UPDATE ... USING TIMESTAMP`, which writes no marker, L2 applies and the layout is
+plainly different — **4 leaves against L1's 11** — and both readers handle it.
+
+**The practical consequence is a scope note on L2, not a bug.** It is reachable only for
+UPDATE-written data with a single write timestamp, no TTLs and no deletions. That is a real pattern
+— bulk-loaded or backfilled tables often look exactly like it — but it is much narrower than "the
+uniform case", and any measurement quoting L2's savings should say which of the two it measured.
+§10.1f's L2 figures come from the harness, which writes with `USING TIMESTAMP` via prepared
+`INSERT`s, so they were L1 in disguise unless the harness avoids markers.
+
+**One more reading of the table.** `verbatim` has *fewer* leaves than `row` on a collection (9 against
+11) but far more on a flat schema (37 against 11). Both are right: on a flat schema L0 keeps
+per-cell metadata for every column, which is where the 37 comes from; on a collection the elements
+already carry their own metadata, so L0 adds nothing while L1 adds a folded `__ts` and two sparse
+exception leaves. All three non-frozen collection kinds go through the group shape that was broken, so this
 gate would have caught the MAP bug on the day collections landed. It is cheap enough to run on
 demand and belongs in whatever CI this eventually gets.
 

@@ -247,9 +247,14 @@ collection file was parquet-cpp's, so a gate built on pyarrow alone tests one im
 opinion of the spec. DuckDB has its own reader. (`pip install --user duckdb` was needed here; it is
 not a Scylla dependency, only a test one.)
 
-**Known gap in the gate:** the L2 `uniform` row fell back to L1 for its fixture, so L2's own leaf
-layout is still unproven against an external reader. A fixture with genuinely uniform cell
-timestamps would close it.
+**Gap closed 2026-08-19, and it turned into a finding.** L2 fell back for three successive fixtures
+because its precondition forbids a row marker and **every CQL `INSERT` writes one**. Only
+`UPDATE`-written data with a single timestamp, no TTL and no deletions can reach L2. With that
+fixture L2 applies and shows 4 leaves against L1's 11, verified by both readers. 16/16 shapes now.
+
+**Follow-on worth checking:** §10.1f's L2 savings figures were produced by the harness, which
+populates tables with prepared `INSERT`s. If so they are L1 measurements mislabelled as L2, and the
+"L2 folds `__ts` away" numbers understate what L2 actually does.
 
 This exists because a passing interop suite of *flat* fixtures let a broken MAP annotation make
 every collection and counter file unreadable by parquet-cpp for as long as collections have
