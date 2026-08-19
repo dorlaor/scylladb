@@ -171,6 +171,31 @@ write volume as well as a rewrite.
 in" are different questions, and only the second one matters to an operator. Any future format
 decision needs a test that calls no compaction endpoint at all.
 
+### Maintenance tooling and object storage — both closed 2026-08-19
+§10.12. The last two Phase 5 surfaces, and one of them had been dismissed for the wrong reason.
+
+**Tooling: 10/10 on a `pq` table.** scrub in all four modes, cleanup, and snapshot → truncate →
+refresh with all 200 000 rows restored. `scrub VALIDATE` is the load-bearing one: it reads every
+sstable and reports errors without rewriting, which makes it a whole-file integrity check of the
+Parquet reader.
+
+**Object storage: 7/7 on minio, and it was never actually blocked.** It was recorded as needing Docker
+because the repo's GCS tests cannot pull their image here. But `minio` is installed as a plain binary
+(`/usr/local/bin/minio`) and `podman` works even though `docker` does not, so no registry was ever
+required. Configuration follows the repo's own `test/pylib/minio_server.py`. The decisive check was
+made against the bucket rather than through Scylla: the `Data.db` object carries **`PAR1` at head and
+tail**.
+
+**Newly open, and blocking for anyone combining the two features:** on object storage the key is
+`sstables/<uuid>/Data.db` — **no version prefix**. The downgrade safety verified in §10.9 is a
+*filename* property: an older node aborts because it cannot parse an unknown version in a filename.
+With no filename, that abort may not happen, and the failure mode would be an older node
+mis-reading an object rather than refusing to start. **§10.9 is verified for local storage only.**
+
+**Encryption at rest is not a gap in this tree.** There is no such code here — no `ee/` directory, no
+symbols. It is a design question for a build that has the feature, and listing it as untested work
+implied someone could pick it up on this branch.
+
 ### Downgrade procedure — written 2026-08-19, was "not started"
 §10.9. The load-bearing fact is observed, not reasoned: an older node meeting an sstable version it
 does not recognise **aborts during the directory scan** rather than skipping the file. Verified by

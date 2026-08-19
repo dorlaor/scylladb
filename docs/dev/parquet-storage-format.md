@@ -4136,6 +4136,63 @@ checked.
   quoted again. That is now the highest-value open measurement in the project, ahead of the
   production-scale read-path work.
 
+### 10.12 Maintenance tooling and object storage — the last two untested surfaces, 2026-08-19
+
+Phase 5 listed "backup/restore/scrub/tooling completion" and object-storage integration, and neither
+had been exercised at all. Both are now covered, and object storage turned out to have been written
+off for the wrong reason.
+
+**Maintenance tooling on a `pq` table: 10/10** (`~/pq-lab/pq_tooling_check.py`, 200 000 rows). These
+are not exotic paths — they are what an operator runs on a Tuesday — and each one reads or rewrites
+every sstable, so a reader that is wrong in a way ordinary queries do not reach would surface here.
+
+| Operation | Result |
+|---|---|
+| `scrub` VALIDATE | 200 000 rows, versions `{pq: 1}` |
+| `scrub` SKIP / SEGREGATE / ABORT | all pass, row count and format unchanged |
+| `cleanup` | passes, stays `pq` |
+| `snapshot` | contains `pq-` files |
+| `truncate` | empties the table |
+| `refresh` (load-and-stream) from that snapshot | all 200 000 rows back |
+
+`scrub VALIDATE` is the one that carries weight: it reads every sstable and reports errors without
+rewriting, so it is a whole-file integrity check of the Parquet reader. The snapshot round trip is the
+backup story end to end — snapshot, truncate to zero, stage the components into `upload/`, refresh,
+everything back.
+
+**Object storage: 7/7** (`~/pq-lab/objstore_check.py`, minio). Recorded as blocked on Docker because
+the repo's GCS tests cannot pull their image on this machine. That was wrong twice over: **`minio` is
+installed as a plain binary**, so no registry is involved, and `podman` works even though `docker`
+does not. The configuration shape is taken from the repo's own harness
+(`test/pylib/minio_server.py`) rather than invented: endpoints in `object_storage_endpoints`,
+credentials from `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, and a keyspace opting in with
+`STORAGE = {'type':'S3','bucket':...,'endpoint':...}`.
+
+| Check | Result |
+|---|---|
+| Keyspace on S3 storage created | pass |
+| `pq` table created on it | pass |
+| sstable objects land in the bucket | 80 objects, 8 of them `Data.db` |
+| All rows readable from object storage | 200 000 / 200 000 |
+| Row content intact | pass |
+
+And the decisive one, checked directly against the bucket rather than through Scylla: the `Data.db`
+object carries **`PAR1` at both head and tail** — a genuine Parquet file, 114 467 bytes, with a TOC
+listing all nine components. What was in question was never the encoding, since the writer does not
+know where its bytes land; it was every path that assumes a local file — the storage layer,
+`data_read()` fetching a footer over HTTP, and the fact that S3 objects cannot be renamed
+(`sstables/storage.cc` refuses to change the state and generation of one), which is how the local
+path moves sstables out of `upload/`.
+
+**One thing this exposes, and it is not resolved.** On object storage the key is
+`sstables/<uuid>/Data.db` — the sstable *version is not in the object name*, where locally it is the
+`pq-` filename prefix. §10.9's downgrade safety rests on exactly that prefix: an older node aborts at
+startup because it cannot parse an unknown version in a filename. On object storage there is no such
+filename, so the version must come from elsewhere and the abort may not happen the same way. **The
+downgrade procedure in §10.9 is verified for local storage only.** Whether an older node refuses or
+silently mis-reads an object-storage `pq` sstable is an open question and a blocking one for anyone
+running both features together.
+
 ### 10.5 Decision log
 
 | Date | Decision | Rationale |
@@ -4645,18 +4702,20 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Mixed-format bucketing at scale | open | Fixed and unit-tested, never measured at scale. Applies to ICS under `'hybrid'` and to any table mid-`ALTER`. |
 | Backblaze 4× anomaly | open | One dataset's Parquet size swung 4× in batch runs only; four hypotheses eliminated, cause unknown. |
-| Encryption at rest | not started | Interaction with the `pq` Data component is undesigned. |
-| Object storage | not started | `pq` sstables on S3-backed storage are untested. |
+| Encryption at rest | **not applicable to this tree** | There is no encryption-at-rest code in this repository at all — no `ee/` directory, no such symbols. The interaction is a design question for a build that has the feature, not work that can be done or tested here. |
+| Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. Open sub-question: the object key has no version prefix, so §10.9's downgrade safety is verified for local storage only. |
+| Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done** | Specified in §10.9, and the behaviour it rests on is observed: an older node *aborts at startup* on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
 | `DELTA_BYTE_ARRAY` | open | Unimplemented; text falls back to dictionary or plain. |
 | C7 / point-read awareness | open | Cannot be evaluated — no counter separates point reads from scans. C5's column ceiling is the stand-in. |
 
 **The honest summary.** The functionality is built and, where the claim is behavioural, verified on a
-running node rather than only in a unit test. What is not done divides into one measurement that
-could change a conclusion (production-scale read path), one accepted trade (no gain check under
-TWCS), and two surfaces nobody has looked at (encryption at rest, object storage).
-Neither is believed hard; neither has been designed. The downgrade procedure was the third and is
-now written (§10.9).
+running node rather than only in a unit test. What is left is narrower than it was: one measurement
+that could change a conclusion (production-scale read path), one that could change two corpus rows
+(the dictionary re-measurement), one accepted trade (no gain check under TWCS), and one open
+interaction — downgrade safety on object storage, where the version is not in the object name.
+Encryption at rest is not a gap in this tree; the code does not exist here. Object storage,
+maintenance tooling and the downgrade procedure for local storage are done and verified.
 
 ## 12. References
 
