@@ -187,7 +187,18 @@ static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
             format::schema_element map_el;
             map_el.name = g->second;
             map_el.repetition_type = repetition::optional;
-            map_el.converted_type = int32_t(format::converted::map);
+            // Deliberately NOT annotated as a Parquet MAP. A MAP's key_value group must have one
+            // or two children and ours has five -- key, value, __ts, __ttl, __ldt -- or six for a
+            // counter, because each element carries its own cell metadata. parquet-cpp enforces
+            // that arity and refuses to open the whole file: "Key-value map node must have 1 or 2
+            // child elements. Found: 5". So the annotation made every sstable containing a
+            // non-frozen collection or a counter unreadable by any parquet-cpp-based reader,
+            // which is the opposite of what it was for.
+            //
+            // Without it the group is an ordinary nested structure -- an optional group holding a
+            // repeated group of typed fields -- which is valid Parquet and which readers resolve
+            // as a list of structs. The Scylla side is unaffected: our reader works from the tree
+            // and the levels, not from the annotation.
             map_el.num_children = 1;
             body.push_back(map_el);
 

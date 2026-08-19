@@ -1947,6 +1947,49 @@ layout has redundancy left to exploit. Reported as measured rather than tidied.
    The format keeps `scylla.folding_level` as its only private metadata and stays
    openable by pyarrow, which `test/boost/sstable_parquet_test.cc` asserts.
 
+### 10.3i The MAP annotation made every collection and counter file unreadable
+
+Verifying the typed counter leaves against pyarrow — the whole point of typing them — produced this
+instead:
+
+```
+ArrowInvalid: Key-value map node must have 1 or 2 child elements. Found: 6
+```
+
+The file would not open **at all**. And a plain `map<text,text>` column fails the same way with
+`Found: 5`, so this was never about counters: **any `pq` sstable containing a non-frozen collection
+or a counter was unreadable by any parquet-cpp-based reader**, which includes pyarrow, DuckDB and
+Arrow. That is the exact opposite of the format's premise — §1 says the value proposition is a file
+other tools can open — and it had been true since collections were implemented.
+
+**Cause.** The group was annotated `ConvertedType::MAP`, but a Parquet MAP's `key_value` child must
+have one or two children. Ours has five — `key`, `value`, `__ts`, `__ttl`, `__ldt` — because each
+element carries its own cell metadata, which is what makes the representation lossless (§5.2).
+parquet-cpp enforces the arity and rejects the file rather than ignoring the annotation.
+
+**Fix: drop the annotation.** Without it the group is an ordinary nested structure — an optional
+group holding a repeated group of typed fields — which is valid Parquet. Readers resolve it as a
+list of structs:
+
+```
+hits: struct<key_value: list<struct<key: binary, value: int64, __ts: int64,
+                                    __ttl: int32, __ldt: int32, clock: int64>>>
+tags: struct<key_value: list<struct<key: binary, value: binary, __ts: int64,
+                                    __ttl: int32, __ldt: int32>>>
+```
+
+pyarrow now opens both and decodes the values — counter shards read out as `value=8 clock=2` and so
+on. The Scylla side is unaffected: our reader works from the tree and the Dremel levels, not from
+the annotation. All five losslessness modes, `parquet_writer_test` and `sstable_parquet_test` pass
+unchanged.
+
+**Why the interop suite missed it.** The seven cross-read fixtures in §10.3 are flat schemas, and
+the Dremel work in §10.3 was validated by writing a `list<string>` for pyarrow — a *proper* LIST,
+not this five-child pseudo-MAP. Nothing in the suite ever wrote a Scylla collection column and
+handed it to another implementation. **The lesson is narrow and worth stating: an interop claim is
+only as broad as the shapes actually handed across.** Two years of "pyarrow reads our files" was
+true and irrelevant for the one shape where it mattered most.
+
 ### 10.1f-raw Against uncompressed: how much is layout and how much is the compressor
 
 Every ratio in this document compares Parquet against a **trained-dictionary** SSTable, which is
