@@ -1989,18 +1989,30 @@ it, and opens every resulting `pq` sstable with pyarrow — reading all row grou
 parse while its pages cannot decode, and reading *every* sstable a major compaction produced rather
 than the first:
 
-| Shape | pyarrow | rows read | schema |
-|---|---|---:|---|
-| flat scalars (8 types) | OK | 120 | 11 leaves, 5 files |
-| `map<text,text>` non-frozen | OK | 120 | 11 leaves, 5 files |
-| `set<int>` non-frozen | OK | 120 | 11 leaves, 5 files |
-| `list<text>` non-frozen | OK | 120 | 11 leaves, 5 files |
-| `frozen<map>` | OK | 120 | 5 leaves, 5 files |
-| static column | OK | 120 | 8 leaves, 5 files |
-| expiring cells (TTL) | OK | 120 | 9 leaves, 5 files |
-| counter | OK | 120 | 11 leaves, 5 files |
+| Shape | pyarrow | DuckDB | rows | schema |
+|---|---|---|---:|---|
+| flat scalars (8 types) | OK | OK | 120 | 11 leaves, 5 files |
+| `map<text,text>` non-frozen | OK | OK | 120 | 11 leaves, 5 files |
+| `set<int>` non-frozen | OK | OK | 120 | 11 leaves, 5 files |
+| `list<text>` non-frozen | OK | OK | 120 | 11 leaves, 5 files |
+| `frozen<map>` | OK | OK | 120 | 5 leaves, 5 files |
+| static column | OK | OK | 120 | 8 leaves, 5 files |
+| expiring cells (TTL) | OK | OK | 120 | 9 leaves, 5 files |
+| counter | OK | OK | 120 | 11 leaves, 5 files |
+| collection at L0 `verbatim` | OK | OK | 120 | 9 leaves, 5 files |
+| collection at L1 `row` | OK | OK | 120 | 11 leaves, 5 files |
+| collection at L2 `uniform` | OK | OK | 120 | 11 leaves, 5 files |
 
-**8/8.** All three non-frozen collection kinds go through the group shape that was broken, so this
+**11/11, and against two implementations rather than one.** DuckDB has its own Parquet reader rather
+than wrapping parquet-cpp, which matters because pyarrow *is* parquet-cpp: the MAP arity check that
+rejected every collection file is parquet-cpp's, so a suite built only on pyarrow tests one
+implementation's opinion. Both now agree.
+
+**Two honest limits on this table.** L2 `uniform` shows 11 leaves, the same as L1 — because the
+uniform precondition did not hold for this fixture and L2 fell back to L1, which is documented
+behaviour (§5.3) but means the row does not actually prove L2's own layout interoperates. And
+`verbatim` has *fewer* leaves than `row` (9 against 11) rather than more, which is right: L1 adds
+the folded `__ts` plus two sparse exception leaves that L0 has no need for. All three non-frozen collection kinds go through the group shape that was broken, so this
 gate would have caught the MAP bug on the day collections landed. It is cheap enough to run on
 demand and belongs in whatever CI this eventually gets.
 

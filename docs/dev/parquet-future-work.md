@@ -239,8 +239,17 @@ MB) ran through its own mtime-based lookup and should be redone before it is cit
 
 ### 12. Run `interop_shapes.py` after any change to the schema mapping
 It builds a table per shape the format emits — flat scalars, all three non-frozen collection kinds,
-frozen collections, statics, TTL, counters — converts each, and reads every resulting `pq` sstable
-with pyarrow. 8/8 today.
+frozen collections, statics, TTL, counters, and a collection at each folding level — converts each,
+and reads every resulting `pq` sstable with **both pyarrow and DuckDB**. 11/11 today.
+
+Two readers on purpose: pyarrow *is* parquet-cpp, and the MAP arity check that rejected every
+collection file was parquet-cpp's, so a gate built on pyarrow alone tests one implementation's
+opinion of the spec. DuckDB has its own reader. (`pip install --user duckdb` was needed here; it is
+not a Scylla dependency, only a test one.)
+
+**Known gap in the gate:** the L2 `uniform` row fell back to L1 for its fixture, so L2's own leaf
+layout is still unproven against an external reader. A fixture with genuinely uniform cell
+timestamps would close it.
 
 This exists because a passing interop suite of *flat* fixtures let a broken MAP annotation make
 every collection and counter file unreadable by parquet-cpp for as long as collections have
