@@ -4544,6 +4544,45 @@ of sustained writes until Parquet holds the majority of the bytes and the bottom
 several times over -- measures the same thing far more slowly. Either is a real experiment; this run
 is not, and the readiness table says so.
 
+### 10.20 Object-storage downgrade — observed, 2026-08-20
+
+§10.12 left this as the one open interaction, and was explicit about why: on object storage the key
+is `sstables/<uuid>/Data.db` with **no version in the object name**, where locally the `pq-` filename
+prefix is what makes an older node refuse to start. The code path was traced -- the version lives in
+`system.sstables_registry` and is parsed by the same `version_from_string()` that throws -- but it was
+read, not observed, because the registry is not reachable through CQL and there was nowhere to plant
+a bogus version. The doc named what would settle it: *"a build with `pq` removed from
+`version_string` reading a bucket written by this one."* That is what this is.
+
+`~/pq-lab/objstore_downgrade.py`, 7/7. Isolation is the part that took thought: a node whose *local*
+data directory also held `pq` sstables would abort on those and prove nothing about object storage, so
+the experiment uses a dedicated data directory where everything local is `me` and the only `pq`
+sstables are in the bucket.
+
+| Stage | Result |
+|---|---|
+| Current binary, endpoint configured, `pq` table on an S3 keyspace | 10 objects in the bucket, 3 000 rows readable |
+| `pq` removed from `version_string`, relinked, same data directory | **refuses to start, exit 1** |
+| Source reverted, relinked, same data directory | starts, 3 000 rows still readable |
+
+The message is the one the reasoning predicted, and it names the bucket:
+
+```
+ERROR database - Exception while populating keyspace 'dgks' with column family 't'
+      from 's3://pqdgbucket': std::out_of_range (Unknown sstable version: pq)
+ERROR init - Startup failed: std::runtime_error (Exception while populating keyspace 'dgks' ...)
+```
+
+So the registry scan for an object-storage table throws on an unknown version and startup fails,
+exactly as the local filename path does. **§10.9's downgrade procedure now holds for object storage
+as well as local disk**, and the readiness table's last "reasoned, not observed" row is closed.
+
+**The third stage is not a formality.** Without it the experiment cannot distinguish "the older node
+refused because of the version" from "the patch broke the binary in some other way" -- and a
+self-reverting source patch that is never verified as reverted is how a tree quietly acquires a
+one-line regression. The script reverts in a `finally` and then proves the reverted build works on
+the same data.
+
 ### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
 
 The readiness table used to call this "not applicable to this tree", which conflated two things.
@@ -5158,20 +5197,30 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
 | Backblaze 4× anomaly | **localised, not solved** | Mechanism found (§10.18): the per-cell tombstone/exception channel is sometimes stored (60 MB across 407 synthetic leaves) and sometimes collapsed (2.7 MB). Not batch-only as previously claimed -- 1 in 7 standalone passes, 2 of 2 batch runs. Why it collapses is open. No published figure depends on it. |
 | Encryption at rest | **done for Parquet Modular Encryption** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys named by id and resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key. Scylla's *own* storage-layer EaR still does not exist in this tree; per-column keys are read but not written. |
-| Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. Open sub-question: the object key has no version prefix, so §10.9's downgrade safety is verified for local storage only. |
+| Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
-| Downgrade procedure | **done** | Specified in §10.9, and the behaviour it rests on is observed: an older node *aborts at startup* on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
+| Downgrade procedure | **done, both storage types** | Specified in §10.9, and the behaviour it rests on is observed on local disk *and* on object storage (§10.20): an older node aborts at startup on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
 
 
-**The honest summary.** The functionality is built and, where the claim is behavioural, verified on a
-running node rather than only in a unit test. What is left is narrower than it was: one measurement
-that could change a conclusion (production-scale read path), one accepted trade (no gain check under
-TWCS), and one open interaction — downgrade safety on object storage, where the version is not in the object name.
-Encryption at rest is a design question rather than missing work: Scylla's own EaR is not in this
-tree, and Parquet's Modular Encryption is a format feature this writer does not emit -- and choosing
-between them is a decision about whether an encrypted file should still be readable by other tools.
-Object storage, maintenance tooling and the downgrade procedure for local storage are done and
-verified.
+**The honest summary.** The functionality is built and, where the claim is behavioural, verified on
+a running node rather than only in a unit test. What is left is genuinely narrow:
+
+- **One measurement that could change a conclusion**: the production-scale read path. Every latency
+  figure comes from a 200–300 k-row sstable, and footer parse costs 4.32 µs per row group, so an
+  8 000-group file pays ~34 ms — that reorders §10.4 rather than merely scaling it.
+- **One accepted trade**: TWCS converts without a gain check, so a schema Parquet stores worse
+  converts anyway. `storage_format = 'sstable'` is the only guard and it is manual.
+- **One half-measurement**: mixed-format bucketing at scale showed the right shape but over too
+  small a share of the bytes to be evidence (§10.19).
+- **One localised-but-unexplained anomaly**: Backblaze's per-cell metadata channel sometimes
+  collapses and sometimes does not (§10.18). No published figure depends on it.
+
+Everything else on the old list is closed. Encryption at rest is built as Parquet Modular Encryption
+and verified end to end, including an external reader opening the encrypted file with the key
+(§10.17) — the earlier "not applicable to this tree" answer conflated Scylla's own EaR, which really
+is absent here, with a standard format feature that was not. Downgrade safety now holds for **both**
+storage types, observed rather than reasoned (§10.20). The corpus survives the deterministic
+dictionary unchanged (§10.16). Object storage and maintenance tooling are done and verified.
 
 ## 12. References
 
