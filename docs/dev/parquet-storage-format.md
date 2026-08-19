@@ -4506,6 +4506,44 @@ and an anomalous file directly, rather than inferring from sizes.
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
 re-measurement for exactly this reason.
 
+### 10.19 Mixed-format bucketing at scale — measured 2026-08-20, and it is only half an answer
+
+The fix (§10.3i) makes a size-tiered candidate set holding both formats bucket on
+`ondisk_data_size()` instead of `data_size()`, because the latter means two different quantities:
+uncompressed length for a compressed native sstable, file size for a `pq` one. It is unit-tested.
+What the unit test cannot show is the consequence the fix exists to prevent -- a hybrid table
+settling into repeatedly rewriting the format that is most expensive to rewrite -- so this measures
+write amplification per format on a live ICS table under `'hybrid'`.
+
+4 000 000 rows, latte, ICS, Zstd-with-dicts, no major compaction issued (the point is what the
+strategy chooses). The table directory was polled throughout; a generation that appears and later
+disappears was rewritten.
+
+| format | appeared | rewritten | bytes seen | bytes rewritten |
+|---|---:|---:|---:|---:|
+| `me` | 18 | 6 | 51 952 131 | 27 040 009 |
+| `pq` | 3 | 0 | 3 465 766 | 0 |
+
+Live at the end: 15 sstables, 12 `me` and 3 `pq`. All 4 000 000 rows read back.
+
+**What this establishes.** Mixed-format candidate sets really do arise under ICS + `'hybrid'` at
+scale -- 12 native and 3 Parquet sstables coexisting in one table -- compaction keeps making
+progress on them, and nothing is lost: the row count is exact.
+
+**What it does not establish, and the distinction is the whole point of writing it down.** `pq` took
+0 % of the rewrites, which is the *shape* the fix is supposed to produce -- but it is not evidence
+of it. Parquet is only 6.3 % of the bytes here (it is the converted bottom tier, so it appears late),
+and the observation window after the load was about two minutes. "0 of 3 files rewritten" is equally
+consistent with correct bucketing and with there having been no opportunity. A green result that a
+broken build would also produce is not a measurement.
+
+**What would settle it** is a differential rather than a longer run: the same load with the fix
+disabled, so the two churn figures can be compared. That needs a way to force `use_ondisk = false`
+at runtime, which today would mean test-only code in the compaction path. The alternative -- hours
+of sustained writes until Parquet holds the majority of the bytes and the bottom tier is rewritten
+several times over -- measures the same thing far more slowly. Either is a real experiment; this run
+is not, and the readiness table says so.
+
 ### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
 
 The readiness table used to call this "not applicable to this tree", which conflated two things.
@@ -5117,7 +5155,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Production-scale re-measurement | **blocking** | Every latency figure is from a 200–300 k-row sstable. Footer parse is 4.32 µs per row group, so an 8 000-group file pays ~34 ms — this **reorders** §10.4 rather than merely scaling it. |
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
-| Mixed-format bucketing at scale | open | Fixed and unit-tested, never measured at scale. Applies to ICS under `'hybrid'` and to any table mid-`ALTER`. |
+| Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
 | Backblaze 4× anomaly | **localised, not solved** | Mechanism found (§10.18): the per-cell tombstone/exception channel is sometimes stored (60 MB across 407 synthetic leaves) and sometimes collapsed (2.7 MB). Not batch-only as previously claimed -- 1 in 7 standalone passes, 2 of 2 batch runs. Why it collapses is open. No published figure depends on it. |
 | Encryption at rest | **done for Parquet Modular Encryption** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys named by id and resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key. Scylla's *own* storage-layer EaR still does not exist in this tree; per-column keys are read but not written. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. Open sub-question: the object key has no version prefix, so §10.9's downgrade safety is verified for local storage only. |
