@@ -1480,6 +1480,15 @@ is specific enough to state as a rule: **a per-column writer setting has to be a
 write paths, because which one runs is a function of data size.** The regression test in
 `test/boost/parquet_writer_test.cc` drives the same rows through both.
 
+**The audit that rule prompted is finished, and it found one more thing.** Every piece of file-level
+metadata was checked against both paths: `scylla.folding_level` (both), `scylla.counter_columns` and
+`scylla.counter_encoding` (both, via `add_counter_metadata()`), and `scylla.uniform_timestamp` --
+which only `write_rows()` wrote. That one turned out to be unreachable rather than broken, for a
+reason that is itself worth knowing; see §10.15. The remaining differences between the paths are
+deliberate: the cutting path uses the conservative leaf set because it must fix the leaf set before
+seeing all the rows, and the export-only entry point skips the losslessness check because L3 is
+export-only. The divergence set is closed as of 2026-08-20.
+
 **`DESCRIBE` had never emitted the property at all.** Independently of the above, `parquet = {...}`
 was missing from `schema::get_create_statement()`, so no parquet setting -- scalar or per-column --
 survived a table recreated from its own description. `to_map()` carried a comment explaining that
