@@ -116,16 +116,12 @@ The encoding that would help exactly where Parquet does worst: HackerNews at 82.
 pageviews at 90.0 % are both dominated by near-unique text (§10.1f-prod). Prefix-sharing between
 adjacent sorted strings is the one mechanism that attacks that, and it is unavailable.
 
-### 6. Counter shard leaves are not *typed* — partly addressed 2026-08-19
-The file now **declares** the convention: `scylla.counter_columns` names them and
-`scylla.counter_encoding` describes the packing, on both write paths, pinned by
-`sstable_parquet_test/test_pq_declares_the_counter_convention`. So a reader can discover what the
-sixteen bytes are instead of having to know.
-
-What remains is making them *typed*: a group inside the MAP value with named `value` and `clock`
-leaves, so an external reader can interpret them without special-casing Scylla. That is a third
-level of Dremel nesting and a schema change, and it is the last remaining functional gap in the
-format itself.
+### 6. ~~Counter shard leaves are not typed~~ — closed 2026-08-19
+`value` and `clock` are now two `INT64` leaves of the counter's group, so an external reader sees a
+count and a logical clock rather than a packed blob. The nested-group work this was deferred for was
+never needed: the `key_value` group already carries five children rather than a strict MAP's two, so
+a sixth typed sibling costs nothing structurally. The metadata declaration added earlier stays as
+documentation of the shard-id packing, which is still 16 bytes.
 
 ### 7. ~~Statistics metadata is thinly fed~~ — closed 2026-08-19
 Investigated and largely a false alarm. `update_live_row_marker_timestamp` *is* fed (an earlier

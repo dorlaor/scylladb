@@ -3630,7 +3630,29 @@ native format** — and 2.1 ms / 61x with numeric dictionaries off.
     requires them ordered by id, and although our writer emits them already ordered, relying
     on that would make the reader depend on an invariant it does not enforce.
 
-    **Partly addressed 2026-08-19: the file now declares the convention.** `cql_column` gained a
+    **Resolved 2026-08-19: the leaves are typed.** A counter's group now carries `value` and
+    `clock` as two `INT64` leaves instead of one packed 16-byte `BYTE_ARRAY`, so any Parquet reader
+    sees a count and a logical clock rather than an opaque blob.
+
+    **Why this turned out to be cheap.** The plan had been a group nested inside the MAP value — a
+    third level of Dremel nesting — and that was the reason for deferring it. It was unnecessary:
+    this writer's `key_value` group already carries **five** children (`key`, `value`, `__ts`,
+    `__ttl`, `__ldt`) rather than the two a strict MAP has, so the shape is already non-standard in
+    exactly the way that makes a sixth sibling free. Adding `clock` alongside is no further
+    departure. Two hours of deferral rested on not having read the group's arity.
+
+    The sixth leaf is **appended after `__ldt`** rather than placed next to `value`, so every
+    existing `vcol + N` offset in the shred and reassemble paths keeps its meaning. Schema order is
+    cosmetic here — a reader sees the siblings of one group either way — and renumbering those
+    offsets is the change most likely to go wrong silently.
+
+    Above the storage layer nothing changed: `read_counter_cell()` still produces a packed pair and
+    the reassembler repacks one, so the counter rebuild path is untouched. Covered by the existing
+    `test_pq_counters_round_trip`, which drives real counter cells through the writer and reader,
+    and by `test_pq_declares_the_counter_convention`, which asserts both leaves are `INT64` in the
+    written footer.
+
+    **Also still declared in the metadata.** `cql_column` gained a
     `counter` flag — until then nothing downstream could distinguish a counter from a collection,
     since both are `multi_cell` — and the footer carries `scylla.counter_columns` naming them plus
     `scylla.counter_encoding` describing the packing: 16-byte shard id as two big-endian int64s

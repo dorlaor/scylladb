@@ -171,8 +171,11 @@ static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
     }
     // Which leaf starts each collection group, and what the group is called.
     std::map<size_t, std::string> group_at;
+    std::map<size_t, size_t> group_leaves;      // five leaves, or six for a counter
     for (size_t k = 0; k < ms.value_is_collection.size(); ++k) {
-        if (ms.value_is_collection[k]) { group_at[ms.value_leaf[k]] = cols[reg_idx[k]].name; }
+        if (!ms.value_is_collection[k]) { continue; }
+        group_at[ms.value_leaf[k]] = cols[reg_idx[k]].name;
+        group_leaves[ms.value_leaf[k]] = ms.value_is_counter[k] ? 6 : 5;
     }
 
     ms.tree.clear();
@@ -188,13 +191,14 @@ static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
             map_el.num_children = 1;
             body.push_back(map_el);
 
+            const size_t nleaves = group_leaves.at(i);
             format::schema_element kv;
             kv.name = "key_value";
             kv.repetition_type = repetition::repeated;
-            kv.num_children = 5;
+            kv.num_children = int32_t(nleaves);
             body.push_back(kv);
 
-            for (size_t j = 0; j < 5; ++j) {
+            for (size_t j = 0; j < nleaves; ++j) {
                 const auto& c = ms.columns[i + j];
                 format::schema_element e;
                 e.type = c.type;
@@ -203,7 +207,7 @@ static void build_tree(mapped_schema& ms, const std::vector<cql_column>& cols) {
                 body.push_back(e);
             }
             ++top_children;
-            i += 5;
+            i += nleaves;
             continue;
         }
         const auto& c = ms.columns[i];
@@ -266,6 +270,7 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     ms.meta_base_index.assign(reg_idx.size(), std::nullopt);
     ms.value_leaf.assign(reg_idx.size(), 0);
     ms.value_is_collection.assign(reg_idx.size(), false);
+    ms.value_is_counter.assign(reg_idx.size(), false);
     ms.ct_ts_index.assign(reg_idx.size(), std::nullopt);
     ms.ct_ldt_index.assign(reg_idx.size(), std::nullopt);
     ms.l1_ttl_index.assign(reg_idx.size(), std::nullopt);
@@ -316,9 +321,14 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
             // levels are filled in by the tree builder, which is the only place
             // that knows the nesting.
             ms.value_is_collection[k] = true;
+            ms.value_is_counter[k] = c.counter;
             ms.columns.push_back(column_spec{"key", phys_type::byte_array,
                                              repetition::required, std::nullopt, std::nullopt});
-            ms.columns.push_back(column_spec{"value", phys_type::byte_array,
+            // A counter shard's value is not an opaque blob: it is a count and a logical clock.
+            // Emitting them as two INT64 leaves makes the column interpretable by any Parquet
+            // reader instead of only by something that knows Scylla's packing (design doc 5.2).
+            ms.columns.push_back(column_spec{"value",
+                                             c.counter ? phys_type::int64 : phys_type::byte_array,
                                              repetition::optional, std::nullopt, std::nullopt});
             ms.columns.push_back(column_spec{"__ts", phys_type::int64,
                                              repetition::required, std::nullopt, std::nullopt});
@@ -326,6 +336,12 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                                              repetition::optional, std::nullopt, std::nullopt});
             ms.columns.push_back(column_spec{"__ldt", phys_type::int32,
                                              repetition::optional, std::nullopt, std::nullopt});
+            if (c.counter) {
+                // Appended rather than placed after `value` so the vcol+N offsets used by the
+                // shred and reassemble paths keep their meaning; see mapped_schema.
+                ms.columns.push_back(column_spec{"clock", phys_type::int64,
+                                                 repetition::optional, std::nullopt, std::nullopt});
+            }
             continue;
         }
         ms.columns.push_back(column_spec{c.name, phys_of(c.type), repetition::optional,
@@ -620,6 +636,9 @@ static void shred_collection(std::vector<column_data>& out, const mapped_schema&
     auto& l_ts  = out[vcol + 2];
     auto& l_ttl = out[vcol + 3];
     auto& l_ldt = out[vcol + 4];
+    // Counters carry a sixth leaf; see mapped_schema::value_is_counter.
+    const bool counter = ms.value_is_counter[k];
+    column_data* l_clock = counter ? &out[vcol + 5] : nullptr;
 
     auto slot = [] (column_data& cd, uint64_t rep, uint64_t def) {
         cd.rep_levels.push_back(rep);
@@ -637,6 +656,7 @@ static void shred_collection(std::vector<column_data>& out, const mapped_schema&
         slot(l_ts,  0, d);
         slot(l_ttl, 0, d);
         slot(l_ldt, 0, d);
+        if (counter) { slot(*l_clock, 0, d); }
     } else {
         for (size_t i = 0; i < cc->elements.size(); ++i) {
             const auto& e = cc->elements[i];
@@ -647,7 +667,22 @@ static void shred_collection(std::vector<column_data>& out, const mapped_schema&
 
             const bool has_val = e.value.has_value();
             slot(l_val, rep, has_val ? 3 : 2);
-            if (has_val) { l_val.str.push_back(*e.value); }
+            if (counter) {
+                // The element value is a packed (count, logical_clock) pair. Split it into the two
+                // typed leaves; a value that is not exactly sixteen bytes cannot have come from
+                // read_counter_cell(), so treat it as absent rather than guessing.
+                int64_t cnt = 0, clk = 0;
+                const bool ok = has_val && unpack_i64_pair(*e.value, cnt, clk);
+                if (ok) { l_val.i64.push_back(cnt); }
+                slot(*l_clock, rep, ok ? 3 : 2);
+                if (ok) { l_clock->i64.push_back(clk); }
+                if (has_val && !ok) {
+                    // Correct the definition level we already wrote: nothing was stored.
+                    l_val.def_levels.back() = 2;
+                }
+            } else if (has_val) {
+                l_val.str.push_back(*e.value);
+            }
 
             slot(l_ts, rep, 2);
             l_ts.i64.push_back(e.timestamp);
@@ -804,6 +839,10 @@ std::vector<column_data> shred(const mapped_schema& ms,
 struct collection_cursor {
     size_t slot = 0;
     size_t v_key = 0, v_val = 0, v_ts = 0, v_ttl = 0, v_ldt = 0;
+    // Counters only. Tracked separately because the clock leaf's values are consumed in step with
+    // the value leaf, and a cursor shared between them would drift the moment one has a slot the
+    // other does not.
+    size_t v_clock = 0;
 };
 
 // Inverse of shred_collection(). Consumes exactly one row's slots and advances
@@ -817,6 +856,8 @@ static std::optional<collection_cell> read_collection(
     const auto& l_ts  = cd[vcol + 2];
     const auto& l_ttl = cd[vcol + 3];
     const auto& l_ldt = cd[vcol + 4];
+    const bool counter = ms.value_is_counter[k];
+    const column_data* l_clock = counter ? &cd[vcol + 5] : nullptr;
 
     const size_t start = cur.slot;
     if (start >= l_key.def_levels.size()) { return std::nullopt; }
@@ -852,7 +893,21 @@ static std::optional<collection_cell> read_collection(
     for (size_t sl = start; sl < end; ++sl) {
         collection_element e;
         e.key = l_key.str[cur.v_key++];
-        if (l_val.def_levels[sl] == 3) { e.value = l_val.str[cur.v_val++]; }
+        if (l_val.def_levels[sl] == 3) {
+            if (counter) {
+                // Repack the two typed leaves into the form the counter rebuild path expects, so
+                // the change is confined to the on-disk representation: everything above this
+                // still sees a packed (count, logical_clock) pair.
+                const int64_t cnt = l_val.i64[cur.v_val++];
+                const int64_t clk = l_clock->def_levels[sl] == 3 ? l_clock->i64[cur.v_clock++] : 0;
+                e.value = pack_i64_pair(cnt, clk);
+            } else {
+                e.value = l_val.str[cur.v_val++];
+            }
+        } else if (counter && l_clock->def_levels[sl] == 3) {
+            // A clock with no value cannot be reassembled and would desynchronise the cursor.
+            ++cur.v_clock;
+        }
         e.timestamp = l_ts.i64[cur.v_ts++];
         if (l_ttl.def_levels[sl] == 3) { e.ttl = l_ttl.i32[cur.v_ttl++]; }
         if (l_ldt.def_levels[sl] == 3) { e.local_deletion_time = l_ldt.i32[cur.v_ldt++]; }

@@ -323,6 +323,13 @@ struct mapped_schema {
     // exactly what broke when the metadata groups were added.
     std::vector<size_t> value_leaf;
     std::vector<bool>   value_is_collection;
+    // A counter column: a collection whose element value is typed rather than opaque. Its group
+    // has six leaves instead of five, and the extra `clock` is appended after __ldt rather than
+    // sitting next to `value`, so every existing vcol+N offset keeps its meaning. Schema order is
+    // cosmetic here -- a reader sees `value` and `clock` as siblings of the same group either way
+    // -- and the alternative was renumbering offsets throughout the shred and reassemble paths,
+    // which is the most delicate code in this file.
+    std::vector<bool>   value_is_counter;
     // Row-level collection tombstone leaves, per regular column.
     std::vector<std::optional<size_t>> ct_ts_index, ct_ldt_index;
     // For L2: the single timestamp shared by every cell.

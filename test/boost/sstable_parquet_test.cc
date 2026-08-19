@@ -1332,6 +1332,25 @@ SEASTAR_THREAD_TEST_CASE(test_pq_declares_the_counter_convention) {
         BOOST_REQUIRE(enc.has_value());
         BOOST_REQUIRE(enc->find("logical_clock") != std::string::npos);
 
+        // The declaration is the fallback; the schema itself is now typed, which is the part that
+        // makes the column interpretable without knowing Scylla. Both `value` and `clock` must be
+        // INT64 leaves of the counter's group -- not a packed BYTE_ARRAY.
+        auto leaves = sstables::parquet::format::walk_leaves(md);
+        int typed = 0;
+        for (const auto& l : leaves) {
+            const auto& path = l.path;
+            if (path.size() < 2 || path.front() != "hits") { continue; }
+            const auto& name = path.back();
+            if (name == "value" || name == "clock") {
+                // leaf_info carries the schema index rather than the type, so read the type from
+                // the schema element it points at.
+                BOOST_REQUIRE(md.schema.at(l.index).type
+                              == sstables::parquet::format::phys_type::int64);
+                ++typed;
+            }
+        }
+        BOOST_REQUIRE_EQUAL(typed, 2);
+
         // And a table with no counters says nothing, rather than emitting an empty key.
         const auto plain_cols = sstables::parquet::columns_of(*pq_schema());
         BOOST_REQUIRE(std::ranges::none_of(plain_cols, [] (const auto& c) { return c.counter; }));
