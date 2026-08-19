@@ -1983,6 +1983,27 @@ on. The Scylla side is unaffected: our reader works from the tree and the Dremel
 the annotation. All five losslessness modes, `parquet_writer_test` and `sstable_parquet_test` pass
 unchanged.
 
+**Closed the gap, not just the bug: every shape is now handed across.**
+`~/pq-lab/interop_shapes.py` builds one real table per schema shape the format can emit, converts
+it, and opens every resulting `pq` sstable with pyarrow — reading all row groups, since a footer can
+parse while its pages cannot decode, and reading *every* sstable a major compaction produced rather
+than the first:
+
+| Shape | pyarrow | rows read | schema |
+|---|---|---:|---|
+| flat scalars (8 types) | OK | 120 | 11 leaves, 5 files |
+| `map<text,text>` non-frozen | OK | 120 | 11 leaves, 5 files |
+| `set<int>` non-frozen | OK | 120 | 11 leaves, 5 files |
+| `list<text>` non-frozen | OK | 120 | 11 leaves, 5 files |
+| `frozen<map>` | OK | 120 | 5 leaves, 5 files |
+| static column | OK | 120 | 8 leaves, 5 files |
+| expiring cells (TTL) | OK | 120 | 9 leaves, 5 files |
+| counter | OK | 120 | 11 leaves, 5 files |
+
+**8/8.** All three non-frozen collection kinds go through the group shape that was broken, so this
+gate would have caught the MAP bug on the day collections landed. It is cheap enough to run on
+demand and belongs in whatever CI this eventually gets.
+
 **Why the interop suite missed it.** The seven cross-read fixtures in §10.3 are flat schemas, and
 the Dremel work in §10.3 was validated by writing a `list<string>` for pyarrow — a *proper* LIST,
 not this five-child pseudo-MAP. Nothing in the suite ever wrote a Scylla collection column and

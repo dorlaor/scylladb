@@ -237,14 +237,26 @@ selector checked first.
 **Unverified as a result:** the row-group-cut leaf-set experiment (+22.7 % for a cut, 69.1 → 84.7
 MB) ran through its own mtime-based lookup and should be redone before it is cited.
 
-### 12. Measure through `live_table_dir.py`, never by glob or mtime
+### 12. Run `interop_shapes.py` after any change to the schema mapping
+It builds a table per shape the format emits — flat scalars, all three non-frozen collection kinds,
+frozen collections, statics, TTL, counters — converts each, and reads every resulting `pq` sstable
+with pyarrow. 8/8 today.
+
+This exists because a passing interop suite of *flat* fixtures let a broken MAP annotation make
+every collection and counter file unreadable by parquet-cpp for as long as collections have
+existed (§10.3i). The seven original fixtures are still worth keeping, but they only ever proved
+that flat schemas interoperate. **Any change to the tree builder or the leaf layout should re-run
+this**, because the failure mode is a file no other tool can open, and nothing inside Scylla
+notices.
+
+### 13. Measure through `live_table_dir.py`, never by glob or mtime
 Every measurement script resolves the table's data directory from its id in
 `system_schema.tables`. Do not reintroduce a glob or an mtime heuristic: deleting files from a
 directory updates that directory's mtime, so a dropped table outranks the live one and the
 pipeline silently measures a corpse. This cost two published conclusions before it was found
 (item 11).
 
-### 13. Environment traps worth knowing
+### 14. Environment traps worth knowing
 - A rebuilt binary does not replace a running node. `~/pq-lab/ensure_fresh_node.sh` is a
   precondition on all measurement scripts for this reason; it cost real debugging time three times
   before it existed.
