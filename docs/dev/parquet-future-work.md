@@ -300,14 +300,42 @@ which term binds depends on row *density*, not column count (§10.1f-rg). On den
 byte budget binds and the row count is inert. Harder than it looks: this budget exists to stop a
 shard OOMing (R-13), so it cannot simply be raised for size.
 
-### 10. C7 needs read-path instrumentation
-The criterion that should refuse a wide table on a point-read path cannot be evaluated: no counter
-separates point reads from scans, and `live_scanned` is an unpopulated Cassandra-compatibility
-stub that would have silently reported zero — i.e. "not point-read dominated" — and converted
-exactly the tables C7 exists to protect. C5's column ceiling is the stand-in. Fixing it means two
-counters where single-partition and range queries enter `replica::table`, exposed through
-`compaction_group_view`, plus a `storage_format = 'auto'` enum value with persistence and a
-round-trip test. Small in lines, large in blast radius.
+### 10. C7: instrumentation landed, criterion still unjustified — and the old note was wrong
+
+**The note this replaces claimed "no counter separates point reads from scans". That is false**, and it
+took one look at the metrics endpoint to disprove: `scylla_sstables_single_partition_reads`,
+`scylla_sstables_range_partition_reads` and `scylla_cql_select_partition_range_scan` all already exist
+and all already make the distinction. What is actually missing is **attribution to a table** — every
+one of them is per shard, and C7 is a per-table decision. A much narrower gap than the note described,
+and worth correcting because the note would have sent someone off to build what already exists.
+
+**Landed:** `single_partition_reads` and `range_scan_reads` on `replica::table`'s stats, incremented in
+`table::query()` — the last place that still knows which kind of query it is, before the partition
+ranges are consumed. A read counts as a point read when *every* range it was given is singular, because
+a coordinator may batch several named partitions into one call and that is still N lookups rather than
+a sweep.
+
+Verified rather than assumed (`c7_counters.py`): single-partition SELECT and point-row SELECT move only
+the point counter, full scans and token-range scans move only the scan counter, and `IN` over two
+partitions moves the point counter by two — the unit is table-level query invocations, not CQL
+statements, which is the right granularity for a read-mix ratio. Also note `live_scanned` remains an
+unpopulated stub; nothing here uses it.
+
+Two traps hit while doing it, both recorded because they cost real time:
+- `table::set_metrics()` has **two** parallel `add_group("column_family")` registrations, and the
+  per-keyspace one is gated on `enable_keyspace_column_family_metrics`, which is **off by default**. A
+  counter registered only there is invisible on a stock node. The tell was that `memtable_switch`, in
+  the same block, was equally absent while `memtable_partition_hits` — registered in both — appeared.
+- `read_latency_count` moving proved the increment site was executing, which is what ruled out the
+  increment and pointed at registration. Worth remembering as a way to bisect a missing metric.
+
+**Still not justified as a criterion, and deliberately not added.** The standing rule is that a
+criterion arrives with a measurement rather than a rationale. The measurement C7 needs is whether the
+read mix identifies tables that C5's column ceiling gets wrong in *either* direction — a wide
+scan-only table that C5 refuses and should not, or a narrow point-read-heavy table that C5 admits and
+should not. The second half of that is a point-read latency measurement, which is out of scope for now
+by instruction. So the counters are landed as telemetry, C5 remains the stand-in, and C7 stays open
+with a precise statement of what would settle it rather than a vague one.
 
 ---
 
