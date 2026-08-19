@@ -259,6 +259,13 @@ not this writer's — which is why they differ from L1 at all, since a fallen-ba
 byte-identical output. They answer "is folding worth it", not "what does this implementation
 produce". For INSERT-written data the answer to the second is L1 and the saving is zero.
 
+**Measured 2026-08-19 and closed: L2 is worth 1.4 %, not 35 %** (§10.1m). L2 applies only when every
+cell shares one timestamp, and a `__ts` column of identical values compresses to nearly nothing —
+294 bytes from 240 111 in one measured file. So the column L2 removes is already free precisely when
+L2 is allowed to remove it. The 35-point figure came from folding away a *varied* timestamp column,
+which is the case L2 cannot legally apply to. Nothing to fix; the size argument for folding rests on
+L1, and L2 should not be quoted as a disk lever.
+
 This exists because a passing interop suite of *flat* fixtures let a broken MAP annotation make
 every collection and counter file unreadable by parquet-cpp for as long as collections have
 existed (§10.3i). The seven original fixtures are still worth keeping, but they only ever proved

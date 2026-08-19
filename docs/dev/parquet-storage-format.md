@@ -2058,6 +2058,40 @@ handed it to another implementation. **The lesson is narrow and worth stating: a
 only as broad as the shapes actually handed across.** Two years of "pyarrow reads our files" was
 true and irrelevant for the one shape where it mattered most.
 
+### 10.1m L2 is self-defeating: measured at 1.4 %, not 35 %
+
+L2's saving through this writer had never been measured, because the writer falls back to L1 for
+INSERT-written data and every existing figure came from the harness's Python folding (§10.3i). The
+three-column ISD shape, written by `UPDATE ... USING TIMESTAMP` so L2 genuinely applies — confirmed
+by `folding_effective: L2` rather than assumed:
+
+| Folding | Effective | Bytes | Leaves |
+|---|---|---:|---:|
+| L0 `verbatim` | L0 | 10 358 | 7 |
+| L1 `row` | L1 | 9 856 | 4 |
+| L2 `uniform` | **L2** | **9 717** | 3 |
+
+**L2 saves 1.4 %.** The doc has carried a 35-point figure for the same idea, and the gap is not a
+measurement error in either — it is a structural fact nobody had noticed:
+
+**The precondition that makes L2 legal is the condition under which the column it removes is
+already free.** L2 applies only when every cell shares one write timestamp. A `__ts` column whose
+values are all identical is the best case a dictionary or RLE encoder will ever see: in the earlier
+export of a harness ISD table it compressed to **294 bytes from 240 111 uncompressed**, 0.8 % of
+that file. Dropping a column that costs 0.1 % cannot save 35 %.
+
+The harness's 35 points came from removing a `__ts` column whose values *varied* — its timestamp
+regime is a hash per partition key — which is a column that genuinely costs something. But varied
+timestamps are exactly what makes L2 illegal. **The two conditions cannot hold at once**, so the
+35-point saving describes a file this format cannot produce.
+
+**Consequence for the design.** L2 is close to worthless as a size lever and should not be
+presented as one. It remains defensible as a *statement* — a file whose timestamps are uniform
+needs no timestamp column, and saying so in the schema is cleaner than storing 300 000 copies of
+one number — but the disk argument for metadata folding rests entirely on **L1**, which is the
+default and which does carry its weight. §10.1f's folding table should be read as "what L1 buys
+over L0", and its L2 column as an upper bound on a case that cannot arise.
+
 ### 10.1f-raw Against uncompressed: how much is layout and how much is the compressor
 
 Every ratio in this document compares Parquet against a **trained-dictionary** SSTable, which is
