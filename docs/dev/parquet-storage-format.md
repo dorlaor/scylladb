@@ -1582,8 +1582,22 @@ and item 12.
 
 ### Phase 3 — Format control and convergence
 - `storage_format` schema property, validated and plumbed through the schema tables
-  (no new system table, no group0 work — see §6.1).
-- `rewrite_to_format` compaction; per-table convergence tracking; nodetool/REST.
+  (no new system table, no group0 work — see §6.1). **Done.**
+- ~~`rewrite_to_format` compaction~~ — **not needed**: `nodetool upgradesstables` already forces
+  convergence, because the sstable creator is shared by the rewrite paths (§6.2a). A separate
+  compaction type would duplicate it.
+- **Per-table convergence tracking — done 2026-08-19.**
+  `GET /column_family/storage_format/{ks}:{cf}` reports `native_bytes`, `parquet_bytes`,
+  `native_sstables`, `parquet_sstables`, `parquet_fraction` and a `converged` verdict of
+  `native` / `mixed` / `parquet`. Verified through all three states on a live node: all-native
+  before the `ALTER`, `parquet` with fraction 1.0000 after a major compaction, and `mixed` at
+  0.6285 once fresh writes flushed — because flushes stay native by design, so **`mixed` is the
+  steady state of any table still being written to**, not a transient.
+
+  Byte columns use `ondisk_data_size()`, not `data_size()`. The latter reports the *uncompressed*
+  length for a compressed native sstable and the file size for a `pq` one, so summing it would
+  compare two units in precisely the table where both formats coexist — the same trap that broke
+  C1 (§6.2a).
 - Cluster feature `PARQUET_SSTABLE_FORMAT`.
 - Streaming, migration, split and merge must keep working across a mixed-format
   table; cluster-feature gating and tests.
