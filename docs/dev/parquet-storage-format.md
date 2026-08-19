@@ -2261,7 +2261,7 @@ times), which is the tell: no rewrite happened, so the same files were measured 
 cause was mine again — a major compaction leaves superseded sstables on disk until they are
 reclaimed, and summing the directory then counts the same data twice over. Both measurement
 scripts now wait for the sstable set to stop changing and require exactly one sstable before
-recording anything; §10.1f-prod already recorded that count as 1 for all seven datasets, which is
+recording anything; §10.1f-prod already recorded that count as 1 for every dataset in the corpus, which is
 why it was unaffected.
 
 **Answered 2026-08-18, and the first version of this answer was wrong.** It said the row knob has
@@ -2676,12 +2676,27 @@ precondition failed and L2 silently fell back to L1, so their near-zero deltas m
 "not measured", not "no cost".)
 
 **This is the case for the design as specified, not against it.** §1 asked whether Parquet
-uses significantly less disk. The honest answer is *"on wide tables, roughly half; on
-narrow text-keyed tables, under 10 % — measure the table"*. A cluster-wide switch would be
+uses significantly less disk. The honest answer, updated for the eight-dataset corpus, is
+*"between a third and nearly all of it, depending on whether the values repeat — measure the
+table"*. It was written here as *"on wide tables, roughly half; on narrow text-keyed tables,
+under 10 %"*, and the width half of that is now falsified: the **three-column** ISD cut is the
+best result in the corpus at 33.8 % and the **197-column** drive telemetry is the worst at
+95.8 % (§10.1f-prod). Width was a proxy for value repetition and an unreliable one. A cluster-wide switch would be
 wrong. The design already assumes this: `storage_format` is a per-table property (§6), and
 criterion C6 refuses to convert anything until the sampling estimator has predicted the
-gain for that specific table (§10.3e validated it at 0.4 % error from 10 % of rows). D10
-and D11 would both be measured at 7–8 % and correctly left as SSTables.
+gain for that specific table (§10.3e validated it at 0.4 % error from 10 % of rows).
+
+**The worked example changed when the corpus was measured properly, and in an instructive
+direction.** This used to read "D10 and D11 would both be measured at 7–8 % and correctly left as
+SSTables". On production output (§10.1f-prod) D10 HackerNews saves **17.5 %** and D11 pageviews
+**10.4 %**, against C6's 15 % floor — so pageviews is declined and **HackerNews is converted**. One
+of the two examples of "correctly declined" is now an accept.
+
+That is not a flaw in C6; it is C6 working. A 17.5 % disk saving on a text-heavy table is worth
+having, and the earlier 7–8 % figures came from pyarrow-written files that understated our writer
+(§10.3h). The lesson is narrower and worth stating: **an example chosen to illustrate a threshold
+has to be re-checked when the measurements move, because it can quietly start illustrating the
+opposite.**
 
 Threats to validity: D9 truncates each payload to 4 000 characters; one hour of GitHub
 Archive and three hours of pageviews are each one traffic pattern.
@@ -2892,7 +2907,7 @@ reading the real SSTables.
 | Backblaze | 300 000 | 32 671 140 | **16 547 521** | **50.6 %** | 17 055 064 | 52.5 % |
 | NYC TLC (§10.3d schema) | 200 000 | 5 317 307 | **2 562 753** | **48.2 %** | — | — |
 
-> Superseded for absolute sizes by §10.1f, which re-measures all seven datasets in one run
+> Superseded for absolute sizes by §10.1f, which re-measures the whole corpus in one run
 > of one binary. This table is kept for the writer-versus-pyarrow comparison it makes, which
 > still holds: §10.1f puts our writer ahead of pyarrow on five of the six datasets where both
 > have been measured, behind by 0.9 % on Backblaze.
@@ -3030,7 +3045,9 @@ because they separate the format's costs from the implementation's:
 *Streaming.* Load the footer alone, turn the partition range into a row-ordinal window via
 the index entry (§5.4 option A), decode one row group at a time in fixed windows, and use
 the V2 page header's `num_rows` to step over pages without decompressing them. This is
-what bought write and scan parity and bounded memory.
+what bought bounded memory, write parity, and a full scan that is *faster* than the row format
+rather than merely level with it — 0.82x, measured (§10.4i). "Scan parity" was the target in §1.2
+and is an understatement of the result.
 
 *Paged reads.* For a bounded range, fetch two extents per column chunk — the dictionary
 page and the contiguous run of data pages the OffsetIndex says covers the wanted rows —

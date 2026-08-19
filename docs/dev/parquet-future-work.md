@@ -191,6 +191,13 @@ and each was written correctly against an earlier corpus:
 
 **When adding a dataset or changing a default, re-read the prose, not just the tables.** A grep for
 stale figures does not catch "five datasets" or "wide tables", because those are words.
+
+The same sweep over the design doc found three more, one of them substantive: its worked example of
+C6 declining a conversion said "D10 and D11 would both be measured at 7–8 % and correctly left as
+SSTables". On production figures D10 saves 17.5 % against a 15 % floor, so it is **converted** — the
+example had come to illustrate the opposite of its point. Also corrected there: the conclusion still
+answered §1 with "on wide tables, roughly half", and "write and scan parity" understated a scan that
+is 0.82× and therefore faster than the row format.
 Three-criteria policy, eight datasets at the shipped defaults, the three-column ISD variant, a
 slide deriving delta encoding of timestamps from the encoder, a slide decomposing the win against
 the **uncompressed** baseline, and the corrected L2 story — which is the one a reader is most likely to push back on,
