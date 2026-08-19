@@ -4423,6 +4423,44 @@ parsed.
 
 ---
 
+### 10.16 The corpus re-measured under the deterministic dictionary — 2026-08-20
+
+The open question was whether §10.1f-prod's eight-dataset table survives the dictionary being made
+deterministic (§10.11). It was flagged because two rows sit close to parity -- Wikipedia pageviews
+at 89.6 % and Backblaze at 95.8 % -- where a few percent decides whether Parquet wins at all.
+
+Same harness, same row counts, autotrainer disabled, one explicit retrain per table.
+
+| Dataset | Input identical? | Native Δ | Parquet Δ | Ratio |
+|---|---|---:|---:|---|
+| ClickBench | yes | +0.04 % | 0.00 % | 59.8 → 59.8 |
+| NYC TLC | yes | +0.02 % | 0.00 % | 56.8 → 56.8 |
+| GitHub Archive | yes | −0.52 % | −0.54 % | 68.3 → 68.3 |
+| HackerNews | yes | +0.03 % | 0.00 % | 82.3 → 82.3 |
+| Wikipedia pageviews | yes | −0.20 % | 0.00 % | 89.6 → 89.8 |
+| Backblaze | yes | −0.32 % | −0.41 % | 260.1 → 259.8 |
+| NOAA ISD-Lite | **no** | −12.40 % | −15.11 % | 51.0 → 49.4 |
+| NOAA ISD-Lite, 3 cols | **no** | −11.05 % | −15.25 % | 33.9 → 32.3 |
+
+**The answer is no material change.** Where the input is identical, nothing moved: six datasets
+within ±0.54 % on both formats, and every ratio stable to 0.2 points. The two near-parity rows are
+the point of the exercise and they are the two that moved least -- pageviews' Parquet output is
+byte-identical.
+
+**The two ISD rows moved because their input changed, not the dictionary**, and the mechanism is
+worth recording because it is a trap in any file-backed corpus. `_load_isd()` reads
+`sorted(glob("*.gz"))` and stops at `nrows`, so the sample is the earliest-sorting stations. The ISD
+scale test (§10.6) downloaded 2 459 station-years, and **38 of the 40 earliest-sorting files
+post-date the previous corpus run** -- so "the first 300 000 rows" is a different set of stations
+than it was. `raw_bytes` moving (14 801 542 → 14 085 218) is what gives it away; a dictionary change
+cannot alter the uncompressed input. Their *ratios* moved 1.6 points, which is a mild independent
+result: the ISD shape holds up under a different station sample.
+
+So the deterministic baseline costs nothing in published figures, and §10.1f-prod stands as written.
+**This closes the corpus re-measurement gap.** What it does not close is Backblaze's absolute
+numbers: both batch runs land in the anomalous regime (§10.17), so that row's 95.8 % rests on the
+standalone runs, not on these.
+
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 
 Two references above point here, so it gets its own section: `single_partition_reads` and
