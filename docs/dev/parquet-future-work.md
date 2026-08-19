@@ -177,10 +177,10 @@ round-trip test. Small in lines, large in blast radius.
 
 ## Housekeeping
 
-### 11. Decks — done at v2.6 (2026-08-19)
+### 11. Decks — done at v2.7 (2026-08-19)
 Three-criteria policy, eight datasets at the shipped defaults, the three-column ISD variant, a
-slide deriving delta encoding of timestamps from the encoder, and a slide decomposing the win
-against the **uncompressed** baseline — which is the one a reader is most likely to push back on,
+slide deriving delta encoding of timestamps from the encoder, a slide decomposing the win against
+the **uncompressed** baseline, and the corrected L2 story — which is the one a reader is most likely to push back on,
 since it shows Scylla's own compressor doing the larger share on six of seven datasets. Version
 appears in the filename as well as the title slide.
 
