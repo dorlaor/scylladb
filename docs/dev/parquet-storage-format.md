@@ -2024,9 +2024,24 @@ plainly different — **4 leaves against L1's 11** — and both readers handle i
 **The practical consequence is a scope note on L2, not a bug.** It is reachable only for
 UPDATE-written data with a single write timestamp, no TTLs and no deletions. That is a real pattern
 — bulk-loaded or backfilled tables often look exactly like it — but it is much narrower than "the
-uniform case", and any measurement quoting L2's savings should say which of the two it measured.
-§10.1f's L2 figures come from the harness, which writes with `USING TIMESTAMP` via prepared
-`INSERT`s, so they were L1 in disguise unless the harness avoids markers.
+uniform case".
+
+**Two provenance corrections follow, and both were worth chasing.**
+
+*The export tool was mislabelling.* `parquet-export` printed `_cfg.level`, the folding level
+*requested*, so a run that fell back reported `L2` while producing L1. It now prints
+`folding_requested` and `folding_effective` separately, which makes the fallback visible:
+requesting `uniform` on a harness-written ISD table gives `requested=L2 effective=L1`, identical
+bytes to `row`, with `__ts` and `__rm` still in the leaves. Every L2 measurement ever taken with
+that tool was labelled wrongly.
+
+*The L2 savings figures in §10.1f are not our writer's.* They are the harness's own folding,
+implemented in Python (`write_variant`): "L2" there simply omits the `__ts` column from what it
+hands pyarrow. That is why they differ from L1 at all — a fallen-back writer would have produced
+identical bytes. So those figures measure **what L2 would save if it applied**, which is a fair
+answer to "is folding worth it" and *not* an answer to "what does this implementation produce".
+For INSERT-written data this implementation produces L1, and the saving is zero. Both statements
+are true and the distinction is the whole point.
 
 **One more reading of the table.** `verbatim` has *fewer* leaves than `row` on a collection (9 against
 11) but far more on a flat schema (37 against 11). Both are right: on a flat schema L0 keeps

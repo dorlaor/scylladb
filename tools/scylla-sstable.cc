@@ -2609,8 +2609,18 @@ public:
         fmt::print("  \"buffered_bytes_estimate\": {},\n", _shredder.buffered_bytes());
         fmt::print("  \"row_groups\": {},\n", md.row_groups.size());
         fmt::print("  \"leaf_columns\": {},\n", md.leaf_count());
-        fmt::print("  \"folding_level\": \"{}\",\n",
+        // Requested *and* effective, because they differ and only the effective one describes the
+        // file. map_schema() falls back from L2 to L1 whenever the uniform precondition breaks --
+        // and it always breaks for INSERT-written data, since an INSERT writes a row marker. This
+        // used to report `_cfg.level` alone, so every L2 measurement taken with this tool was
+        // labelled L2 while being L1, which is how the L2 savings figures in the design doc came
+        // to describe the wrong folding level.
+        const auto effective = sstables::parquet::map_schema(
+                _shredder.columns(), _cfg.level, _shredder.rows(), _cfg.exc).level;
+        fmt::print("  \"folding_requested\": \"{}\",\n",
                    sstables::parquet::to_string(_cfg.level));
+        fmt::print("  \"folding_effective\": \"{}\",\n",
+                   sstables::parquet::to_string(effective));
         fmt::print("  \"columns\": [\n");
         bool first = true;
         for (const auto& rg : md.row_groups) {

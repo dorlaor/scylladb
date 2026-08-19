@@ -252,9 +252,12 @@ because its precondition forbids a row marker and **every CQL `INSERT` writes on
 `UPDATE`-written data with a single timestamp, no TTL and no deletions can reach L2. With that
 fixture L2 applies and shows 4 leaves against L1's 11, verified by both readers. 16/16 shapes now.
 
-**Follow-on worth checking:** §10.1f's L2 savings figures were produced by the harness, which
-populates tables with prepared `INSERT`s. If so they are L1 measurements mislabelled as L2, and the
-"L2 folds `__ts` away" numbers understate what L2 actually does.
+**Checked, and it was two separate problems.** The export tool printed the *requested* folding
+level rather than the effective one, so every L2 measurement it produced was mislabelled; it now
+prints both and the fallback is visible. And §10.1f's L2 savings are the *harness's* Python folding,
+not this writer's — which is why they differ from L1 at all, since a fallen-back writer produces
+byte-identical output. They answer "is folding worth it", not "what does this implementation
+produce". For INSERT-written data the answer to the second is L1 and the saving is zero.
 
 This exists because a passing interop suite of *flat* fixtures let a broken MAP annotation make
 every collection and counter file unreadable by parquet-cpp for as long as collections have
