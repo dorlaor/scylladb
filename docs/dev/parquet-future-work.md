@@ -206,9 +206,18 @@ tail**.
 With no filename, that abort may not happen, and the failure mode would be an older node
 mis-reading an object rather than refusing to start. **§10.9 is verified for local storage only.**
 
-**Encryption at rest is not a gap in this tree.** There is no such code here — no `ee/` directory, no
-symbols. It is a design question for a build that has the feature, and listing it as untested work
-implied someone could pick it up on this branch.
+**~~Encryption at rest is not a gap in this tree~~ — that answer was wrong, and the work is now
+done.** It conflated two things. Scylla's *own* encryption at rest genuinely does not exist here, so
+that interaction still cannot be tested on this branch. But **Parquet Modular Encryption** is a
+standard part of parquet-format 2.7+, and it is the right layer for this format: encrypting the Data
+component from outside would make the file opaque to every external reader and forfeit the
+interoperability that is the whole argument for Parquet. Built and verified end to end on 2026-08-20
+— see storage-format §10.17. AES_GCM_V1 and AES_GCM_CTR_V1, encrypted footer, keys named by id and
+resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key.
+
+Still open within it: per-column keys are *read* but not written (the writer encrypts every column
+with the footer key), plaintext-footer mode, key rotation, and any KMS integration. The key file is
+exactly as strong as its permissions.
 
 ### Downgrade procedure — written 2026-08-19, was "not started"
 §10.9. The load-bearing fact is observed, not reasoned: an older node meeting an sstable version it
