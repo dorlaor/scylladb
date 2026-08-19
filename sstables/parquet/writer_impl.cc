@@ -7,6 +7,7 @@
  */
 
 #include "sstables/parquet/writer_impl.hh"
+#include "sstables/parquet/encryption_keys.hh"
 
 #include "exceptions/exceptions.hh"
 
@@ -358,6 +359,23 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                         seastar::format("Unsupported 'metadata_folding' value '{}' in the 'parquet' "
                                "option; supported: auto, verbatim, row, uniform", v));
             }
+        } else if (k == ENCRYPTION) {
+            if (v == "none") {
+                _cfg.encryption_key_id = "";
+            } else if (v == "aes_gcm_v1") {
+                _cfg.encryption_algo = format::cipher::aes_gcm_v1;
+            } else if (v == "aes_gcm_ctr_v1") {
+                // Page *bodies* are AES-CTR and carry no authentication tag, so tampering with
+                // one is not detected by the format. It exists because it is measurably faster
+                // and because other writers produce it, not because it is a good default.
+                _cfg.encryption_algo = format::cipher::aes_gcm_ctr_v1;
+            } else {
+                throw exceptions::configuration_exception(seastar::format(
+                        "Unsupported 'encryption' value '{}' in the 'parquet' option; supported: "
+                        "none, aes_gcm_v1, aes_gcm_ctr_v1", v));
+            }
+        } else if (k == ENCRYPTION_KEY) {
+            _cfg.encryption_key_id = v;
         } else if (k.size() > std::strlen(ENCODING_PREFIX)
                    && k.compare(0, std::strlen(ENCODING_PREFIX), ENCODING_PREFIX) == 0) {
             const sstring col = k.substr(std::strlen(ENCODING_PREFIX));
@@ -383,8 +401,8 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
             throw exceptions::configuration_exception(
                     seastar::format("Unknown sub-option '{}' for the 'parquet' option; supported: "
                                     "row_group_rows, row_group_buffer_bytes, page_rows, compression, "
-                                    "compression_level, metadata_folding, dictionary, and "
-                                    "'encoding.<column>'", k));
+                                    "compression_level, metadata_folding, dictionary, encryption, "
+                                    "encryption_key, and 'encoding.<column>'", k));
         }
     }
 }
@@ -428,6 +446,13 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
     // dropping it from DESCRIBE would make the schema unreproducible.
     for (const auto& [col, enc] : _column_encodings) {
         m[sstring(ENCODING_PREFIX) + col] = to_string(enc);
+    }
+    // The key *id* round-trips; there is no key material here to leak. The algorithm is only
+    // emitted alongside it, because 'encryption' without a key is meaningless.
+    if (!_cfg.encryption_key_id.empty()) {
+        m[ENCRYPTION] = _cfg.encryption_algo == format::cipher::aes_gcm_v1
+                      ? "aes_gcm_v1" : "aes_gcm_ctr_v1";
+        m[ENCRYPTION_KEY] = _cfg.encryption_key_id;
     }
     return m;
 }
@@ -1057,6 +1082,31 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
     // From the table's `parquet = {...}` property. Already validated at CREATE/ALTER
     // time, so anything stored here parses; an empty map yields the defaults.
     pq_writer_config pcfg = parquet_parameters(s.parquet_options()).config();
+    // The key is resolved here, at the last moment before writing, so a key file that changes
+    // takes effect on the next sstable rather than needing a restart -- and so a missing key is
+    // a loud failure at write time rather than a file written in the clear. Writing an
+    // unencrypted file for a table that asked for encryption would be the worst outcome
+    // available, since nothing downstream would ever notice.
+    if (!pcfg.encryption_key_id.empty()) {
+        auto k = keys().find(pcfg.encryption_key_id);
+        if (!k) {
+            throw std::runtime_error(seastar::format(
+                    "{}.{}: parquet encryption key '{}' is not in parquet_encryption_key_file",
+                    s.ks_name(), s.cf_name(), pcfg.encryption_key_id));
+        }
+        pcfg.wopt.encryption.enabled = true;
+        pcfg.wopt.encryption.algo = pcfg.encryption_algo;
+        pcfg.wopt.encryption.footer_key = *k;
+        // Binds the file to the table it belongs to: a Data.db moved between tables, or replayed
+        // from a backup into a different one, fails authentication instead of decoding.
+        pcfg.wopt.encryption.aad_prefix = seastar::format("{}.{}", s.ks_name(), s.cf_name());
+        pcfg.wopt.encryption.store_aad_prefix = true;
+        // The reader needs to know which key. Wrapped in the key-material JSON that pyarrow and
+        // Spark's KMS layers require, so an authorised external reader can open the file; see
+        // make_key_metadata() for why the convention beats the minimal encoding here.
+        pcfg.wopt.encryption.key_metadata =
+                std::string(make_key_metadata(pcfg.encryption_key_id));
+    }
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
                                             std::move(pcfg), enc_stats, shard, nullptr);
 }

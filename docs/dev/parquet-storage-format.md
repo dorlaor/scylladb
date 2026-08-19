@@ -4461,6 +4461,77 @@ So the deterministic baseline costs nothing in published figures, and §10.1f-pr
 numbers: both batch runs land in the anomalous regime (§10.17), so that row's 95.8 % rests on the
 standalone runs, not on these.
 
+### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
+
+The readiness table used to call this "not applicable to this tree", which conflated two things.
+Scylla's own encryption at rest genuinely does not exist here. **Parquet Modular Encryption** does
+exist -- it is a standard part of parquet-format 2.7+ -- and it is the right layer for this format,
+because encrypting the Data component from outside would make the file opaque to every external
+reader and forfeit the interoperability that is the entire argument for using Parquet. Modular
+encryption keeps it a Parquet file: a reader with the key opens it with a stock library.
+
+**Built against a reference implementation, not against the spec text.** Every constant was read
+off files written by parquet-cpp and then pinned by a test that decrypts those files with our code:
+module type numbers, the little-endian ordinal order, the `length | nonce | ciphertext | tag`
+envelope, which bytes of a V2 page fall inside the body module, and the one that would have been
+guessed wrong -- `compressed_page_size` counts the *encrypted* envelope including its length
+prefix, while `uncompressed_page_size` stays the plaintext size.
+
+| Layer | What it does |
+|---|---|
+| `format/encryption.{hh,cc}` | AES-GCM and AES-CTR over OpenSSL EVP, the AAD builder, module envelopes, `FileCryptoMetaData` |
+| `format/parquet_writer.cc` | encrypted-footer mode over page headers, page bodies, dictionary pages, the OffsetIndex and the footer |
+| `format/parquet_reader.cc` | `parse_encrypted_footer()` plus an optional `read_crypto` threaded through the decode path |
+| `encryption_keys.{hh,cc}` | key ids resolved to bytes from a local file |
+| `db/config` | `parquet_encryption_key_file` |
+| `cf_prop_defs` | DDL validation |
+
+**Keys are named, never stored.** A table says
+`parquet = {'encryption': 'aes_gcm_v1', 'encryption_key': 'tablekey'}`, and the bytes come from
+`parquet_encryption_key_file` on the local node. That is not a detail: schema properties are
+replicated to every node, kept in system tables and printed by `DESCRIBE`, so a key placed in one
+would be copied into the cluster's metadata and into every schema dump.
+
+Three failure modes are refused at DDL time, because each would otherwise surface as a compaction
+error hours later: a key id this node does not have, an algorithm with no key, and an unknown
+algorithm. The first check is **local only** -- another node may lack the key and its writes will
+fail there. There is no key distribution here, so this is the strongest check available rather than
+the one that would be right.
+
+**The AAD prefix is the table's name**, stored in the file. A `Data.db` moved between tables, or
+restored from a backup into a different one, then fails authentication instead of decoding -- which
+is the property that makes a stolen file useless even to someone holding the key for another table.
+
+**Two consequences callers have to know.** An encrypted file is **not byte-reproducible**: every
+module carries a fresh random nonce, because reusing one under a single key breaks AES-GCM outright.
+Any test asserting byte-identical output must leave encryption off. And there is no degraded read
+path -- without the key the file does not open at all.
+
+**`AES_GCM_CTR_V1` is supported but is not a good default.** Its page bodies are AES-CTR with no
+authentication tag, so tampering with one is not detected by the format. It exists because it is
+faster and because other writers produce it.
+
+**One finding about interoperability that is not in the format at all.** `key_metadata` is opaque
+per the spec -- "whatever the reader needs to find the key" -- so the first version wrote the bare
+key id. That file is readable only through a reader's low-level explicit-key API; pyarrow's Python
+API and Spark decrypt *only* through a KMS, and their KMS layer requires parquet-java's "key tools"
+key-material JSON. Since interoperability is the whole point, the writer now emits that JSON, with
+`masterKeyID` carrying our key id and `wrappedDEK` a placeholder -- so a reader's KMS is asked for
+the key by name and no key material is in the file. This is a convention *above* the format, and it
+took a failing interop test to notice it.
+
+**Verified end to end on a running node** (`~/pq-lab/encryption_e2e.py`, 13/13): the three DDL
+rejections; every `Data.db` of a multi-group table begins and ends with `PARE`; no plaintext value
+appears in any of them; Scylla reads all 2 000 rows back including a single-partition read; **pyarrow
+reads the same raw files with the key** (2 000 rows across 4 files, values exact); and the files
+refuse to open without it. The format layer is covered from both directions in
+`sstables/parquet/run_tests.sh` suites 19 and 20.
+
+**What is not built.** Per-column keys are read but not written -- the reader handles
+`ColumnCryptoMetaData` and encrypted column metadata, including files that leave some columns in
+the clear, but the writer encrypts every column with the footer key. Also absent: plaintext-footer
+mode, key rotation, and any KMS integration. The key file is exactly as strong as its permissions.
+
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 
 Two references above point here, so it gets its own section: `single_partition_reads` and
@@ -5003,7 +5074,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | open | Fixed and unit-tested, never measured at scale. Applies to ICS under `'hybrid'` and to any table mid-`ALTER`. |
 | Backblaze 4× anomaly | open | One dataset's Parquet size swung 4× in batch runs only; four hypotheses eliminated, cause unknown. |
-| Encryption at rest | **design question, not absent** | Two separate things, and the earlier "not applicable" answer conflated them. (a) *Scylla's* encryption at rest: no such code in this tree, so the interaction cannot be tested here. (b) *Parquet Modular Encryption*: a *standard format feature* (parquet-format 2.7+, AES_GCM_V1 / AES_GCM_CTR_V1, per-column keys, encrypted or plaintext footer) that this writer does not emit. The design question is which layer should encrypt: storage-layer EaR would make the file opaque to every external reader and forfeit the interoperability that motivates the format, whereas Modular Encryption keeps the file a Parquet file and lets a reader with the key decrypt only the columns it is entitled to. See §8.2b for how a per-column property would express the key mapping. |
+| Encryption at rest | **done for Parquet Modular Encryption** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys named by id and resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key. Scylla's *own* storage-layer EaR still does not exist in this tree; per-column keys are read but not written. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. Open sub-question: the object key has no version prefix, so §10.9's downgrade safety is verified for local storage only. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done** | Specified in §10.9, and the behaviour it rests on is observed: an older node *aborts at startup* on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |

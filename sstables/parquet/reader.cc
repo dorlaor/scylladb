@@ -7,6 +7,7 @@
  */
 
 #include "sstables/parquet/reader.hh"
+#include "sstables/parquet/encryption_keys.hh"
 
 #include <array>
 #include <seastar/core/when_all.hh>
@@ -217,6 +218,12 @@ class pq_reader : public mutation_reader::impl {
     std::vector<std::optional<format::offset_index>> _oi;
     // The raw footer, kept alive because row-group metadata is decoded from it lazily.
     temporary_buffer<char> _footer;
+    // When the file is encrypted the footer on disk is a ciphertext, so the plaintext lives here
+    // and footer_bytes() hands out this instead. Both the schema parse and every later
+    // materialise_row_group() read through that one accessor, which is why adding encryption did
+    // not have to touch either.
+    std::vector<uint8_t> _footer_plain;
+    std::optional<format::read_crypto> _crypto;
 
     // Decoded window.
     std::vector<row> _rows;
@@ -240,9 +247,11 @@ class pq_reader : public mutation_reader::impl {
     future<> load_offset_indexes(size_t rg);
 
     std::span<const uint8_t> footer_bytes() const {
+        if (!_footer_plain.empty()) { return _footer_plain; }
         return std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_footer.get()), _footer.size());
     }
+    const format::read_crypto* crypto() const { return _crypto ? &*_crypto : nullptr; }
     // Decode this row group's column metadata if it has not been decoded yet. Cheap and
     // idempotent; called before anything reads _md.row_groups[rg].columns.
     void need_columns(size_t rg) {
@@ -343,9 +352,47 @@ future<> pq_reader::init() {
     uint32_t flen;
     std::memcpy(&flen, tail.get(), 4);
     if (uint64_t(flen) + 12 > len) { throw std::runtime_error("pq: bad footer length"); }
+    // "PARE" rather than "PAR1" means the footer is a ciphertext preceded by a plaintext
+    // FileCryptoMetaData. The tail read above is the same either way -- length then magic --
+    // which is why only this branch is new.
+    const bool encrypted = std::memcmp(tail.get() + 4, format::magic_encrypted, 4) == 0;
     {
         rtimer _t{rphase::footer_io};
         _footer = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+    }
+    if (encrypted) {
+        rtimer _t{rphase::footer_parse};
+        auto region = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(_footer.get()), _footer.size());
+        size_t consumed = 0;
+        auto fcm = format::parse_file_crypto_metadata(region, &consumed);
+        // key_metadata carries the key id the writer used. Trusting the file to name its own key
+        // is safe: it is an id, not a capability, and a wrong one simply fails to authenticate.
+        const seastar::sstring key_id =
+                fcm.key_metadata ? key_id_from_metadata(seastar::sstring(*fcm.key_metadata))
+                                 : seastar::sstring();
+        auto k = keys().find(key_id);
+        if (!k) {
+            throw std::runtime_error(seastar::format(
+                    "pq: {} is encrypted with key '{}', which is not in "
+                    "parquet_encryption_key_file", _sst->get_filename(), key_id));
+        }
+        format::read_crypto rc;
+        rc.key = *k;
+        rc.algo = fcm.algo;
+        rc.aad_file_unique = fcm.aad_file_unique;
+        // The writer stores the prefix, so this normally comes from the file. The fallback
+        // reconstructs what the writer would have used, which keeps a file written before
+        // store_aad_prefix was set readable.
+        rc.aad_prefix = fcm.aad_prefix;
+        if (rc.aad_prefix.empty()) {
+            rc.aad_prefix = fmt::format("{}.{}", _schema->ks_name(), _schema->cf_name());
+        }
+        auto aad = format::build_aad(rc.aad_prefix, rc.aad_file_unique,
+                                     format::module_type::footer);
+        _footer_plain = format::decrypt_module(region.subspan(consumed), rc.key, aad, nullptr,
+                                               rc.algo, false);
+        _crypto = std::move(rc);
     }
     {
         // Lazy: decode the schema and each row group's row count, but not the per-column
@@ -448,7 +495,7 @@ future<bool> pq_reader::next_window() {
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
         colsdata = format::read_row_range(img, _rg_base, _md, rg,
-                                          lo - _rg_start[rg], hi - _rg_start[rg]);
+                                          lo - _rg_start[rg], hi - _rg_start[rg], crypto());
     }
     _rows = reassemble(_ms, _cols, colsdata, size_t(hi - lo));
     _cursor = hi;
@@ -495,7 +542,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         co_await load_row_group(rg);
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
-        co_return format::read_row_range(img, _rg_base, _md, rg, lo, hi);
+        co_return format::read_row_range(img, _rg_base, _md, rg, lo, hi, crypto());
     }
 
     // Two extents per column: the dictionary page at the head of the chunk, and the
@@ -558,7 +605,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
     }
 
     rtimer _td{rphase::decode_cpu};
-    co_return format::decode_columns(in, _md, rg, lo, hi);
+    co_return format::decode_columns(in, _md, rg, lo, hi, crypto());
 }
 
 void pq_reader::close_partition() {

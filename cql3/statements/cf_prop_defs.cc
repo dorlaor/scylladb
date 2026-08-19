@@ -15,6 +15,7 @@
 #include "data_dictionary/data_dictionary.hh"
 #include "db/extensions.hh"
 #include "sstables/parquet/writer_impl.hh"
+#include "sstables/parquet/encryption_keys.hh"
 #include "db/tags/extension.hh"
 #include "cdc/log.hh"
 #include "cdc/cdc_extension.hh"
@@ -465,6 +466,30 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
                         sstables::parquet::parquet_parameters::to_string(enc), col,
                         cdef.type->name()));
             }
+        }
+        // An encryption key that this node does not have is refused at DDL time. The
+        // alternative is a table that accepts its DDL and then fails every flush, and whose
+        // first symptom is a compaction error hours later -- the DDL is the only point where
+        // the operator is present to be told.
+        //
+        // This checks the *local* node's key file, which is a real limitation and worth naming:
+        // another node may not have the key, and its writes will fail there. There is no
+        // cluster-wide key distribution here, so the check is the strongest one available
+        // rather than the one that would be right.
+        if (auto it = opts->find("encryption_key"); it != opts->end() && !it->second.empty()) {
+            if (!sstables::parquet::keys().find(it->second)) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "The 'parquet' option names encryption key '{}', which is not in this "
+                        "node's parquet_encryption_key_file", it->second));
+            }
+        }
+        // Asking for an algorithm without naming a key is a setting that does nothing.
+        if (auto it = opts->find("encryption");
+            it != opts->end() && it->second != "none"
+            && opts->find("encryption_key") == opts->end()) {
+            throw exceptions::configuration_exception(
+                    "The 'parquet' option sets 'encryption' but no 'encryption_key'; encryption "
+                    "needs a key id from parquet_encryption_key_file");
         }
         builder.set_parquet_options(*opts);
     }

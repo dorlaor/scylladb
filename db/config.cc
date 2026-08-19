@@ -1513,6 +1513,11 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Minimum age of the current compression dictionary before another dictionary for this table is trained.")
     , sstable_compression_dictionaries_autotrainer_tick_period_in_seconds(this, "sstable_compression_dictionaries_autotrainer_tick_period_in_seconds", liveness::LiveUpdate, value_status::Used, 900,
         "The period with which automatic dictionary training is attempted.")
+    , parquet_encryption_key_file(this, "parquet_encryption_key_file", value_status::Used, "",
+        "Path to a file of 'key_id base64_key' lines, one per line, used by Parquet Modular "
+        "Encryption. A table names its key by id (parquet = {'encryption_key': '<id>'}) so that "
+        "no key material is stored in the schema; the bytes are resolved locally from this file. "
+        "Empty means no keys are configured and any table asking for encryption will be refused.")
     , sstable_compression_dictionaries_min_training_dataset_bytes(this, "sstable_compression_dictionaries_min_training_dataset_bytes", liveness::LiveUpdate, value_status::Used, 1*1024*1024*1024,
         "The minimum size a table has to reach before dictionaries will be trained for it.")
     , sstable_compression_dictionaries_min_training_improvement_factor(this, "sstable_compression_dictionaries_min_training_improvement_factor", liveness::LiveUpdate, value_status::Used, 0.95,

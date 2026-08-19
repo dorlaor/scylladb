@@ -43,6 +43,10 @@ struct pq_writer_config {
     // Per-column encodings an operator asked for, already translated from the CQL enum to the
     // Parquet one. Empty for every table that does not set them, which is the common case.
     std::map<std::string, format::encoding> column_encodings{};
+    // Empty key id means no encryption. Kept as an id rather than resolved bytes so that a
+    // config round-trip (to_map) cannot leak key material.
+    seastar::sstring encryption_key_id{};
+    format::cipher   encryption_algo = format::cipher::aes_gcm_v1;
     // A row group is cut when either limit trips.
     //
     // `row_group_buffer_bytes` is **buffered shredder memory**, not encoded output, and
@@ -112,6 +116,11 @@ public:
     // nesting to be had. The column name is taken verbatim, so a quoted CQL identifier keeps its
     // case.
     static constexpr const char* ENCODING_PREFIX        = "encoding.";
+    // Parquet Modular Encryption. The algorithm is an enum; the key is named by *id* and
+    // resolved locally from parquet_encryption_key_file, so no key material ever enters the
+    // schema (which is replicated, stored in system tables and printed by DESCRIBE).
+    static constexpr const char* ENCRYPTION            = "encryption";
+    static constexpr const char* ENCRYPTION_KEY        = "encryption_key";
 
     // Guard rails. The lower bound on rows is not arbitrary: below ~1 000 rows the
     // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --

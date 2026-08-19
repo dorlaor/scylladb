@@ -471,6 +471,7 @@ public:
     named_value<float> sstable_compression_dictionaries_memory_budget_fraction;
     named_value<float> sstable_compression_dictionaries_retrain_period_in_seconds;
     named_value<float> sstable_compression_dictionaries_autotrainer_tick_period_in_seconds;
+    named_value<sstring> parquet_encryption_key_file;
     named_value<uint64_t> sstable_compression_dictionaries_min_training_dataset_bytes;
     named_value<float> sstable_compression_dictionaries_min_training_improvement_factor;
     named_value<bool> uuid_sstable_identifiers_enabled;
