@@ -4610,6 +4610,40 @@ guesswork. From there the question becomes a specific one about that compaction'
 If it turns out they are droppable by design, the anomaly is fully explained and Backblaze's corpus
 figure should be taken from a run with `tombstone_gc` pinned so it stops varying between runs.
 
+**The bisect ran, and it eliminated more than it identified — including my own reimplementation.**
+`bb_bisect.py` walks flush → none → lz4 → zstd → lz4_dict → zstd_dict → parquet, measuring
+`estimated_tombstone_drop_time` after each step. The calibration gate passed exactly: the first
+flush reports **42 448 175 histogram points**, the precise tombstone count, so the probe provably
+counts dead atomic cells and every later reading means something.
+
+Then all **five** runs kept every tombstone at every stage:
+
+| stage | bytes | tombstones |
+|---|---:|---:|
+| flush | 66 682 357 | 42 448 175 |
+| none | 242 357 702 | 42 448 175 |
+| lz4 | 67 781 169 | 42 448 175 |
+| zstd | 49 003 336 | 42 448 175 |
+| lz4_dict | 52 507 015 | 42 448 175 |
+| zstd_dict | 32 234 454 | 42 448 175 |
+| parquet | 85 986 241 | 42 448 175 (72.56 % of `__ldt`) |
+
+Five anomalous runs in a row, against the harness's rate of roughly one in seven, is about a
+1-in-17 000 coincidence — so this is systematic, not luck. **The removal is therefore not in the
+load, not in the codec rewrites, and not in the conversion**, because this pipeline performs all of
+those and never loses a tombstone.
+
+**What it is, is a difference between the harness and my reimplementation of it**, and that is the
+lesson worth keeping. The harness does considerably more compaction than the bisect copied:
+`flush_and_compact()` before each codec, `rewrite(); flush_and_compact()` **twice** for the two
+dictionary codecs (the second pass exists so the freshly trained dictionary is actually used), and a
+full-table read afterwards — roughly twelve major compactions per run against the bisect's five.
+
+So the next step is not another hypothesis, and not a better reimplementation: **instrument the
+harness itself**, probing tombstone counts between its real stages. Reimplementing a pipeline in
+order to bisect it introduced the very divergence that made the bisect inconclusive, which is a
+cheaper lesson here than it usually is.
+
 **No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
 re-measurement for exactly this reason.
