@@ -102,23 +102,28 @@ def main():
 
         kms = pe.KmsConnectionConfig(custom_kms_conf={})
         dc = pe.DecryptionConfiguration(cache_lifetime=None)
-        # KNOWN GAP, deliberately not counted as a failure here so the suite stays honest about
-        # what is and is not true. Our writer's column-key columns are readable by *our* reader
-        # (test_encrypt_write asserts that, including the wrong-key refusal), and parquet-cpp's own
-        # per-column files are readable by our reader (test_encryption.cc asserts that too). But
-        # pyarrow cannot decrypt a column-key column *we* wrote -- "Failed decryption
-        # finalization" -- so the divergence is on our write side and is not yet found. Until it
-        # is, per-column keys are not exposed through CQL. See storage-format 10.17.
+        # Both keys: every column decodes. This was a known gap until 2026-08-20 -- pyarrow
+        # failed with "Failed decryption finalization" on the column-key column -- and the cause
+        # was our writer omitting RowGroup.ordinal. parquet-cpp reads that field to get the AAD's
+        # row-group ordinal and substitutes -1 when it is absent, so its AAD for the encrypted
+        # ColumnMetaData had 0xFFFF where ours had 0x0000. Nothing else in the file depends on
+        # it, which is why uniform mode never noticed. See storage-format 10.17.
         both = {"footerkey": KEY, "namekey": b"fedcba9876543210"}
         try:
             f = pq.ParquetFile(p, decryption_properties=factory_for(both)
                                .file_decryption_properties(kms, dc))
             t = f.read()
-            print("  NOTE  pyarrow now reads our column-key column (%d rows) -- the known gap "
-                  "is fixed; make this an assertion." % t.num_rows)
+            fails += check(t.num_rows == 100, "both keys: 100 rows read")
+            fails += check(t.column_names == ["id", "name"], "both keys: column names")
+            fails += check(t.column("id").to_pylist() == list(range(100)),
+                           "both keys: footer-key column values exact")
+            # BYTE_ARRAY with no UTF8 annotation, so pyarrow hands these back as bytes.
+            fails += check(t.column("name").to_pylist()
+                           == [b"g%d" % (i % 4) for i in range(100)],
+                           "both keys: column-key column values exact")
         except Exception as e:
-            print("  known gap: pyarrow cannot decrypt our column-key column -- %s"
-                  % str(e)[:90])
+            fails += check(False, "both keys: pyarrow decrypts the column-key column",
+                           str(e)[:180])
 
         # Footer key only: projecting the footer-key column must work...
         try:
