@@ -18,28 +18,34 @@ Point-read p50 went **1 915 µs → 581 µs (3.3×)** across four changes (§10.
 dictionary paging), for about 14 % of size. Further optimisation is **explicitly paused** — the
 remaining items are recorded, not scheduled.
 
-### 1. Footer metadata cache — specified, not built
-**Why deferred:** needs a format-layer refactor, and the obvious implementation is wrong.
+### 1. ~~Footer metadata cache~~ — built 2026-08-20
+Built, measured and evicted on a running node: storage-format §10.4l for the design, §10.24 for the
+numbers. Cold point reads improved 1.5× to 12.6× depending on row-group count, with the biggest gain
+at the worst configuration, and the row-group latency slope inverted from +4.42 µs per row group per
+file to −0.449.
 
-Lazy footer parsing (§10.4k) shrank the cacheable object from tens of megabytes to ~128 kB but
-only bought 12 %, because TCompactProtocol has no length prefixes so `skip()` is O(content) — a
-lazy parse still walks every byte it intends to ignore. Caching is what removes the walk.
+Two of the three obstacles recorded here turned out to be avoidable rather than solved:
 
-**The trap:** per-sstable state lives in `shareable_components`, declared
-`foreign_ptr<lw_shared_ptr<shareable_components>>`. Caching parsed metadata there and calling
-`materialise_row_group()` on it per reader mutates shard-foreign state. Single-shard testing —
-which is all the perf harness does — will not show it.
+- the `shareable_components` cross-shard hazard is sidestepped by holding the entry on the
+  shard-local `sstable` object, where the reclaim machinery already operates;
+- the format-layer refactor ("the bulk of the work") was not needed: a reader materialises the one
+  row group it reads into a *one-group* `file_metadata` and passes index 0, so `read_row_range()`
+  needs no new parameter and the shared entry is never mutated.
 
-**Shape that works:** cache the lazily-parsed `file_metadata` plus footer bytes, immutable after
-construction (both are pure functions of an immutable file, so the cache dies with the sstable and
-needs no invalidation); keep materialised column metadata in per-reader state, one entry for a
-point read.
+**Still open, and it is the more important half.** A cache helps the *second* read of a file. The
+first read after a restart still fetches and walks the whole footer, and on a node that has just
+restarted every read is a first read — the control run in §10.24 is exactly that cost. The persisted
+side index of §10.23 ("row group → footer offset, length" beside `Data.db`, ~8 bytes per row group)
+is what makes the first read O(1), and it is not built.
 
-**Bulk of the work:** `format::read_row_range()` indexes `row_groups[rg].columns` itself, so the
-column list must be threaded through the format-layer read functions as a parameter. Mechanical.
+**Also not done:** the recovered `mapped_schema` is still rebuilt per reader. It is O(leaves), not
+O(row groups), so it does not scale with sstable size; caching it would mean keying by query schema,
+which is a different and worse problem.
 
-**Expected, not measured:** on the 8 000-row-group sstable of §10.4j, footer parse per read goes
-from ~34 ms to ~0.
+**Known trade, accepted:** a compaction reading N sstables publishes N entries it will never read
+twice, converting footer bytes into resident memory for the duration. The reclaimer bounds it — the
+entries are the largest reclaimable objects on the shard and the first thing dropped — but "populate
+only for bounded reads" is the obvious refinement if it ever shows up as pressure.
 
 ### 2. `decode_cpu` — 279 µs, largest remaining phase at test scale
 Needs sub-splitting into page-header parse versus value decode before anything is attempted, on

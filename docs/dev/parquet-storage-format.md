@@ -3370,40 +3370,77 @@ parses cleanly and yields *wrong values*, so parsing is not evidence. The checks
 are re-read by pyarrow with every row group fully decoded rather than only their metadata
 inspected; and the streamed-vs-buffered images remain byte-identical.
 
-### 10.4l The footer cache: specified, and one constraint that makes the obvious version wrong
+### 10.4l The footer cache — built 2026-08-20, and two of its three obstacles were avoidable
 
-§10.4k established the sequence — lazy parse to make the cached object small (~128 kB rather than
-tens of megabytes), then cache it to remove the repeated Thrift byte walk. Writing it revealed a
-constraint worth recording before anyone implements it.
+§10.21 measured a cold point read at **4.42 µs per row group per file**, and §10.22 showed why: the
+footer is 1 420 bytes per row group, so fetching it and walking it is the term that scales. Both are
+pure functions of an immutable file, so both need happen once per sstable rather than once per read.
+Numbers in §10.24; this section is the design.
 
-**The obvious version is a cross-shard data race.** Per-sstable state lives in
-`shareable_components`, reached through `sstable::get_shared_components()`. That member is declared
-`foreign_ptr<lw_shared_ptr<shareable_components>>` — it can belong to a different shard, and
-`foreign_ptr` exists to make cross-shard misuse hard to write by accident. So caching a parsed
-footer there and having each reader call `materialise_row_group()` on it, which is what "cache the
-footer" naturally means, mutates shard-foreign state from whichever shard happens to be reading.
-Single-shard testing would never show it.
+**What is cached, and where it lives.** One entry per sstable, held by the `sstable` object itself.
+The entry type is declared through a deliberately Parquet-free header
+(`sstables/parquet/footer_cache.hh`) so that `sstables.hh` can hold, size and drop it without
+pulling in the format layer:
 
-**So the cached object must be immutable and materialisation must be per-reader:**
+- the **plaintext** footer bytes — the whole Thrift blob, because the lazily-parsed metadata is a
+  set of byte extents into it;
+- the lazily-parsed `file_metadata`: the schema plus each row group's `num_rows` and column-list
+  extent, and no per-column metadata;
+- the cumulative first-row table, which every read needs in order to map a row ordinal to a row
+  group and which is itself O(row groups);
+- for an encrypted file, the crypto *envelope* — algorithm, `aad_file_unique`, AAD prefix, key id —
+  and **not the key**.
 
-- **Cached, written once, never mutated:** the lazily-parsed `file_metadata` (schema, per-group
-  `num_rows`, per-group column-list extents) plus the footer bytes those extents index into. Both
-  are pure functions of an immutable file, so there is no invalidation problem at all — the cache
-  dies with the sstable.
-- **Per-reader:** the materialised column metadata, held in reader-local state keyed by row group.
-  A point read touches one group, so this is one entry.
+**Obstacle 1, avoided: it lives on `sstable`, not in `shareable_components`.** The warning this
+section carried stands — `_components` is a `foreign_ptr<lw_shared_ptr<shareable_components>>`, may
+belong to another shard, and mutating a parsed footer there would be a cross-shard race that
+single-shard testing cannot show. But the `sstable` object is shard-local, and the reclaim machinery
+already operates on it, so putting the entry there makes publishing and dropping it shard-local by
+construction. The cost is that two shards holding the same file hold two entries; the reclaim budget
+is per-shard anyway, so they are accounted separately and correctly.
 
-**One thing that makes it more than a small change.** `format::read_row_range()` takes the
-`file_metadata` and indexes `row_groups[rg].columns` itself, so a reader holding its columns
-separately cannot use it as it stands. The column list has to be threaded through the format-layer
-read functions as a parameter instead of being looked up from the metadata. That is the bulk of the
-work, and it is mechanical rather than subtle.
+**Obstacle 2, avoided: the format-layer refactor called "the bulk of the work" was not needed.** The
+objection was that `read_row_range()` indexes `md.row_groups[rg].columns` itself, so a reader holding
+its materialised columns separately cannot use it. True — but a reader can hold a *one-group*
+`file_metadata`: the schema, which is all `walk_leaves()` needs, plus a copy of the single row group
+it is reading, materialised into that copy and passed as row-group index 0. Fixed size, no threading
+of column lists through the format layer, and the shared entry is never mutated. That last property
+is what keeps a full scan from growing the entry into the eager parse that lazy mode exists to
+avoid.
 
-**Expected payoff, stated as an expectation rather than a measurement:** the Thrift walk becomes
-once per sstable instead of once per point read, so `footer_parse` should fall from 4.32 us per row
-group to roughly nothing on the steady-state path — which on the 8 000-group sstable of §10.4j is
-the difference between ~34 ms and ~0 per read. That number should be measured on a deliberately
-large sstable and not on the 100 000-row perf file, for the reason §10.4j gives.
+**Obstacle 3, changed rather than avoided: it is not reloaded, it is re-parsed.** Bloom filters are
+read at open time and nothing else will put one back, which is why `sstables_manager` keeps a
+`_reclaimed` set and a reload fiber. A footer cache repopulates itself on the next read that wants
+it, and reloading it eagerly would re-read footers for sstables nobody is reading. So
+`reclaim_memory_from_components()` now distinguishes *released* bytes from *owed* bytes: it returns
+the former and adds only the latter to `total_memory_reclaimed()`, and the manager inserts into
+`_reclaimed` only when something is actually owed. Everything else — being reported through
+`total_reclaimable_memory_size()`, being picked by "reclaim from the sstable holding the most", being
+governed by `components_memory_reclaim_threshold` — is the existing policy untouched. There is no
+second policy.
+
+Two incidental faults in that loop were fixed while reading it: it dereferenced `_active.end()` if
+the accounting ever claimed more was held than any live sstable holds, and it spun without a yield
+when nothing could be reclaimed — a reactor stall rather than a bad decision. Both are now bounded.
+
+**Memory is measured, not estimated.** `memory_size()` sums container capacities: the footer vector,
+the row-group and schema vectors, every heap-allocated string in them, and the cumulative-row table.
+Nothing is inferred from the on-disk footer length. Measured at **1 522 bytes per row group** against
+1 425 on disk (§10.24) — the difference is the 88-byte lazy row-group record plus its 8-byte
+cumulative-row entry, which is the structure the number should have and is the reason to measure it
+rather than assert it. A unit test asserts the figure is non-zero, because an entry reporting zero
+would be invisible to the reclaimer and the cache would silently stop being evictable.
+
+**Encryption.** The entry holds the *decrypted* footer and never the key. That split is the point:
+the plaintext is exactly as sensitive as the row cache's contents and dies with the sstable, whereas
+a cached key would outlive the read that was authorised to fetch it and would sit outside the
+provider's control. A reader on a cache hit asks the provider again; what it saves is the footer
+read, the decrypt and the parse. Verified on live `PARE` tables — reads hit the cache and return
+identical rows (§10.24).
+
+**Metrics**, on the `sstables` group: `pq_footer_cache_hits`, `_misses`, `_populations`, `_evictions`
+— drops under memory pressure only, since an sstable closing is not an eviction — and the `_bytes`
+gauge, which is the one to watch against the reclaim threshold.
 
 ### 10.4k Lazy footer parsing: 12 %, because Thrift skip is O(content)
 
@@ -3473,7 +3510,8 @@ badly by a factor of 2.5, which is the same failure that produced the C2 thresho
 point-read figure; a per-dataset check is cheap and should precede any default that trades size.
 And the direction of travel for point-read latency should be the footer cache (§10.4l), which at
 production scale dominates everything measured in §10.4 and costs no size at all — as against page
-and row-group tuning, which are now both spent and both paid in disk.
+and row-group tuning, which are now both spent and both paid in disk. Built and measured on
+2026-08-20: 1.5× to 12.6× on cold point reads for no disk at all (§10.24).
 
 ### 10.4j Footer parse scales with sstable size — and it invalidates the ranking above
 
@@ -4784,6 +4822,11 @@ Fewer, larger row groups improve point reads — 402 groups is 5.4× — while s
 size want the opposite (§10.4a). Whoever tunes this is choosing between them explicitly rather than
 finding a setting that is good for both.
 
+**Superseded for the cached case by §10.24.** Everything above is the *uncached* cost, and it is
+still what the first read of an sstable pays. Once the footer cache is in play the slope inverts and
+smaller row groups become the faster point read; the trade described here applies to a cold start,
+not to a steady-state node.
+
 ### 10.23 Why the whole footer is read for one row group — and how to stop
 
 Raised as an objection and it is a fair one: a point read needs one row group's entry, about
@@ -4823,6 +4866,82 @@ read.
 Cheaper mitigations, both already quantified and neither a substitute: fewer, larger row groups
 (§10.21) and trimming what per-chunk metadata is written at all.
 
+### 10.24 The footer cache, measured — 2026-08-20, and the predicted inversion happened
+
+Same harness, arms and estimator as §10.21 (8 M rows, `BYPASS CACHE`, production caching,
+interleaved arms, min of 400 probes × 3 rounds, one restart before the cold pass), so the tables are
+directly comparable. The repeat used `pointread_probe.py`, which is §10.21's measurement half
+without the ninety-minute rebuild.
+
+**The control is the important column.** "Squeezed" is the *same binary and the same data* with
+`components_memory_reclaim_threshold` set to 3 × 10⁻⁵ — about 250 kB on an 8 G shard, below one
+sstable's footer — so the reclaimer takes every entry away as soon as a read publishes it. It
+reproduces §10.21 to within 9 %, which is what makes the improvement attributable to the cache
+rather than to anything else that moved in the tree today.
+
+| arm | row groups | §10.21 cold | squeezed (control) | cached | cached vs control |
+|---|---:|---:|---:|---:|---:|
+| native | — | 462 | 460 | 470 | — |
+| pq rg=20 000 | 402 | 2 500 | 2 563 | **1 684** | 1.5× |
+| pq rg=5 000 | 1 601 | 3 958 | 4 321 | **1 361** | 3.2× |
+| pq rg=2 000 | 4 002 | 6 198 | 6 196 | **1 030** | 6.0× |
+| pq rg=1 000 | 8 001 | 10 905 | 10 458 | **832** | 12.6× |
+
+All figures µs, cold minimum. Canary min 225–261 µs (16 % spread) on the cached run and 225–253 µs
+(12 %) on the control, against 224–244 µs in §10.21 — so all three are comparable and none of this
+is the machine, which matters on a box whose load average passed 30 earlier in the same hour. The
+cached run was measured twice, on two node restarts, agreeing to within 12 % (946/1 042/1 441/1 672
+against 832/1 030/1 361/1 684).
+
+**Against the row format, cold: 1.8–3.6× rather than 5.4–23.6×.** The worst case improves most,
+which is the shape to expect from removing a term that scales.
+
+**The slope inverted, exactly as §10.21 predicted it might.** It was +4.42 µs per row group per
+file; with the footer cached it is **−0.449 µs per row group per file** (−0.112 per row group across
+the four files), and the control run reproduces +4.155. So the intuition §10.21 had to argue against
+— that *smaller* row groups make point reads faster — is now the visible effect, because the footer
+term it was competing with is gone and what remains is the per-chunk dictionary and page extents a
+read fetches inside its group. §10.21 said "the ordering could invert once the cache lands; that is
+a prediction to measure, not to assume". It inverted.
+
+**This changes the tuning advice back.** With the cache, `row_group_rows` no longer trades point-read
+latency against size in the same direction: smaller groups are both faster to point-read *and* worse
+for size (§10.2), which is the trade §10.4c originally described at test scale. The
+larger-row-groups-for-latency argument in §10.21 applies to the *uncached* first read, which is what
+§10.23's side index is for.
+
+**Warm reads are unchanged at ~256 µs across every arm**, because that is the client round trip
+(§10.21) and no storage change can move it.
+
+**Eviction, on a node rather than in a unit test** (`footer_cache_evict.py`, same data, two node
+starts):
+
+| threshold | misses | hits | evictions | bytes retained after |
+|---|---:|---:|---:|---:|
+| 0.2 (default) | 4 | 196 | 0 | 12 181 471 |
+| 3 × 10⁻⁵ | 200 | 0 | 200 | 0 |
+
+200 single-partition reads either way, and **every column of every row identical across the two
+phases**. At the default an 8 G shard has 1.6 GB of budget, four files are parsed once and 196 reads
+hit; squeezed, every read publishes an entry and the reclaimer removes it again, so the miss and
+eviction counters move in lockstep and the gauge sits at zero. The 1 600-probe control run above
+recorded 1 600 misses and 1 600 evictions with no wrong answers, which is the same evidence at
+eight times the volume.
+
+**The retained size, and the "too much to pin" argument checked against reality.** 12 181 471 bytes
+for one table's four files at 8 001 row groups is **1 522 bytes per row group**, against 1 425 on
+disk (§10.22) — footer blob plus 96 bytes of lazy row-group record and cumulative-row entry. The
+five arms of this experiment together held 21.4 MB, which is 1.3 % of one 8 G shard's reclaimable
+budget for 32 M rows; a node with a thousand 1 601-group sstables would want ~2.4 GB, which is the
+number that made this evictable rather than pinned in the first place.
+
+**What the cache does not do.** The *first* read of an sstable after a restart still fetches and
+walks the whole footer — the squeezed column above is what that costs — and on a node that has just
+restarted, every read is a first read. That is §10.23's side index, and it is not built. Compaction
+also publishes an entry per input sstable that it will never read twice, converting footer bytes into
+resident memory for the duration; the reclaimer bounds it, and "populate only for bounded reads" is
+the refinement if it ever shows up as pressure.
+
 ### 10.22 Footer size, measured per file and per row group
 
 Prerequisite for deciding whether a metadata cache is worth building (§10.4l), measured on the same
@@ -4849,7 +4968,8 @@ would want ~2.3 GB. That is far too much to pin, which settles the design questi
 `sstables_manager`'s existing reclaim machinery — `_total_reclaimable_memory` against
 `memory_reclaim_threshold` (default 0.2), with the intrusive list ordered by
 `lesser_reclaimed_memory` — which is how bloom filters are already dropped, rather than inventing a
-second policy.
+second policy. Built that way and measured in §10.24, where the retained size comes out at
+1 522 bytes per row group — this estimate plus 96 bytes of parsed row-group record.
 
 ### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
 
@@ -5613,8 +5733,8 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 
 | Area | Severity | What is missing |
 |---|---|---|
-| Point-read latency | known, structural | 20–33× the row format; 71 % is a fixed floor. The footer cache that would help is specified, not built. Parquet is for scanned data. |
-| Production-scale re-measurement | **blocking** | Every latency figure is from a 200–300 k-row sstable. Footer parse is 4.32 µs per row group, so an 8 000-group file pays ~34 ms — this **reorders** §10.4 rather than merely scaling it. |
+| Point-read latency | known | **1.8–3.6× the row format cold**, at 8 M rows with the footer cache in place (§10.24), down from 5.4–23.6×. Warm reads are at the client round-trip floor for every format. What remains uncovered is the *first* read of an sstable after a restart, which still walks the whole footer: §10.23's side index is specified, not built. Parquet is still for scanned data. |
+| Production-scale re-measurement | **done for point reads** | §10.21 re-measured them at 8 M rows with a canary and `BYPASS CACHE`, and retired every warm ratio in §10.4 as a measurement of the client round trip. §10.24 then measured the footer cache against a squeezed-cache control on the same data. Scan and write figures are still from 200–300 k-row sstables. |
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
