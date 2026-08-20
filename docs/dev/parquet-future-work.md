@@ -342,13 +342,19 @@ what was tested.
 ### 8. C2's replacement should gate on rows, not bytes
 C2 was removed as subsumed by C6, but if a size floor is ever wanted again it must be a row count:
 four row groups is 126 kB at 6.3 B/row and 1.4 MB at 69 B/row, so no byte threshold suits both.
-`rows >= 4 × row_group_rows`, fed from sstable stats.
+`rows >= 4 × rows_per_row_group`, fed from sstable stats.
 
 ### 9. `row_group_buffer_bytes` per shape
-The effective row-group size is `min(row_group_rows, what 64 MiB of shredder memory allows)`, and
+The effective row-group size is `min(rows_per_row_group, what 64 MiB of shredder memory allows)`, and
 which term binds depends on row *density*, not column count (§10.1f-rg). On dense wide tables the
 byte budget binds and the row count is inert. Harder than it looks: this budget exists to stop a
 shard OOMing (R-13), so it cannot simply be raised for size.
+
+To be clear about what this item is and is not: `row_group_buffer_bytes` is a **guard rail**, not a
+tuning dial -- `rows_per_row_group` is the dial (design doc §8.2). The question here is whether the
+guard should be *shape-aware*, because a single 64 MiB figure means very different row counts across
+the corpus and on a dense wide table it silently becomes the thing that cuts. That is a correctness-
+of-the-guard question. It is not a proposal to trade the budget against file size or latency.
 
 ### 10. ~~C7, the read-pattern gate~~ — dropped 2026-08-19, not deferred
 
@@ -546,10 +552,10 @@ Under the id lookup, two consecutive runs give lz4 **byte-identical** at 59 351 
 
 **Leaf-set hypothesis disproven, 2026-08-19.** The suspicion was that a row-group cut flips the
 writer from the *derived* leaf set to the *conservative* one — 199 leaves against 394 on this
-table — and that this caused the 4x swing. Swept `row_group_rows` on one loaded table under the
+table — and that this caused the 4x swing. Swept `rows_per_row_group` on one loaded table under the
 id-based lookup:
 
-| `row_group_rows` | `pq` bytes |
+| `rows_per_row_group` | `pq` bytes |
 |---:|---:|
 | no cut (10⁸ rows, 1 GiB buffer) | 18 037 425 |
 | 20 000 | 19 908 060 |

@@ -537,12 +537,14 @@ defer.
 Columnar writing requires buffering a whole row group before it can be emitted. This is
 the main new resource risk and must be designed for, not discovered.
 
-- Row group size is bounded by **both** `row_group_rows` and `row_group_bytes`,
-  whichever trips first.
+- Row group size is bounded by **both** `rows_per_row_group` and `row_group_bytes`,
+  whichever trips first. (As shipped these are not co-equal: the row count is the dial and
+  the byte budget -- `row_group_buffer_bytes` -- is a guard rail that does not bind at the
+  default. See §8.2 and §5.5a.)
 - Classic Parquet advice (128 MB – 1 GB, sized to an HDFS block) is **wrong for
   Scylla**. Concurrent compactions × shards × row group bytes is the memory bill.
-  Proposed default: **64 MiB** uncompressed, with `row_group_rows` default 1 000 000.
-  (Superseded — `row_group_rows` shipped at 1 000 000 and was moved to **5 000** on
+  Proposed default: **64 MiB** uncompressed, with `rows_per_row_group` default 1 000 000.
+  (Superseded — `rows_per_row_group` shipped at 1 000 000 and was moved to **5 000** on
   2026-08-18 once the read cost of a large row group was swept; §10.4c.)
 - Buffering is charged against a dedicated semaphore
   (`parquet_writer_memory_budget`, default a small fraction of shard memory) so that
@@ -556,7 +558,7 @@ the main new resource risk and must be designed for, not discovered.
 ### 5.5a Write-side memory — measured 2026-08-17, and R-13 is **not** met here
 
 §5.5 above specifies what should happen. What the writer actually does is emit **one row
-group per sstable**: `write_rows()` calls `add_row_group()` exactly once, `row_group_rows` is
+group per sstable**: `write_rows()` calls `add_row_group()` exactly once, `rows_per_row_group` is
 declared in `pq_writer_config` and never read, `row_group_bytes` does not exist, and there is
 no semaphore. So `fragment_shredder::_rows` accumulates every row of the sstable before
 anything is encoded.
@@ -582,7 +584,7 @@ Multiply by concurrent compactions × shards and this is the OOM that R-13 exist
 The read path is bounded (1.13× memory for 8× rows, §10.4); the write path is not.
 
 **A refinement to §5.5 that the measurement forces.** §5.5 proposes bounding a row group by
-`row_group_bytes` (64 MiB uncompressed) and `row_group_rows` (1 000 000). Neither is the right
+`row_group_bytes` (64 MiB uncompressed) and `rows_per_row_group` (1 000 000). Neither is the right
 budget on its own:
 
 - The quantity that can OOM a shard is the **shredder's in-memory footprint**, not the encoded
@@ -590,7 +592,7 @@ budget on its own:
   output on D12 — **343×**. Budgeting 64 MiB of *encoded* bytes would therefore permit
   something on the order of gigabytes of shredder memory. The budget has to be charged where
   the memory actually is.
-- `row_group_rows = 1 000 000` is roughly **50× too large** for the current row model: a
+- `rows_per_row_group = 1 000 000` is roughly **50× too large** for the current row model: a
   64 MiB shredder budget is about **37 000 rows**. The byte budget would trip first every
   time, which is exactly why §5.5 says "whichever trips first" — the row count is a backstop,
   not the operative limit. **Acted on 2026-08-18:** the default is now 5 000, which makes the
@@ -628,7 +630,7 @@ only cuts a row group slightly early. Validated against measured RSS rather than
 The RSS slope is **1 814 B/row** (the intercept is a ≈62 MiB fixed baseline); the estimator
 says **1 887 B/row**. So it is **4 % conservative** — accurate enough to budget on, and wrong
 in the safe direction. At a 64 MiB budget that is **≈35 600 rows per row group**. When this was
-written the declared `row_group_rows` default was 1 000 000, so the byte budget was the operative
+written the declared `rows_per_row_group` default was 1 000 000, so the byte budget was the operative
 limit and the row count a dead letter. §10.4c moved the default to **5 000**, which reverses that:
 5 000 rows is about 9 MB of shredder buffer, well under the budget, so the row count now cuts and
 the byte budget is what it should be — a safety net against a pathological partition.
@@ -1411,13 +1413,47 @@ Guard rails, with reasons rather than round numbers:
 
 | Bound | Value | Why |
 |---|---:|---|
-| `row_group_rows` floor | 1 000 | Below this the fixed ~225 B per leaf per row group dominates: at 100 rows on a 20-leaf table that is 45 B/row against a 5.2 B/row total, so the file grows ~9x (§10.4c) |
-| `row_group_rows` ceiling | 100 000 000 | Sanity |
-| `row_group_buffer_bytes` | 1 MiB - 1 GiB | This is *buffered shredder memory*, not output; see §5.5a |
+| `rows_per_row_group` floor | 1 000 | Below this the fixed ~225 B per leaf per row group dominates: at 100 rows on a 20-leaf table that is 45 B/row against a 5.2 B/row total, so the file grows ~9x (§10.4c) |
+| `rows_per_row_group` ceiling | 100 000 000 | Sanity |
+| `row_group_buffer_bytes` | 1 MiB - 1 GiB | A guard rail, not a dial: *buffered shredder memory* rather than output, sized to stop a shard OOMing on a pathological partition (R-13). At the 5 000-row default it never binds; see §5.5a |
 | `page_rows` | 128 - 1 000 000 | |
 | `compression_level` | 1 - 22 | zstd's range |
 
 `row_group_buffer_bytes` accepts a `KiB`/`MiB`/`GiB` suffix as well as a plain count.
+
+**The two are not co-equal knobs, and the doc used to imply they were.** `rows_per_row_group`
+is the tuning dial: it is what read cost depends on, it is the one that actually cuts at the
+5 000-row default, and §10.21 is a sweep of it. `row_group_buffer_bytes` is a **guard rail**.
+It measures buffered shredder memory rather than output -- the two differ by ~343x, 1 887 B/row
+held against 5.2 B/row written -- and it exists to stop a shard running out of memory on a
+pathological partition (R-13). At the default it never binds: a 5 000-row group is about 9 MB of
+shredder buffer against a 64 MiB budget. So it is not a dial an operator reaches for to trade
+size against latency; raising it does not buy size, and lowering it does not buy latency, it
+just moves where the safety net sits. The one open question about it (§10.1f-rg, open question
+15) is whether the *guard* should vary by table shape, not whether it should be tuned for
+performance.
+
+**`rows_per_row_group` was called `row_group_rows` until 2026-08-20.** The rename is behavioural
+only in the sense that the old name was actively misleading: it reads as though it sets the
+number of row groups, and it was read that way. The two move in **opposite** directions -- 8 M
+rows at 1 000 rows/group is ~8 000 groups, at 20 000 it is ~400 -- so a reader with the direction
+backwards tunes the wrong way and concludes the setting does nothing. `rows_per_row_group` cannot
+be read the other way.
+
+**`row_group_rows` remains an accepted alias, permanently.** This map is persisted in schema
+(`schema::parquet_options()`, stored by `db/schema_tables.cc`) and `parquet_parameters` is
+reconstructed from it on every schema read -- the writer, the reader and the compaction manager
+all do it -- so a parser that rejected the old key would stop pre-rename tables from loading and
+fail their next DDL, not merely warn. Both spellings parse to the same setting; there is no
+removal date. Setting **both** in one map is a configuration error naming both, rather than a
+silent last-one-wins, because map order would otherwise decide and the operator who wrote both
+almost certainly meant the second to replace the first.
+
+`to_map()` emits the canonical name whichever spelling arrived. Note that this does not rewrite
+anyone's stored property, because `to_map()` is not on the persistence path: `cf_prop_defs` stores
+the raw map as written and `DESCRIBE` echoes that map verbatim, so a table created or altered
+with the old name keeps the old name in its schema and in its `DESCRIBE`. What `to_map()` owes is
+that its output re-parses to an equal config.
 
 **A round-trip asymmetry the test caught immediately:** `to_map()` first emitted
 `to_string(folding_level)`, which produces the internal `"L0"`/`"L1"`/`"L2"`, while the
@@ -1470,7 +1506,7 @@ two paths, chosen by size and invisible to the operator: `cut_row_group()` drive
 directly once the sstable outgrows the row-group budget, and `write_rows()` emits it in one shot
 when the whole thing fits a single row group. Only the first passed the overrides through. The
 symptom was not "the option does nothing" -- it was worse than that. The option worked on large
-tables and silently did nothing on small ones, so raising `row_group_rows` appeared to *enable*
+tables and silently did nothing on small ones, so raising `rows_per_row_group` appeared to *enable*
 it, when all that did was force a cut. Two hours went into chasing a non-existent dependency on
 the scalar options before the second write path was noticed.
 
@@ -1500,6 +1536,11 @@ recreates a table from its own `DESCRIBE` output and re-verifies the encoding in
 
 Mirrors the existing `compression = {...}` map property, parsed and validated into a
 `parquet_parameters` object analogous to `compression_parameters`:
+
+*Quoted as originally written, so the names below are the proposed ones rather than the
+shipped ones: `row_group_rows` is now spelled `rows_per_row_group` (§8.2), and
+`row_group_bytes`, `page_bytes` and the `lz4`/`snappy`/`gzip` codecs were never
+implemented.*
 
 ```cql
 ALTER TABLE ks.t WITH parquet = {
@@ -2304,7 +2345,7 @@ are the `-Data.db` size of the same table, same rows, rewritten with compression
 **Backblaze is excluded from the table above** because its uncompressed figure came from a batch
 run that also produced an anomalous `pq` size. Its raw volume, 242 357 583, is plausible on its
 face — 807 B/row across 197 columns — but the same run reported `pq` 84 538 396 where every
-controlled run gives 20 803 872. A subsequent `row_group_rows` sweep on one loaded table lands on
+controlled run gives 20 803 872. A subsequent `rows_per_row_group` sweep on one loaded table lands on
 20 803 872 at the default and varies only 18.0–26.9 MB across settings, so no configuration
 produces 84.5 MB. The anomaly has appeared only inside full-corpus batches and never in isolation;
 it is recorded in parquet-future-work.md and no figure here depends on it.
@@ -2367,7 +2408,7 @@ about Parquet.** Every row group writes a column chunk header and statistics per
 rows per group a 300 000-row table has 60 row groups, so a 199-leaf table pays that fixed cost
 11 940 times against 420 for a 7-leaf table. The +7.4 % measured in §10.4c was on a 6-leaf
 table; on Backblaze the same default costs 18.6 points. **A single row-group default cannot be
-right for both** — the honest reading is that `row_group_rows` should scale inversely with leaf
+right for both** — the honest reading is that `rows_per_row_group` should scale inversely with leaf
 count, and until it does, wide tables should be given a larger value explicitly via the
 `parquet` property. Recorded as §11 open item.
 
@@ -2400,13 +2441,13 @@ now cut at 5 000 rows, so four of them is about 200 kB on this shape. The floor 
 **The shape-independent form is a row floor, not a byte floor**, and that is the remaining gap.
 At 6.3 B/row four row groups is 126 kB; at Backblaze's 69 B/row it is 1.4 MB, so a single byte
 threshold admits under one row group on a wide table while correctly excluding it on a narrow
-one. The right criterion is `rows >= 4 x row_group_rows`, which needs a row count in
+one. The right criterion is `rows >= 4 x rows_per_row_group`, which needs a row count in
 `tiering_inputs` that the sstable stats can supply. Recorded as an open item.
 
-### 10.1f-rg Does `row_group_rows` need to scale with leaf count? Partly answered
+### 10.1f-rg Does `rows_per_row_group` need to scale with leaf count? Partly answered
 
 Open question 15 proposes scaling the row-group row count inversely with leaf count. The size
-half is answerable without a code change, because `row_group_rows` is already a per-table
+half is answerable without a code change, because `rows_per_row_group` is already a per-table
 property: load once, then for each candidate value convert native -> `pq` and measure what the
 server writes (`~/pq-lab/sweep_rg_by_width.sh`).
 
@@ -2414,7 +2455,7 @@ server writes (`~/pq-lab/sweep_rg_by_width.sh`).
 5 000-row point reproduces §10.1f-prod's 50.9 % exactly, from a separate run and a separate
 script, which is the cross-check that makes the rest of the column trustworthy:
 
-| `row_group_rows` | pq bytes | Ratio |
+| `rows_per_row_group` | pq bytes | Ratio |
 |---:|---:|---:|
 | 5 000 (default) | 1 887 314 | 50.9 % |
 | 20 000 | 1 809 544 | 48.8 % |
@@ -2438,7 +2479,7 @@ why it was unaffected.
 no effect on a wide table, generalising from one synthetic schema. The guarded sweep on the real
 Backblaze table then showed it does:
 
-| `row_group_rows` | pq bytes | Ratio |
+| `rows_per_row_group` | pq bytes | Ratio |
 |---:|---:|---:|
 | 5 000 (default) | 20 803 872 | 95.0 % |
 | 20 000 | 19 908 060 | 91.0 % |
@@ -2446,7 +2487,7 @@ Backblaze table then showed it does:
 | 200 000 | 19 908 060 | 91.0 % |
 
 **The correct statement is that the effective row-group size is
-`min(row_group_rows, whatever the byte budget allows)`, and which term binds depends on how much
+`min(rows_per_row_group, whatever the byte budget allows)`, and which term binds depends on how much
 shredder memory a row costs — which is a property of row *density*, not of column count.** Two wide
 tables land on opposite sides of it:
 
@@ -2463,7 +2504,7 @@ That decomposes Backblaze's export-to-production gap. Against the guarded native
 the row default and three quarters is the byte budget** — and the byte budget is a memory-safety
 knob (R-13), not a tuning dial.
 
-**So open question 15 is reframed rather than withdrawn.** Scaling `row_group_rows` by leaf count
+**So open question 15 is reframed rather than withdrawn.** Scaling `rows_per_row_group` by leaf count
 would buy about 4 points on a sparse wide table and nothing at all on a dense one, because on the
 dense one it is not the binding constraint. The question worth pursuing is whether
 `row_group_buffer_bytes` should vary by shape, which is harder: it trades against OOM rather than
@@ -2471,7 +2512,7 @@ against latency, and the same 64 MiB means very different row counts across the 
 
 The narrow-table result stands and settles the default. Measured at 3 000 random point reads:
 
-| `row_group_rows` | point mean | scan memory | pq bytes |
+| `rows_per_row_group` | point mean | scan memory | pq bytes |
 |---:|---:|---:|---:|
 | 5 000 (default) | 1 258 us | 5 548 kB | 1 269 816 |
 | 20 000 | 1 784 us | 19 900 kB | 1 235 425 |
@@ -2540,7 +2581,7 @@ of table width — D12 has ten CQL columns and wins most; D2 has 197 and wins se
   `scylla sstable parquet-export` accumulates the whole sstable in the shredder and calls
   `fragment_shredder::to_parquet()`, which emits one row group for everything. The
   row-group cutting that the storage writer does lives in `pq_writer_impl`, which the export
-  path never enters. Re-running the whole corpus after changing the `row_group_rows` default
+  path never enters. Re-running the whole corpus after changing the `rows_per_row_group` default
   from 1 000 000 to 5 000 produced **byte-identical Parquet figures**, which is how this was
   found. Production files are larger by the cutting cost, measured at **+7.4 %** on the
   perf-test dataset (§10.4c). So every ratio here is optimistic by roughly that much, and the
@@ -2884,7 +2925,7 @@ scale is still to do.
 | D1 ClickBench (105 cols) | 15 761 792 | 16 177 362 | 16 177 362 | **−2.6 %** |
 
 No universal answer: narrow tables want large row groups (dictionary and delta state
-amortise), while ClickBench is *better* with smaller ones. Confirms `row_group_rows` must
+amortise), while ClickBench is *better* with smaller ones. Confirms `rows_per_row_group` must
 stay user-tunable (§8.2) — a single cluster-wide value costs 3–17 % depending on schema.
 
 ### 10.3 Sensitivity to metadata folding level
@@ -3284,7 +3325,7 @@ finding those repeats and the dictionary page was mostly overhead.
 | 20 000 | 1 252 083 | 2 836 µs |
 
 8 192 is the default: +1.9 % size over the largest page for 24 % lower latency. Like
-`row_group_rows` (§8.2), it stays tunable, because the right point on that curve depends
+`rows_per_row_group` (§8.2), it stays tunable, because the right point on that curve depends
 on whether a table is scanned or probed.
 
 #### The target still missed
@@ -3322,7 +3363,7 @@ table, not the size.
 The writer emits `min(page_values, row group size)` values per page. With `page_values` at 8 192
 and row groups cut at 5 000 rows (§10.4c), the page bound never bound: every data page covered a
 whole row group, so a point read decoded 5 000 values to return one row. The same defect as
-`row_group_rows` before it was changed — a knob whose value could not reach the code — and it went
+`rows_per_row_group` before it was changed — a knob whose value could not reach the code — and it went
 unnoticed because fixing the *other* one is what made this one dead.
 
 Re-swept at the current row-group default, 3 000 random point reads, one pinned core:
@@ -3663,7 +3704,7 @@ row-group tuning is now exhausted — both act only on the 29 %.
 grows with row-group count. Tested directly by varying row groups at a fixed 2 048-value page, so
 decode volume is held constant while the footer shrinks 20-fold:
 
-| `row_group_rows` | point p50 | scan memory |
+| `rows_per_row_group` | point p50 | scan memory |
 |---:|---:|---:|
 | 5 000 | 776 us | 5 612 kB |
 | 20 000 | 731 us | 19 900 kB |
@@ -3773,7 +3814,7 @@ mean / 41.4x p50**. The p99 ratio is only 6.5x, because the native format's p99 
 times its own p50 while Parquet's (1 551 us) is 1.3x — the columnar path is far more predictable,
 it is just uniformly slower.
 
-**A consequence worth stating:** with `row_group_rows` at 5 000, a row group holds about 9 MB of
+**A consequence worth stating:** with `rows_per_row_group` at 5 000, a row group holds about 9 MB of
 shredder buffer, far under the 64 MiB budget -- so the row count becomes the operative limit and
 `row_group_buffer_bytes` reverts to being purely a safety net against a pathological partition.
 That is the right division of labour between the two knobs, and it is the opposite of today's
@@ -4766,19 +4807,25 @@ the same data.
 ### 10.21 Point reads, measured properly — 2026-08-20, and it invalidates §10.4's method
 
 Re-measured with `BYPASS CACHE`, production cache settings, interleaved arms, a constant-cost canary
-and min-of-400-probes as the estimator (`pointread_v2.py`). 8 M rows, `row_group_rows` swept to vary
+and min-of-400-probes as the estimator (`pointread_v2.py`). 8 M rows, `rows_per_row_group` swept to vary
 row groups per file at a fixed row count. Note the direction, because the shorthand `rg=` used in
-earlier versions of these tables made it easy to misread: `row_group_rows` is *rows per group*, so
+earlier versions of these tables made it easy to misread: `rows_per_row_group` is *rows per group*, so
 **lowering** it **raises** the number of row groups. 8 M rows at 1 000 rows per group is ~8 000
 groups; at 20 000 it is ~400. The setting and the count move in opposite directions.
+
+This misreading is why the property was renamed from `row_group_rows` on 2026-08-20 (§8.2): the
+old name could be parsed as "the number of row-group rows" *or* as "row groups, in rows", and the
+first reading inverts the tuning direction. A comment warning about it -- which is what this
+paragraph originally was -- only helps the reader who finds the comment; the name is what everyone
+else sees. The old name still parses, permanently, because it is persisted in schema.
 
 | arm | files | row groups | warm min | bypass min | cold min |
 |---|---:|---:|---:|---:|---:|
 | native | 1 | — | 254 | 455 | 462 |
-| `row_group_rows` 20 000 | 4 | 402 | 256 | 2 494 | 2 500 |
-| `row_group_rows` 5 000 | 4 | 1 601 | 249 | 3 942 | 3 958 |
-| `row_group_rows` 2 000 | 4 | 4 002 | 254 | 5 947 | 6 198 |
-| `row_group_rows` 1 000 | 4 | 8 001 | 256 | 10 155 | 10 905 |
+| `rows_per_row_group` 20 000 | 4 | 402 | 256 | 2 494 | 2 500 |
+| `rows_per_row_group` 5 000 | 4 | 1 601 | 249 | 3 942 | 3 958 |
+| `rows_per_row_group` 2 000 | 4 | 4 002 | 254 | 5 947 | 6 198 |
+| `rows_per_row_group` 1 000 | 4 | 8 001 | 256 | 10 155 | 10 905 |
 
 Canary min across every block: 224–244 µs, a 9 % spread, so the machine was quiet enough for the
 numbers to mean something — which matters on a shared 32-core box whose load average moved between
@@ -4820,7 +4867,7 @@ finally become visible, because page-level decode would be all that is left. So 
 *invert* once the cache lands. That is a prediction to measure, not to assume.
 
 **The trade is now quantified, and it points the opposite way from the size tuning.** At the shipping
-default of `row_group_rows = 5 000` an 8 M-row table gives 1 601 groups and an 8.6× cold point read.
+default of `rows_per_row_group = 5 000` an 8 M-row table gives 1 601 groups and an 8.6× cold point read.
 Fewer, larger row groups improve point reads — 402 groups is 5.4× — while scan-side projection and
 size want the opposite (§10.4a). Whoever tunes this is choosing between them explicitly rather than
 finding a setting that is good for both.
@@ -4885,10 +4932,10 @@ improvement attributable to the cache rather than to anything else that moved in
 | arm | row groups | §10.21 cold | squeezed (control) | cached | cached vs control |
 |---|---:|---:|---:|---:|---:|
 | native | — | 462 | 460 | 470 | — |
-| `row_group_rows` 20 000 | 402 | 2 500 | 2 563 | **1 684** | 1.5× |
-| `row_group_rows` 5 000 | 1 601 | 3 958 | 4 321 | **1 361** | 3.2× |
-| `row_group_rows` 2 000 | 4 002 | 6 198 | 6 196 | **1 030** | 6.0× |
-| `row_group_rows` 1 000 | 8 001 | 10 905 | 10 458 | **832** | 12.6× |
+| `rows_per_row_group` 20 000 | 402 | 2 500 | 2 563 | **1 684** | 1.5× |
+| `rows_per_row_group` 5 000 | 1 601 | 3 958 | 4 321 | **1 361** | 3.2× |
+| `rows_per_row_group` 2 000 | 4 002 | 6 198 | 6 196 | **1 030** | 6.0× |
+| `rows_per_row_group` 1 000 | 8 001 | 10 905 | 10 458 | **832** | 12.6× |
 
 All figures µs, cold minimum. Canary min 225–261 µs (16 % spread) on the cached run and 225–253 µs
 (12 %) on the control, against 224–244 µs in §10.21 — so all three are comparable and none of this
@@ -4908,7 +4955,7 @@ term it was competing with is gone and what remains is the per-chunk dictionary 
 read fetches inside its group. §10.21 said "the ordering could invert once the cache lands; that is
 a prediction to measure, not to assume". It inverted.
 
-**This changes the tuning advice back.** With the cache, `row_group_rows` no longer trades point-read
+**This changes the tuning advice back.** With the cache, `rows_per_row_group` no longer trades point-read
 latency against size in the same direction: smaller groups are both faster to point-read *and* worse
 for size (§10.2), which is the trade §10.4c originally described at test scale. The
 larger-row-groups-for-latency argument in §10.21 applies to the *uncached* first read, which is what
@@ -5634,13 +5681,13 @@ recorded here rather than guessed at.
     (L1, sparse exceptions). §6 specifies table-level control of folding level and row
     group sizing; wiring the schema properties through to the writer is not done.
 15. **Should `row_group_buffer_bytes` vary by shape?** (Reframed 2026-08-18 — the original
-   form, "`row_group_rows` should scale inversely with leaf count", is answered in §10.1f-rg: it
+   form, "`rows_per_row_group` should scale inversely with leaf count", is answered in §10.1f-rg: it
    buys ~4 points on a sparse wide table and nothing on a dense one, because there the byte budget
-   binds first.) The effective row-group size is `min(row_group_rows, what 64 MiB of shredder
+   binds first.) The effective row-group size is `min(rows_per_row_group, what 64 MiB of shredder
    memory allows)`, and the second term varies enormously across the corpus because it depends on
    row density. The hard part is that this budget exists to stop a shard OOMing (R-13), so it
    cannot simply be raised for size. Superseded rationale follows.
-   **`row_group_rows` should scale inversely with leaf count.** A single default cannot suit
+   **`rows_per_row_group` should scale inversely with leaf count.** A single default cannot suit
    both ends of the corpus. Every row group writes a column-chunk header plus statistics per
    leaf, so at the 5 000-row default a 300 000-row table has 60 row groups and pays that fixed
    cost 11 940 times on a 199-leaf table against 420 times on a 7-leaf one. Measured
@@ -5649,12 +5696,12 @@ recorded here rather than guessed at.
    a 23 % win and a 4 % one. A rule of the shape `rows = clamp(target_chunk_bytes * leaves⁻¹)`
    would equalise the metadata overhead across shapes; the target has to be chosen against
    point-read latency, which is what the row count buys. Until then, wide tables should be given
-   a larger `row_group_rows` explicitly via the `parquet` property (§8.2).
+   a larger `rows_per_row_group` explicitly via the `parquet` property (§8.2).
 16. **C2 should gate on rows, not bytes.** Its purpose is "enough row groups to amortise the
    per-row-group metadata", which is a row count. Expressed in bytes it is shape-dependent: four
    row groups is 126 kB at ISD-Lite's 6.3 B/row and 1.4 MB at Backblaze's 69 B/row, so any single
    byte threshold admits under one row group on a wide table while correctly excluding it on a
-   narrow one. The fix is `rows >= 4 x row_group_rows` in `tiering_inputs`, fed from sstable
+   narrow one. The fix is `rows >= 4 x rows_per_row_group` in `tiering_inputs`, fed from sstable
    stats. The 256 KiB byte floor set in §10.1f-c2 is the interim form.
 
 ## 10.9 Downgrade: what happens, and the procedure
