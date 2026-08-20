@@ -5485,6 +5485,17 @@ raises no bias question: it changes when a read is abandoned, not what it does, 
 the same value in the same session. The 2 % slice of §10.25 is retained as a cross-check rather than
 replaced, and it agrees to 1.2–1.5×.
 
+Two pieces of lab state this leaves behind, recorded because a later measurement inherits both. The
+node now stands at **300 s** rather than back at 10 s — the slowest arm here ran 66 s, so the default
+makes a whole-table scan on one shard unmeasurable rather than merely slow, which is the trap §10.25
+fell into; the standing cost is that a genuine range-scan timeout regression would show up on this
+node as a slow query instead of a failed one, so anything testing whether a scan fits the production
+default must put 10 s back for the duration. And the **`pqps` keyspace is kept** (535 MB, 10 arms at
+8 M rows), because these figures overturn the format's headline claim and re-probing them is 14
+minutes against 45 to rebuild. `select_internal_page_size` and `read_request_timeout_in_ms` were both
+raised for single probes and are back at their defaults — written back explicitly, since a LiveUpdate
+option keeps its last live value when the key is merely deleted from the file.
+
 ### 10.22 Footer size, measured per file and per row group
 
 Prerequisite for deciding whether a metadata cache is worth building (§10.4l), measured on the same
