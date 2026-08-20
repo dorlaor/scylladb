@@ -4592,11 +4592,23 @@ droppable — but a cell tombstone that shadows nothing may be droppable under r
 not verified, and asserting a Scylla-wide correctness claim on the strength of a size measurement
 would be exactly the overreach the rest of this section avoids.
 
-**The next step is a bisect, not another hypothesis.** Measure `__ldt` population after *each* stage
-of the sweep instead of only at the end: six measurements name the compaction that drops them, and
-from there the question becomes a specific one about that compaction's purge decision rather than a
-search. If it turns out to be droppable-by-design, the anomaly is fully explained and Backblaze's
-corpus figure should be taken from a run with `tombstone_gc` pinned so it stops varying.
+**The next step is a bisect, not another hypothesis, and the instrument exists.** Native sstable size
+cannot be the signal — the codec sweep moves it from 242 MB to 32 MB, which buries a ~10 MB tombstone
+effect. But the sstable Statistics carry `estimated_tombstone_drop_time`
+(`sstables/types.hh`), and the in-tree tool reads it without needing a running node or a schema file,
+autodetecting the schema from the sstable's own path:
+
+```bash
+scylla sstable dump-statistics <path>/me-...-Data.db   # -> stats.estimated_tombstone_drop_time
+```
+
+Empty means no tombstones; populated means they are there. Verified against a table known to have
+none, which returns `{}`. So the bisect is six invocations — after the flush and after each of the
+five codec rewrites — and it names the compaction that drops the tombstones without any further
+guesswork. From there the question becomes a specific one about that compaction's purge decision.
+
+If it turns out they are droppable by design, the anomaly is fully explained and Backblaze's corpus
+figure should be taken from a run with `tombstone_gc` pinned so it stops varying between runs.
 
 **No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
