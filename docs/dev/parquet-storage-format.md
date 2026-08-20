@@ -5818,7 +5818,7 @@ provider-id shape with an empty id) encrypts and reads back too, since that is t
 deployment actually writes. The format layer is covered from both directions in
 `sstables/parquet/run_tests.sh` suites 19 and 20.
 
-**Per-column keys: written, and not yet interoperable.** The writer now takes a key per column,
+**Per-column keys: interoperable, after one absent field.** The writer now takes a key per column,
 encrypts that column's pages, dictionary page and OffsetIndex under it, emits
 `EncryptionWithColumnKey` in `ColumnCryptoMetaData`, and moves the `ColumnMetaData` out of the
 footer into `ColumnChunk.encrypted_column_metadata`. Verified from three directions:
@@ -5828,22 +5828,54 @@ footer into `ColumnChunk.encrypted_column_metadata`. Verified from three directi
   other column as present-but-encrypted rather than as a malformed footer;
 - **pyarrow, given the footer key alone, reads the footer-key column and cannot touch the
   column-key one** -- which is the partial access the feature exists for, working through a stock
-  reader.
+  reader;
+- **pyarrow, given both keys, reads both columns**, values exact. `test_encrypt_interop.py`
+  asserts all four of these.
 
-But pyarrow given *both* keys still cannot decrypt the column-key column: `Failed decryption
-finalization`. Our reader can, and our reader also decrypts parquet-cpp's own per-column files
-(§ suite 19), so **the divergence is on our write side and is not yet found.** Ruled out so far: the
-AAD module type and ordinals (the conformance test decrypts parquet-cpp's `encrypted_column_metadata`
-with exactly the AAD our writer builds), which key encrypts the column metadata (the column's, not
-the footer's, again from parquet-cpp's file), and the envelope layout (the 4-byte length prefix is
-included, same as ours). Next suspects are `RowGroup.ordinal`, which our writer does not emit at all,
-and the field order or presence rules around `ColumnChunk` fields 3/8/9.
+**The bug that blocked that last line was one absent field: `RowGroup.ordinal`.** For a day this
+section said pyarrow given both keys failed with `Failed decryption finalization` and that the cause
+was unfound. It is worth recording how it was found, because the first three rounds of searching
+looked in the wrong place.
 
-**So per-column keys are not exposed through CQL.** A property that produced files only Scylla could
-read would defeat the reason for encrypting inside the format, and shipping it as an option while
-that is true would be the "setting that lies" failure mode this codebase keeps refusing elsewhere.
-The interop suite prints the gap on every run rather than asserting it, and says what to change when
-it closes.
+parquet-format marks `RowGroup.ordinal` optional, and our writer never emitted it -- the row group's
+position in the file says the same thing. But **parquet-cpp reads the encryption AAD's row-group
+ordinal out of that field, and substitutes -1 when the field is absent.** So for our files it built
+the AAD for the encrypted `ColumnMetaData` with `0xFFFF` where our writer had put `0x0000`, and the
+GCM tag did not verify. Nothing else in the file is affected: the footer module has no ordinals at
+all, and for page headers and page bodies parquet-cpp takes the row-group ordinal from the row
+group's *position*, not from this field. `ColumnChunk.encrypted_column_metadata` is the single module
+keyed off it -- which is exactly why uniform mode, where the `ColumnMetaData` sits inline inside an
+already-encrypted footer and that module type is never used, worked from the first day.
+
+**Why the earlier attempts missed it.** They compared our file with parquet-cpp's *structurally*,
+using our own parser, and asked whether each field was present and plausible. `RowGroup.ordinal` was
+absent from ours and `0` in parquet-cpp's, which reads as "an optional field with its default value"
+-- the least suspicious difference in the file. The AAD was also checked, but by enumerating
+row-group ordinals 0 and 1: nobody tried -1, because -1 is not a row group.
+
+**What did find it was bisection on files rather than reasoning about them**, in two steps, both
+scriptable against pyarrow with no Scylla build in the loop:
+
+1. *A control from the working side.* Take parquet-cpp's own `percol_gcm.parquet`, decrypt its
+   `encrypted_column_metadata` and re-encrypt it with **our** envelope code, our AAD and a fresh
+   nonce, re-encrypt the footer, and hand it back to pyarrow. It still read it. That eliminated the
+   entire cipher/envelope/AAD-construction surface in one measurement and moved the search to "what
+   else is different about our file".
+2. *Mutate our file toward theirs, one field at a time.* Decrypt our footer, change exactly one
+   thing, re-serialise, re-encrypt, ask pyarrow. Adding `RowGroup.ordinal = 0` -- and nothing else
+   -- turned the failure into a full read of both columns. Re-encrypting the module under an AAD
+   with the row-group ordinal forced to `0xFFFF` then confirmed the mechanism directly.
+
+The lesson generalises past encryption: **a field whose value is the default is not the same as an
+absent field**, once anything derives a *computation* from its presence. The fix is two lines in
+`write_footer()`, plus a guard, since the field is an `i16` and a file with more than 32768 row
+groups therefore has no ordinal to write -- such a file cannot be encrypted at all, and now says so
+instead of silently reusing an AAD.
+
+**Per-column keys are still not exposed through CQL**, but for a different reason than before.
+Interop is no longer the blocker; what is missing is the property syntax for "which columns get
+which keys" and the decision about how a reader is told the per-column key ids. That is a design
+question, not a bug.
 
 **The `ent/encryption` alignment — built, and the conflict is what shaped it.**
 
@@ -6473,7 +6505,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
 | Backblaze 4× anomaly | **localised, not solved** | Mechanism found (§10.18): the per-cell tombstone/exception channel is sometimes stored (60 MB across 407 synthetic leaves) and sometimes collapsed (2.7 MB). Not batch-only as previously claimed -- 1 in 7 standalone passes, 2 of 2 batch runs. Why it collapses is open. No published figure depends on it. |
-| Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Not covered: key rotation (unexercised), per-column keys (written but not yet interoperable), plaintext-footer mode, node-global `user_info_encryption`. |
+| Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). Not covered: key rotation (unexercised), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done, both storage types** | Specified in §10.9, and the behaviour it rests on is observed on local disk *and* on object storage (§10.20): an older node aborts at startup on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |

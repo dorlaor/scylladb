@@ -284,14 +284,16 @@ interoperability that is the whole argument for Parquet. Built and verified end 
 
 Still open within it:
 
-- **Per-column keys are written but not interoperable.** The writer emits them and our reader
-  round-trips them; pyarrow with the footer key alone correctly reads the footer-key column and
-  cannot touch the column-key one (which is the partial access the feature is for), but pyarrow
-  *with* the column key still fails to decrypt it. Our reader handles parquet-cpp's own per-column
-  files, so the bug is on our write side. Ruled out: the AAD ordinals and module type, which key
-  encrypts the column metadata, and the envelope layout. Next suspects: `RowGroup.ordinal`, which
-  we never emit, and the `ColumnChunk` field 3/8/9 presence rules. Not exposed through CQL until
-  this closes.
+- ~~**Per-column keys are written but not interoperable.**~~ **Interoperable as of 2026-08-20.**
+  The cause was `RowGroup.ordinal`, which our writer never emitted. parquet-cpp takes the AAD's
+  row-group ordinal from that Thrift field and substitutes **-1** when it is absent, so its AAD
+  for the encrypted `ColumnMetaData` carried `0xFFFF` where ours carried `0x0000` — a tag
+  mismatch reported as "Failed decryption finalization". Uniform mode never noticed because it is
+  the only module parquet-cpp keys off that field; page and footer modules get their ordinals from
+  position. The writer now emits it, and `test_encrypt_interop.py` asserts the both-keys case.
+  What remains open is the **CQL surface**: per-column keys are still not exposed as a table
+  property, because that needs a syntax for "which columns, which keys" and a decision about how
+  the ids reach a reader — a separate design question from interop.
 - ~~**Alignment with `ent/encryption`.**~~ **Done, 2026-08-20.** The bespoke
   `parquet_encryption_key_file` and its `key_registry` are deleted; the key now comes from
   `encryption_context::get_provider()` with `scylla_encryption_options`' own option vocabulary
