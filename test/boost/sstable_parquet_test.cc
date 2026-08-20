@@ -36,6 +36,7 @@
 #include "test/lib/mutation_assertions.hh"
 #include "test/lib/mutation_reader_assertions.hh"
 #include "test/lib/reader_concurrency_semaphore.hh"
+#include "test/lib/eventually.hh"
 
 #include "schema/schema_builder.hh"
 #include "readers/from_mutations.hh"
@@ -43,6 +44,7 @@
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "sstables/sstables.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
+#include "sstables/parquet/footer_cache.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
 #include "mutation/collection_mutation.hh"
@@ -1675,4 +1677,124 @@ SEASTAR_THREAD_TEST_CASE(test_unknown_sstable_version_is_rejected) {
     for (const char* bad : {"zz", "pqq", "p", "", "PQ"}) {
         BOOST_REQUIRE_THROW(sstables::version_from_string(bad), std::out_of_range);
     }
+}
+
+// The parsed-footer cache (design doc 10.4l) must be invisible to a reader except in the metrics.
+// Two things have to hold, and the second is the one that can silently break: a dropped entry has
+// to be re-parsed rather than read as an empty footer, and the entry has to stay immutable after
+// publication -- a reader that materialised a row group *into* the shared entry would both grow it
+// without bound over a scan and hand another reader half-decoded state.
+SEASTAR_THREAD_TEST_CASE(test_pq_footer_cache_is_transparent_across_reclaim) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 16, 10);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto stats_of = [] { return sstables::parquet::footer_cache_stats_local(); };
+
+        // make_sstable_containing() validates by reading, which has already populated the entry.
+        // Drop it so that the first counted read below is a miss.
+        sstables::test(sst).reclaim_memory_from_components();
+        BOOST_REQUIRE(!sst->pq_footer_cache());
+
+        const auto before_first = stats_of();
+        auto first = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(first.size(), expected.size());
+        BOOST_REQUIRE_EQUAL(stats_of().misses - before_first.misses, 1u);
+        BOOST_REQUIRE_EQUAL(stats_of().populations - before_first.populations, 1u);
+
+        auto entry = sst->pq_footer_cache();
+        BOOST_REQUIRE(entry);
+        const size_t entry_bytes = entry->memory_size();
+        // Measured, not assumed: an entry that reported zero would be reclaim-invisible, which is
+        // the failure mode that makes an evictable cache un-evictable.
+        BOOST_REQUIRE_GT(entry_bytes, 0u);
+        BOOST_REQUIRE_EQUAL(stats_of().bytes, entry_bytes);
+
+        // A second read hits, and returns the same data.
+        const auto before_second = stats_of();
+        auto second = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(stats_of().hits - before_second.hits, 1u);
+        BOOST_REQUIRE_EQUAL(stats_of().misses - before_second.misses, 0u);
+        BOOST_REQUIRE_EQUAL(second.size(), expected.size());
+        for (size_t i = 0; i < second.size(); ++i) {
+            assert_that(second[i]).is_equal_to(expected[i]);
+        }
+        // The hit did not mutate the entry: same object, same size.
+        BOOST_REQUIRE(sst->pq_footer_cache().get() == entry.get());
+        BOOST_REQUIRE_EQUAL(entry->memory_size(), entry_bytes);
+
+        // Now what the reclaimer does. This is the same call sstables_manager makes when
+        // _total_reclaimable_memory crosses components_memory_reclaim_threshold.
+        const auto before_evict = stats_of();
+        const size_t reclaimed = sstables::test(sst).reclaim_memory_from_components();
+        BOOST_REQUIRE_GE(reclaimed, entry_bytes);
+        BOOST_REQUIRE(!sst->pq_footer_cache());
+        BOOST_REQUIRE_EQUAL(stats_of().evictions - before_evict.evictions, 1u);
+        BOOST_REQUIRE_EQUAL(stats_of().bytes, before_evict.bytes - entry_bytes);
+        // Nothing is owed to the reload fiber for it: the next read re-parses it. Reclaiming the
+        // bloom filter alongside is what the remaining balance is.
+        BOOST_REQUIRE_LT(sstables::test(sst).total_reclaimable_memory_size(), entry_bytes);
+
+        // And the read after the eviction is a miss that returns identical data.
+        const auto before_third = stats_of();
+        auto third = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(stats_of().misses - before_third.misses, 1u);
+        BOOST_REQUIRE_EQUAL(third.size(), expected.size());
+        for (size_t i = 0; i < third.size(); ++i) {
+            assert_that(third[i]).is_equal_to(expected[i]);
+        }
+        // Re-parsing an immutable file must produce a byte-identical entry.
+        BOOST_REQUIRE(sst->pq_footer_cache());
+        BOOST_REQUIRE_EQUAL(sst->pq_footer_cache()->memory_size(), entry_bytes);
+
+        // Single-partition reads go through the same footer, so evicting between them must not
+        // change an answer either. This is the path a point read takes.
+        for (const auto& want : expected) {
+            sstables::test(sst).reclaim_memory_from_components();
+            auto pr = dht::partition_range::make_singular(want.decorated_key());
+            auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+            auto close = deferred_close(rd);
+            auto got = read_mutation_from_mutation_reader(rd).get();
+            BOOST_REQUIRE(got);
+            assert_that(*got).is_equal_to(want);
+        }
+    }).get();
+}
+
+// The reclaimer has to be able to reach the footer cache through the manager's own policy, not
+// only through a direct call: the whole point of registering with the existing machinery is that
+// components_memory_reclaim_threshold governs it. available_memory = 0 makes the threshold zero,
+// so anything the read publishes is immediately over it.
+SEASTAR_THREAD_TEST_CASE(test_pq_footer_cache_is_reclaimed_by_the_manager) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 8, 10);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto before = sstables::parquet::footer_cache_stats_local();
+        auto got = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+
+        // The reclaim fiber runs on the maintenance scheduling group, so this is eventual.
+        REQUIRE_EVENTUALLY_EQUAL<bool>([&] { return bool(sst->pq_footer_cache()); }, false);
+        BOOST_REQUIRE_GT(sstables::parquet::footer_cache_stats_local().evictions, before.evictions);
+
+        // And the sstable still reads correctly with the reclaimer racing every read.
+        for (int i = 0; i < 3; ++i) {
+            auto again = read_all(sst, s, env.make_reader_permit());
+            BOOST_REQUIRE_EQUAL(again.size(), expected.size());
+            for (size_t j = 0; j < again.size(); ++j) {
+                assert_that(again[j]).is_equal_to(expected[j]);
+            }
+        }
+    }, {
+        // Zero available memory means the reclaim threshold is zero: the cache is dropped as soon
+        // as it is published.
+        .available_memory = 0
+    }).get();
 }
