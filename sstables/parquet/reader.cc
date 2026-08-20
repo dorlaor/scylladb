@@ -30,11 +30,14 @@
 #include "types/types.hh"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/util/log.hh>
 
 #include <bit>
 #include <cstring>
 
 namespace sstables::parquet {
+
+static seastar::logger pqlog("pq_reader");
 
 namespace {
 
@@ -227,17 +230,34 @@ namespace {
 // pages outside the requested rows using the V2 header's num_rows without
 // decompressing them.
 // ---------------------------------------------------------------- profiling
-// Six phases, chosen to match the candidates in design doc 10.4g so the report answers the
-// question that was actually asked rather than whatever was easy to instrument.
+// Phases chosen to match the candidates in design doc 10.4g so the report answers the question that
+// was actually asked rather than whatever was easy to instrument.
+//
+// **The phases are non-overlapping, and that is a property the report depends on** -- its share
+// column is each phase against the sum, which means nothing if one phase contains another. Two
+// corrections were needed to make it true, both recorded in design doc 10.27:
+//
+//   * `page_decode` used to wrap the whole of decode_paged() and so *contained* page_fetch and
+//     decode_cpu, which the report then also added into its own total. Every share was diluted by
+//     the double count. It is gone; its two halves were always the interesting part of it, and what
+//     is left of it is extent planning.
+//   * the **streaming** path had no timer at all. That was harmless when only a scan streamed, and
+//     wrong the moment 10.26's window fix made a point read at the shipping defaults stream too:
+//     the row-group fetch and its decode -- by then the whole of the read's data cost -- were
+//     invisible, so a profile of a shipping-default point read attributed essentially all of it to
+//     the footer by omission. rg_fetch and rg_decode are that path.
 enum class rphase : size_t {
     footer_io,      // the two bounded reads that fetch the footer
-    footer_parse,   // Thrift decode of FileMetaData
+    footer_parse,   // Thrift decode of FileMetaData, plus the footer decrypt for a PARE file
     schema_recover, // rebuilding the mapped schema from the footer
     index_lookup,   // partition key -> row ordinal, via the sstable index
+    rg_materialise, // one row group's column metadata, decoded out of the retained footer bytes
     offset_index,   // reading and parsing the OffsetIndex for the projected columns
-    page_decode,    // the whole of decode_paged, i.e. the two sub-phases below plus overhead
-    page_fetch,     // sub-phase: the data_read calls that pull dictionary and data pages
-    decode_cpu,     // sub-phase: header parse and value decode, no I/O
+    rg_fetch,       // streaming path: one sequential read of a whole row group
+    rg_decode,      // streaming path: decode of that row group's wanted rows
+    page_fetch,     // paged path: the data_read calls that pull dictionary and data pages
+    decode_cpu,     // paged path: header parse and value decode, no I/O
+    reassemble,     // levels and values -> CQL rows, common to both paths
     _count
 };
 
@@ -370,6 +390,7 @@ class pq_reader : public mutation_reader::impl {
     // columns(). The group's own index inside _rgmd is always 0.
     void need_columns(size_t rg) {
         if (_rgmd_rg == rg) { return; }
+        rtimer _t{rphase::rg_materialise};
         _rgmd.row_groups.assign(1, _cf->md.row_groups.at(rg));
         format::materialise_row_group(_rgmd, 0, footer_bytes());
         _rgmd_rg = rg;
@@ -529,10 +550,14 @@ future<> pq_reader::load_footer() {
     // Footer only: the last 8 bytes give its length, then one bounded read.
     const uint64_t len = _sst->ondisk_data_size();
     if (len < 12) { throw std::runtime_error("pq: data component too small"); }
+    // Local, per-miss accumulators alongside the global rprof ones: see the log line at the end.
+    std::chrono::steady_clock::duration t_fetch{}, t_parse{};
     temporary_buffer<char> tail;
     {
         rtimer _t{rphase::footer_io};
+        const auto t0 = std::chrono::steady_clock::now();
         tail = co_await _sst->data_read(len - 8, 8, _permit);
+        t_fetch += std::chrono::steady_clock::now() - t0;
     }
     uint32_t flen;
     std::memcpy(&flen, tail.get(), 4);
@@ -544,7 +569,9 @@ future<> pq_reader::load_footer() {
     temporary_buffer<char> raw;
     {
         rtimer _t{rphase::footer_io};
+        const auto t0 = std::chrono::steady_clock::now();
         raw = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+        t_fetch += std::chrono::steady_clock::now() - t0;
     }
     entry->encrypted = encrypted;
     if (!encrypted) {
@@ -552,6 +579,7 @@ future<> pq_reader::load_footer() {
                              reinterpret_cast<const uint8_t*>(raw.get()) + raw.size());
     } else {
         rtimer _t{rphase::footer_parse};
+        const auto t0 = std::chrono::steady_clock::now();
         auto region = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(raw.get()), raw.size());
         size_t consumed = 0;
@@ -586,6 +614,9 @@ future<> pq_reader::load_footer() {
         entry->footer = format::decrypt_module(region.subspan(consumed), rc.key, aad, nullptr,
                                                rc.algo, false);
         _crypto = std::move(rc);
+        // Includes the key fetch, which is a provider round trip rather than CPU. The log line
+        // says so; a PARE breakdown that hid it would misattribute a KMS call as decrypt cost.
+        t_parse += std::chrono::steady_clock::now() - t0;
     }
     {
         // Lazy: decode the schema and each row group's row count, but not the per-column
@@ -593,8 +624,10 @@ future<> pq_reader::load_footer() {
         // this read touches (design doc 10.4j). The footer bytes are retained so the wanted
         // group can be decoded on demand.
         rtimer _t{rphase::footer_parse};
+        const auto t0 = std::chrono::steady_clock::now();
         entry->md = format::parse_file_metadata(entry->footer, {}, format::semantic_check::yes,
                                                 format::metadata_mode::lazy);
+        t_parse += std::chrono::steady_clock::now() - t0;
     }
     entry->rg_start.reserve(entry->md.row_groups.size());
     for (const auto& g : entry->md.row_groups) {
@@ -602,6 +635,22 @@ future<> pq_reader::load_footer() {
         entry->total_rows += g.num_rows;
     }
     entry->measure();
+
+    // Per-miss breakdown, not an aggregate, and the reason it exists is that no aggregate could
+    // answer the question. A footer miss happens once per sstable, so in any run long enough to
+    // measure, the global rprof counters have summed one miss with thousands of hits and the miss
+    // is lost in them -- while the estimator every cold figure in the design doc uses (min over 400
+    // probes after one restart) discards it outright, because only the first of the 400 pays it.
+    // This is what §10.27 was measured with: at the shipping defaults a 568 kB footer over 399 row
+    // groups costs ~1 150 us to fetch and ~1 400 us to walk, and those 2.5 ms are 69 % of a genuine
+    // first read -- none of which appears in the 1 149 us the same read costs once cached.
+    if (rprof::enabled) {
+        pqlog.info("footer miss: {} bytes={} groups={} fetch={:.0f}us parse={:.0f}us{}",
+                   _sst->get_filename(), flen, entry->md.row_groups.size(),
+                   double(std::chrono::duration_cast<std::chrono::microseconds>(t_fetch).count()),
+                   double(std::chrono::duration_cast<std::chrono::microseconds>(t_parse).count()),
+                   encrypted ? " (PARE: parse includes decrypt)" : "");
+    }
 
     _cf = entry;
     // Published last, and only after the entry is complete and immutable. A concurrent reader
@@ -686,7 +735,10 @@ future<> pq_reader::load_row_group(size_t rg) {
     if (_cur_rg == rg) { co_return; }
     const auto [lo, hi] = row_group_span();
     if (lo >= hi) { throw std::runtime_error("pq: empty row group extent"); }
-    _rg_buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
+    {
+        rtimer _t{rphase::rg_fetch};
+        _rg_buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
+    }
     _rg_base = lo;
     _cur_rg = rg;
 }
@@ -844,7 +896,6 @@ future<bool> pq_reader::next_window() {
 
     std::vector<format::column_data> colsdata;
     if (!stream) {
-        rtimer _t{rphase::page_decode};
         colsdata = co_await decode_paged(rg, lo - _rg_start[rg], hi - _rg_start[rg]);
     } else {
         co_await load_row_group(rg);
@@ -854,10 +905,12 @@ future<bool> pq_reader::next_window() {
         // the read, because the chunks are contiguous and splitting the read around them would
         // cost more operations than it saves.
         const auto& elide = elidable_leaves(rg);
+        rtimer _t{rphase::rg_decode};
         colsdata = format::read_row_range(img, _rg_base, _rgmd, 0,
                                           lo - _rg_start[rg], hi - _rg_start[rg], crypto(),
                                           elide);
     }
+    rtimer _tr{rphase::reassemble};
     _rows = reassemble(_ms, _cols, colsdata, size_t(hi - lo));
     _cursor = hi;
     co_return true;
@@ -903,8 +956,9 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         co_await load_row_group(rg);
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
-        co_return format::read_row_range(img, _rg_base, _rgmd, 0, lo, hi, crypto(),
-                                         elidable_leaves(rg));
+        const auto& elide = elidable_leaves(rg);
+        rtimer _t{rphase::rg_decode};
+        co_return format::read_row_range(img, _rg_base, _rgmd, 0, lo, hi, crypto(), elide);
     }
 
     // Two extents per column: the dictionary page at the head of the chunk, and the
@@ -1254,11 +1308,15 @@ std::string reader_profile_report() {
     if (!rprof::enabled) {
         return "reader profile disabled (set PQ_READER_PROFILE=1)\n";
     }
+    // In enum order, and every one of them disjoint from the others -- see the note on rphase.
     static constexpr const char* names[] = {
-        "footer_io", "footer_parse", "schema_recover",
-        "index_lookup", "offset_index", "page_decode",
-        "  .page_fetch", "  .decode_cpu",
+        "footer_io", "footer_parse", "schema_recover", "index_lookup",
+        "rg_materialise", "offset_index",
+        "rg_fetch", "rg_decode",
+        "page_fetch", "decode_cpu",
+        "reassemble",
     };
+    static_assert(std::size(names) == size_t(rphase::_count));
     uint64_t total = 0;
     for (auto v : rprof::ns) { total += v; }
     std::string out = "  reader phase        total ms    calls     us/call     share\n";
