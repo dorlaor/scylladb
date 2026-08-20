@@ -88,11 +88,17 @@ Two of the three obstacles recorded here turned out to be avoidable rather than 
   row group it reads into a *one-group* `file_metadata` and passes index 0, so `read_row_range()`
   needs no new parameter and the shared entry is never mutated.
 
-**Still open, and it is the more important half.** A cache helps the *second* read of a file. The
-first read after a restart still fetches and walks the whole footer, and on a node that has just
-restarted every read is a first read — the control run in §10.24 is exactly that cost. The persisted
-side index of §10.23 ("row group → footer offset, length" beside `Data.db`, ~8 bytes per row group)
-is what makes the first read O(1), and it is not built.
+**The other half is measured and closed, by declining it.** A cache helps the *second* read of a
+file. The first read after a restart still fetches and walks the whole footer, and on a node that has
+just restarted every read is a first read — the control run in §10.24 is exactly that cost. The
+persisted side index of §10.23 ("row group → footer offset, length" beside `Data.db`, ~20 bytes per
+row group) is what would make the first read O(1).
+
+**§10.27 measured it at 2.5 ms per sstable — 69 % of a 3 680 µs first read — and decided against
+building it**, because that cost is paid once per sstable per restart (about half a second for a
+200-sstable shard) and nothing in steady state moves: every published cold ratio is `min` over 400
+probes and so a footer-cache hit. The design in `parquet-side-index-design.md` is kept, with the
+conditions that would reopen it, rather than queued.
 
 **Also not done:** the recovered `mapped_schema` is still rebuilt per reader. It is O(leaves), not
 O(row groups), so it does not scale with sstable size; caching it would mean keying by query schema,

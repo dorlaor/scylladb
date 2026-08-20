@@ -1,7 +1,39 @@
 # Row-group side index for `pq` sstables — design
 
-Status: **design only, nothing implemented.** Written while another change was in flight in
-`parquet-storage-format.md`, hence a separate file; fold it into §10.23 when that settles.
+Status: **measured, and decided against — 2026-08-20. Not implemented, and not planned.**
+The measurement and the reasoning are in `parquet-storage-format.md` §10.27; the summary is below.
+This file is kept because the design is sound and the decision is contingent on numbers that could
+change, not because the work is queued.
+
+## Decision
+
+**The cost is real and the design would remove it. It is not worth an on-disk structure.**
+
+At the shipping defaults (`rows_per_row_group` 5 000, ~400 row groups and 568 kB of footer per
+sstable), a genuine *first* read of an sstable costs **3 680 µs** where a subsequent read costs
+**1 149 µs**, and the **2 530 µs difference is the footer** — 69 % of the first read. Three
+independent estimators agree on it to within 3 %: defeating the footer cache with the reclaim
+threshold, the reader's own per-miss instrumentation, and the literal first reads after six restarts.
+Split roughly 45 % fetch / 55 % Thrift walk, both scaling with row groups.
+
+**What decides it is the frequency, not the share.** That 2.5 ms is paid once per sstable per
+restart — the footer cache holds it thereafter, and a shard's footer working set fits the reclaim
+budget at any sane row-group size — so a 200-sstable shard is exposed to about half a second of extra
+latency, once, per restart. Steady state does not move at all: every cold ratio published for `pq` is
+`min` over 400 probes and therefore a footer-cache *hit*, so the index would not change a single
+number in the document. Against that, the index has to be written on **both** write paths (the
+divergence behind two previous bugs), read at every sstable open, and kept working through compaction
+and `scylla-sstable`, with a fallback path to test for as long as the format exists.
+
+**Two hesitations recorded below were wrong when measured**, and both are corrected in place:
+residency is ~8 kB per sstable rather than ~40 kB, and an encrypted file would keep roughly half the
+benefit rather than losing most of it.
+
+**What would reopen it:** an SLO that covers the minutes after a restart, or a `rows_per_row_group`
+low enough that the footer working set stops fitting the reclaim budget (a thousand 1 601-group
+sstables want ~2.4 GB against 1.6 GB on an 8 G shard). Both are recognisable in advance.
+
+The rest of this file is the design as it stood, with the two measured corrections marked.
 
 ## The problem, restated from measurement
 
@@ -56,7 +88,7 @@ this way — `ent/encryption` stores its serialised options and key id there (`e
 - an sstable written before this change simply lacks the attribute, and the reader falls back to
   the current whole-footer path. **The fallback is the compatibility story** — there is no migration.
 
-## The one thing to measure before building
+## The one thing to measure before building — measured, and it is a non-issue
 
 `Scylla.db` is read when an sstable is opened, not lazily per read. So the index becomes resident
 for **every** open sstable, not just ones being read: 40 kB × sstables. A thousand 2 000-group
@@ -69,6 +101,13 @@ That suggests it should be **reclaimable on the same terms as the footer cache**
 machinery bloom filters and the footer cache already share — with re-read from `Scylla.db` on miss.
 Whether that is worth the complexity depends on the real number, so **measure resident size across a
 realistic sstable count first**. If 40 MB is noise, pin it and keep the code simple.
+
+> **Measured (§10.27): pin it, and none of the above is needed.** The 40 kB figure quotes the
+> 2 000-row-group arm, which this project argues against on both size and latency grounds. At the
+> *shipping* defaults an sstable holds ~400 row groups, so the index is **20 B × 400 ≈ 8 kB** and a
+> thousand sstables cost **8 MB**. The reclaim question never arises, and the paragraph above was
+> the wrong thing to have called "the one thing to measure before building" — the thing that
+> actually decided it was how often a first read happens.
 
 ## Interaction with the footer cache
 
@@ -96,3 +135,9 @@ checking against `cached_footer` before implementing.
   and decrypted before the slab can be cut out of it. **That removes most of the benefit for
   encrypted tables**, and is the one case where this design does not obviously pay. Needs thought
   before implementation, not after.
+
+  > **Measured (§10.27): about half the benefit is kept, not lost.** The fetch that an encrypted file
+  > cannot avoid is only ~45 % of the footer cost; the Thrift walk is ~55 %, and the index removes it
+  > for a `PARE` file exactly as for a plaintext one. Decryption is not the obstacle either — AES-GCM
+  > over a footer-sized buffer runs at ~5 GB/s, about 110 µs for 568 kB, against ~1 150 µs to fetch
+  > it. So this was the wrong reason to hesitate; the decision rests on frequency instead.

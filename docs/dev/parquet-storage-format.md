@@ -4945,6 +4945,17 @@ not to a steady-state node.
 
 ### 10.23 Why the whole footer is read for one row group — and how to stop
 
+> **Decided against, with the measurement, in §10.27 (2026-08-20).** The mechanism below is right and
+> so is the arithmetic: the footer is **69 % of a genuine first read** of an sstable at the shipping
+> defaults (2 530 µs of 3 680 µs, three independent estimators), and a side index would take that read
+> to parity with a warm one. It is not built, because 2.5 ms is paid **once per sstable per restart** —
+> roughly half a second, once, for a 200-sstable shard — and nothing in steady state moves: every
+> cold figure in §10.21, §10.24, §10.25 and §10.26 is `min` over 400 probes and therefore a footer-cache
+> *hit*, so the cost this section describes has never been inside any published number. Two of the
+> hesitations below and in `parquet-side-index-design.md` were also wrong when measured — residency is
+> 8 kB per sstable rather than 40, and an encrypted file keeps about half the benefit rather than
+> losing most of it. §10.27 has all of it, including what would reopen the question.
+
 Raised as an objection and it is a fair one: a point read needs one row group's entry, about
 1 420 bytes, and instead reads the entire footer — up to 2.84 MB at 2 000 row groups
 (`reader.cc:525`, `data_read(len - 8 - flen, flen)`).
@@ -5061,7 +5072,9 @@ number that made this evictable rather than pinned in the first place.
 
 **What the cache does not do.** The *first* read of an sstable after a restart still fetches and
 walks the whole footer — the squeezed column above is what that costs — and on a node that has just
-restarted, every read is a first read. That is §10.23's side index, and it is not built. Compaction
+restarted, every read is a first read. That is §10.23's side index, which §10.27 measured at **2.5 ms
+per sstable** and decided against building — the cost is real but paid once per sstable per restart,
+and the squeezed column here is the only place in this document where it appears at all. Compaction
 also publishes an entry per input sstable that it will never read twice, converting footer bytes into
 resident memory for the duration; the reclaimer bounds it, and "populate only for bounded reads" is
 the refinement if it ever shows up as pressure.
@@ -5674,6 +5687,194 @@ it is recorded as such in `parquet-future-work.md`. Note what it is now worth: o
 value columns the query does not name are ~94 % of the *bytes* but a scan already reads only 21.3 MB
 of a 23.4 MB file, so the ceiling on projection here is the difference between 0.91× read
 amplification and something below it — worth having on a wide table, no longer worth a headline.
+
+### 10.27 The side index, measured and decided against — 2026-08-20, and every "cold" figure in this document is a footer-cache hit
+
+§10.23 specified a persisted row-group side index and §10.24, §10.26 and the GA table all carry it as
+"specified, not built". This section measures the cost it would remove and **declines to build it**.
+The measurement is the deliverable; the reasoning it overturns is partly this document's own.
+
+#### The premise had to be re-derived, and not for the reason expected
+
+The suspicion going in was that §10.26's two read-path fixes had invalidated the case: they moved the
+shipping-default cold point read from 1 930 µs to **1 149 µs against native's 455**, and at those
+defaults a point read now *streams* a whole row group rather than paging it. If the footer had become
+a small share of that 1 149 µs, the index would be unjustifiable.
+
+**It is not a share of it at all.** Every cold figure in §10.21, §10.24, §10.25 and §10.26 is `min`
+over 400 probes taken after one node restart — and the footer cache means the footer is fetched and
+walked on the *first* of those 400 and never again. The minimum of 400 can only be a cache **hit**.
+So the quantity the side index attacks was never inside any published number, and the two fixes
+neither helped nor hurt it. §10.24's own sentence — "the *first* read of an sstable after a restart
+still fetches and walks the whole footer" — was exactly right, and the estimator that has been used
+ever since cannot see it.
+
+That is the methodological finding of this section, and it generalises: **`min`-of-N silently
+discards any cost paid once per sstable.** Anything amortised over the probe set — footer, summary
+page-in, bloom filter load — is invisible to the estimator §10.21 imposed, which is otherwise the
+right one.
+
+#### The cost, measured three independent ways
+
+All on `pqps.pqdef` (8 M rows, shipping `rows_per_row_group` 5 000 / `page_rows` 8 192, 4 sstables of
+399–402 row groups, 568 kB of footer each), `BYPASS CACHE`, production caching, native in the same
+block as the canary. The 40 `pqps` Data.db files were verified byte-identical by name and size across
+every restart here, so nothing recompacted and the rows compare directly against §10.26's.
+
+**1. Defeat the cache, so every read is a first read** (`~/pq-lab/footer_share.py`, two node
+sessions). `components_memory_reclaim_threshold` is live-updated to 3 × 10⁻⁵ — §10.24's control,
+reused here as the measurement — so the reclaimer takes every entry away as soon as a read publishes
+it. Blocks are interleaved within one session and the threshold is written back explicitly, since a
+LiveUpdate option keeps its last live value when its key is merely deleted.
+
+| arm | footer cached | every read a first read | difference | ratio |
+|---|---:|---:|---:|---:|
+| native (`me`) | 456 / 455 | 455 / 460 | ~0 | 1.00× / 1.01× |
+| **`pq`, shipping 5 000 / 8 192** | 1 177 / 1 149 | **3 756 / 3 680** | **2 578 / 2 530** | 3.19× / 3.20× |
+
+Two sessions, µs, cold minimum, canary spread 15 % and 2 %. **The native column is the control that
+matters**: the reclaimer drops bloom filters as well as footers, so squeezing costs both formats
+something that has nothing to do with Parquet — and it costs native nothing measurable, which is what
+makes the `pq` difference attributable to the footer. The cached column reproduces §10.26's published
+1 149 µs, which is what makes the two comparable.
+
+The squeeze is shown rather than assumed, from the footer-cache metrics per block: the cached blocks
+recorded **396 hits and 4 misses** over 400 probes — four sstables, parsed once — and the squeezed
+blocks **0 hits, 400 misses and 400 evictions**.
+
+**2. The reader's own per-miss instrumentation.** `PQ_READER_PROFILE=1` now logs one line per footer
+miss with the fetch and the walk timed separately (`pq_reader - footer miss: … fetch=…us parse=…us`),
+because no aggregate could answer this: a miss happens once per sstable, so any run long enough to
+measure has summed one miss with thousands of hits. Over the 400 misses of a squeezed pass:
+
+| phase | min | p50 |
+|---|---:|---:|
+| footer fetch, 568 kB | 817 | 1 153 |
+| footer walk, 399 row groups (lazy Thrift) | 1 392 | 1 435 |
+| **sum** | **2 254** | **2 600** |
+
+The fetch does **not** get cheaper across 400 repetitions of the same bytes (min 817, p50 1 153),
+which confirms these reads bypass the page cache and so that arm 1 really is a first-read proxy
+rather than a memcpy.
+
+**3. The literal first reads after a restart**, no configuration change at all — six restarts, `min`
+across them by read ordinal, six reads to distinct partitions each time:
+
+| | read 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| `pq`, shipping | 6 151 | 4 714 | 5 241 | **2 090** | 4 923 | **2 278** |
+| native | 525 | 683 | 592 | 625 | 599 | 558 |
+
+Four of the six land on an sstable whose footer is not yet loaded and cost 4 714–6 151 µs; reads 4
+and 6 land on one already loaded and cost ~2 100 µs — still above the 1 149 µs steady state, because
+the summary, index and bloom filter are also cold on a read that early. The difference between the
+two groups is **~2 550 µs**, which is the same number as arms 1 and 2 by a method that manipulates
+nothing. Native's first read is 525–683 µs against its 455 µs steady state: the row format has
+almost no first-read penalty, which is the comparison that matters.
+
+**Three estimators, ~2 530 / ~2 600 / ~2 550 µs.** Call it **2.5 ms**, split roughly 45 % fetch and
+55 % Thrift walk, both scaling with row groups per sstable.
+
+#### The decision: not worth an on-disk structure
+
+The footer is **69 % of a genuine first read** (2 530 of 3 680 µs), so the share test §10.23 set is
+passed comfortably. The index would take a first read from 3 680 µs to about 1 200 µs — to parity
+with the steady state. And two of the design's own worries turn out to be unfounded (below). So this
+is not a decision against a broken idea; it is a decision against a working one that is not worth
+what it costs.
+
+**The number that decides it is not the share, it is the frequency.** 2.5 ms is paid **once per
+sstable per restart** and never again — the footer cache holds it, and at 1 522 B per row group
+(§10.24) a shard's whole footer working set fits inside the 0.2 reclaim budget at any realistic
+sstable shape, so misses do not recur through thrashing. A shard with 200 sstables is therefore
+exposed to `2.5 ms × 200 ≈ 0.5 s` of aggregate extra latency, once, per restart. Nothing in steady
+state moves at all: the 1 149 µs and the 2.53× of native that §10.26 publishes, and every ratio in
+this document, are footer-cache hits and are **exactly unchanged** by the index.
+
+Against that: the index must be written on **both** write paths — `cut_row_group()` and the
+single-row-group `write_rows()`, the divergence that has already produced two separate bugs (§8.2b,
+§10.15) — must be read at sstable open, must be kept working through compaction and `scylla-sstable`,
+and leaves a fallback path to be tested for as long as the format exists. Half a second per restart
+does not buy that.
+
+**The cost also already scales the right way**, which is the reason to be comfortable. Footer cost is
+proportional to row groups, hence to sstable size — and a large sstable is also the one that serves
+many reads and amortises it, while a node with many small sstables has small footers. The pathology
+would be an sstable large enough for a costly footer but read once, which is compaction and
+streaming: both read the whole file anyway, so 2.5 ms is noise against seconds.
+
+**What would reopen this.** A workload whose SLO covers the minutes after a restart, or a
+`rows_per_row_group` setting low enough that the footer working set stops fitting the reclaim budget
+(§10.24 puts a thousand 1 601-group sstables at ~2.4 GB against 1.6 GB of budget on an 8 G shard, so
+the narrow settings this document already argues against are where it would bite). Both are
+recognisable in advance, and the design in `parquet-side-index-design.md` is kept for that reason.
+
+#### Two things the design guessed wrong, in opposite directions
+
+**Residency is a non-issue, not the open question.** The design's "one thing to measure before
+building" was that `Scylla.db` is read at sstable open, so the index goes resident for every open
+sstable at ~40 kB each — 40 MB per thousand — and might need to join the reclaim machinery. At the
+*shipping* defaults a sstable holds ~400 row groups, not 2 000, so the index is **20 B × 400 ≈ 8 kB**
+and a thousand sstables cost 8 MB. Pin it and keep the code simple; the reclaim question never
+arises. The 40 MB figure came from quoting the 2 000-group arm, which this document elsewhere argues
+against on both size and latency grounds.
+
+**Encryption keeps about half the benefit, not "most of it removed".** The design flagged `PARE`
+files as "the one case where this design does not obviously pay", because the extents are offsets
+into the *plaintext* footer, so the whole ciphertext must still be fetched and decrypted before a
+slab can be cut from it. True — but the measurement above says the fetch is only ~45 % of the cost
+and the Thrift walk is ~55 %, and the walk is removed for an encrypted file exactly as it is for a
+plaintext one. Decryption itself is not the obstacle either: AES-GCM over a footer-sized buffer runs
+at ~5 GB/s (`bench_footer`), i.e. ~110 µs for 568 kB, against the ~1 150 µs of fetching it. So an
+encrypted table would keep roughly half of what a plaintext one gains. That does not change the
+decision, but it removes the reason the design gave for hesitating.
+
+**Stated as a projection, because it is one.** No large encrypted table was measured: the `PARE`
+tables in `encryption_e2e.py` are 640-byte footers of one row group each, whose miss lines read
+`fetch=196..2999us parse=35..42us` — dominated by the key-provider round trip that `parse` includes
+for an encrypted file, and far too small to show a split. The ~50 % figure is the plaintext
+fetch/walk split composed with the measured decrypt throughput, not a measurement of an encrypted
+first read. Anyone reopening this should measure one rather than inherit the arithmetic.
+
+#### A negative result on the cheaper alternative
+
+Before reaching for an on-disk structure the obvious question is whether the walk can simply be made
+faster in code, since it is the larger half. In a standalone `-O2` harness it plainly can:
+`bench_footer` measures the lazy walk of this footer at **4.60 µs per row group against 3.17 for the
+*eager* parse that decodes the same bytes into objects** — skipping cost more than parsing, which
+cannot be right. The cause is one non-inlined recursive call plus a depth guard per *field*, where
+almost every field is a primitive needing three instructions; stepping primitives over inline in the
+struct loop makes the walk **2.2× faster** (2 210 → 990 µs, interleaved A/B, both orders, suite
+green).
+
+**On the node the same change is worth 8 % of the walk and 1.6 % of a first read** — parse p50
+1 435 → 1 334 µs, first read 3 766 → 3 705 µs, measured in one session with the per-miss log. The
+standalone result does not transfer, and the gap between a plain `-O2` build and the `dev` build the
+node runs is not explained here. **So the change was reverted**: a second code path through a routine
+that walks hostile input, for a gain inside the replicate spread on the only build that matters, is
+not a trade worth making. It is recorded because the isolated 2.2× is real and will tempt the next
+person who profiles the standalone layer, and because "the walk looks cheap to fix and is not" is
+half the reason the on-disk index looked necessary.
+
+#### The profiling facility was measuring something else, and is fixed
+
+The task of re-deriving the premise turned on `PQ_READER_PROFILE` and the `rphase` phases, and they
+no longer measured what their names claimed:
+
+- **The streaming path had no timer at all.** Harmless while only a scan streamed — and wrong from
+  the moment §10.26's window fix made a point read at the shipping defaults stream too. The row-group
+  fetch and its decode, by then the whole of a point read's data cost, were unattributed, so a
+  profile of the very read this section is about credited essentially all of it to the footer *by
+  omission*. Now `rg_fetch` and `rg_decode`.
+- **`page_decode` contained `page_fetch` and `decode_cpu`**, and the report added all three into the
+  total it divided by, diluting every share. Removed; its two halves were always the content.
+- `rg_materialise` (the per-row-group column decode) and `reassemble` were untimed, so the phases did
+  not add up to a read. Both added, and the set is now disjoint — which is what makes the share
+  column mean anything.
+
+With that fixed, a warm-footer point read at the shipping defaults profiles as **58 % reassemble,
+32 % row-group decode, 1.6 % row-group fetch and 0.0 % footer** — the last being the whole point of
+this section, and the first being where a future point-read optimisation should look instead.
 
 ### 10.22 Footer size, measured per file and per row group
 
@@ -6498,7 +6699,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 
 | Area | Severity | What is missing |
 |---|---|---|
-| Point-read latency | known | **1.8–3.6× the row format cold**, at 8 M rows with the footer cache in place (§10.24), down from 5.4–23.6×; §10.26's read-path fixes then moved the shipping arm to **2.53×** (cold min 1 149 µs against native's 455, from 1 930) without a change aimed at point reads. Warm reads are at the client round-trip floor for every format. What remains uncovered is the *first* read of an sstable after a restart, which still walks the whole footer: §10.23's side index is specified, not built. Parquet is still for scanned data. |
+| Point-read latency | known | **1.8–3.6× the row format cold**, at 8 M rows with the footer cache in place (§10.24), down from 5.4–23.6×; §10.26's read-path fixes then moved the shipping arm to **2.53×** (cold min 1 149 µs against native's 455, from 1 930) without a change aimed at point reads. Warm reads are at the client round-trip floor for every format. Note what "cold" means in that 1 149 µs: `min` over 400 probes after a restart, so it is a footer-cache *hit*. The **first** read of an sstable costs **3 680 µs**, 69 % of it the footer — measured three ways in §10.27, which then decided against §10.23's side index because that 2.5 ms is paid once per sstable per restart and steady state does not move. Parquet is still for scanned data. |
 | **Scan path** | **done** | **1.03× the row format through CQL** at 8 M rows and the shipping defaults, reading 21.3 MB of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796 (§10.26). It was 2.29×, 460 MB and ~497 000 extents until 2026-08-20, because the reader chose the point-read path for any *bounded* partition range and the coordinator splits every range scan at tablet boundaries; the window is now chosen per row group by which strategy fetches fewer bytes. Leaves the file's statistics prove empty are also skipped, which is 23 of 28 on the time-series schema. What remains unimplemented is *query* projection, and §10.26 argues it cannot be done at this layer without a fetched-vs-queried split above the sstable: `count(*)` still reads every value column. |
 | Production-scale re-measurement | **done for point reads and scans** | §10.21 re-measured point reads at 8 M rows with a canary and `BYPASS CACHE`, and retired every warm ratio in §10.4 as a measurement of the client round trip. §10.24 then measured the footer cache against a squeezed-cache control on the same data. §10.26 did the same for scans, and it moved a conclusion rather than scaling one. Write figures are still from 200–300 k-row sstables. |
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
