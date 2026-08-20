@@ -4725,6 +4725,71 @@ self-reverting source patch that is never verified as reverted is how a tree qui
 one-line regression. The script reverts in a `finally` and then proves the reverted build works on
 the same data.
 
+### 10.21 Point reads, measured properly — 2026-08-20, and it invalidates §10.4's method
+
+Re-measured with `BYPASS CACHE`, production cache settings, interleaved arms, a constant-cost canary
+and min-of-400-probes as the estimator (`pointread_v2.py`). 8 M rows, `row_group_rows` swept to vary
+row groups per file at a fixed row count.
+
+| arm | files | row groups | warm min | bypass min | cold min |
+|---|---:|---:|---:|---:|---:|
+| native | 1 | — | 254 | 455 | 462 |
+| pq rg=20 000 | 4 | 402 | 256 | 2 494 | 2 500 |
+| pq rg=5 000 | 4 | 1 601 | 249 | 3 942 | 3 958 |
+| pq rg=2 000 | 4 | 4 002 | 254 | 5 947 | 6 198 |
+| pq rg=1 000 | 4 | 8 001 | 256 | 10 155 | 10 905 |
+
+Canary min across every block: 224–244 µs, a 9 % spread, so the machine was quiet enough for the
+numbers to mean something — which matters on a shared 32-core box whose load average moved between
+5.9 and 29.2 earlier the same day.
+
+**The warm column is the finding that invalidates the old method.** Every arm lands at ~250 µs
+regardless of format or row-group count, and the canary floor is 224–244 µs. Warm point reads were
+measuring the **client round trip**, not the storage engine. That is why §10.4's earlier figure came
+out at `pq/native = 1.05×`: both arms were pinned to the floor, and the comparison could not have
+shown a difference whatever the engine did. **Any conclusion drawn from warm point-read ratios in
+this project should be discarded**, including the reassuring ones.
+
+**Cold, the effect is large and scales with row groups, not bytes.** Against native's 462 µs: 5.4× at
+402 row groups, 8.6× at 1 601, 23.6× at 8 001. The measured slope is **1.11 µs per row group** over
+402–8 001 groups — so §10.4j's 4.32 µs estimate was about 4× too pessimistic *per group*, while the
+effect it predicted is entirely real. The doc's "20–33× the row format" happens to be right only at
+the high end of the row-group range.
+
+**The trade is now quantified, and it points the opposite way from the size tuning.** At the shipping
+default of `row_group_rows = 5 000` an 8 M-row table gives 1 601 groups and an 8.6× cold point read.
+Fewer, larger row groups improve point reads — 402 groups is 5.4× — while scan-side projection and
+size want the opposite (§10.4a). Whoever tunes this is choosing between them explicitly rather than
+finding a setting that is good for both.
+
+### 10.22 Footer size, measured per file and per row group
+
+Prerequisite for deciding whether a metadata cache is worth building (§10.4l), measured on the same
+four files:
+
+| row groups | file bytes | footer bytes | footer share | bytes/row group |
+|---:|---:|---:|---:|---:|
+| 101 | 4 987 795 | 153 583 | 3.1 % | 1 521 |
+| 399 | 5 829 954 | 568 679 | 9.8 % | 1 425 |
+| 1 005 | 8 992 781 | 1 431 985 | 15.9 % | 1 425 |
+| 1 995 | 13 680 138 | 2 843 066 | **20.8 %** | 1 425 |
+
+**1 420 bytes per row group, plus ~10 kB fixed**, at 28 leaves — so it scales with row groups and
+leaves, not with rows. Two consequences.
+
+The footer is **20.8 % of the file** at 1 995 row groups. That is a size argument for larger row
+groups quite separate from the latency one, and it is the same direction: the narrow-row-group
+setting is expensive twice over.
+
+And it sizes the cache. Holding the parsed footer for one sstable costs on the order of
+`1.4 kB × row groups`; a 1 601-group sstable is ~2.3 MB, and a node holding a thousand such sstables
+would want ~2.3 GB. That is far too much to pin, which settles the design question in §10.4l:
+**a metadata cache has to be evictable under pressure, not merely bounded.** It should register with
+`sstables_manager`'s existing reclaim machinery — `_total_reclaimable_memory` against
+`memory_reclaim_threshold` (default 0.2), with the intrusive list ordered by
+`lesser_reclaimed_memory` — which is how bloom filters are already dropped, rather than inventing a
+second policy.
+
 ### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
 
 **A correction first, because it shaped the design.** This section previously said Scylla has "no
