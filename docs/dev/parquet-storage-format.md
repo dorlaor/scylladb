@@ -4493,14 +4493,45 @@ tombstone per null -- roughly 58 M of them across 300 000 rows. At about a byte 
 the tombstone metadata**, and the normal one is the one where it has collapsed. Native moving with
 it (21.8 → 32.3 M) fits: the row format stores the same tombstones.
 
-**What is still unknown is why it collapses**, and the load is deterministic -- the same rows, the
-same 197 columns, the same `USING TIMESTAMP` per row, and `pq_bytes` byte-identical across normal
-passes. So something downstream sometimes drops or folds that metadata and sometimes does not.
-`gc_grace_seconds` is the default 10 days while the mutation timestamps are back-dated to 2023,
-which makes purge eligibility worth looking at first, but a tombstone's `local_deletion_time` is
-wall-clock at write time, so on the face of it none of them should be purgeable. That is the next
-thing to check, and the check is cheap: compare cell timestamps and deletion times between a normal
-and an anomalous file directly, rather than inferring from sizes.
+**The channel is now named, from the anomalous file itself** (caught on the 6th of 7 passes and
+kept: `out/bb_anomalous_pass6.parquet`). It is not the timestamp-exception channel, as the
+size arithmetic suggested — it is `__ldt_<column>`, **local deletion time**:
+
+| leaf | bytes | values | nulls |
+|---|---:|---:|---:|
+| `__ts` | 1 893 064 | 300 000 | 0 |
+| `__ldt_smart_27_raw` | 394 255 | 300 000 | 4 818 |
+| `__ldt_smart_189_raw` | 393 854 | 300 000 | 23 872 |
+| ~390 more `__ldt_*` | ~390 kB each | 300 000 | varies |
+
+`__ts` barely moves between the two regimes; the `__ldt_*` leaves are the entire 60 MB. Each holds a
+deletion time for ~295 000 of 300 000 rows, and the null counts differ per column in step with how
+often that column actually has a reading. So this is exactly what binding every column with NULL for
+a missing value produces: **a cell tombstone per null**, ~58 M of them, and the anomalous file is the
+one that stores them.
+
+**And the obvious explanation is wrong.** The natural guess was purge eligibility: the mutation
+timestamps are back-dated to 2023 and `gc_grace_seconds` is the default 10 days, so the tombstones
+would be droppable and a compaction might or might not drop them. Read out of the file directly, the
+write timestamps *are* 2023 — but `local_deletion_time` is **wall-clock at write time**, minutes old:
+
+```
+__ts   1700346220936144  ->  2023-11-18T22:23:40Z   (the USING TIMESTAMP)
+__ldt  1787184561        ->  2026-08-20T00:09:21Z   (wall clock, ~7 minutes before the read)
+```
+
+At 0 days against a 10-day grace these tombstones are **not purgeable in either regime**, so
+compaction dropping them cannot be what distinguishes the runs. That eliminates the first hypothesis
+rather than confirming it, which is worth more than it sounds: it moves the question from the read
+side to the write side. If the normal runs have no tombstones *at all* — and their `__ldt_*` leaves
+totalling ~0.7 MB across ~400 leaves is what all-null looks like — then the difference is whether
+those NULLs were bound as deletions in the first place, not whether they were later removed.
+
+**Next steps, both cheap and both specific.** Save a normal file alongside an anomalous one and
+compare `__ldt_*` null counts directly, rather than inferring "all-null" from an aggregate. And check
+the Backblaze slice for duplicate primary keys: the harness logs collapse counts for other datasets
+(pageviews: 176 082 rows to 163 845 distinct keys), and a duplicate row inserted twice under
+different `USING TIMESTAMP` values is a way for a later live cell to shadow an earlier tombstone.
 
 **No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
