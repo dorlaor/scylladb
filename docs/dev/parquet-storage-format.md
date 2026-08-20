@@ -4905,6 +4905,16 @@ rotation has been exercised end to end here, and the one provider this lab can d
 (`LocalFileSystemKeyProviderFactory`) issues no ids, so it cannot demonstrate it. Claiming it works
 would be claiming a green run that never happened.
 
+**And it *is* testable here, contrary to the note above.** The obstacle was stated as "the only
+provider this lab can drive issues no ids", which is true of `LocalFileSystemKeyProviderFactory` and
+not of the others: `replicated_key_provider` returns `encode_id(uuid)` and keeps its keys in a system
+table, so it needs no external service and runs on one node (it does need a system key, via
+`system_key_directory`). That makes the rotation round trip drivable: write a table under the
+replicated provider, force a new key, and assert that sstables written before the rotation still
+read — their `key_metadata` carries the old id — while new ones carry the new one. Until that is run,
+rotation remains **claimed by construction and unverified**, which is the weakest statement in this
+section.
+
 **Also absent**: plaintext-footer mode.
 
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
