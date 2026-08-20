@@ -325,8 +325,15 @@ void sstables_manager::increment_total_reclaimable_memory(sstable* sst) {
     _components_memory_change_event.signal();
 }
 
-void sstables_manager::add_reclaimable_memory(size_t bytes) {
-    _total_reclaimable_memory += bytes;
+void sstables_manager::adjust_total_reclaimable_memory(ssize_t delta) {
+    if (delta < 0) {
+        // Clamped rather than wrapped: an accounting bug should cost a suboptimal reclaim
+        // decision, not a size_t that has gone round the houses and reads as 16 exabytes held.
+        const size_t drop = size_t(-delta);
+        _total_reclaimable_memory -= std::min(_total_reclaimable_memory, drop);
+    } else {
+        _total_reclaimable_memory += size_t(delta);
+    }
     _components_memory_change_event.signal();
 }
 

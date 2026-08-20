@@ -2128,18 +2128,21 @@ size_t sstable::total_reclaimable_memory_size() const {
 }
 
 void sstable::set_pq_footer_cache(parquet::cached_footer_ptr footer) {
-    drop_pq_footer_cache(false);
-    if (!footer) {
-        return;
+    // Replacing an entry is a real case, not a defensive one: two readers can miss on the same
+    // sstable concurrently, both parse, and both publish. The old entry's bytes have to come back
+    // out of the manager's total or it drifts upwards once per race.
+    const size_t replaced = drop_pq_footer_cache(false);
+    size_t size = 0;
+    if (footer) {
+        size = footer->memory_size();
+        _pq_footer = std::move(footer);
+        parquet::note_footer_cache_populated(size);
+        _total_reclaimable_memory.reset();
     }
-    const size_t size = footer->memory_size();
-    _pq_footer = std::move(footer);
-    parquet::note_footer_cache_populated(size);
-    _total_reclaimable_memory.reset();
     // A delta rather than increment_total_reclaimable_memory(): unlike a bloom filter, this
     // component appears after the sstable was loaded and counted, so the whole-sstable form
     // would count the filter twice.
-    _manager.add_reclaimable_memory(size);
+    _manager.adjust_total_reclaimable_memory(ssize_t(size) - ssize_t(replaced));
 }
 
 size_t sstable::drop_pq_footer_cache(bool evicted) noexcept {

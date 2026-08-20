@@ -192,8 +192,9 @@ public:
         }
         n += md.row_groups.capacity() * sizeof(format::row_group);
         for (const auto& g : md.row_groups) {
-            // Zero in a pristine entry -- and asserted to stay zero by the boost test, since a
-            // materialised group here would mean the entry had been mutated after publication.
+            // Zero in a pristine entry. A materialised group here would mean the entry had been
+            // mutated after publication, which the reader-local one-group copy exists to prevent;
+            // it is summed anyway so that the number stays honest if that ever changes.
             n += g.columns.capacity() * sizeof(format::column_chunk);
         }
         n += md.key_value_metadata.capacity() * sizeof(format::key_value);
