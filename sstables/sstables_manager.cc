@@ -325,6 +325,11 @@ void sstables_manager::increment_total_reclaimable_memory(sstable* sst) {
     _components_memory_change_event.signal();
 }
 
+void sstables_manager::add_reclaimable_memory(size_t bytes) {
+    _total_reclaimable_memory += bytes;
+    _components_memory_change_event.signal();
+}
+
 future<> sstables_manager::maybe_reclaim_components() {
     while(_total_reclaimable_memory > get_components_memory_reclaim_threshold()) {
         // Memory consumption is above threshold. Reclaim from the SSTable that
@@ -333,14 +338,32 @@ future<> sstables_manager::maybe_reclaim_components() {
         auto sst_with_max_memory = std::max_element(_active.begin(), _active.end(), [](const sstable& sst1, const sstable& sst2) {
             return sst1.total_reclaimable_memory_size() < sst2.total_reclaimable_memory_size();
         });
+        if (sst_with_max_memory == _active.end()) {
+            // Nothing to reclaim from, so the accounting says more is held than any live sstable
+            // holds. Bailing out beats dereferencing end(), and beats spinning without a yield.
+            break;
+        }
 
+        // Some of what was just released has to be reloaded by maybe_reload_components() (the
+        // bloom filter) and some repopulates itself on the read path (the pq footer cache). Only
+        // the former is owed, and only for it does the sstable belong in _reclaimed -- putting an
+        // sstable there with nothing to reload would have the fiber walk it forever.
+        const auto owed_before = sst_with_max_memory->total_memory_reclaimed();
         auto memory_reclaimed = sst_with_max_memory->reclaim_memory_from_components();
-        _total_memory_reclaimed += memory_reclaimed;
+        const auto newly_owed = sst_with_max_memory->total_memory_reclaimed() - owed_before;
+        _total_memory_reclaimed += newly_owed;
         _total_reclaimable_memory -= memory_reclaimed;
-        _reclaimed.insert(*sst_with_max_memory);
-        // TODO: As of now only bloom filter is reclaimed. Print actual component names when adding support for more components.
+        if (newly_owed) {
+            _reclaimed.insert(*sst_with_max_memory);
+        }
+        // TODO: Print actual component names.
         smlogger.info("Reclaimed {} bytes of memory from components of {}. Total memory reclaimed so far is {} bytes",
                 memory_reclaimed, sst_with_max_memory->get_filename(), _total_memory_reclaimed);
+        if (!memory_reclaimed) {
+            // Nothing left to squeeze out of the largest holder, so the rest cannot help either.
+            // Without this the loop spins forever when the threshold is below what is pinned.
+            break;
+        }
         }
         co_await coroutine::maybe_yield();
 }
@@ -419,8 +442,9 @@ void sstables_manager::reclaim_memory_and_stop_tracking_sstable(sstable* sst) {
     // remove the sstable from the memory tracking metrics
     _total_reclaimable_memory -= sst->total_reclaimable_memory_size();
     _total_memory_reclaimed -= sst->total_memory_reclaimed();
-    // reclaim any remaining memory from the sstable
-    sst->reclaim_memory_from_components();
+    // reclaim any remaining memory from the sstable. `closing`: the sstable is going away, so
+    // dropping its footer cache is not an eviction and should not read as memory pressure.
+    sst->reclaim_memory_from_components(true);
     // disable further reload of components
     _reclaimed.erase(*sst);
     sst->disable_component_memory_reload();

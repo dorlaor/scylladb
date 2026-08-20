@@ -4750,11 +4750,33 @@ out at `pq/native = 1.05×`: both arms were pinned to the floor, and the compari
 shown a difference whatever the engine did. **Any conclusion drawn from warm point-read ratios in
 this project should be discarded**, including the reassuring ones.
 
-**Cold, the effect is large and scales with row groups, not bytes.** Against native's 462 µs: 5.4× at
-402 row groups, 8.6× at 1 601, 23.6× at 8 001. The measured slope is **1.11 µs per row group** over
-402–8 001 groups — so §10.4j's 4.32 µs estimate was about 4× too pessimistic *per group*, while the
-effect it predicted is entirely real. The doc's "20–33× the row format" happens to be right only at
-the high end of the row-group range.
+**Cold, the effect is large and scales with the *number* of row groups.** Against native's 462 µs:
+5.4× at 402 row groups, 8.6× at 1 601, 23.6× at 8 001.
+
+**The slope is 4.42 µs per row group *per file*, and §10.4j's 4.32 µs estimate was right.** An earlier
+version of this section said the estimate was "4× too pessimistic" on the strength of a 1.11 µs
+slope; that figure was the slope against *total* row groups across the table's **four** files, while a
+point read touches one file's footer. Dividing by files gives 4.42 µs and the estimate lands almost
+exactly. The mistake was mine, not the estimate's, and it is recorded because dividing by the wrong
+denominator produced a confident correction of something that was already correct.
+
+**And the direction is the opposite of the obvious intuition, which is worth explaining.** A bigger
+row group sounds like more work per point read — more rows to wade through for one answer. It is not,
+because the reader never scans a row group: the index entry carries a *row ordinal* (§5.4 option A)
+and the OffsetIndex turns that into a single page, so decode cost is bounded by `page_rows` (8 192 by
+default) no matter how large the row group is. The only term that moves with row-group configuration
+is the **footer**, and that scales with the row-group *count*. Bigger row groups mean fewer of them,
+a smaller footer, and a faster cold point read.
+
+The footer is also where the time goes rather than being a parse-only cost. Fitting cold latency
+against footer size gives ≈ 2.1 ms fixed + 3.1 ms per MB — an implied ~320 MB/s, which is
+read-and-parse throughput, not CPU alone. The fit predicts 6.5 ms at 1.42 MB against 6.2 measured and
+3.9 ms at 0.57 MB against 3.96 measured.
+
+**One consequence for the cache in §10.4l**: if the dominant term is fetching and parsing a
+multi-megabyte footer, caching it removes most of this curve — and then the intuition above may
+finally become visible, because page-level decode would be all that is left. So the ordering could
+*invert* once the cache lands. That is a prediction to measure, not to assume.
 
 **The trade is now quantified, and it points the opposite way from the size tuning.** At the shipping
 default of `row_group_rows = 5 000` an 8 M-row table gives 1 601 groups and an 8.6× cold point read.

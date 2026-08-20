@@ -137,6 +137,82 @@ atomic_cell_or_collection build_collection(const column_definition& cdef,
     return atomic_cell_or_collection(std::move(w).finish());
 }
 
+// ------------------------------------------------------------------ footer cache
+// Bytes a std::string holds on the heap. libstdc++ keeps up to 15 characters inline, so a string
+// at or below that costs nothing beyond the object itself -- which the enclosing vector's
+// capacity has already accounted for.
+size_t heap_size(const std::string& s) {
+    return s.capacity() > 15 ? s.capacity() + 1 : 0;
+}
+
+template <typename T>
+size_t heap_size_of_pod_vector(const std::vector<T>& v) {
+    return v.capacity() * sizeof(T);
+}
+
+} // namespace
+
+// The retained form of one sstable's footer: the plaintext Thrift blob, the lazily-parsed
+// metadata whose row-group extents index into it, and the two derived tables every read needs.
+//
+// Immutable once published. In particular materialise_row_group() is never called on `md`: a
+// reader materialises into its own single-group copy instead (pq_reader::need_columns). Two
+// reasons. It keeps the entry a fixed size -- otherwise a full scan would grow it into the eager
+// parse the lazy mode exists to avoid, tens of megabytes on a large sstable. And it keeps
+// concurrent readers of the same sstable off each other's state.
+class cached_footer final : public cached_footer_base {
+public:
+    std::vector<uint8_t>  footer;           // plaintext, even when the file on disk is encrypted
+    format::file_metadata md;               // metadata_mode::lazy: no per-column metadata
+    std::vector<int64_t>  rg_start;         // cumulative first row of each row group
+    int64_t               total_rows = 0;
+
+    // The encryption envelope, minus the key -- deliberately. This entry outlives the read that
+    // created it, and a key that outlives its read is a key the provider no longer controls. A
+    // reader on a cache hit asks the provider again; what it saves is the footer I/O, the
+    // decrypt and the parse, not the key lookup.
+    bool                  encrypted = false;
+    format::cipher        algo = format::cipher::aes_gcm_v1;
+    std::string           aad_file_unique;
+    std::string           aad_prefix;
+    seastar::sstring      key_id;
+
+    size_t memory_size() const noexcept override { return _retained; }
+
+    // Call once, after filling everything in. Measured rather than estimated: every container is
+    // asked for its capacity, so the number does not depend on believing anything about the
+    // relationship between the on-disk footer length and the parsed form.
+    void measure() {
+        size_t n = sizeof(cached_footer);
+        n += footer.capacity();
+        n += heap_size_of_pod_vector(rg_start);
+        n += md.schema.capacity() * sizeof(format::schema_element);
+        for (const auto& e : md.schema) {
+            n += heap_size(e.name);
+        }
+        n += md.row_groups.capacity() * sizeof(format::row_group);
+        for (const auto& g : md.row_groups) {
+            // Zero in a pristine entry -- and asserted to stay zero by the boost test, since a
+            // materialised group here would mean the entry had been mutated after publication.
+            n += g.columns.capacity() * sizeof(format::column_chunk);
+        }
+        n += md.key_value_metadata.capacity() * sizeof(format::key_value);
+        for (const auto& kv : md.key_value_metadata) {
+            n += heap_size(kv.key) + heap_size(kv.value);
+        }
+        if (md.created_by) {
+            n += heap_size(*md.created_by);
+        }
+        n += heap_size(aad_file_unique) + heap_size(aad_prefix);
+        _retained = n;
+    }
+
+private:
+    size_t _retained = 0;
+};
+
+namespace {
+
 // Streams a pq sstable: footer once, then one row group's bytes at a time,
 // decoded in fixed-size row windows and turned straight into fragments.
 //
@@ -199,11 +275,19 @@ class pq_reader : public mutation_reader::impl {
     const bool _use_index;
 
     bool _init = false;
-    format::file_metadata _md;
+    // The sstable's parsed footer, shared and immutable. Held by shared_ptr rather than looked up
+    // per use, so that a reclaim in the middle of a read cannot pull it out from under us: the
+    // entry leaves the sstable and stays alive here until this reader is done with it.
+    cached_footer_ptr _cf;
+    // One row group's column metadata, materialised into a reader-local metadata object holding
+    // exactly that group at index 0. This is what keeps the shared entry immutable; see
+    // cached_footer.
+    format::file_metadata _rgmd;
+    size_t _rgmd_rg = size_t(-1);
     mapped_schema _ms;
     std::vector<cql_column> _cols;
     size_t _n_pk = 0, _n_ck = 0, _static_base = 0;
-    std::vector<int64_t> _rg_start;     // cumulative first row of each row group
+    std::span<const int64_t> _rg_start;   // cumulative first row of each row group, from _cf
 
     // Ordinal window this read is confined to, from the partition index.
     int64_t _row_lo = 0, _row_hi = 0;
@@ -216,13 +300,7 @@ class pq_reader : public mutation_reader::impl {
     int64_t _rg_base = 0;               // file offset of _rg_buf[0]
     size_t _oi_rg = size_t(-1);
     std::vector<std::optional<format::offset_index>> _oi;
-    // The raw footer, kept alive because row-group metadata is decoded from it lazily.
-    temporary_buffer<char> _footer;
-    // When the file is encrypted the footer on disk is a ciphertext, so the plaintext lives here
-    // and footer_bytes() hands out this instead. Both the schema parse and every later
-    // materialise_row_group() read through that one accessor, which is why adding encryption did
-    // not have to touch either.
-    std::vector<uint8_t> _footer_plain;
+    // Per-reader, never cached: see cached_footer for why the key does not go in the entry.
     std::optional<format::read_crypto> _crypto;
 
     // Decoded window.
@@ -242,21 +320,26 @@ class pq_reader : public mutation_reader::impl {
     bool _skipping = false;
 
     future<> init();
+    future<> load_footer();             // cache hit, or fetch-decrypt-parse-publish
     future<bool> next_window();         // false at end of the ordinal range
     future<> load_row_group(size_t rg);
     future<> load_offset_indexes(size_t rg);
 
-    std::span<const uint8_t> footer_bytes() const {
-        if (!_footer_plain.empty()) { return _footer_plain; }
-        return std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(_footer.get()), _footer.size());
-    }
+    // The plaintext footer, which the cached entry always holds whether or not the file on disk
+    // was encrypted. Row-group column metadata is decoded from it on demand.
+    std::span<const uint8_t> footer_bytes() const { return _cf->footer; }
     const format::read_crypto* crypto() const { return _crypto ? &*_crypto : nullptr; }
-    // Decode this row group's column metadata if it has not been decoded yet. Cheap and
-    // idempotent; called before anything reads _md.row_groups[rg].columns.
+    // Decode this row group's column metadata if it has not been decoded yet, into the
+    // reader-local single-group metadata. Cheap and idempotent; called before anything reads
+    // columns(). The group's own index inside _rgmd is always 0.
     void need_columns(size_t rg) {
-        format::materialise_row_group(_md, rg, footer_bytes());
+        if (_rgmd_rg == rg) { return; }
+        _rgmd.row_groups.assign(1, _cf->md.row_groups.at(rg));
+        format::materialise_row_group(_rgmd, 0, footer_bytes());
+        _rgmd_rg = rg;
     }
+    // The column metadata of the currently materialised row group. need_columns(rg) first.
+    const std::vector<format::column_chunk>& columns() const { return _rgmd.row_groups[0].columns; }
     // Reads only the pages covering [lo, hi). Falls back to the whole row group
     // when the file carries no OffsetIndex.
     future<std::vector<format::column_data>> decode_paged(size_t rg, int64_t lo, int64_t hi);
@@ -337,9 +420,32 @@ public:
     future<> close() noexcept override { return make_ready_future<>(); }
 };
 
-future<> pq_reader::init() {
-    if (_init) { co_return; }
-    _init = true;
+// Get the parsed footer into _cf, from the sstable's cache if it is there and by reading,
+// decrypting and parsing the file if it is not.
+//
+// The cache makes this once per sstable rather than once per read, which is the whole point: the
+// footer is 1.4 kB per row group (design doc 10.22) and both fetching it and walking it scale
+// with row groups, which is where a cold point read's 1.11 us per row group goes (10.21).
+future<> pq_reader::load_footer() {
+    if (_cf) {
+        // fast_forward_to() re-runs init() for the new range. The file's footer has not changed.
+        co_return;
+    }
+    auto& stats = footer_cache_stats_local();
+    if (auto& cached = _sst->pq_footer_cache()) {
+        ++stats.hits;
+        _cf = cached;
+        if (_cf->encrypted) {
+            // The envelope was cached; the key was not, on purpose. Fetch it again.
+            _crypto = co_await read_crypto_for(_cf->algo, _cf->aad_file_unique, _cf->aad_prefix,
+                                               _cf->key_id);
+        }
+        prepare_row_group_metadata();
+        co_return;
+    }
+    ++stats.misses;
+
+    auto entry = seastar::make_shared<cached_footer>();
 
     // Footer only: the last 8 bytes give its length, then one bounded read.
     const uint64_t len = _sst->ondisk_data_size();
@@ -356,14 +462,19 @@ future<> pq_reader::init() {
     // FileCryptoMetaData. The tail read above is the same either way -- length then magic --
     // which is why only this branch is new.
     const bool encrypted = std::memcmp(tail.get() + 4, format::magic_encrypted, 4) == 0;
+    temporary_buffer<char> raw;
     {
         rtimer _t{rphase::footer_io};
-        _footer = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+        raw = co_await _sst->data_read(len - 8 - flen, flen, _permit);
     }
-    if (encrypted) {
+    entry->encrypted = encrypted;
+    if (!encrypted) {
+        entry->footer.assign(reinterpret_cast<const uint8_t*>(raw.get()),
+                             reinterpret_cast<const uint8_t*>(raw.get()) + raw.size());
+    } else {
         rtimer _t{rphase::footer_parse};
         auto region = std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(_footer.get()), _footer.size());
+                reinterpret_cast<const uint8_t*>(raw.get()), raw.size());
         size_t consumed = 0;
         auto fcm = format::parse_file_crypto_metadata(region, &consumed);
         // key_metadata carries the id the key provider issued for this file, or nothing at all if
@@ -377,41 +488,23 @@ future<> pq_reader::init() {
         // Recorded in the design doc as a known limitation -- key_metadata is a single opaque
         // string, and packing the option map into it would break the "id, verbatim" contract that
         // makes the provider-neutral shape work.
-        const seastar::sstring key_id =
-                fcm.key_metadata ? key_id_from_metadata(seastar::sstring(*fcm.key_metadata))
-                                 : seastar::sstring();
-        auto* ksrc = key_source_ptr();
-        if (!ksrc) {
-            throw std::runtime_error(seastar::format(
-                    "pq: {} is encrypted, but this node has no encryption key provider registered",
-                    _sst->get_filename()));
-        }
-        const auto key_opts = parquet_parameters(_schema->parquet_options()).key_opts();
-        format::read_crypto rc;
-        try {
-            rc.key = co_await ksrc->key_for_read(key_opts, key_id);
-        } catch (...) {
-            std::throw_with_nested(std::runtime_error(seastar::format(
-                    "pq: {} is encrypted, but its key could not be obtained from the key provider "
-                    "(id '{}')", _sst->get_filename(), key_id)));
-        }
-        if (!rc.key.valid()) {
-            throw std::runtime_error(seastar::format(
-                    "pq: {}: the key provider returned a {}-byte key; AES needs 16, 24 or 32",
-                    _sst->get_filename(), rc.key.bytes.size()));
-        }
-        rc.algo = fcm.algo;
-        rc.aad_file_unique = fcm.aad_file_unique;
+        entry->key_id = fcm.key_metadata
+                ? key_id_from_metadata(seastar::sstring(*fcm.key_metadata))
+                : seastar::sstring();
+        entry->algo = fcm.algo;
+        entry->aad_file_unique = fcm.aad_file_unique;
         // The writer stores the prefix, so this normally comes from the file. The fallback
         // reconstructs what the writer would have used, which keeps a file written before
         // store_aad_prefix was set readable.
-        rc.aad_prefix = fcm.aad_prefix;
-        if (rc.aad_prefix.empty()) {
-            rc.aad_prefix = fmt::format("{}.{}", _schema->ks_name(), _schema->cf_name());
+        entry->aad_prefix = fcm.aad_prefix;
+        if (entry->aad_prefix.empty()) {
+            entry->aad_prefix = fmt::format("{}.{}", _schema->ks_name(), _schema->cf_name());
         }
+        auto rc = co_await read_crypto_for(entry->algo, entry->aad_file_unique, entry->aad_prefix,
+                                           entry->key_id);
         auto aad = format::build_aad(rc.aad_prefix, rc.aad_file_unique,
                                      format::module_type::footer);
-        _footer_plain = format::decrypt_module(region.subspan(consumed), rc.key, aad, nullptr,
+        entry->footer = format::decrypt_module(region.subspan(consumed), rc.key, aad, nullptr,
                                                rc.algo, false);
         _crypto = std::move(rc);
     }
@@ -421,22 +514,45 @@ future<> pq_reader::init() {
         // this read touches (design doc 10.4j). The footer bytes are retained so the wanted
         // group can be decoded on demand.
         rtimer _t{rphase::footer_parse};
-        _md = format::parse_file_metadata(footer_bytes(), {}, format::semantic_check::yes,
-                                          format::metadata_mode::lazy);
+        entry->md = format::parse_file_metadata(entry->footer, {}, format::semantic_check::yes,
+                                                format::metadata_mode::lazy);
     }
+    entry->rg_start.reserve(entry->md.row_groups.size());
+    for (const auto& g : entry->md.row_groups) {
+        entry->rg_start.push_back(entry->total_rows);
+        entry->total_rows += g.num_rows;
+    }
+    entry->measure();
+
+    _cf = entry;
+    // Published last, and only after the entry is complete and immutable. A concurrent reader
+    // that missed at the same time simply parsed it too and overwrites this with an identical
+    // entry; both are correct, and the loser's copy dies with its reader.
+    _sst->set_pq_footer_cache(_cf);
+}
+
+future<> pq_reader::init() {
+    if (_init) { co_return; }
+    _init = true;
+
+    co_await load_footer();
+    const auto& md = _cf->md;
+
+    _rgmd = format::file_metadata{};
+    _rgmd.schema = md.schema;           // fixed size; walk_leaves() needs the tree, not the groups
+    _rgmd_rg = size_t(-1);
 
     _cols = columns_of(*_schema);
     {
         rtimer _t{rphase::schema_recover};
-        _ms = recover_mapped_schema(_md, _cols);
+        _ms = recover_mapped_schema(md, _cols);
     }
     _n_pk = _schema->partition_key_size();
     _n_ck = _schema->clustering_key_size();
     _static_base = static_base(*_schema);
 
-    _rg_start.clear();
-    int64_t acc = 0;
-    for (const auto& g : _md.row_groups) { _rg_start.push_back(acc); acc += g.num_rows; }
+    _rg_start = _cf->rg_start;
+    const int64_t acc = _cf->total_rows;
     _row_lo = 0;
     _row_hi = acc;
 

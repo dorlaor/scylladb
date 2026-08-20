@@ -2120,13 +2120,40 @@ void sstable::build_delayed_filter(uint64_t num_partitions) {
 
 size_t sstable::total_reclaimable_memory_size() const {
     if (!_total_reclaimable_memory) {
-        _total_reclaimable_memory = _components->filter ? _components->filter->memory_size() : 0;
+        _total_reclaimable_memory = (_components->filter ? _components->filter->memory_size() : 0)
+                + (_pq_footer ? _pq_footer->memory_size() : 0);
     }
 
     return _total_reclaimable_memory.value();
 }
 
-size_t sstable::reclaim_memory_from_components() {
+void sstable::set_pq_footer_cache(parquet::cached_footer_ptr footer) {
+    drop_pq_footer_cache(false);
+    if (!footer) {
+        return;
+    }
+    const size_t size = footer->memory_size();
+    _pq_footer = std::move(footer);
+    parquet::note_footer_cache_populated(size);
+    _total_reclaimable_memory.reset();
+    // A delta rather than increment_total_reclaimable_memory(): unlike a bloom filter, this
+    // component appears after the sstable was loaded and counted, so the whole-sstable form
+    // would count the filter twice.
+    _manager.add_reclaimable_memory(size);
+}
+
+size_t sstable::drop_pq_footer_cache(bool evicted) noexcept {
+    if (!_pq_footer) {
+        return 0;
+    }
+    const size_t size = _pq_footer->memory_size();
+    _pq_footer = nullptr;
+    parquet::note_footer_cache_dropped(size, evicted);
+    _total_reclaimable_memory.reset();
+    return size;
+}
+
+size_t sstable::reclaim_memory_from_components(bool closing) {
     size_t memory_reclaimed_this_iteration = 0;
 
     if (_components->filter) {
@@ -2136,11 +2163,18 @@ size_t sstable::reclaim_memory_from_components() {
             // No need to remove it from _recognized_components as the filter is still in disk.
             _components->filter = std::make_unique<utils::filter::always_present_filter>();
             memory_reclaimed_this_iteration += filter_memory_size;
+            // Only the filter has to be reloaded by the manager's fiber: nothing else will put
+            // it back, since it is read at open time and never on the read path.
+            _total_memory_reclaimed += filter_memory_size;
         }
     }
 
+    // The parsed pq footer, by contrast, is repopulated by the next read that needs it, so it is
+    // released without being remembered as owed. Reloading it eagerly would re-read footers for
+    // sstables nobody is reading, and the manager reload fiber has no way to tell the difference.
+    memory_reclaimed_this_iteration += drop_pq_footer_cache(!closing);
+
     _total_reclaimable_memory.reset();
-    _total_memory_reclaimed += memory_reclaimed_this_iteration;
     return memory_reclaimed_this_iteration;
 }
 
@@ -4139,6 +4173,20 @@ future<> init_metrics() {
             sm::description("Number of bytes currently used by cached promoted index blocks")),
         sm::make_gauge("pi_cache_block_count", [] { return promoted_index_cache_metrics.block_count; },
             sm::description("Number of promoted index blocks currently cached")),
+
+        // The pq (Parquet) parsed-footer cache. `bytes` is what the reclaimer sees, so it is the
+        // one to watch against components_memory_reclaim_threshold; a rising eviction count with
+        // a rising miss count is the cache being squeezed rather than merely cold.
+        sm::make_counter("pq_footer_cache_hits", [] { return parquet::footer_cache_stats_local().hits; },
+            sm::description("Parquet footer parses avoided because the sstable's footer was already cached")),
+        sm::make_counter("pq_footer_cache_misses", [] { return parquet::footer_cache_stats_local().misses; },
+            sm::description("Reads that had to fetch and parse a Parquet footer because it was not cached")),
+        sm::make_counter("pq_footer_cache_populations", [] { return parquet::footer_cache_stats_local().populations; },
+            sm::description("Parsed Parquet footers inserted into the cache")),
+        sm::make_counter("pq_footer_cache_evictions", [] { return parquet::footer_cache_stats_local().evictions; },
+            sm::description("Parsed Parquet footers dropped by the component memory reclaimer")),
+        sm::make_gauge("pq_footer_cache_bytes", [] { return parquet::footer_cache_stats_local().bytes; },
+            sm::description("Bytes retained by parsed Parquet footers on this shard")),
 
         sm::make_counter("partition_writes", [] { return sstables_stats::get_shard_stats().partition_writes; },
             sm::description("Number of partitions written")),
