@@ -42,8 +42,12 @@ namespace {
 // bytes, is the reader's memory footprint -- neither grows with the sstable,
 // which is what R-13 asks for.
 constexpr int64_t scan_window_rows = 16384;
-// A bounded read usually wants one partition, so it starts small: the cost of
+// A point read usually wants one partition, so it starts small: the cost of
 // looping is a page header walk, while the cost of over-decoding is real work.
+//
+// This is *not* the window a bounded range gets -- that was the defect §10.26 named. It is the
+// window a read gets when fetching pages is measurably cheaper than fetching the row group, which
+// next_window() decides per row group from the OffsetIndex.
 constexpr int64_t point_window_rows = 512;
 
 // Inverse of the `decode` in writer_impl.cc. Scylla serialises fixed-width
@@ -293,9 +297,9 @@ class pq_reader : public mutation_reader::impl {
     // Ordinal window this read is confined to, from the partition index.
     int64_t _row_lo = 0, _row_hi = 0;
 
-    // Currently loaded row group and its bytes. A scan holds the whole row group
-    // (sequential reads are what a scan wants); a bounded read instead holds two
-    // small extents per column and never touches the pages in between.
+    // Currently loaded row group and its bytes. A streaming window holds the whole row group
+    // (sequential reads are what a scan wants); a paged window instead holds two small extents
+    // per column and never touches the pages in between.
     size_t _cur_rg = size_t(-1);
     temporary_buffer<char> _rg_buf;
     int64_t _rg_base = 0;               // file offset of _rg_buf[0]
@@ -339,6 +343,15 @@ class pq_reader : public mutation_reader::impl {
     future<bool> next_window();         // false at end of the ordinal range
     future<> load_row_group(size_t rg);
     future<> load_offset_indexes(size_t rg);
+    // Byte span of one row group: the first dictionary or data page of any of its chunks to the
+    // end of the last. This is exactly what load_row_group() fetches, in one read.
+    std::pair<int64_t, int64_t> row_group_span() const;
+    // True when every chunk of the materialised row group has a usable OffsetIndex, which is
+    // what decode_paged() needs in order to fetch pages rather than the whole group.
+    bool have_page_index() const;
+    // Would the paged path fetch at least as many bytes as one sequential read of the row group,
+    // to cover group-local rows [lo, hi)? See the long comment at the call site.
+    bool paged_fetch_is_not_cheaper(int64_t lo, int64_t hi) const;
 
     // The plaintext footer, which the cached entry always holds whether or not the file on disk
     // was encrypted. Row-group column metadata is decoded from it on demand.
@@ -642,11 +655,10 @@ future<> pq_reader::init() {
     _mon.on_read_completed();
 }
 
-future<> pq_reader::load_row_group(size_t rg) {
-    // Before the early return, not after: a fast_forward_to() resets the materialised group while
-    // leaving the buffered bytes in place, and the callers below index columns() either way.
-    need_columns(rg);
-    if (_cur_rg == rg) { co_return; }
+// The materialised row group's byte span: [first page of any chunk, end of the last). One call
+// site fetches it and the other compares against its size, and they must agree, so there is one
+// definition. need_columns(rg) first.
+std::pair<int64_t, int64_t> pq_reader::row_group_span() const {
     int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
     for (const auto& cc : columns()) {
         if (!cc.meta) { continue; }
@@ -656,10 +668,54 @@ future<> pq_reader::load_row_group(size_t rg) {
         lo = std::min(lo, s);
         hi = std::max(hi, s + cm.total_compressed_size);
     }
+    return {lo, hi};
+}
+
+future<> pq_reader::load_row_group(size_t rg) {
+    // Before the early return, not after: a fast_forward_to() resets the materialised group while
+    // leaving the buffered bytes in place, and the callers below index columns() either way.
+    need_columns(rg);
+    if (_cur_rg == rg) { co_return; }
+    const auto [lo, hi] = row_group_span();
     if (lo >= hi) { throw std::runtime_error("pq: empty row group extent"); }
     _rg_buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
     _rg_base = lo;
     _cur_rg = rg;
+}
+
+bool pq_reader::have_page_index() const {
+    if (_oi.size() != columns().size()) { return false; }
+    for (const auto& o : _oi) { if (!o || o->pages.empty()) { return false; } }
+    return true;
+}
+
+bool pq_reader::paged_fetch_is_not_cheaper(int64_t lo, int64_t hi) const {
+    const auto [span_lo, span_hi] = row_group_span();
+    const int64_t extent = span_lo >= span_hi ? 0 : span_hi - span_lo;
+    if (extent <= 0) { return true; }
+    const auto& cols = columns();
+    int64_t paged = 0;
+    // Every window the paged path would still issue inside this row group, because streaming
+    // pays for the group once and then serves the rest of it from _rg_buf. Bails out as soon as
+    // the paged path has spent the group's own size, which is the only thing the answer turns on
+    // -- so the loop is short in exactly the case where it would otherwise be long.
+    for (int64_t w = lo; w < hi; w += point_window_rows) {
+        const int64_t wend = std::min(hi, w + point_window_rows);
+        for (size_t c = 0; c < cols.size(); ++c) {
+            if (!cols[c].meta) { continue; }
+            const auto& pages = _oi[c]->pages;
+            const size_t i0 = _oi[c]->page_for_row(w);
+            const size_t i1 = _oi[c]->page_for_row(wend > w ? wend - 1 : w);
+            if (i0 >= pages.size() || i1 >= pages.size() || i1 < i0) { return true; }
+            paged += pages[i1].offset + pages[i1].compressed_page_size - pages[i0].offset;
+            if (cols[c].meta->dictionary_page_offset) {
+                const int64_t d0 = *cols[c].meta->dictionary_page_offset;
+                if (pages.front().offset > d0) { paged += pages.front().offset - d0; }
+            }
+        }
+        if (paged >= extent) { return true; }
+    }
+    return paged >= extent;
 }
 
 future<bool> pq_reader::next_window() {
@@ -672,16 +728,56 @@ future<bool> pq_reader::next_window() {
     const size_t rg = size_t(std::distance(
             _rg_start.begin(),
             std::prev(std::upper_bound(_rg_start.begin(), _rg_start.end(), _cursor))));
-    const int64_t rg_end = _rg_start[rg] + _cf->md.row_groups[rg].num_rows;
+    const int64_t rg_first = _rg_start[rg];
+    const int64_t rg_end = rg_first + _cf->md.row_groups[rg].num_rows;
 
     const int64_t lo = _cursor;
-    const bool bounded = _pr->start() || _pr->end();
-    const int64_t win = bounded ? point_window_rows : scan_window_rows;
+    // Rows of this row group the read still wants. The ordinal window [_row_lo, _row_hi) is
+    // contiguous, so every row group strictly inside it is wanted whole and only the two at the
+    // ends can be partial -- which is why the cheap test below settles a scan without touching
+    // the page index at all.
+    const int64_t grp_hi = std::min(rg_end, _row_hi);
+
+    // Streaming or paging, decided per row group by which one fetches fewer bytes.
+    //
+    // This used to be decided by `_pr->start() || _pr->end()` -- the *presence* of a bound rather
+    // than the *width* of the range -- and since the coordinator splits every range scan at
+    // tablet boundaries before a replica sees it, every scan a client can issue is bounded and
+    // every scan took the point-read path: 512 rows at a time, re-fetching each window's
+    // containing page for every leaf. At the shipping defaults that pulled 460 MB through a 23 MB
+    // file for one aggregate, in ~497 000 reads against the row format's 1 792 (design doc
+    // §10.26).
+    //
+    // The predicate is now the comparison the cost model actually turns on, with no constant to
+    // tune: the paged path is worth it only while the pages covering the wanted rows are smaller
+    // than the row group holding them. Two cases, and the first is the common one:
+    //
+    //   * the whole group is wanted -- any scan, and every interior group of any range -- so
+    //     streaming reads it once, sequentially, in one operation. No page index needed.
+    //   * the group is wanted in part -- a point read, or a boundary group of a range -- so the
+    //     OffsetIndex (which the paged path has to read anyway) says exactly what paging would
+    //     fetch, and it wins unless the re-fetching makes it cost the group's own size.
+    //
+    // That second test is what keeps a point read on the paged path where paging is genuinely
+    // cheaper, and it is also why a point read at the shipping defaults now streams: with
+    // page_rows >= rows_per_row_group the containing "page" *is* the chunk, so paging fetched the
+    // whole group anyway -- the same bytes in 2 x leaves operations instead of one.
+    bool stream;
+    if (lo == rg_first && grp_hi == rg_end) {
+        stream = true;
+    } else {
+        need_columns(rg);
+        co_await load_offset_indexes(rg);
+        stream = !have_page_index()
+              || paged_fetch_is_not_cheaper(lo - rg_first, grp_hi - rg_first);
+    }
+
+    const int64_t win = stream ? scan_window_rows : point_window_rows;
     const int64_t hi = std::min({rg_end, _row_hi, lo + win});
     if (hi <= lo) { co_return false; }
 
     std::vector<format::column_data> colsdata;
-    if (bounded) {
+    if (!stream) {
         rtimer _t{rphase::page_decode};
         colsdata = co_await decode_paged(rg, lo - _rg_start[rg], hi - _rg_start[rg]);
     } else {

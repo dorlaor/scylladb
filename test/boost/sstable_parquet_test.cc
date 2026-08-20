@@ -114,14 +114,20 @@ utils::chunked_vector<mutation> make_muts(schema_ptr s, int n_part, int n_rows) 
 
 // The raw fragment stream, printed. Reassembling into mutations normalises
 // range-tombstone bounds, which hides a lost bound weight; the fragments do not.
-std::vector<sstring> fragments_of(shared_sstable sst, schema_ptr s, reader_permit permit) {
-    auto rd = sst->make_reader(s, permit, query::full_partition_range, s->full_slice());
+std::vector<sstring> fragments_in(shared_sstable sst, schema_ptr s, reader_permit permit,
+                                  const dht::partition_range& pr,
+                                  const query::partition_slice& slice) {
+    auto rd = sst->make_reader(s, permit, pr, slice);
     auto close = deferred_close(rd);
     std::vector<sstring> out;
     while (auto mf = rd().get()) {
         out.push_back(seastar::format("{}", mutation_fragment_v2::printer(*s, *mf)));
     }
     return out;
+}
+
+std::vector<sstring> fragments_of(shared_sstable sst, schema_ptr s, reader_permit permit) {
+    return fragments_in(sst, s, permit, query::full_partition_range, s->full_slice());
 }
 
 utils::chunked_vector<mutation> read_all(shared_sstable sst, schema_ptr s,
@@ -237,6 +243,69 @@ SEASTAR_THREAD_TEST_CASE(test_pq_single_partition_read) {
             assert_that(*got).is_equal_to(want);
             BOOST_REQUIRE(!read_mutation_from_mutation_reader(rd).get());
         }
+    }).get();
+}
+
+// A *bounded* range wide enough that the reader streams whole row groups instead of paging
+// 512 rows at a time. That choice used to be made from the presence of a bound rather than the
+// width of the range (design doc 10.26), so this is the case whose read path changed, and the
+// thing to prove about it is that the rows did not: fragment for fragment against the row
+// format, over the whole span, over an interior sub-range that starts and ends mid-row-group,
+// and over a single partition -- the three shapes the per-row-group decision has to get right.
+//
+// 40 x 200 = 8 000 rows cuts more than one row group at the 5 000-row default, so the span case
+// really does contain interior groups wanted whole, which is what the cheap half of the
+// predicate resolves; the sub-range case exercises the other half, where a partial group is
+// compared against its own page index.
+SEASTAR_THREAD_TEST_CASE(test_pq_bounded_range_streams_and_agrees_with_row_format) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 40, 200);
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        auto check = [&] (const char* what, const dht::partition_range& pr, bool expect_rows = true) {
+            auto fw = fragments_in(ref, s, env.make_reader_permit(), pr, s->full_slice());
+            auto fg = fragments_in(sst, s, env.make_reader_permit(), pr, s->full_slice());
+            BOOST_TEST_CONTEXT(what) {
+                BOOST_REQUIRE_EQUAL(fg.size(), fw.size());
+                for (size_t i = 0; i < fg.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(fg[i], fw[i]);
+                }
+                // Guards the guard: a range that silently returned nothing would pass every
+                // comparison above.
+                BOOST_REQUIRE_EQUAL(!fg.empty(), expect_rows);
+            }
+        };
+
+        // The whole ring segment the sstable holds, bounded at both ends -- what a range scan
+        // looks like once the coordinator has split it at a tablet boundary.
+        check("full span, both bounds closed",
+              dht::partition_range::make({muts.front().decorated_key(), true},
+                                         {muts.back().decorated_key(), true}));
+        // Open start, closed end: the first piece of a split, and the shape that made
+        // `start() || end()` true for every scan in the first place.
+        check("open start, closed end",
+              dht::partition_range::make_ending_with({muts.back().decorated_key(), true}));
+        check("closed start, open end",
+              dht::partition_range::make_starting_with({muts.front().decorated_key(), true}));
+        // An interior slab, and the same slab with its bounds excluded, so the boundary row
+        // groups are partial at both ends.
+        check("interior, inclusive",
+              dht::partition_range::make({muts[7].decorated_key(), true},
+                                         {muts[31].decorated_key(), true}));
+        check("interior, exclusive",
+              dht::partition_range::make({muts[7].decorated_key(), false},
+                                         {muts[31].decorated_key(), false}));
+        // One partition, which must keep taking the narrow path it was measured on.
+        check("singular", dht::partition_range::make_singular(muts[19].decorated_key()));
+        // A range that selects nothing between two adjacent keys.
+        check("empty interior",
+              dht::partition_range::make({muts[5].decorated_key(), false},
+                                         {muts[6].decorated_key(), false}),
+              false);
     }).get();
 }
 
