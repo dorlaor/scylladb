@@ -7,45 +7,72 @@ know that is not obvious from the code.
 Every item names the trap that would catch a reasonable first attempt, because in this project
 that has been the expensive part rather than the implementation.
 
-Last reviewed 2026-08-18. Corpus figures live in `parquet-storage-format.md` §10.1f-prod; the
-decks are generated from `~/pq-lab/deck_data.py` and are at v2.5.
+Last reviewed 2026-08-20. Corpus figures live in `parquet-storage-format.md` §10.1f-prod; the
+decks are generated from `~/pq-lab/deck_data.py`.
 
 ---
 
-## Read-path performance — reopened 2026-08-20 for the scan path
+## Read-path performance
 
 Point-read p50 went **1 915 µs → 581 µs (3.3×)** across four changes (§10.4c, 10.4f, 10.4i, and
 dictionary paging), for about 14 % of size. Point-read optimisation stays **paused** — items 2–4
-below are recorded, not scheduled. **The scan path is a different matter and is now the top item
-here** (0, below), because storage-format §10.26 found the format's headline advantage was never
-real and the reason is fixable.
+below are recorded, not scheduled. The scan path was reopened on 2026-08-20 when storage-format
+§10.26 found the format's headline advantage was never real; **both items it named are now done**
+(0 and 0a below), and what is left of projection is not a pq change at all.
 
-### 0. A bounded partition range takes the point-read path — the scan is 2.3× the row format
-**Top of this list.** `pq_reader::next_window()` picks its unit of work from
-`bounded = _pr->start() || _pr->end()`: unbounded streams whole row groups in 16 384-row windows,
-bounded uses 512-row windows and re-fetches each window's containing page for every leaf. The
-predicate should be the *width* of `[_row_lo, _row_hi)`, not the presence of a bound — a bounded
-range spanning two million rows is not a point read.
+### 0. ~~A bounded partition range takes the point-read path~~ — fixed 2026-08-20
+`pq_reader::next_window()` picked its unit of work from `bounded = _pr->start() || _pr->end()`, and
+since the coordinator splits every range scan at tablet boundaries, every scan a client could issue
+took the point-read path: 512-row windows, re-fetching each window's containing page for every leaf.
+A whole-table aggregate over 8 M rows was **2.29×** the row format, 460 MB through a 23 MB file, in
+~497 000 read extents.
 
-It matters because **CQL never produces an unbounded range**: a range scan is split at tablet
-boundaries by `query_ranges_to_vnodes_generator` and every piece of the split carries a bound.
-So `query::full_partition_range` reaches the reader only from compaction, streaming and in-process
-tests. Measured (storage-format §10.26): a whole-table aggregate over 8 M rows is **2.29×** the row
-format and pulls **460 MB through a 23 MB file**; the same rows on the streaming path are at
-**parity**, 1.02–1.13×.
+Fixed, and **not** by testing the width of `[_row_lo, _row_hi)` as this item proposed. Width needs a
+threshold and the threshold has no defensible value; the comparison the cost model actually turns on
+does not. The ordinal window is contiguous, so a row group is either wanted whole — in which case one
+sequential read is unbeatable and no page index is even needed — or wanted in part, which only the
+two groups at the ends of a range can be, in which case the OffsetIndex the paged path must read
+anyway says exactly what paging would fetch: page it unless the re-fetching costs the group's own
+extent. Measured after: **1.03×** of the row format through CQL, 1 601 read extents, 21.3 MB
+(storage-format §10.26, "Fixed, and re-measured"). Point reads improved too, because at the shipping
+defaults `page_rows ≥ rows_per_row_group` means the "page" is the chunk, so paging was fetching the
+whole group in 2 × leaves operations where streaming does it in one.
 
-Two things to be careful of when fixing it. The width test has to be on the *ordinal* window the
-index produced, not on the CQL range, because the point of the fork is what the reader will do.
-And `perf_pq_vs_default` now times both paths (`bscan` column) precisely so the fix can be shown
-rather than argued; it should move `bscan` to `scan` and leave `scan` alone.
+`perf_pq_vs_default`'s `bscan` column stays: it is now the regression test for the fork (bounded
+within 0.98–1.01× of unbounded across nine arms), and it is the cheapest place to catch a
+reintroduction.
 
-### 0a. Column projection is not pushed down — and the win is read operations, not bytes
-`reader.cc:1031` says so, and §10.26 confirms it at the level of bytes read: `count(*)`,
-`count(temp)` and a three-column aggregate on a 28-leaf table all read 497 632 extents and 460 MB,
-identical to 0.005 %. Independent of item 0 and worth most on wide tables. Note what the benefit
-actually is on Scylla's shredded schemas: the two dozen `__ttl_*`, `__ldt_*` and tombstone leaves
-are all-null and RLE to ~45 kB each, so they are 5 % of the bytes and 23/28 of the reads. §10.1c's
-byte-based estimate of the prize is the wrong unit, though it errs low.
+### 0a. Column projection — the safe half is done, the rest is not a pq change
+§10.26 asked for projection pushdown and measured that the prize on a shredded schema is read
+*operations*, not bytes: the two dozen `__ttl_*`, `__ldt_*` and tombstone leaves are all-null, RLE to
+~45 kB each, so they are 5 % of the bytes and 23/28 of the per-leaf work.
+
+**That half is done, and without consulting the query at all.** A leaf whose chunk statistics say
+`null_count == num_values` is null for every row of its row group, so the reader neither fetches nor
+decodes it and tells the reassembler *absent* (`column_data::skipped`). Being a property of the file,
+it applies to `SELECT *`, compaction and repair as well. On the paging arm of the §10.26 harness that
+took a whole-table aggregate from 99 902 read extents to 33 038. Excluded, deliberately: repeated
+leaves and leaves inside a collection group, because `num_values` counts *slots* and a repeated slot
+that is "present but empty" counts as null there — which is not the same as absent, and
+`read_collection()` distinguishes the two.
+
+**Query projection itself is blocked, and not at this layer.** A CQL row is live if its marker is
+live *or* any of its cells is, and the compacting reader decides that from the fragment it is handed.
+Drop the cells of an unprojected column and a marker-less row — i.e. any row written by `UPDATE` —
+loses its liveness: `SELECT b` over rows that only ever had `a` written must return rows with
+`b = null` and would return nothing instead. "The marker is live in this sstable" does not save it
+either, because a row tombstone in another sstable can shadow the marker while a cell of ours written
+with a later `USING TIMESTAMP` survives. Cassandra solves this by distinguishing *fetched* from
+*queried* columns — it reads every regular column from storage and projects above it — and mx
+sidesteps it by never consulting the slice. So a working projection needs either that same split
+above the sstable layer, or a way for `mutation_fragment_v2` to assert row liveness without carrying
+the cell. **Whoever picks this up: the first attempt that "just honours `slice.regular_columns`"
+passes every round-trip test in the tree and loses rows in production.**
+`test_pq_restricted_slice_still_returns_every_cell` is there to fail it.
+
+What it is now worth, since the numbers moved: a whole-table aggregate already reads 21.3 MB of a
+23.4 MB file (read amplification 0.91×), so projection can no longer be a headline. It is worth
+having on wide tables, where the unnamed columns are most of the bytes.
 
 ### 1. ~~Footer metadata cache~~ — built 2026-08-20
 Built, measured and evicted on a running node: storage-format §10.4l for the design, §10.24 for the

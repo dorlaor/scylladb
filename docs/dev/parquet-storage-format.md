@@ -339,9 +339,9 @@ Restating the prompt's targets with mechanism, so we know what to measure.
 |---|---|---|
 | Write (flush) | Parity to −10 % | Same mutation-fragment stream; extra cost is buffering + encode. Only relevant if Parquet is used at flush time, which the hybrid design mostly avoids |
 | Write (compaction) | −5 to −20 % CPU-bound | Encode + zstd on the write side; offset by less I/O |
-| Full scan, all columns | Parity to +30 % | Less I/O, more decode. **Met on the streaming path (1.02–1.13×), missed by 2.3× through CQL** — §10.26 |
-| **Scan with column projection** | **1.5–5×** | The headline win; reads only the projected column chunks. **Not implemented** — the reader reads every leaf on every path, §10.26 |
-| Aggregations / analytics | Large win | Projection + page-index skipping via min/max. Neither reaches a scan yet; §10.26 |
+| Full scan, all columns | Parity to +30 % | Less I/O, more decode. **Met on both paths: 1.02–1.13× streaming, 1.03× through CQL** since §10.26's window fix (it was 2.29× through CQL while a bounded range took the point-read path) |
+| **Scan with column projection** | **1.5–5×** | Was billed as the headline win. **Query projection is not implemented and cannot be at this layer** — dropping an unprojected column's cells drops the liveness of a marker-less row (§10.26). The reader does skip leaves its statistics prove empty, which is where the *operation* count went; the bytes win needs a fetched-vs-queried split above the sstable |
+| Aggregations / analytics | Large win | Projection + page-index skipping via min/max. A whole-table aggregate now reads 21.3 MB of a 23.4 MB file against the row format's 234 MB, so the I/O win is real; neither projection nor min/max skipping is what delivers it (§10.26) |
 | **Single-partition point read (cache miss)** | **−10 to −40 % latency** | N column-chunk page decodes instead of one contiguous row read. Worse the wider the `SELECT *` |
 | Single-partition point read (cache hit) | **No change** | Row cache is above the format entirely |
 | Range read within a partition | Parity to slight loss | Page index limits the damage |
@@ -2096,15 +2096,20 @@ read whole rows.
 | D5 `SELECT total_amount` | 824 891 | 5.3 % | ~19× |
 | D5 4 columns | 2 892 781 | 18.4 % | ~5× |
 
-**These are what the *format* permits, and the reader claims none of it (§10.26, 2026-08-20).**
-Projection is not pushed down on any path — single-partition read, token-range scan or
-coordinator-side aggregate — and that is now measured at the level of bytes read, not inferred:
-`count(*)`, `count(temp)` and a three-column aggregate on the same 28-leaf table all read 497 632
-extents and 460 MB, identical to 0.005 %. So this table is a target, not a result. It also
-understates what the target is worth on Scylla's shredded schemas: the reduction there is mostly in
-read *operations* and per-leaf decode setup rather than bytes, because the two dozen `__ttl_*`,
-`__ldt_*` and tombstone leaves are all-null, RLE to ~45 kB each, and still cost a read apiece per
-window.
+**These are what the *format* permits, and the reader claims part of it — the part that is safe
+(§10.26, 2026-08-20).** Query projection is still not pushed down on any path: `count(*)`,
+`count(temp)` and a three-column aggregate on the same 28-leaf table read identical bytes, because a
+reader that drops an unprojected column's cells drops the liveness of any row that had no marker,
+which is what an `UPDATE` produces. That is a Scylla-wide change (Cassandra's fetched-vs-queried
+split), not a pq one, and §10.26 has the argument.
+
+What the reader *does* claim is the part of this that does not depend on the query at all, and on
+Scylla's shredded schemas it is most of the operations: a leaf whose chunk statistics say every value
+is null is neither fetched nor decoded, which on the 28-leaf time-series schema removes 23 leaves —
+every `__ttl_*`, `__ldt_*` and tombstone channel, all-null, RLE to ~45 kB each and formerly a read
+apiece per window. Measured: a paging arm's whole-table aggregate went from 99 902 to 33 038 read
+extents. So the bytes column above remains a target rather than a result; the *operations* it
+understates are now largely collected.
 
 ### 10.1d Estimator accuracy (validates C6)
 
@@ -3284,17 +3289,19 @@ bytes, which would make every format look alike.
 |---|---:|---:|---:|---|---|
 | Write | 580 ms | 609 ms | **1.05×** | ≥ −10 % | **yes** |
 | Full scan, streaming | 143 ms | 136 ms | **0.95×** | ≥ parity | **yes** — at parity |
-| Full scan, through CQL | 15 200 ms | 34 866 ms | **2.29×** | ≥ parity | **no** — §10.26 |
+| Full scan, through CQL | 14 820 ms | 15 192 ms | **1.03×** | ≥ parity | **yes** — since §10.26's fix |
 | Point read | 26–136 µs | 1.15–18.3 ms | **44–134×** | ≤ 1.2× | **no** |
 | Data size | 3 994 586 B | 1 275 614 B | **0.32×** | — | — |
 | Peak scan memory | 256 kB | 5 548 kB | 22× | bounded | **yes** — see below |
 
 The scan row was one row until 2026-08-20 and it hid the result that matters. The reader has two scan
-paths and takes the fast one only for an unbounded partition range, which is what compaction and
-streaming pass and what this in-process test passes; a range scan from a client is split at tablet
-boundaries and every piece of the split is bounded, so it gets the point-read path instead. The
-figures in the second row are 8 M rows through the coordinator (§10.26), not the 100 000 in the
-first, so read the ratio and not the milliseconds. **The format scans at parity; the reader does not.**
+paths, and it used to take the fast one only for an *unbounded* partition range — which is what
+compaction, streaming and this in-process test pass, while a client's range scan is split at tablet
+boundaries and every piece of the split is bounded, so it got the point-read path. That fork is
+fixed: the window is now chosen per row group by which strategy fetches fewer bytes, and the CQL row
+above went 34 866 ms → 15 192 (2.29× → 1.03×) with 497 632 read extents → 1 601. The figures in that
+row are 8 M rows through the coordinator (§10.26), not the 100 000 in the first, so read the ratio and
+not the milliseconds. **The format scans at parity, and now so does the reader — on both paths.**
 
 **R-13 (bounded memory) holds on the read path.** Peak *scan* memory against sstable size,
 same schema. The **write** path is a different story and is not bounded at all — see §5.5a:
@@ -3326,13 +3333,16 @@ the index entry (§5.4 option A), decode one row group at a time in fixed window
 the V2 page header's `num_rows` to step over pages without decompressing them. This is
 what bought bounded memory, write parity, and a full scan level with the row format — 1.02–1.13x on
 the streaming path, re-measured across nine arms in §10.26. It was recorded here as 0.82x and as
-"an understatement of the target"; both are withdrawn. "Scan parity" (§1.2) is met on this path and
-missed by 2.3x on the one CQL uses, for the reason §10.26 gives.
+"an understatement of the target"; both are withdrawn. "Scan parity" (§1.2) is met on this path, and
+since §10.26's fix it is met on the path CQL uses too, at 1.03x of the row format through the
+coordinator.
 
-*Paged reads.* For a bounded range, fetch two extents per column chunk — the dictionary
-page and the contiguous run of data pages the OffsetIndex says covers the wanted rows —
-instead of the whole row group. Worth little on its own here, because the cost had already
-moved elsewhere; it matters at scale, where a row group is far larger than a partition.
+*Paged reads.* Fetch two extents per column chunk — the dictionary page and the contiguous
+run of data pages the OffsetIndex says covers the wanted rows — instead of the whole row group.
+Taken when it fetches fewer bytes than the row group does, decided per row group rather than from
+the presence of a range bound, which is the correction §10.26 made after that fork turned every CQL
+scan into a point read. Worth little on its own here, because the cost had already moved elsewhere;
+it matters at scale, where a row group is far larger than a partition.
 
 *The dictionary was the real cost, and profiling was the only way to find it.* Three
 plausible explanations were each measured and rejected before the right one turned up: the
@@ -3793,11 +3803,12 @@ matters is access pattern. When this was written the read path could not answer,
 was all there was; per-table point-read and scan counters now exist (§10.14) and the proxy was kept
 anyway, because nothing showed a read-mix criterion deciding better (§6.3). Refusing on width alone
 is cruder — it declines a wide table that is only ever scanned, and a scan is Parquet's *best*
-relative showing, though at parity rather than at the 0.82x once claimed here and 2.3x slower than
-the row format through CQL until the reader stops treating a bounded range as a point read (§10.26).
-Width is if anything the wrong proxy in a second way: the ~497 000 reads a scan costs today scale
-with leaf count, so the wide table this refuses is the one that would gain most from the projection
-pushdown §10.26 asks for. That false negative is now a deliberate choice rather
+relative showing, at parity rather than at the 0.82x once claimed here — and, since §10.26's fix,
+at parity through CQL as well (1.03x, against 2.29x while the reader treated a bounded range as a
+point read). Width is if anything the wrong proxy in a second way: the per-leaf read and decode cost
+a scan pays scales with leaf count, so the wide table this refuses is the one that gained most from
+§10.26's fix (a paging arm's aggregate: 99 902 read extents down to 33 038) and would gain most again
+from the query projection that is still not pushed down. That false negative is now a deliberate choice rather
 than a limitation: it errs towards leaving data in the row format, and at 134x on the worst shape
 that is the error to prefer. An operator who knows better sets `storage_format = 'parquet'`.
 
@@ -3862,8 +3873,10 @@ from ~62x to **38.4x mean / 41.4x p50**.
 > even on its own path 0.82 does not reproduce: nine arms measured under §10.21's method put the
 > streaming ratio at **1.02–1.13x**, i.e. parity, and §10.4's own table reported 0.95x for the same
 > quantity from the same binary. 0.82 was one unreplicated pair of 121–144 ms probes with no canary.
-> Read it as: **the format scans at parity on the streaming path, and the reader is 2.3x slower on
-> the path CQL actually uses.** The p99 ratio is only 6.5x, because the native format's p99 (239 us) is eight
+> Read it as: **the format scans at parity, on both paths.** The reader's 2.29x on the CQL path
+> was the fork described above, and it was fixed the same day: 15 192 ms against native's 14 820,
+> 1.03x, with 1 601 read extents against 497 632 (see §10.26, "Fixed, and re-measured"). What
+> does *not* come back is the advantage — 0.82x was never real, and parity is the honest claim. The p99 ratio is only 6.5x, because the native format's p99 (239 us) is eight
 times its own p50 while Parquet's (1 551 us) is 1.3x — the columnar path is far more predictable,
 it is just uniformly slower.
 
@@ -5161,7 +5174,17 @@ sweeps. It was the path, as suspected, but not for the suspected reason and not 
   only because a 300 ms probe is mostly noise floor.
 - **Column projection is not honoured** — on any path, confirmed at the level of bytes read — but
   that is not why this looked slow: the query above projects all three of the table's regular
-  columns, so a working projection would have skipped nothing.
+  columns, so a working projection would have skipped nothing. (It is still not honoured, and §10.26
+  gives the reason it cannot be honoured at this layer; what *was* claimed instead is the elision of
+  leaves the file's own statistics prove empty.)
+
+**The fork is fixed (§10.26), and what it moves here is this section's scan column rather than its
+recommendation.** With the window chosen per row group by which strategy fetches fewer bytes, the
+same 10 %-ring probe puts `pq`/native at 1.06× at the shipping default and 1.09–1.31× across the
+sweep, and the ordering follows *file size* rather than page size. So "both read shapes want smaller
+pages" is withdrawn for scans: a streaming scan reads the file, and a page is not a unit of work in
+it. Point reads still want smaller pages — which is what the recommendation actually rests on — and
+they got faster on every arm (shipping cold min 1 930 → 1 149 µs).
 
 So the numbers in the `scan ms` column stand as measurements of the path CQL uses. What does *not*
 follow from them is a page recommendation: their slope is a property of the reader being on the wrong
@@ -5297,8 +5320,11 @@ call this project has made the same way twice before (§10.4c, §10.1f-rg) and w
 memory-rich deployment could reasonably decide differently; and that +18–20 % of the file is too much
 for 293 µs on a metric that is still 2.4–3.0× the row format, which is §10.4m's judgement re-examined
 against better numbers rather than inherited. The scan column carries no part of this, which §10.26
-turned from a caution into a positive reason: its slope comes from the reader taking the point-read
-path for a bounded range, so a page chosen on it would be tuned to a defect that is meant to be fixed.
+turned from a caution into a positive reason: its slope came from the reader taking the point-read
+path for a bounded range, so a page chosen on it would have been tuned to a defect. The defect is now
+fixed, and the re-probe confirms the decision: with a bounded range streaming, the scan column's
+slope against page size is gone and what remains tracks file size (1.06–1.31× of native, best at the
+two largest pages), so a scan-driven choice would if anything argue for *larger* pages than 2 048.
 
 **Should the defaults differ by table shape?** The data says the *optimum* does and the *achievable
 gain* does not justify a second default. Wide tables pay the small-row-group tax about four times
@@ -5313,7 +5339,7 @@ it trades against OOM rather than against latency. ClickBench preferring *smalle
 (§10.2) points the same way: no single row count is right, and the useful response is that both are
 per-table properties (§8.2) rather than a second global pair.
 
-### 10.26 The two scan numbers were two different readers — resolved 2026-08-20, and §10.4c's headline is wrong
+### 10.26 The two scan numbers were two different readers — resolved 2026-08-20, §10.4c's headline is wrong, and both defects then fixed
 
 §10.25 left one thing unresolved and flagged it as the thing to settle before any scan figure in this
 document is relied on: it measured `pq` at **2.0–4.7×** the row format on a scan, where §10.4c had
@@ -5472,6 +5498,10 @@ Parquet. Two changes are indicated, in this order:
 - **Push the projection down.** Independent of the above, and worth most on wide tables, where the
   ~497 000 reads and the per-leaf decode setup scale with leaf count while the useful bytes do not.
 
+**Both changes were then made the same day. The figures are at the end of this section
+("Fixed, and re-measured"), and the short version is that the scan advantage does not come back —
+parity does, and it now holds through CQL.** The rest of this section is the defect as it stood.
+
 **What this does *not* change.** The §10.25 recommendation stands untouched, and for a better reason
 than "the scan column was kept out of it": the direction that column points — smaller pages help
 scans — is an artifact of the reader being on the wrong path. On the streaming path the page does not
@@ -5495,6 +5525,138 @@ default must put 10 s back for the duration. And the **`pqps` keyspace is kept**
 minutes against 45 to rebuild. `select_internal_page_size` and `read_request_timeout_in_ms` were both
 raised for single probes and are back at their defaults — written back explicitly, since a LiveUpdate
 option keeps its last live value when the key is merely deleted from the file.
+
+#### Fixed, and re-measured the same day — 2026-08-20
+
+Two commits, measured separately so each is attributable, because the second one's value depends on
+which path the first one selects.
+
+**Fix 1 — the window is chosen per row group, by which strategy fetches fewer bytes.** Not by the
+width of the range either, in the end, and not by any constant: the ordinal window `[_row_lo,
+_row_hi)` is contiguous, so a row group is either wanted *whole* — every interior group of every
+range, and every group of a scan — or wanted in part, which only the two groups at the ends of a
+range can be. A whole group is one sequential read and nothing beats that. A partial group is
+compared against its own OffsetIndex, which the paged path has to read anyway: paging wins unless
+re-fetching pages costs the group's own extent. So the predicate is the comparison the cost model
+turns on, and it needs no tuning.
+
+That has a consequence worth stating in advance, because it is the opposite of a regression: at the
+shipping defaults a *point read* now streams. With `page_rows` ≥ `rows_per_row_group` the containing
+page **is** the chunk (§10.25), so paging was fetching the whole row group anyway — the same bytes in
+2 × leaves operations instead of one.
+
+**Fix 2 — leaves the file's own statistics prove empty are neither fetched nor decoded.** Query
+projection is *not* how the prize above is claimed, and the attempt is what showed why. A CQL row is
+live if its marker is live **or** any of its cells is, and Scylla's compacting reader decides that
+from the fragment it is handed. Drop the cells of an unprojected column and a live row becomes an
+empty one whenever that column was the only thing keeping it alive — and a row written by `UPDATE`
+has no marker at all, so `SELECT b` over rows that only ever had `a` written must return rows with
+`b = null` and would instead return nothing. "The marker is live in this sstable" does not rescue it
+either: a row tombstone in *another* sstable can shadow the marker while a cell of ours, written with
+a later `USING TIMESTAMP`, survives it. Cassandra hits the same wall and answers it by distinguishing
+*fetched* from *queried* columns — it reads every regular column from storage and projects afterwards
+— and mx sidesteps it by never consulting the slice at all. So pq now matches mx by contract, with a
+test that pins it (`test_pq_restricted_slice_still_returns_every_cell`).
+
+The same work is claimed from the file instead of from the query. A chunk whose statistics say
+`null_count == num_values` carries nothing for any row of its row group, so it is skipped and the
+reassembler is told *absent* rather than being handed levels that say the same thing. On this schema
+that is 23 of the 28 leaves — exactly the ones this section identified as costing 23/28 of the
+operations while holding 5 % of the bytes — and because it is a statement about the file rather than
+about the query, `SELECT *`, compaction and repair get it too. Repeated leaves and leaves inside a
+collection group are excluded: `num_values` counts *slots*, and a repeated slot that is "present but
+empty" is counted as a null there, which is not the same as absent.
+
+**The node, same harness and arms as above.** Whole-table `SELECT count(temp), count(status),
+count(note) ... BYPASS CACHE` over 8 M rows, `BYPASS CACHE`, min of two replicates, native measured
+in the same block as the canary. The `pqps` sstables are byte-identical across the restarts (checked
+by name and size — 40 Data.db files, 4 tablets per arm, nothing recompacted), so these rows compare
+against the defect rows directly:
+
+| arm | before | after fix 1 | after both | vs native, after |
+|---|---:|---:|---:|---:|
+| native (`me`) | 15 200 ms / 1 792 reads / 234.0 MB | 15 276 / 1 796 / 234.0 | **14 820 / 1 796 / 234.0** | 1.00× |
+| **`pq`, shipping 5 000 / 8 192** | 34 866 / 497 632 / 460.0 | 15 466 / 1 601 / 21.3 | **15 192 / 1 601 / 21.3** | **1.03×** |
+| `pq`, page 2 048 | 28 945 / 497 632 / 366.6 | 15 956 / 1 601 / 30.9 | **15 217 / 1 601 / 30.9** | 1.03× |
+| `pq`, page 512 | 23 424 / 496 402 / 328.2 | 18 351 / 99 902 / 124.6 | **16 838 / 33 038 / 88.6** | 1.14× |
+| `pq`, page 20 000 | 65 420 / 496 402 / 887.3 | 17 649 / 800 / 16.4 | **16 508 / 800 / 16.4** | 1.11× |
+
+**2.29× → 1.03×, 497 632 reads → 1 601, and 460.0 MB → 21.3 MB through a 23.4 MB file.** Read
+amplification is now **0.91×** — less than the file, because the footer is cached and the page index
+is not read on the streaming path — against the row format's 1.0× *of a ten times larger file*. The
+predicted "~15.4 s against native's 15.2 s" came out at 15.2 against 14.8; the estimate was sound and
+it is now a measurement.
+
+Where the two fixes divide is visible in the table and worth reading off it. Fix 1 is the whole of
+the time and nearly the whole of the I/O on every arm whose groups are wanted whole. Fix 2 shows up
+where the reader still legitimately pages — the page-512 arm, whose boundary groups are cheaper to
+page than to stream — and there it takes the reads from 99 902 to 33 038, a factor of 3.0, which is
+the 23-of-28 leaf ratio arriving as promised. On the streaming arms fix 2 changes neither reads nor
+bytes at all (1 601 and 21.3 MB before and after) because the group is one sequential read either
+way: **there it buys decode, not I/O, and the decode it buys is inside the replicate spread.** That
+is a smaller result than "projection saves the scan", and it is the honest one.
+
+Replicate agreement: 0.4 % (native), 6.1 % (shipping), 2.3 %, 0.8 %, 1.0 % — looser than the 0.6 %
+of the defect run, because the probes are now half as long. Native moved 15 447 → 14 820 across the
+hour (4 %), which is why the ratio column rather than the millisecond column is the result.
+
+**In-process, the fork itself is gone.** `~/pq-lab/scanpath.sh` unchanged (20 000 partitions × 5
+rows, min of 5, one pinned core), reading the same rows unbounded and bounded:
+
+| arm | `pq` bounded / `pq` streaming, before | after | `pq`/native streaming, after | `pq`/native bounded, after |
+|---|---:|---:|---:|---:|
+| **shipping 5 000 / 8 192** | 2.05× | **1.00×** | 1.02× | 1.02× |
+| 20 000 / 256 | 1.11× | 1.00× | 1.14× | 1.14× |
+| 20 000 / 512 | 1.12× | 1.00× | 1.11× | 1.10× |
+| 20 000 / 1 024 | 1.21× | 1.00× | 1.12× | 1.11× |
+| 20 000 / 2 048 | 1.39× | 1.01× | 1.14× | 1.15× |
+| 20 000 / 8 192 | 2.39× | 0.98× | 1.07× | 1.04× |
+| 20 000 / 20 000 | **4.32×** | **1.00×** | 1.14× | 1.14× |
+| 5 000 / 2 048 | 1.39× | 1.00× | 1.05× | 1.05× |
+| shipping, +21 leaves | 1.55× | 0.99× | 1.09× | 1.07× |
+
+**A bound now costs 0.98–1.01× across all nine arms, against 1.00–4.32×.** Native's control column is
+123–124 ms throughout (0.8 % spread), as before. And the page size no longer moves a bounded scan,
+which was the whole signature of the defect.
+
+**Point reads did not regress; they improved, on every arm.** `~/pq-lab/pagesweep.py` in probe-only
+mode against the same `pqps` tables §10.25 measured, so this reads directly against §10.25's table
+(400 probes × 3 rounds, `BYPASS CACHE`, production caching, canary spread 16 % against §10.25's
+13 %):
+
+| arm | §10.25 bypass / cold | after fix 1 | after both |
+|---|---:|---:|---:|
+| native | 460 / 470 | 456 / 466 | **454 / 455** |
+| **default 5 000 / 8 192** | 1 603 / 1 930 | 1 276 / 1 265 | **1 201 / 1 149** |
+| 20 000 / 256 | 1 037 / 1 345 | 985 / 1 248 | **966 / 963** |
+| 20 000 / 512 | 1 284 / 1 503 | 990 / 926 | **816 / 1 015** |
+| 20 000 / 1 024 | 1 339 / 1 228 | 914 / 849 | **930 / 783** |
+| 20 000 / 2 048 | 1 155 / 1 288 | 1 133 / 1 375 | **743 / 770** |
+| 20 000 / 8 192 | 1 730 / 2 295 | 1 444 / 1 693 | **1 265 / 1 385** |
+| 20 000 / 20 000 | 3 978 / 3 853 | 3 688 / 3 390 | **2 661 / 2 691** |
+
+The shipping arm's cold point read goes **1 930 → 1 149 µs against native's 455**, i.e. 4.11× → 2.53×
+— which keeps it inside §10.24's "1.8–3.6× cold" band rather than moving it out, and by the mechanism
+predicted above: one operation for the group instead of 2 × 28, and then 23 of those 28 leaves not
+decoded at all. Fix 2 is the larger half of that on the arms that page (2 048: 1 375 → 770 cold).
+
+**One conclusion of §10.25 moves, in the direction §10.26 predicted.** The 10 %-ring scan column,
+which §10.25 could not collect at all, now runs and no longer favours small pages: `pq`/native is
+1.06× at the shipping default (22.3 MB), 1.09× at page 20 000 (15.9 MB) and 1.21–1.31× at pages
+256–2 048 (28–86 MB). The ordering follows **file size**, not page size, because a streaming scan
+reads the file and a page is not a unit of work. So the §10.25 recommendation is not merely still
+standing — the reason it was right is now the measured one, and choosing `page_rows` small "for
+scans" would now be the wrong direction as well as the wrongly-derived one.
+
+**What is still not done.** Column projection, in the sense the query means it: `count(*)` reads
+every value column and reads exactly as much as `count(temp), count(status), count(note)` — 1 601
+reads and 21.3 MB, identical — because of the liveness argument above. Claiming it needs a way to
+establish row liveness without materialising a cell, which `mutation_fragment_v2` has no way to
+express; it is a Scylla-wide change (Cassandra's fetched-vs-queried split) rather than a pq one, and
+it is recorded as such in `parquet-future-work.md`. Note what it is now worth: on this schema the
+value columns the query does not name are ~94 % of the *bytes* but a scan already reads only 21.3 MB
+of a 23.4 MB file, so the ceiling on projection here is the difference between 0.91× read
+amplification and something below it — worth having on a wide table, no longer worth a headline.
 
 ### 10.22 Footer size, measured per file and per row group
 
@@ -6287,8 +6449,8 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 
 | Area | Severity | What is missing |
 |---|---|---|
-| Point-read latency | known | **1.8–3.6× the row format cold**, at 8 M rows with the footer cache in place (§10.24), down from 5.4–23.6×. Warm reads are at the client round-trip floor for every format. What remains uncovered is the *first* read of an sstable after a restart, which still walks the whole footer: §10.23's side index is specified, not built. Parquet is still for scanned data. |
-| **Scan path** | **known, and it is the format's justification** | **2.3× the row format through CQL** at 8 M rows and the shipping defaults, where the format itself scans at parity (§10.26). The reader takes the point-read path — 512-row windows, per-window page fetch of every leaf — for any *bounded* partition range, and the coordinator splits every range scan at tablet boundaries, so no client scan reaches the streaming path. 460 MB read through a 23 MB file for one aggregate. Column projection is also not pushed down on any path. Two bounded fixes, both specified in §10.26, neither built. |
+| Point-read latency | known | **1.8–3.6× the row format cold**, at 8 M rows with the footer cache in place (§10.24), down from 5.4–23.6×; §10.26's read-path fixes then moved the shipping arm to **2.53×** (cold min 1 149 µs against native's 455, from 1 930) without a change aimed at point reads. Warm reads are at the client round-trip floor for every format. What remains uncovered is the *first* read of an sstable after a restart, which still walks the whole footer: §10.23's side index is specified, not built. Parquet is still for scanned data. |
+| **Scan path** | **done** | **1.03× the row format through CQL** at 8 M rows and the shipping defaults, reading 21.3 MB of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796 (§10.26). It was 2.29×, 460 MB and ~497 000 extents until 2026-08-20, because the reader chose the point-read path for any *bounded* partition range and the coordinator splits every range scan at tablet boundaries; the window is now chosen per row group by which strategy fetches fewer bytes. Leaves the file's statistics prove empty are also skipped, which is 23 of 28 on the time-series schema. What remains unimplemented is *query* projection, and §10.26 argues it cannot be done at this layer without a fetched-vs-queried split above the sstable: `count(*)` still reads every value column. |
 | Production-scale re-measurement | **done for point reads and scans** | §10.21 re-measured point reads at 8 M rows with a canary and `BYPASS CACHE`, and retired every warm ratio in §10.4 as a measurement of the client round trip. §10.24 then measured the footer cache against a squeezed-cache control on the same data. §10.26 did the same for scans, and it moved a conclusion rather than scaling one. Write figures are still from 200–300 k-row sstables. |
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
@@ -6303,12 +6465,13 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 **The honest summary.** The functionality is built and, where the claim is behavioural, verified on
 a running node rather than only in a unit test. What is left is genuinely narrow:
 
-- **One conclusion that has already changed, and it is the headline one**: scans. §10.26 measured a
-  whole-table scan through CQL and it is **2.3× the row format**, not the 0.82× §10.4c reported and
-  the deck quoted. The format scans at parity; the reader takes the point-read path for any bounded
-  range and the coordinator never hands it an unbounded one. This is the one remaining item that
-  bears on whether the format is worth shipping, because scan performance is its justification — and
-  it is an implementation defect with a named cause, not a property of Parquet.
+- **One conclusion that changed, and it was the headline one**: scans. §10.26 measured a whole-table
+  scan through CQL at **2.3× the row format**, not the 0.82× §10.4c reported and the deck quoted,
+  and localised it to the reader taking the point-read path for any bounded range while the
+  coordinator never hands it an unbounded one. That defect is fixed and re-measured: **1.03×**, with
+  21.3 MB read against native's 234 MB. So the corrected claim is **parity with an order of magnitude
+  less read I/O** — not the advantage 0.82× promised, which was never real, and not the 2.3× penalty
+  either. Point reads improved as a side effect (shipping arm, cold min 1 930 → 1 149 µs).
 - **One accepted trade**: TWCS converts without a gain check, so a schema Parquet stores worse
   converts anyway. `storage_format = 'sstable'` is the only guard and it is manual.
 - **One half-measurement**: mixed-format bucketing at scale showed the right shape but over too
