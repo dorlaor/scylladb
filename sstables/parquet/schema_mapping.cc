@@ -898,10 +898,13 @@ struct collection_cursor {
 static std::optional<collection_cell> read_collection(
         const std::vector<column_data>& cd, const mapped_schema& ms,
         size_t k, size_t vcol, size_t row_i, collection_cursor& cur) {
-    // A skipped key leaf means no row of this window has the collection at all, which is what
-    // read_collection() reports by returning nullopt. The reader only ever skips a collection
-    // group whole (reader.cc, elidable_leaves()), so the slot-indexed leaves below are either all
-    // present or never reached.
+    // The reader never elides a leaf inside a collection group -- the group's leaves are consumed
+    // together, slot by slot, by one cursor, so eliding one of them would desynchronise the rest
+    // (reader.cc, elidable_leaves()). This check is therefore not reachable today; it is here so
+    // that a future rule which elides a *whole* group degrades to "the collection is absent from
+    // every row", which is what an all-null key leaf means, rather than indexing an empty vector.
+    // The row-level tombstone leaves (__ct_ts_, __ct_ldt_) sit outside the group and are elidable;
+    // they are read through a size check below, which an elided leaf fails.
     if (cd[vcol].skipped) { return std::nullopt; }
     const auto& l_key = cd[vcol];
     const auto& l_val = cd[vcol + 1];
@@ -1017,6 +1020,11 @@ std::vector<row> reassemble(const mapped_schema& ms,
         std::map<size_t, int64_t> exc;
         if (ms.tsx_mask_index && !absent(*ms.tsx_mask_index) &&
             cd[*ms.tsx_mask_index].def_levels[i]) {
+            // The two sparse-exception leaves are written together -- a row with an exception has
+            // a value in both -- so an elided `vals` beside a live `mask` is impossible. Rejecting
+            // it costs one branch per window and turns "impossible" into a loud failure rather
+            // than a wrong timestamp.
+            require_read(*ms.tsx_vals_index, "sparse exception values");
             const std::string& mask = cd[*ms.tsx_mask_index].str[i];
             const std::string& vals = cd[*ms.tsx_vals_index].str[i];
             size_t pos = 0;
