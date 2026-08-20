@@ -1416,10 +1416,28 @@ Guard rails, with reasons rather than round numbers:
 | `rows_per_row_group` floor | 1 000 | Below this the fixed ~225 B per leaf per row group dominates: at 100 rows on a 20-leaf table that is 45 B/row against a 5.2 B/row total, so the file grows ~9x (§10.4c) |
 | `rows_per_row_group` ceiling | 100 000 000 | Sanity |
 | `row_group_buffer_bytes` | 1 MiB - 1 GiB | A guard rail, not a dial: *buffered shredder memory* rather than output, sized to stop a shard OOMing on a pathological partition (R-13). At the 5 000-row default it never binds; see §5.5a |
-| `page_rows` | 128 - 1 000 000 | |
+| `page_rows` | 128 - 1 000 000 | The ceiling has to exceed the row-group ceiling for `page_rows` to be expressible as "one page per group"; the floor is where the curve has gone flat — below ~2 048 rows a smaller page buys no latency at all and only costs size (§10.25) |
 | `compression_level` | 1 - 22 | zstd's range |
 
 `row_group_buffer_bytes` accepts a `KiB`/`MiB`/`GiB` suffix as well as a plain count.
+
+**Three knobs, three different jobs — measured and separated in §10.25.** The short version, because
+the natural reading of the names gets all three wrong:
+
+| knob | what it actually trades | measured |
+|---|---|---|
+| `rows_per_row_group` | size against **scan memory**, at ~1.1 kB of reader memory per row of group | 5 000 → 20 000 is −4.3/−5.0 % of the file for **3.6×** the memory (5.6 → 19.9 MB) |
+| `page_rows` | size against **latency**, at **zero** memory cost | ~130 ns of cold point read per row of page, five independent estimates 114–131; 4× smaller costs +18/+20 % of the file on real data |
+| `row_group_buffer_bytes` | nothing, deliberately — it is a guard rail against OOM | binds on sparse wide shapes (cuts Backblaze at ~6 400 rows) and never at the default on narrow ones |
+
+**`page_rows` is a ceiling, not a page size, and that is why 8 192 exceeds the 5 000-row group.** The
+writer emits `min(page_rows, rows in the group)` values per page, so at the defaults the page bound
+does not bind and the effective page *is* the row group. That is intentional: the setting exists to
+cap decode volume as soon as the group is larger, and the cap is worth **2.9×** (a 20 000-row group
+costs 3 641 µs per cold point read with one page per group against 1 240 µs at 8 192). Where it is not
+needed it costs nothing — Backblaze's 8 192 and 20 000 outputs are byte-identical. Setting
+`page_rows` ≥ `rows_per_row_group` is therefore not an error, it is how you ask for one page per row
+group; it is also the worst measured configuration on every axis except size.
 
 **The two are not co-equal knobs, and the doc used to imply they were.** `rows_per_row_group`
 is the tuning dial: it is what read cost depends on, it is the one that actually cuts at the
@@ -4961,6 +4979,13 @@ for size (§10.2), which is the trade §10.4c originally described at test scale
 larger-row-groups-for-latency argument in §10.21 applies to the *uncached* first read, which is what
 §10.23's side index is for.
 
+**And the inversion turned out not to be about row groups at all — see §10.25.** Every arm in this
+table changed its *page* size along with its row group, because the writer emits
+`min(page_rows, rows in the group)` values per page and 8 192 cannot bind at 5 000. Re-measured with
+the row group held fixed, cold latency tracks the page at ~130 ns/row and the row-group count retains
+only a 10–20 %-per-4× residual: the −0.449 µs per row group above is mostly the page effect wearing
+the row group's label. The slope is real; its attribution was not.
+
 **Warm reads are unchanged at ~256 µs across every arm**, because that is the client round trip
 (§10.21) and no storage change can move it.
 
@@ -4992,6 +5017,249 @@ restarted, every read is a first read. That is §10.23's side index, and it is n
 also publishes an entry per input sstable that it will never read twice, converting footer bytes into
 resident memory for the duration; the reclaimer bounds it, and "populate only for bounded reads" is
 the refinement if it ever shows up as pressure.
+
+### 10.25 The two knobs, separated — 2026-08-20, and `page_rows` is a ceiling rather than a size
+
+§10.24 left a fork. Caching the footer inverted the `rows_per_row_group` slope, from +4.42 µs per row
+group per file to −0.449, and two readings fit that equally well while recommending opposite
+defaults: either the row-group count still drives point-read cost with a different sign, or row
+groups only ever mattered *through* the footer and what remains is page decode. Another
+`rows_per_row_group` sweep could not settle it, because of a structural confound present in every
+sweep in this section.
+
+**The writer slices pages at `min(page_rows, rows in the row group)`** (`parquet_writer.cc`), and
+`parquet_reader.cc:375` steps over any page whose row range excludes the target without
+decompressing it, then decodes the containing page in full. At the shipping defaults — 5 000 rows per
+group, an 8 192-row page — the page bound cannot bind: there is one data page per column chunk, so
+the **effective page size *is* the row-group size**. §10.21 and §10.24 therefore moved three terms at
+once: footer bytes, the per-chunk dictionary page, and the data page. That is the same defect §10.4f
+found one level down, reappearing: the value was reachable, but only if the other knob left it room.
+
+So both are swept separately, and the decisive figure is a prediction at a point the fit did not see.
+
+#### Method
+
+`~/pq-lab/pagesweep.py`. 8 M rows, the same 28-leaf time-series schema, and §10.21's estimator and
+gates unchanged so the tables read directly against §10.21 and §10.24: `BYPASS CACHE`, production
+cache settings, interleaved arms, a constant-cost canary, min of 400 probes × 3 rounds, one node
+restart before the cold pass. `rows_per_row_group` is held at 20 000 — large enough that the footer
+term is small and, more importantly, *constant*: every arm in the sweep has 401 row groups and
+~620 kB of footer, which the table shows rather than asserts. Footer bytes come from each file's own
+tail (the `uint32` before the `PAR1` magic), because the encoded length is what a cold read fetches
+and walks, not pyarrow's parsed view of it.
+
+Two failures worth recording, because both were avoidable and neither was anticipated. A restarted
+node schedules compaction for every table it finds, and with this many 8 M-row tables on one shard
+that starved the cold pass enough to time a read out — which killed the first attempt *after* all
+three phases had been collected, because the table and the JSON are both written at the end. The
+harness now quiesces after the restart and drops a failed probe rather than the run. And a
+**whole-table aggregate is not measurable this way at all**: an 8 M-row scan on one shard exceeds
+`range_request_timeout_in_ms`, and all 24 scan probes, native included, returned read timeouts.
+Scans are therefore measured over a fixed 2 % token slice — identical across arms, so the comparison
+holds and only the absolute figure is a fiftieth of a table.
+
+#### Cold point reads and file size against the effective page
+
+8 M rows, 2 sstables. Two independent replicates; the second adds the control arm and the scans.
+Canary 227–257 µs (13 % spread) and 228–266 µs (17 %), against 224–244 µs in §10.21, so all three
+runs are comparable.
+
+| arm | row groups | footer share | effective page | cold µs (run 1) | cold µs (run 2) | MB | scan ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| native | — | — | — | 470 | 454 | 223.18 | 326 |
+| **5 000 / 8 192 (shipping)** | 1 601 | 9.8 % | **5 000** | 1 930 | 1 366 | 22.32 | 921 |
+| 20 000 / 256 | 401 | 0.7 % | 256 | 1 345 | 1 008 | 86.22 | 683 |
+| 20 000 / 512 | 401 | 1.0 % | 512 | 1 503 | 996 | 58.52 | 660 |
+| 20 000 / 1 024 | 401 | 1.5 % | 1 024 | 1 228 | 937 | 39.87 | 810 |
+| 20 000 / 2 048 | 401 | 2.1 % | 2 048 | 1 288 | 1 193 | 28.05 | 946 |
+| 20 000 / 8 192 | 401 | 3.1 % | 8 192 | 2 295 | 1 240 | 18.95 | 1 126 |
+| 20 000 / 20 000 | 401 | 3.6 % | 20 000 | 3 853 | 3 641 | 15.84 | 1 531 |
+| 5 000 / 2 048 *(control)* | 1 601 | 6.9 % | 2 048 | — | 1 073 | 32.45 | 742 |
+
+**The hypothesis holds, and the slope is reproducible across measurements that share no code.** A
+least-squares fit of cold latency against *effective* page size gives **130.6 ns per row** (run 1)
+and **129.4 ns** (run 2). §10.4g measured the page-decode slope directly at **114 ns/value** on a
+different schema, a different binary and an in-process harness; §10.24's `rows_per_row_group` slope
+re-expressed per *page* row implies **118 ns/row**; and the in-process grid below gives
+**116 ns/row**. Five estimates spanning 114–131 ns/row is one mechanism, not a coincidence.
+
+**And the prediction the fit did not see.** The shipping arm has **four times** the row groups of
+every arm the fit was built from — 1 601 against 401, and 3.9× the footer bytes — but its effective
+page is a point on the line. Predicted from the six 20 000-row arms alone: 1 874 µs. Measured:
+1 930 µs, **within 3.0 %**. An arm that is off the curve by 4× in row-group count is on it to 3 % in
+page size. With the footer cached, the row-group count is very nearly not a term.
+
+**"Very nearly" is measured rather than hedged.** The control arm puts a number on the residual: same
+2 048-row page, four times the row groups, **120 µs faster** at 1 073 against 1 193 µs — 10 %, in the
+direction §10.24's negative slope predicted, and about a twentieth of the 2 400 µs the page spans.
+The in-process grid agrees: 19 % for the same 4× at page 2 048, 8 % at page 512. So **the page is the
+dial and the row group retains a residual worth roughly 10–20 % per 4×**. The candidates for that
+residual are named by the format: Parquet defines the dictionary page as per column *chunk*, so its
+decode cost tracks the row group whatever the page is, and a read landing in the last page of a chunk
+parses the header of every page before it.
+
+**Below about 2 048 rows per page the curve flattens and is not resolvably monotone** — 1 008, 996,
+937, 1 193 µs across 256…2 048 in run 2, against a 228 µs canary floor and a fixed cost the fit puts
+at 800–1 229 µs. This is §10.4g's "71 % is a fixed floor" surviving the footer cache: roughly 1 ms
+per read that no page setting touches. Spending size below 2 048 rows buys nothing.
+
+**Scans move the same way as point reads, not the opposite way.** This was the risk the sweep existed
+to check — a page chosen on point reads quietly hurting the workload Parquet is for — and it is not
+there: scan time falls from 1 531 ms at a 20 000-row page to 660 ms at 512, monotone apart from the
+256 point. Both read shapes want smaller pages; only *size* wants larger ones.
+
+**Two caveats keep the scan column out of the recommendation's load-bearing structure.** It disagrees
+with §10.4c, which measured `pq` at **0.82×** the row format on a full scan where this measures
+**2.0–4.7×**; and it disagrees with §10.4c and §10.4f, which both found scan time *flat* across page
+and row-group sweeps. The difference is plausibly the path rather than the format — §10.4c timed an
+in-process mutation reader over 100 k rows, this times a server-side aggregate through the
+coordinator at 8 M rows — and the obvious suspect is whether the `pq` reader restricts itself to the
+projected columns on this path, which is §10.1c's claim and is not verified here. **Unresolved, and
+it should be resolved before any scan figure in this document is relied on**; recorded as measured
+rather than quietly dropped.
+
+#### Scan memory is what `rows_per_row_group` actually costs
+
+Peak reader memory during a scan is in-process and the node harness cannot see it, so it comes from
+`perf_pq_scan_memory_scaling`, which already reads both knobs from the environment
+(`~/pq-lab/scanmem_page.sh`). 160 000 rows, 7-leaf perf schema:
+
+| `rows_per_row_group` | `page_rows` | data bytes | **peak scan memory** | in-process point µs |
+|---:|---:|---:|---:|---:|
+| 1 000 | 8 192 (→1 000) | 2 528 084 | **1 168 kB** | 490 |
+| 5 000 | 8 192 (→5 000) | 2 049 689 | **5 584 kB** | 1 037 |
+| 5 000 | 2 048 | 2 176 053 | **5 576 kB** | 732 |
+| 5 000 | 512 | 2 563 315 | **5 588 kB** | 516 |
+| 20 000 | 8 192 | 1 996 552 | **19 872 kB** | 1 869 |
+| 20 000 | 2 048 | 2 103 746 | **19 860 kB** | 869 |
+| 20 000 | 512 | 2 522 977 | **20 188 kB** | 559 |
+| 50 000 | 8 192 | 1 984 926 | **20 616 kB** | 1 481 |
+| 100 000 | 8 192 | 1 984 926 | **20 628 kB** | 1 604 |
+
+**Peak scan memory is a function of `rows_per_row_group` alone, and is flat across a 16× change in
+page size** — 5 576–5 588 kB at every page at 5 000 rows, 19 860–20 188 kB at every page at 20 000.
+That one fact separates the knobs, and it is the most decision-relevant number here:
+
+- **`rows_per_row_group` trades size against scan memory**, roughly linearly at ~1.1 kB per row of
+  row group, and R-13 is a requirement rather than a preference. 5 000 → 20 000 is **3.6×**. It
+  saturates above 20 000 because the 64 MiB shredder budget takes over from the row count
+  (§10.1f-rg), which is why 50 000 and 100 000 produce byte-identical files.
+- **`page_rows` trades size against latency at zero memory cost.** Nothing in the memory column
+  moves when the page changes by 16×.
+
+#### What a smaller page costs in size on real data — and the synthetic schemas are the outliers
+
+§10.4m's lesson was that a size cost measured on one schema transferred badly by 2.5×, so this is
+measured per dataset, sweeping *pairs* rather than the page alone (`~/pq-lab/sweep_page.sh`). Each
+point round-trips native → `pq` through a real major compaction; the row-group count of the result is
+recorded, because on sparse wide shapes the byte budget binds before the row count does and the pair
+asked for is not the pair written.
+
+| pair | ISD-Lite, 20 leaves | vs shipping | Backblaze, 199 leaves | vs shipping |
+|---|---:|---:|---:|---:|
+| **5 000 / 8 192 (shipping)** | 1 530 718 — **48.8 %** | base | 20 803 872 — **95.2 %** | base |
+| 20 000 / 8 192 | 1 454 056 — 46.3 % | −5.0 % | 19 908 060 — 91.1 % | −4.3 % |
+| 50 000 / 8 192 | 1 430 185 — 45.6 % | −6.6 % | 19 908 060 — 91.1 % | −4.3 % |
+| 20 000 / 20 000 | 1 406 834 — 44.8 % | −8.1 % | 19 908 060 — 91.1 % | −4.3 % |
+| 20 000 / 2 048 | 1 717 478 — 54.7 % | **+12.2 %** | 23 888 754 — **109.3 %** | **+14.8 %** |
+
+300 000 rows each, against a dictionary-compressed SSTable baseline of 3 139 684 and 21 850 343
+bytes. The 5 000-row Backblaze figure is byte-for-byte the 20 803 872 of §10.1f-rg from a separate
+run and script, which is the cross-check that makes the rest of the column trustworthy.
+
+**A 4× smaller page costs +18.1 % of the Parquet file on ISD-Lite and +20.0 % on Backblaze** (both
+against the 8 192 arm at the same row group). §10.4m measured +16.8 % from a different pairing. The
+28-leaf synthetic table in the latency sweep above says **+48 %** for the same step — **the synthetic
+schema is the outlier by 2.7×**, in the direction that would have made small pages look unaffordable.
+The mechanism is the one §10.4m's correction implies: a page is the unit a codec and a delta baseline
+restart on, so the cost of cutting it depends entirely on how much the long-run encodings were
+amortising, which is a property of the data.
+
+And the page swept at the *shipping* row group, which is the tuning move an operator would actually
+make. Separate load of the same dataset, so the baseline moved slightly (3 246 444 native) and the
+column is internally consistent rather than comparable to the one above:
+
+| `rows_per_row_group` | `page_rows` | `pq` bytes | ratio | vs the inert default |
+|---:|---:|---:|---:|---:|
+| 5 000 | 8 192 (→5 000) | 1 603 302 | 49.4 % | base |
+| 5 000 | 4 096 | 1 703 794 | 52.5 % | **+6.3 %** |
+| 5 000 | 2 048 | 1 878 547 | 57.9 % | **+17.2 %** |
+| 5 000 | 1 024 | 2 209 104 | 68.0 % | +37.8 % |
+
+**Three independent measurements of the same step now agree**: +17.2 % here, +18.1 % at the
+20 000-row group, and §10.4m's +16.8 % from a different pairing and run. Likewise 4 096 costs +6.3 %
+against §10.4m's +7.5 %. The size cost of halving the page is a stable ~+17 % per 4× on real data —
+which is the number that was previously in doubt, and it is *not* the +48 % the synthetic schema
+reports.
+
+**Three things in the pair table are worth reading twice.** Backblaze at a 2 048-row page crosses from a
+4.8 % win to a **9.3 % loss** — the format stops being worth using on that shape, which is exactly
+§10.4m's finding and it survives the footer cache untouched, because the cache changed the latency
+side and not the size side. `20 000 / 20 000` and `20 000 / 8 192` are **byte-identical** on
+Backblaze, which is the inertness rule visible in real output: the byte budget cuts that table at
+~6 400 rows per group, so both page settings exceed the group and produce one page per chunk. And
+50 000 buys nothing over 20 000 there for the same reason, while on ISD-Lite, where the budget never
+binds, it keeps working.
+
+#### The recommendation: `rows_per_row_group = 5 000`, `page_rows = 8 192` — unchanged, for different reasons
+
+**`rows_per_row_group` stays at 5 000, and the binding constraint is scan memory, not latency.**
+Raising it to 20 000 buys −4.3 % to −5.0 % of the Parquet file on real data and costs **3.6× the peak
+scan memory**, 5.6 → 19.9 MB per reader. That is ~3.2 MB of reader memory per 1 % of file size saved,
+and it would give back most of what the §10.4c default change bought (which was chosen on the same
+memory argument, then against a synthetic size figure; the size figure is now real and is smaller
+than the synthetic one suggested). Latency is not the reason: with the footer cached the row group is
+worth only 10–20 % per 4×, and it points the other way.
+
+**`page_rows` stays at 8 192, and it should be understood as a ceiling rather than a page size.** At
+a 5 000-row group it does not bind, and that is correct rather than a defect. Its job is to cap
+decode volume the moment the group is larger, and the cap is worth **2.9×**: on the 20 000-row arm,
+one page per group is 3 641 µs against 1 240 µs at 8 192. Where it is not needed it costs nothing —
+Backblaze's 8 192 and 20 000 outputs are byte-identical. This is the same argument §10.4f made about
+dictionary chunks scaling with a knob, and it is why the value should not be lowered to "make it do
+something": lowering it to 2 048 costs +18–20 % of the file on both real datasets, pushes Backblaze
+into a net loss, and buys 173–293 µs against a ~1 ms floor.
+
+**The trade, in the units the decision is made in.** From the shipping pair, the two available moves
+cost:
+
+| move | size, real data | cold point read | scan memory |
+|---|---:|---:|---:|
+| lower `page_rows` to 4 096 | +6.3 % | ≈ −120 µs (from the 130 ns/row slope) | unchanged |
+| lower `page_rows` to 2 048 | **+17 to +20 %** | −293 µs (1 366 → 1 073), 3.0× → 2.4× native | unchanged |
+| lower `page_rows` to 1 024 | +37.8 % | nothing further — the floor | unchanged |
+| raise `rows_per_row_group` to 20 000 | **−4.3 to −5.0 %** | neutral within replicate spread | **+3.6×** |
+
+So the latency move is ~17 µs of cold point read per 1 % of file size, and the size move is ~3.2 MB
+of reader memory per 1 % of file size. Neither is a bargain, which is what "the defaults are already
+on the frontier" looks like when it is measured instead of assumed. 4 096 is the one move that is
+close to fair — 6.3 % for about 120 µs — and it is left as a per-table option rather than a default
+because it is a straight trade of the format's strongest metric for its weakest, and §10.4m already
+declined it once on the same grounds with the same numbers.
+
+**What is data and what is judgement.** Data: the 130 ns/row page slope and its five-way replication;
+the 3 % prediction across a 4× change in row-group count; the 10–20 % residual row-group term; scan
+memory being a function of the row group alone; the real-data size costs (+18/+20 % for the page,
+−4.3/−5.0 % for the row group); the 2.9× value of the ceiling; Backblaze crossing into a net loss at
+2 048. Judgement: that 3.6× scan memory outweighs 5 % of file size, which is a memory-versus-disk
+call this project has made the same way twice before (§10.4c, §10.1f-rg) and which a
+memory-rich deployment could reasonably decide differently; and that +18–20 % of the file is too much
+for 293 µs on a metric that is still 2.4–3.0× the row format, which is §10.4m's judgement re-examined
+against better numbers rather than inherited. The scan column is measured but its disagreement with
+§10.4c is unresolved, so it is deliberately not carrying any part of this.
+
+**Should the defaults differ by table shape?** The data says the *optimum* does and the *achievable
+gain* does not justify a second default. Wide tables pay the small-row-group tax about four times
+harder per group — Backblaze's footer is 10.9 % of its file at 5 000 rows against ISD-Lite's 5.2 %,
+because footer bytes scale as groups × leaves (§10.22) — which argues for larger groups on wide
+tables. But that is precisely where the knob stops working: the 64 MiB byte budget already cuts
+Backblaze at ~6 400 rows, so `rows_per_row_group` above 20 000 is inert there, and the whole
+available gain is 4.3 %. A per-shape *row-count* default would therefore be inert exactly where it is
+most wanted. That is a measured argument for the reframing already recorded in open question 15: the
+per-shape lever worth pursuing is `row_group_buffer_bytes`, not the row count — with the caveat that
+it trades against OOM rather than against latency. ClickBench preferring *smaller* row groups
+(§10.2) points the same way: no single row count is right, and the useful response is that both are
+per-table properties (§8.2) rather than a second global pair.
 
 ### 10.22 Footer size, measured per file and per row group
 
