@@ -98,7 +98,6 @@
 #include "service/cache_hitrate_calculator.hh"
 #include "compaction/compaction_manager.hh"
 #include "sstables/sstables.hh"
-#include "sstables/parquet/encryption_keys.hh"
 #include "sstables/exceptions.hh"
 #include "gms/feature_service.hh"
 #include "replica/distributed_loader.hh"
@@ -1111,17 +1110,6 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 sstables::set_abort_on_malformed_sstable_error(val);
             });
             sstables::set_abort_on_malformed_sstable_error(cfg->abort_on_malformed_sstable_error());
-
-            // Parquet encryption keys. Loaded here, before anything can open an sstable, and
-            // loudly: a node that silently came up with no keys would refuse every read of an
-            // encrypted table later, with the failure pointing at the table rather than at the
-            // configuration. A malformed file is a startup error for the same reason.
-            if (!cfg->parquet_encryption_key_file().empty()) {
-                sstables::parquet::keys().load(cfg->parquet_encryption_key_file());
-                startlog.info("parquet encryption: loaded {} key(s) from {}",
-                              sstables::parquet::keys().size(),
-                              cfg->parquet_encryption_key_file());
-            }
 
             checkpoint(stop_signal, "creating snitch");
             debug::the_snitch = &snitch;

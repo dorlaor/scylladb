@@ -24,6 +24,7 @@
 
 #include "sstables/parquet/schema_mapping.hh"
 #include <map>
+#include <set>
 #include <seastar/core/sstring.hh>
 #include "sstables/metadata_collector.hh"
 #include "sstables/writer_impl.hh"
@@ -44,11 +45,15 @@ struct pq_writer_config {
     // Per-column encodings an operator asked for, already translated from the CQL enum to the
     // Parquet one. Empty for every table that does not set them, which is the common case.
     std::map<std::string, format::encoding> column_encodings{};
-    // Empty key id means no encryption. Kept as an id rather than resolved bytes so that a
-    // config round-trip (to_map) cannot leak key material.
-    seastar::sstring encryption_key_id{};
+    // Parquet Modular Encryption. `encryption_enabled` is the selector; the key itself is never
+    // held here, only the options that tell a key provider how to find it, so a config round-trip
+    // (to_map) cannot leak key material.
+    bool             encryption_enabled = false;
     format::cipher   encryption_algo = format::cipher::aes_gcm_v1;
     key_metadata_format encryption_key_metadata = key_metadata_format::provider;
+    // ent/encryption's option vocabulary, forwarded verbatim to key_source. Empty unless
+    // encryption is on.
+    key_options      key_opts{};
     // A row group is cut when either limit trips.
     //
     // `row_group_buffer_bytes` is **buffered shredder memory**, not encoded output, and
@@ -118,16 +123,31 @@ public:
     // nesting to be had. The column name is taken verbatim, so a quoted CQL identifier keeps its
     // case.
     static constexpr const char* ENCODING_PREFIX        = "encoding.";
-    // Parquet Modular Encryption. The algorithm is an enum; the key is named by *id* and
-    // resolved locally from parquet_encryption_key_file, so no key material ever enters the
-    // schema (which is replicated, stored in system tables and printed by DESCRIBE).
+    // Parquet Modular Encryption. `encryption` selects the algorithm -- and, being in the
+    // `parquet` map rather than in `scylla_encryption_options`, says specifically "encrypt
+    // *inside the format*".
+    //
+    // That separation is not cosmetic. `scylla_encryption_options` drives an sstable file-io
+    // extension that encrypts the whole Data component, which would (a) double-encrypt and (b)
+    // leave a file no external reader can open -- the exact outcome modular encryption exists to
+    // prevent. So the two are mutually exclusive, enforced at DDL time in cf_prop_defs.
+    //
+    // The *key* still comes from ent/encryption, using its own option vocabulary (see
+    // KEY_OPTIONS below), so every provider it supports -- including BYOK through KMIP, AWS KMS,
+    // GCP and Azure -- works here. No key material enters the schema; only the options that
+    // locate it, exactly as with scylla_encryption_options.
     static constexpr const char* ENCRYPTION            = "encryption";
-    static constexpr const char* ENCRYPTION_KEY        = "encryption_key";
     // What goes into FileCryptoMetaData.key_metadata: 'provider' (the key id verbatim, the
     // default, and what works with every provider including BYOK) or 'parquet_kms'
     // (parquet-java's key-material JSON, needed only by pyarrow's and Spark's KMS-mediated
     // readers). See encryption_keys.hh for why this is the operator's choice.
     static constexpr const char* ENCRYPTION_KEY_METADATA = "encryption_key_metadata";
+    // The sub-options forwarded verbatim to the key provider. A closed list on purpose: an
+    // unrecognised sub-option is an error (see the `else` in the parser), and providers ignore
+    // options they do not know, so an open-ended pass-through would turn a typo'd
+    // `secret_key_fil` into a silent fall back to the default key file. Adding a provider option
+    // means adding it here -- which is the cost of having typos be errors.
+    static const std::set<sstring>& key_option_names();
 
     // Guard rails. The lower bound on rows is not arbitrary: below ~1 000 rows the
     // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --
@@ -160,7 +180,17 @@ public:
 
     const std::map<sstring, column_encoding>& column_encodings() const { return _column_encodings; }
 
+    // For the read path, which needs the same provider options the writer used but none of the
+    // rest of the config.
+    const key_options& key_opts() const { return _cfg.key_opts; }
+    bool encryption_enabled() const { return _cfg.encryption_enabled; }
+
 private:
+    // Runs once the whole map is parsed: the interesting checks are about combinations (an
+    // algorithm the format cannot honour, provider options with encryption off) rather than
+    // single values, and CQL map order is not the operator's.
+    void validate_key_options();
+
     pq_writer_config _cfg;
     std::map<sstring, column_encoding> _column_encodings;
 };

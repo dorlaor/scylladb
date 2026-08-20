@@ -366,19 +366,40 @@ future<> pq_reader::init() {
                 reinterpret_cast<const uint8_t*>(_footer.get()), _footer.size());
         size_t consumed = 0;
         auto fcm = format::parse_file_crypto_metadata(region, &consumed);
-        // key_metadata carries the key id the writer used. Trusting the file to name its own key
-        // is safe: it is an id, not a capability, and a wrong one simply fails to authenticate.
+        // key_metadata carries the id the key provider issued for this file, or nothing at all if
+        // the provider issues no ids. Trusting the file to name its own key is safe: it is an id,
+        // not a capability, and a wrong one simply fails to authenticate.
+        //
+        // The provider *options* come from the schema rather than from the file. That is a real
+        // difference from the whole-component encryption path, which stores them in the sstable's
+        // own extension attributes: changing the key provider on a table with existing sstables
+        // will make them unreadable, where scylla_encryption_options would still open them.
+        // Recorded in the design doc as a known limitation -- key_metadata is a single opaque
+        // string, and packing the option map into it would break the "id, verbatim" contract that
+        // makes the provider-neutral shape work.
         const seastar::sstring key_id =
                 fcm.key_metadata ? key_id_from_metadata(seastar::sstring(*fcm.key_metadata))
                                  : seastar::sstring();
-        auto k = keys().find(key_id);
-        if (!k) {
+        auto* ksrc = key_source_ptr();
+        if (!ksrc) {
             throw std::runtime_error(seastar::format(
-                    "pq: {} is encrypted with key '{}', which is not in "
-                    "parquet_encryption_key_file", _sst->get_filename(), key_id));
+                    "pq: {} is encrypted, but this node has no encryption key provider registered",
+                    _sst->get_filename()));
         }
+        const auto key_opts = parquet_parameters(_schema->parquet_options()).key_opts();
         format::read_crypto rc;
-        rc.key = *k;
+        try {
+            rc.key = co_await ksrc->key_for_read(key_opts, key_id);
+        } catch (...) {
+            std::throw_with_nested(std::runtime_error(seastar::format(
+                    "pq: {} is encrypted, but its key could not be obtained from the key provider "
+                    "(id '{}')", _sst->get_filename(), key_id)));
+        }
+        if (!rc.key.valid()) {
+            throw std::runtime_error(seastar::format(
+                    "pq: {}: the key provider returned a {}-byte key; AES needs 16, 24 or 32",
+                    _sst->get_filename(), rc.key.bytes.size()));
+        }
         rc.algo = fcm.algo;
         rc.aad_file_unique = fcm.aad_file_unique;
         // The writer stores the prefix, so this normally comes from the file. The fallback

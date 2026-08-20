@@ -467,30 +467,11 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
                         cdef.type->name()));
             }
         }
-        // An encryption key that this node does not have is refused at DDL time. The
-        // alternative is a table that accepts its DDL and then fails every flush, and whose
-        // first symptom is a compaction error hours later -- the DDL is the only point where
-        // the operator is present to be told.
-        //
-        // This checks the *local* node's key file, which is a real limitation and worth naming:
-        // another node may not have the key, and its writes will fail there. There is no
-        // cluster-wide key distribution here, so the check is the strongest one available
-        // rather than the one that would be right.
-        if (auto it = opts->find("encryption_key"); it != opts->end() && !it->second.empty()) {
-            if (!sstables::parquet::keys().find(it->second)) {
-                throw exceptions::configuration_exception(seastar::format(
-                        "The 'parquet' option names encryption key '{}', which is not in this "
-                        "node's parquet_encryption_key_file", it->second));
-            }
-        }
-        // Asking for an algorithm without naming a key is a setting that does nothing.
-        if (auto it = opts->find("encryption");
-            it != opts->end() && it->second != "none"
-            && opts->find("encryption_key") == opts->end()) {
-            throw exceptions::configuration_exception(
-                    "The 'parquet' option sets 'encryption' but no 'encryption_key'; encryption "
-                    "needs a key id from parquet_encryption_key_file");
-        }
+        // The remaining encryption checks -- an algorithm the format cannot honour, provider
+        // options with encryption off -- are in parquet_parameters itself, above, because they
+        // must hold everywhere the property is parsed and not only where a DDL statement created
+        // it. Whether the provider can actually be *reached* is checked in validate(), which is
+        // allowed to block.
         builder.set_parquet_options(*opts);
     }
     if (has_property(KW_STORAGE_FORMAT)) {

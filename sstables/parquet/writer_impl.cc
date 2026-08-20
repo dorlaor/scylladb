@@ -361,10 +361,12 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
             }
         } else if (k == ENCRYPTION) {
             if (v == "none") {
-                _cfg.encryption_key_id = "";
+                _cfg.encryption_enabled = false;
             } else if (v == "aes_gcm_v1") {
+                _cfg.encryption_enabled = true;
                 _cfg.encryption_algo = format::cipher::aes_gcm_v1;
             } else if (v == "aes_gcm_ctr_v1") {
+                _cfg.encryption_enabled = true;
                 // Page *bodies* are AES-CTR and carry no authentication tag, so tampering with
                 // one is not detected by the format. It exists because it is measurably faster
                 // and because other writers produce it, not because it is a good default.
@@ -374,8 +376,10 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                         "Unsupported 'encryption' value '{}' in the 'parquet' option; supported: "
                         "none, aes_gcm_v1, aes_gcm_ctr_v1", v));
             }
-        } else if (k == ENCRYPTION_KEY) {
-            _cfg.encryption_key_id = v;
+        } else if (key_option_names().contains(k)) {
+            // Forwarded to ent/encryption untouched. Validated below, once the whole map is in
+            // hand, because the checks are about combinations rather than single values.
+            _cfg.key_opts[k] = v;
         } else if (k == ENCRYPTION_KEY_METADATA) {
             auto f = parse_key_metadata_format(v);
             if (!f) {
@@ -410,8 +414,104 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                     seastar::format("Unknown sub-option '{}' for the 'parquet' option; supported: "
                                     "row_group_rows, row_group_buffer_bytes, page_rows, compression, "
                                     "compression_level, metadata_folding, dictionary, encryption, "
-                                    "encryption_key, encryption_key_metadata, and "
-                                    "'encoding.<column>'", k));
+                                    "encryption_key_metadata, 'encoding.<column>', and the key "
+                                    "provider options ({})",
+                                    k, fmt::join(key_option_names(), ", ")));
+        }
+    }
+    validate_key_options();
+}
+
+const std::set<sstring>& parquet_parameters::key_option_names() {
+    // ent/encryption's own vocabulary, spelled exactly as `scylla_encryption_options` spells it,
+    // so an operator who has configured encryption at rest already knows this list. The names are
+    // duplicated rather than pulled from ent/encryption/encryption.hh deliberately: sstables must
+    // not depend on scylla_encryption, which depends on it (see encryption_keys.hh).
+    static const std::set<sstring> names{
+        // generic
+        "key_provider", "secret_key_provider_factory_class",
+        "cipher_algorithm", "secret_key_strength",
+        // local file / replicated
+        "secret_key_file", "system_key_file",
+        // KMIP
+        "kmip_host", "template_name", "key_namespace",
+        // AWS KMS
+        "kms_host", "aws_assume_role_arn",
+        // GCP
+        "gcp_host", "gcp_credentials_file", "gcp_impersonate_service_account",
+        "gcp_iam_endpoint_override",
+        // Azure
+        "azure_host",
+        // shared by the cloud providers
+        "master_key",
+    };
+    return names;
+}
+
+void parquet_parameters::validate_key_options() {
+    if (!_cfg.encryption_enabled) {
+        // Provider options without `encryption` do nothing, and an inert security setting is
+        // worse than a rejected one: it reads, in DESCRIBE and in a review, as if the table were
+        // encrypted.
+        if (!_cfg.key_opts.empty()) {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option sets key provider option '{}' but no 'encryption'; "
+                    "the key options only apply when encryption is on",
+                    _cfg.key_opts.begin()->first));
+        }
+        return;
+    }
+
+    // Parquet Modular Encryption permits AES-GCM and AES-GCM-CTR and nothing else, and even
+    // AES_GCM_CTR_V1 uses GCM for every metadata module -- so the key is always an AES-GCM key.
+    // ent/encryption's default is `AES/CBC/PKCS5Padding`, which cannot be honoured at all.
+    //
+    // Two rules follow, and they are different on purpose. An *absent* cipher_algorithm is
+    // defaulted here to the only thing the format can use -- overriding a default is not
+    // overriding a request. An *explicit* one that names another mode is refused outright,
+    // because quietly giving a table AES-GCM when its DDL says CBC would be the worst kind of
+    // help.
+    //
+    // The default is applied on every parse rather than persisted into the schema, which echoes
+    // what the operator wrote (see schema.cc's parquet_options). So the writer and the reader
+    // derive the same value from the same stored map, and DESCRIBE stays as terse as it is for
+    // every other defaulted option. Ordinarily a default that is not written down is a hazard --
+    // change it later and old files stop opening -- but not here: AES-GCM is the only thing the
+    // format permits, so there is no other value for it to become.
+    static constexpr const char* CIPHER = "cipher_algorithm";
+    static constexpr const char* required_cipher = "AES/GCM/NoPadding";
+    if (auto it = _cfg.key_opts.find(CIPHER); it == _cfg.key_opts.end()) {
+        _cfg.key_opts[CIPHER] = required_cipher;
+    } else {
+        // JCE spelling: transformation/mode/padding, case-insensitive, mode and padding optional
+        // (and an absent mode means CBC to both OpenSSL and ent/encryption -- so it is refused
+        // rather than treated as unspecified).
+        std::string spec(it->second);
+        std::transform(spec.begin(), spec.end(), spec.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        const auto first = spec.find('/');
+        const std::string alg  = spec.substr(0, first);
+        const std::string mode = first == std::string::npos
+                               ? std::string()
+                               : spec.substr(first + 1, spec.find('/', first + 1) - first - 1);
+        if (alg != "aes" || mode != "gcm") {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option asks for cipher_algorithm '{}', which Parquet Modular "
+                    "Encryption cannot honour: the format permits only AES-GCM (and AES-GCM-CTR, "
+                    "whose metadata is still GCM). Use '{}', or encrypt the whole component with "
+                    "scylla_encryption_options instead -- at the cost of a file no external "
+                    "reader can open", it->second, required_cipher));
+        }
+    }
+
+    // 128/192/256 -> 16/24/32 bytes, which is what format::encryption_key accepts. Anything else
+    // would be a table that takes its DDL and then fails every flush.
+    static constexpr const char* STRENGTH = "secret_key_strength";
+    if (auto it = _cfg.key_opts.find(STRENGTH); it != _cfg.key_opts.end()) {
+        if (it->second != "128" && it->second != "192" && it->second != "256") {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option asks for secret_key_strength '{}'; AES keys are 128, "
+                    "192 or 256 bits", it->second));
         }
     }
 }
@@ -456,12 +556,16 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
     for (const auto& [col, enc] : _column_encodings) {
         m[sstring(ENCODING_PREFIX) + col] = to_string(enc);
     }
-    // The key *id* round-trips; there is no key material here to leak. The algorithm is only
-    // emitted alongside it, because 'encryption' without a key is meaningless.
-    if (!_cfg.encryption_key_id.empty()) {
+    // The provider *options* round-trip; there is no key material here to leak, exactly as with
+    // scylla_encryption_options. Note that cipher_algorithm comes back out even when the operator
+    // did not write it, because validate_key_options() defaulted it -- DESCRIBE showing the
+    // algorithm actually in force is the point.
+    if (_cfg.encryption_enabled) {
         m[ENCRYPTION] = _cfg.encryption_algo == format::cipher::aes_gcm_v1
                       ? "aes_gcm_v1" : "aes_gcm_ctr_v1";
-        m[ENCRYPTION_KEY] = _cfg.encryption_key_id;
+        for (const auto& [ko, kv] : _cfg.key_opts) {
+            m[ko] = kv;
+        }
         if (_cfg.encryption_key_metadata != key_metadata_format::provider) {
             // Qualified: the member to_string(column_encoding) would otherwise hide it.
             m[ENCRYPTION_KEY_METADATA] =
@@ -1096,33 +1200,77 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
     // From the table's `parquet = {...}` property. Already validated at CREATE/ALTER
     // time, so anything stored here parses; an empty map yields the defaults.
     pq_writer_config pcfg = parquet_parameters(s.parquet_options()).config();
-    // The key is resolved here, at the last moment before writing, so a key file that changes
-    // takes effect on the next sstable rather than needing a restart -- and so a missing key is
-    // a loud failure at write time rather than a file written in the clear. Writing an
-    // unencrypted file for a table that asked for encryption would be the worst outcome
+    // The key is resolved here, at the last moment before writing, so a rotated or newly reachable
+    // key takes effect on the next sstable rather than needing a restart -- and so a provider that
+    // cannot be reached is a loud failure at write time rather than a file written in the clear.
+    // Writing an unencrypted file for a table that asked for encryption would be the worst outcome
     // available, since nothing downstream would ever notice.
-    if (!pcfg.encryption_key_id.empty()) {
-        auto k = keys().find(pcfg.encryption_key_id);
-        if (!k) {
+    //
+    // Blocking is legal here: this runs in the same seastar thread as pq_writer_impl's constructor,
+    // which already waits on sst.create_data().
+    if (pcfg.encryption_enabled) {
+        auto* ks = key_source_ptr();
+        if (!ks) {
             throw std::runtime_error(seastar::format(
-                    "{}.{}: parquet encryption key '{}' is not in parquet_encryption_key_file",
-                    s.ks_name(), s.cf_name(), pcfg.encryption_key_id));
+                    "{}.{}: the 'parquet' option asks for encryption but this node has no "
+                    "encryption key provider registered", s.ks_name(), s.cf_name()));
+        }
+        resolved_key rk;
+        try {
+            rk = ks->key_for_write(pcfg.key_opts).get();
+        } catch (...) {
+            std::throw_with_nested(std::runtime_error(seastar::format(
+                    "{}.{}: could not obtain a parquet encryption key from the key provider",
+                    s.ks_name(), s.cf_name())));
+        }
+        if (!rk.key.valid()) {
+            throw std::runtime_error(seastar::format(
+                    "{}.{}: the key provider returned a {}-byte key; AES needs 16, 24 or 32",
+                    s.ks_name(), s.cf_name(), rk.key.bytes.size()));
         }
         pcfg.wopt.encryption.enabled = true;
         pcfg.wopt.encryption.algo = pcfg.encryption_algo;
-        pcfg.wopt.encryption.footer_key = *k;
+        pcfg.wopt.encryption.footer_key = rk.key;
         // Binds the file to the table it belongs to: a Data.db moved between tables, or replayed
         // from a backup into a different one, fails authentication instead of decoding.
         pcfg.wopt.encryption.aad_prefix = seastar::format("{}.{}", s.ks_name(), s.cf_name());
         pcfg.wopt.encryption.store_aad_prefix = true;
-        // The reader needs to know which key. Wrapped in the key-material JSON that pyarrow and
-        // Spark's KMS layers require, so an authorised external reader can open the file; see
-        // make_key_metadata() for why the convention beats the minimal encoding here.
+        // The reader needs to be able to get the same key back. That is what the provider's id is
+        // for, and key_metadata is where Parquet puts it. Some providers issue none (their options
+        // alone identify the key), in which case this is the empty string in the `provider` shape
+        // and an empty masterKeyID in the `parquet_kms` one -- both of which the read path
+        // understands as "no id".
         pcfg.wopt.encryption.key_metadata = std::string(
-                make_key_metadata(pcfg.encryption_key_id, pcfg.encryption_key_metadata));
+                make_key_metadata(rk.id, pcfg.encryption_key_metadata));
     }
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
                                             std::move(pcfg), enc_stats, shard, nullptr);
+}
+
+future<> validate_encryption(const ::schema& s) {
+    if (s.parquet_options().empty()) {
+        co_return;
+    }
+    const parquet_parameters pp{s.parquet_options()};
+    if (!pp.encryption_enabled()) {
+        co_return;
+    }
+    auto* ks = key_source_ptr();
+    if (!ks) {
+        throw exceptions::configuration_exception(seastar::format(
+                "{}.{}: the 'parquet' option asks for encryption but this node has no encryption "
+                "key provider registered", s.ks_name(), s.cf_name()));
+    }
+    try {
+        co_await ks->validate(pp.key_opts());
+    } catch (...) {
+        // Nested rather than flattened: the provider's own message ("Could not read
+        // '/etc/scylla/foo'", "kmip host bar not configured") is the actionable part, and it is
+        // several layers down.
+        std::throw_with_nested(exceptions::configuration_exception(seastar::format(
+                "{}.{}: the 'parquet' option asks for encryption, but no key could be obtained "
+                "from the key provider", s.ks_name(), s.cf_name())));
+    }
 }
 
 } // namespace sstables::parquet
