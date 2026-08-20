@@ -5598,7 +5598,10 @@ is a smaller result than "projection saves the scan", and it is the honest one.
 
 Replicate agreement: 0.4 % (native), 6.1 % (shipping), 2.3 %, 0.8 %, 1.0 % — looser than the 0.6 %
 of the defect run, because the probes are now half as long. Native moved 15 447 → 14 820 across the
-hour (4 %), which is why the ratio column rather than the millisecond column is the result.
+hour (4 %), which is why the ratio column rather than the millisecond column is the result. Taking
+the shipping arm's three paired probes across the session — 15 466/15 276, 15 192/14 820 and
+15 055/15 270, the last on the exact committed binary — the ratio is **0.99×, 1.03× and 1.01×**. Read
+that as parity within the noise, not as an advantage in the runs where it lands under 1.00.
 
 **In-process, the fork itself is gone.** `~/pq-lab/scanpath.sh` unchanged (20 000 partitions × 5
 rows, min of 5, one pinned core), reading the same rows unbounded and bounded:
