@@ -4565,12 +4565,38 @@ gc_grace (the deletion times are wall-clock and minutes old against a 10-day gra
 per row). Yet a bind-NULL insert must write a dead cell, and in most runs no dead cell survives to
 the first measurable sstable.
 
-**The next experiment is on the Scylla side, not in the files.** Dump the tombstone count of the
-native sstable immediately after the load and the first flush, *before* the harness's codec sweep
-rewrites it five times, and see whether it already differs between runs. That splits the remaining
-space cleanly in two: if the first flush already differs, the write path is responsible; if it does
-not, one of the six major compactions is dropping cells it should not be able to drop, which would be
-a correctness question well beyond this format.
+**The write path is exonerated too: it emits the tombstones every time.** Measured as tightly as it
+can be — table created with `storage_format='parquet'` and **auto-compaction disabled**, so the first
+memtable flush is itself a pq file with nothing between the write path and the bytes read back
+(`bb_writepath.py`):
+
+| pass | pq files | `__ldt` values | non-null | populated |
+|---|---:|---:|---:|---:|
+| 1 | 34 | 58 500 000 | 42 448 175 | 72.56 % |
+| 2 | 33 | 58 500 000 | 42 448 175 | 72.56 % |
+| 3 | 33 | 58 500 000 | 42 448 175 | 72.56 % |
+
+Identical to the digit across three passes, and identical to the anomalous corpus file. So the load
+is not the variable, and neither is the Parquet writer. **Something downstream removes ~42.4 M cell
+tombstones in six corpus runs out of seven** — one of the harness's five codec-sweep rewrites, or the
+conversion compaction.
+
+Disabling auto-compaction was not a convenience: ICS began compacting the instant the flush landed,
+which both raced the read and would have made the measured file something other than what the write
+path produced. The first attempt at this experiment died on a half-written footer, which is the only
+reason the race was noticed at all.
+
+**Whether that removal is legitimate is deliberately left open here.** Their `local_deletion_time` is
+wall-clock and minutes old against a 10-day `gc_grace`, so the timeout rule should not make them
+droppable — but a cell tombstone that shadows nothing may be droppable under rules this project has
+not verified, and asserting a Scylla-wide correctness claim on the strength of a size measurement
+would be exactly the overreach the rest of this section avoids.
+
+**The next step is a bisect, not another hypothesis.** Measure `__ldt` population after *each* stage
+of the sweep instead of only at the end: six measurements name the compaction that drops them, and
+from there the question becomes a specific one about that compaction's purge decision rather than a
+search. If it turns out to be droppable-by-design, the anomaly is fully explained and Backblaze's
+corpus figure should be taken from a run with `tombstone_gc` pinned so it stops varying.
 
 **No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
