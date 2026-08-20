@@ -4767,15 +4767,18 @@ the same data.
 
 Re-measured with `BYPASS CACHE`, production cache settings, interleaved arms, a constant-cost canary
 and min-of-400-probes as the estimator (`pointread_v2.py`). 8 M rows, `row_group_rows` swept to vary
-row groups per file at a fixed row count.
+row groups per file at a fixed row count. Note the direction, because the shorthand `rg=` used in
+earlier versions of these tables made it easy to misread: `row_group_rows` is *rows per group*, so
+**lowering** it **raises** the number of row groups. 8 M rows at 1 000 rows per group is ~8 000
+groups; at 20 000 it is ~400. The setting and the count move in opposite directions.
 
 | arm | files | row groups | warm min | bypass min | cold min |
 |---|---:|---:|---:|---:|---:|
 | native | 1 | — | 254 | 455 | 462 |
-| pq rg=20 000 | 4 | 402 | 256 | 2 494 | 2 500 |
-| pq rg=5 000 | 4 | 1 601 | 249 | 3 942 | 3 958 |
-| pq rg=2 000 | 4 | 4 002 | 254 | 5 947 | 6 198 |
-| pq rg=1 000 | 4 | 8 001 | 256 | 10 155 | 10 905 |
+| `row_group_rows` 20 000 | 4 | 402 | 256 | 2 494 | 2 500 |
+| `row_group_rows` 5 000 | 4 | 1 601 | 249 | 3 942 | 3 958 |
+| `row_group_rows` 2 000 | 4 | 4 002 | 254 | 5 947 | 6 198 |
+| `row_group_rows` 1 000 | 4 | 8 001 | 256 | 10 155 | 10 905 |
 
 Canary min across every block: 224–244 µs, a 9 % spread, so the machine was quiet enough for the
 numbers to mean something — which matters on a shared 32-core box whose load average moved between
@@ -4882,10 +4885,10 @@ improvement attributable to the cache rather than to anything else that moved in
 | arm | row groups | §10.21 cold | squeezed (control) | cached | cached vs control |
 |---|---:|---:|---:|---:|---:|
 | native | — | 462 | 460 | 470 | — |
-| pq rg=20 000 | 402 | 2 500 | 2 563 | **1 684** | 1.5× |
-| pq rg=5 000 | 1 601 | 3 958 | 4 321 | **1 361** | 3.2× |
-| pq rg=2 000 | 4 002 | 6 198 | 6 196 | **1 030** | 6.0× |
-| pq rg=1 000 | 8 001 | 10 905 | 10 458 | **832** | 12.6× |
+| `row_group_rows` 20 000 | 402 | 2 500 | 2 563 | **1 684** | 1.5× |
+| `row_group_rows` 5 000 | 1 601 | 3 958 | 4 321 | **1 361** | 3.2× |
+| `row_group_rows` 2 000 | 4 002 | 6 198 | 6 196 | **1 030** | 6.0× |
+| `row_group_rows` 1 000 | 8 001 | 10 905 | 10 458 | **832** | 12.6× |
 
 All figures µs, cold minimum. Canary min 225–261 µs (16 % spread) on the cached run and 225–253 µs
 (12 %) on the control, against 224–244 µs in §10.21 — so all three are comparable and none of this
