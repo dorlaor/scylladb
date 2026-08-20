@@ -12,11 +12,40 @@ decks are generated from `~/pq-lab/deck_data.py` and are at v2.5.
 
 ---
 
-## Read-path performance — closed for now
+## Read-path performance — reopened 2026-08-20 for the scan path
 
 Point-read p50 went **1 915 µs → 581 µs (3.3×)** across four changes (§10.4c, 10.4f, 10.4i, and
-dictionary paging), for about 14 % of size. Further optimisation is **explicitly paused** — the
-remaining items are recorded, not scheduled.
+dictionary paging), for about 14 % of size. Point-read optimisation stays **paused** — items 2–4
+below are recorded, not scheduled. **The scan path is a different matter and is now the top item
+here** (0, below), because storage-format §10.26 found the format's headline advantage was never
+real and the reason is fixable.
+
+### 0. A bounded partition range takes the point-read path — the scan is 2.3× the row format
+**Top of this list.** `pq_reader::next_window()` picks its unit of work from
+`bounded = _pr->start() || _pr->end()`: unbounded streams whole row groups in 16 384-row windows,
+bounded uses 512-row windows and re-fetches each window's containing page for every leaf. The
+predicate should be the *width* of `[_row_lo, _row_hi)`, not the presence of a bound — a bounded
+range spanning two million rows is not a point read.
+
+It matters because **CQL never produces an unbounded range**: a range scan is split at tablet
+boundaries by `query_ranges_to_vnodes_generator` and every piece of the split carries a bound.
+So `query::full_partition_range` reaches the reader only from compaction, streaming and in-process
+tests. Measured (storage-format §10.26): a whole-table aggregate over 8 M rows is **2.29×** the row
+format and pulls **460 MB through a 23 MB file**; the same rows on the streaming path are at
+**parity**, 1.02–1.13×.
+
+Two things to be careful of when fixing it. The width test has to be on the *ordinal* window the
+index produced, not on the CQL range, because the point of the fork is what the reader will do.
+And `perf_pq_vs_default` now times both paths (`bscan` column) precisely so the fix can be shown
+rather than argued; it should move `bscan` to `scan` and leave `scan` alone.
+
+### 0a. Column projection is not pushed down — and the win is read operations, not bytes
+`reader.cc:1031` says so, and §10.26 confirms it at the level of bytes read: `count(*)`,
+`count(temp)` and a three-column aggregate on a 28-leaf table all read 497 632 extents and 460 MB,
+identical to 0.005 %. Independent of item 0 and worth most on wide tables. Note what the benefit
+actually is on Scylla's shredded schemas: the two dozen `__ttl_*`, `__ldt_*` and tombstone leaves
+are all-null and RLE to ~45 kB each, so they are 5 % of the bytes and 23/28 of the reads. §10.1c's
+byte-based estimate of the prize is the wrong unit, though it errs low.
 
 ### 1. ~~Footer metadata cache~~ — built 2026-08-20
 Built, measured and evicted on a running node: storage-format §10.4l for the design, §10.24 for the
