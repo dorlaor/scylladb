@@ -4539,14 +4539,38 @@ The slice holds **42 448 175 nulls** across 195 data columns — 141.5 per row. 
 So there is no missing mechanism on the size side. Every run writes those tombstones, and the
 question is entirely what removes them in the other six passes out of seven.
 
-**What is left is narrow and specific.** Tombstone removal here cannot be gc_grace (age 0 against 10
-days), cannot be shadowing (no duplicate keys), and cannot be a difference in the load (identical
-input, identical statements, identical `USING TIMESTAMP` per row). That leaves the tombstone-GC path
-itself — `tombstone_gc` mode and what a compaction is able to prove about coverage — as the thing to
-instrument. The cheap next step is no longer a size comparison but a direct one: keep a normal file
-next to the anomalous one and compare `__ldt_*` null counts leaf by leaf, which distinguishes "the
-tombstones are absent" from "the tombstones are present but cheap" once and for all. Everything above
-assumes the former on the strength of an aggregate.
+**The absent-versus-cheap question is now settled, on the files rather than on an aggregate**
+(`bb_compare_ldt.py`, comparing a kept normal file against the kept anomalous one):
+
+| | `__ldt_*` leaves | values | non-null | bytes |
+|---|---:|---:|---:|---:|
+| normal | 195 | 58 500 000 | **0 (0.00 %)** | 327 600 (1 680 B per leaf) |
+| anomalous | 195 | 58 500 000 | **42 448 175 (72.56 %)** | 57 327 020 |
+
+1 680 bytes per leaf is what an all-null column costs: definition levels and nothing else. And
+42 448 175 is *exactly* the null count of the source slice — so the anomalous file carries precisely
+one tombstone per source null and the normal file carries none. The data columns are identical in
+both, same per-column null counts and sizes to within 0.1 %, so the `__ldt_*` channel is the only
+difference between a 20.8 MB file and an 84.3 MB one.
+
+**So the tombstones are genuinely absent in six runs out of seven, and the cause is upstream of the
+Parquet writer.** Two things follow. The Parquet side is exonerated: it faithfully records what it is
+given, and `pq_bytes` is byte-identical (20 803 872) across all six normal passes, which is what
+identical input looks like. And the native sstable moves with it — 21.9 MB normal against 32.3 MB
+anomalous — so the divergence already exists *before* the format conversion.
+
+**What remains genuinely puzzling, stated as such.** Every explanation checked is eliminated: not
+gc_grace (the deletion times are wall-clock and minutes old against a 10-day grace), not shadowing
+(no duplicate keys), not the load (identical input, identical statements, identical `USING TIMESTAMP`
+per row). Yet a bind-NULL insert must write a dead cell, and in most runs no dead cell survives to
+the first measurable sstable.
+
+**The next experiment is on the Scylla side, not in the files.** Dump the tombstone count of the
+native sstable immediately after the load and the first flush, *before* the harness's codec sweep
+rewrites it five times, and see whether it already differs between runs. That splits the remaining
+space cleanly in two: if the first flush already differs, the write path is responsible; if it does
+not, one of the six major compactions is dropping cells it should not be able to drop, which would be
+a correctness question well beyond this format.
 
 **No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
