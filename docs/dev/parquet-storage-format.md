@@ -4722,21 +4722,46 @@ prefix, while `uncompressed_page_size` stays the plaintext size.
 | `format/encryption.{hh,cc}` | AES-GCM and AES-CTR over OpenSSL EVP, the AAD builder, module envelopes, `FileCryptoMetaData` |
 | `format/parquet_writer.cc` | encrypted-footer mode over page headers, page bodies, dictionary pages, the OffsetIndex and the footer |
 | `format/parquet_reader.cc` | `parse_encrypted_footer()` plus an optional `read_crypto` threaded through the decode path |
-| `encryption_keys.{hh,cc}` | key ids resolved to bytes from a local file |
-| `db/config` | `parquet_encryption_key_file` |
-| `cf_prop_defs` | DDL validation |
+| `encryption_keys.{hh,cc}` | the `key_source` seam, `key_metadata` shapes, DDL-time key validation |
+| `ent/encryption/parquet_key_source.cc` | that seam implemented over `key_provider` — local file, replicated, KMIP, AWS KMS, GCP, Azure |
+| `cf_prop_defs` | DDL validation, including the mutual exclusion with `scylla_encryption_options` |
+| `migration_manager` | the async DDL-time check that the provider can actually produce a key |
 
-**Keys are named, never stored.** A table says
-`parquet = {'encryption': 'aes_gcm_v1', 'encryption_key': 'tablekey'}`, and the bytes come from
-`parquet_encryption_key_file` on the local node. That is not a detail: schema properties are
-replicated to every node, kept in system tables and printed by `DESCRIBE`, so a key placed in one
-would be copied into the cluster's metadata and into every schema dump.
+**Keys come from `ent/encryption`'s providers, so BYOK works.** A table says
 
-Three failure modes are refused at DDL time, because each would otherwise surface as a compaction
-error hours later: a key id this node does not have, an algorithm with no key, and an unknown
-algorithm. The first check is **local only** -- another node may lack the key and its writes will
-fail there. There is no key distribution here, so this is the strongest check available rather than
-the one that would be right.
+```cql
+parquet = {'encryption': 'aes_gcm_v1',
+           'key_provider': 'KmipKeyProviderFactory',
+           'kmip_host': 'my-kmip', 'secret_key_strength': '256'}
+```
+
+and the options are `scylla_encryption_options`' own vocabulary, forwarded verbatim to
+`encryption_context::get_provider()`. No key material enters the schema — only the options that
+locate it. That is not a detail: schema properties are replicated to every node, kept in system
+tables and printed by `DESCRIBE`, so a key placed in one would be copied into the cluster's
+metadata and into every schema dump.
+
+The provider returns a key **and an opaque id**; the id goes into `FileCryptoMetaData.key_metadata`
+and is handed back to the provider on read, which is the mechanism rotation needs — a file written
+before a rotation would get the key it was written with, not the current one. Some providers (the
+local-file one) issue no id at all, because their options alone identify the key; an empty id means
+exactly that, and is not an error.
+
+Five failure modes are refused at DDL time — six, counting the mutual exclusion with
+`scylla_encryption_options` described below — because each would otherwise surface as a compaction
+error hours later:
+
+| refused | why |
+|---|---|
+| an unknown algorithm | |
+| `cipher_algorithm` naming any mode but AES-GCM | the format permits nothing else; see below |
+| `secret_key_strength` that is not 128/192/256 | not an AES key length |
+| provider options with no `encryption` | an inert security setting reads, in `DESCRIBE` and in review, as if the table were encrypted |
+| a provider that cannot produce a key | the sync property check cannot do I/O, so this one hangs off the schema-announcement path in `migration_manager::validate()`, alongside where the sstable EaR path validates its own extension |
+
+The last check is **local only** — another node may not reach the same provider and its writes will
+fail there. There is no cluster-wide key distribution here, so this is the strongest check available
+rather than the one that would be right.
 
 **The AAD prefix is the table's name**, stored in the file. A `Data.db` moved between tables, or
 restored from a backup into a different one, then fails authentication instead of decoding -- which
@@ -4767,11 +4792,17 @@ convenience at the cost of assuming its key management for everyone. It is opt-i
 trade belongs to the operator. Both shapes are read back correctly; `key_id_from_metadata()` accepts
 either.
 
-**Verified end to end on a running node** (`~/pq-lab/encryption_e2e.py`, 13/13): the three DDL
-rejections; every `Data.db` of a multi-group table begins and ends with `PARE`; no plaintext value
-appears in any of them; Scylla reads all 2 000 rows back including a single-partition read; **pyarrow
-reads the same raw files with the key** (2 000 rows across 4 files, values exact); and the files
-refuse to open without it. The format layer is covered from both directions in
+**Verified end to end on a running node** (`~/pq-lab/encryption_e2e.py`, 24/24), with the key coming
+from `LocalFileSystemKeyProviderFactory` — the only provider that can be driven without an external
+service, and the same `key_provider::key()` path the other five take: all six DDL rejections; the
+provider options round-trip through `DESCRIBE` with no key material in them; every `Data.db` of a
+multi-group table begins and ends with `PARE`; no plaintext value appears in any of them; Scylla
+reads all 2 000 rows back including a single-partition read; **pyarrow reads the same raw files with
+the provider's key** (2 000 rows across 4 files, values exact); the files refuse to open **without a
+key and with the wrong key** — the second being the control that makes the first mean something; and
+a second table on the defaults (no `cipher_algorithm`, no `encryption_key_metadata`, so the
+provider-id shape with an empty id) encrypts and reads back too, since that is the combination a BYOK
+deployment actually writes. The format layer is covered from both directions in
 `sstables/parquet/run_tests.sh` suites 19 and 20.
 
 **Per-column keys: written, and not yet interoperable.** The writer now takes a key per column,
@@ -4801,55 +4832,80 @@ that is true would be the "setting that lies" failure mode this codebase keeps r
 The interop suite prints the gap on every run rather than asserting it, and says what to change when
 it closes.
 
-**The remaining alignment work, now that `ent/encryption` is known to exist — including a conflict
-that changes the shape of it.**
+**The `ent/encryption` alignment — built, and the conflict is what shaped it.**
 
-The seam is already there. `encryption_context::get_provider(const options&)` returns a provider for
+The seam was already there. `encryption_context::get_provider(const options&)` returns a provider for
 an options map, and `get_key_info(options)` parses `cipher_algorithm` / `secret_key_strength` from the
-same map, so:
+same map, so the whole of the BYOK entry point is:
 
 ```cpp
 auto provider = ctx.get_provider(opts);                       // local | replicated | KMIP | KMS | Azure | GCP
 auto [key, id] = co_await provider->key(get_key_info(opts), existing_id);
 ```
 
-That is the BYOK entry point, and the id it returns is what belongs in Parquet's `key_metadata`. On
-read, `key_for_read(id)` closes the loop. The context is created by `register_extensions()` during
-startup, so reaching it from `sstables/parquet` needs a process-global accessor of the same shape as
-the `keys()` singleton this code already has.
+**The conflict, which is why the key and the selector come from different places.** Scylla's EaR
+encrypts the *whole Data component* through an sstable file-io extension, keyed off the
+`scylla_encryption_options` schema extension. So a `pq` table carrying that property is **already**
+encrypted at the storage layer — and that file is opaque to every external reader, which is the exact
+outcome Parquet Modular Encryption exists to avoid. Driving Parquet encryption from the same property
+would double-encrypt *and* still hand out an unreadable file. Hence:
 
-**The async objection turns out not to bite.** `pq_writer_impl`'s constructor already blocks on
-futures (`sst.create_data().get()`), so it runs somewhere `.get()` is legal and key resolution fits
-there; the reader is a coroutine and can simply `co_await`.
+- the **selector** stays in `parquet = {'encryption': ...}`, where it means *this table encrypts
+  inside the format*;
+- the **key** comes from `ent/encryption`, reusing its options vocabulary (and therefore its BYOK
+  providers) without reusing the property that triggers the storage-layer path;
+- a table asking for **both** is refused at DDL time, in `cf_prop_defs::validate()` — the one place
+  the `parquet` map and the schema extensions are both in hand.
 
-**The conflict, which is the part worth knowing before starting.** Scylla's EaR encrypts the *whole
-Data component* through an sstable file-io extension, keyed off the `scylla_encryption_options`
-schema extension, storing the key id in the sstable's own Scylla-metadata attributes. So a `pq` table
-carrying `scylla_encryption_options` is **already** encrypted at the storage layer — and that file is
-opaque to every external reader, which is the outcome Parquet Modular Encryption exists to avoid.
-Driving Parquet encryption from the same property would therefore double-encrypt and still hand out
-an unreadable file.
+**Deleted:** the bespoke `parquet_encryption_key_file`, the `key_registry` that read it, the
+`encryption_key` sub-option that named an entry in it, and the startup block that loaded it. It
+reimplemented the local-file provider in miniature and supported none of the others. What survived
+from that file is the part that was always about the *format* rather than about key management:
+`key_metadata_format`, `make_key_metadata()` and `key_id_from_metadata()`.
 
-So the two layers have to be mutually exclusive per table, and that is a design decision rather than
-a detail:
+**Three things went differently from the plan written here beforehand.**
 
-- keep a Parquet-side selector (`parquet = {'encryption': 'aes_gcm_v1', ...}`) that says *this table
-  encrypts inside the format*, and take the **key** from `ent/encryption`'s provider — reusing its
-  options vocabulary and therefore its BYOK providers, without reusing the property that triggers the
-  storage-layer path;
-- **refuse at DDL time** a table that asks for both, rather than silently applying one or both.
+*The global accessor is installed from `register_extensions()`, not from `main.cc`.* The plan said
+`main.cc`, but `register_extensions()` is not called from there — it is called from a `configurable`
+in `encryption_config.cc`, which also runs for `cql_test_env` and the offline tools. Installing it at
+the point the context is created covers every path that can open an sstable, and there is exactly one
+such point.
 
-Two further constraints for whoever picks this up. `cipher_algorithm` is a JCE-style string like
-`AES/CBC/PKCS5Padding`, while Parquet permits only AES-GCM and AES-GCM-CTR — a CBC-configured table
-cannot be honoured and must be refused, not quietly given another mode. And the bespoke
-`parquet_encryption_key_file` plus `encryption_keys.cc` registry should be deleted once the provider
-path lands; it reimplements the local-file provider in miniature and supports none of the others.
+*The seam is an abstract class, not a direct call.* `sstables/parquet` cannot call `encryption::`
+directly: `scylla_encryption` is a CMake target that already links against `sstables` (its file-io
+extension takes an `sstables::sstable`), so the dependency cannot be mutual. `sstables` therefore
+declares `key_source` and `ent/encryption/parquet_key_source.cc` implements it — which also means a
+unit test can install a fake.
 
-Until then the current state is: Parquet Modular Encryption works end to end with keys from that local
-file, `key_metadata` is provider-neutral by default so nothing about the file format presumes a key
-manager, and BYOK is reachable only by pointing that file at a key the operator supplied out of band.
+*`cipher_algorithm` is defaulted rather than required.* Parquet permits only AES-GCM (and AES-GCM-CTR,
+whose metadata modules are still GCM), while `get_key_info()`'s default is `AES/CBC/PKCS5Padding` —
+unusable. An **absent** `cipher_algorithm` is therefore defaulted to `AES/GCM/NoPadding`, because
+overriding a default is not overriding a request; an **explicit** one naming another mode is refused
+outright. The default is re-applied on every parse rather than persisted into the schema, which echoes
+what the operator wrote; normally an unwritten default is a hazard, but AES-GCM is the only thing the
+format permits, so there is no other value for it to become.
 
-**Also absent**: plaintext-footer mode and key rotation.
+**One known limitation, and it is a real difference from the storage-layer path.** The provider
+*options* are read from the **schema**, not from the file — only the key id lives in the file. The
+whole-component path stores the options in the sstable's own extension attributes, so it can still
+open a file after the table's provider is reconfigured; this cannot. `key_metadata` is a single opaque
+string, and packing the option map into it would break the "the id, verbatim" contract that makes the
+provider-neutral shape work with providers we have never seen. Changing a table's key provider while
+it has encrypted sstables is therefore a one-way door.
+
+**Also not covered:** node-global `user_info_encryption`, which applies whole-component encryption to
+every user table without appearing in the table's schema extensions, so the mutual-exclusion check
+cannot see it. A `pq` table with format-level encryption on such a node would be encrypted twice. The
+check would need `encryption_context` to expose the global extension, which is currently
+implementation-private, so it is named here rather than half-built.
+
+**Key rotation is supported by construction but not verified.** Handing the stored id back to the
+provider is exactly the mechanism, and it is the same one the whole-component path uses -- but no
+rotation has been exercised end to end here, and the one provider this lab can drive
+(`LocalFileSystemKeyProviderFactory`) issues no ids, so it cannot demonstrate it. Claiming it works
+would be claiming a green run that never happened.
+
+**Also absent**: plaintext-footer mode.
 
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 
@@ -5393,7 +5449,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
 | Backblaze 4× anomaly | **localised, not solved** | Mechanism found (§10.18): the per-cell tombstone/exception channel is sometimes stored (60 MB across 407 synthetic leaves) and sometimes collapsed (2.7 MB). Not batch-only as previously claimed -- 1 in 7 standalone passes, 2 of 2 batch runs. Why it collapses is open. No published figure depends on it. |
-| Encryption at rest | **done for Parquet Modular Encryption** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys named by id and resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key. Scylla's *own* storage-layer EaR still does not exist in this tree; per-column keys are read but not written. |
+| Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Not covered: key rotation (unexercised), per-column keys (written but not yet interoperable), plaintext-footer mode, node-global `user_info_encryption`. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done, both storage types** | Specified in §10.9, and the behaviour it rests on is observed on local disk *and* on object storage (§10.20): an older node aborts at startup on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
@@ -5413,9 +5469,11 @@ a running node rather than only in a unit test. What is left is genuinely narrow
   collapses and sometimes does not (§10.18). No published figure depends on it.
 
 Everything else on the old list is closed. Encryption at rest is built as Parquet Modular Encryption
-and verified end to end, including an external reader opening the encrypted file with the key
-(§10.17) — the earlier "not applicable to this tree" answer conflated Scylla's own EaR, which really
-is absent here, with a standard format feature that was not. Downgrade safety now holds for **both**
+with its keys taken from Scylla's own encryption-at-rest providers, so BYOK works, and verified end to
+end including an external reader opening the encrypted file with the provider's key (§10.17) — the
+earlier "not applicable to this tree" answer conflated a standard format feature with Scylla's own
+EaR, and was wrong about both: the format feature was available, and `ent/encryption` was there all
+along. Downgrade safety now holds for **both**
 storage types, observed rather than reasoned (§10.20). The corpus survives the deterministic
 dictionary unchanged (§10.16). Object storage and maintenance tooling are done and verified.
 

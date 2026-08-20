@@ -216,8 +216,9 @@ Parquet's `key_metadata` plays, so the models line up. But **Parquet Modular Enc
 standard part of parquet-format 2.7+, and it is the right layer for this format: encrypting the Data
 component from outside would make the file opaque to every external reader and forfeit the
 interoperability that is the whole argument for Parquet. Built and verified end to end on 2026-08-20
-— see storage-format §10.17. AES_GCM_V1 and AES_GCM_CTR_V1, encrypted footer, keys named by id and
-resolved from a local file, DDL validation, and pyarrow reading the encrypted `Data.db` with the key.
+— see storage-format §10.17. AES_GCM_V1 and AES_GCM_CTR_V1, encrypted footer, **keys from
+`ent/encryption`'s providers so BYOK works**, DDL validation, and pyarrow reading the encrypted
+`Data.db` with the provider's key.
 
 Still open within it:
 
@@ -229,19 +230,29 @@ Still open within it:
   encrypts the column metadata, and the envelope layout. Next suspects: `RowGroup.ordinal`, which
   we never emit, and the `ColumnChunk` field 3/8/9 presence rules. Not exposed through CQL until
   this closes.
-- **Alignment with `ent/encryption` is the main remaining item.** Keys are still resolved from a
-  bespoke `parquet_encryption_key_file`, which reimplements the local-file provider in miniature and
-  supports none of the others. Drop it, call `key_provider::key()`, and take the options from
-  `scylla_encryption_options` (`cipher_algorithm`, `secret_key_strength`, `key_provider`) instead of
-  the bespoke `encryption`/`encryption_key` pair. Not mechanical: `key()` is a future while the
-  Parquet write path is synchronous, so the key must be resolved before the writer is constructed;
-  and `cipher_algorithm` is JCE-style (`AES/CBC/PKCS5Padding`) while Parquet permits only AES-GCM
-  and AES-GCM-CTR, so a CBC-configured table must be refused at DDL time rather than quietly given
-  another mode.
-- `key_metadata` now defaults to the provider's key id verbatim, with parquet-java's key-material
-  JSON as an explicit `encryption_key_metadata: 'parquet_kms'` opt-in. Emitting that JSON
-  unconditionally, as the first version did, assumed one key-management model for everyone.
-- Plaintext-footer mode and key rotation.
+- ~~**Alignment with `ent/encryption`.**~~ **Done, 2026-08-20.** The bespoke
+  `parquet_encryption_key_file` and its `key_registry` are deleted; the key now comes from
+  `encryption_context::get_provider()` with `scylla_encryption_options`' own option vocabulary
+  (`key_provider`, `cipher_algorithm`, `secret_key_strength`, `kmip_host`, `secret_key_file`, ...)
+  carried in the `parquet` map, so every provider — and therefore BYOK — works. The *selector* stays
+  in `parquet = {...}` and a table asking for both it and `scylla_encryption_options` is refused,
+  because that property encrypts the whole Data component and would double-encrypt while handing out
+  a file no external reader can open. `cipher_algorithm` is defaulted to `AES/GCM/NoPadding` when
+  absent and refused when it explicitly names another mode.
+- `key_metadata` defaults to the provider's key id verbatim, with parquet-java's key-material JSON as
+  an explicit `encryption_key_metadata: 'parquet_kms'` opt-in. Emitting that JSON unconditionally, as
+  the first version did, assumed one key-management model for everyone.
+- **Key rotation is supported by construction but unverified.** The provider id round-trips through
+  `key_metadata`, which is the mechanism; but no rotation has been exercised, and the one provider
+  this lab can drive issues no ids, so it cannot demonstrate one.
+- **Provider options are read from the schema, not from the file.** Reconfiguring a table's key
+  provider makes its existing encrypted sstables unreadable, where the whole-component path — which
+  stores the options per sstable — would still open them.
+- **Node-global `user_info_encryption` is not covered.** It applies whole-component encryption without
+  appearing in a table's schema extensions, so the mutual-exclusion check cannot see it, and such a
+  node would encrypt a format-encrypted `pq` table twice. Closing it needs `encryption_context` to
+  expose the global extension, which is implementation-private today.
+- Plaintext-footer mode.
 
 ### Downgrade procedure — written 2026-08-19, was "not started"
 §10.9. The load-bearing fact is observed, not reasoned: an older node meeting an sstable version it
