@@ -5738,6 +5738,11 @@ something that has nothing to do with Parquet — and it costs native nothing me
 makes the `pq` difference attributable to the footer. The cached column reproduces §10.26's published
 1 149 µs, which is what makes the two comparable.
 
+The two sessions were not the same binary: the second carried the faster Thrift walk described at the
+end of this section, which was then reverted. That it barely moves the `pq` column (2 578 → 2 530 µs,
+inside the difference between the two canary blocks) is the first sign of the negative result recorded
+there. **The first session is the committed code**, and so are the per-miss figures below.
+
 The squeeze is shown rather than assumed, from the footer-cache metrics per block: the cached blocks
 recorded **396 hits and 4 misses** over 400 probes — four sstables, parsed once — and the squeezed
 blocks **0 hits, 400 misses and 400 evictions**.
