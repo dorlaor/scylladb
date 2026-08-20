@@ -733,6 +733,26 @@ void parquet_file_writer::write_footer() {
             }
             w.field_i64(2, rg.total_byte_size);
             w.field_i64(3, rg.num_rows);
+            // RowGroup.ordinal, and it is not optional in practice even though the schema says
+            // it is. parquet-cpp derives the *encryption AAD's* row-group ordinal from this
+            // field, and returns -1 when the field is absent -- so a file that omits it makes
+            // every reader compute an AAD with 0xFFFF where the writer put 0x0000. That is
+            // invisible in uniform mode (page and column ordinals for the modules parquet-cpp
+            // reads there come from position, not from here) and fatal for a column-key column,
+            // whose ColumnMetaData is the one module keyed off this value: "Failed decryption
+            // finalization". Ours is always the positional index, which is what it means.
+            const size_t ord = size_t(&rg - _rgs.data());
+            if (ord > 0x7fff) {
+                // The field is an i16, so past this there is no ordinal to write. Encryption
+                // cannot proceed at all -- the AAD would repeat across row groups, which is
+                // precisely what the ordinals exist to prevent.
+                if (encrypting()) {
+                    throw std::runtime_error("parquet: more than 32768 row groups cannot be "
+                                             "encrypted -- RowGroup.ordinal is an i16");
+                }
+            } else {
+                w.field_i16(7, int16_t(ord));
+            }
         }
         // --- key/value metadata
         if (!_kv.empty()) {

@@ -54,6 +54,7 @@ public:
         _last_id = id;
     }
 
+    void field_i16(int16_t id, int16_t v) { field(id, ctype::i16); zigzag(v); }
     void field_i32(int16_t id, int32_t v) { field(id, ctype::i32); zigzag(v); }
     void field_i64(int16_t id, int64_t v) { field(id, ctype::i64); zigzag(v); }
     void field_bool(int16_t id, bool v) {
