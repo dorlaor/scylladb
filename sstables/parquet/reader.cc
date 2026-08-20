@@ -305,6 +305,11 @@ class pq_reader : public mutation_reader::impl {
     int64_t _rg_base = 0;               // file offset of _rg_buf[0]
     size_t _oi_rg = size_t(-1);
     std::vector<std::optional<format::offset_index>> _oi;
+    // Leaves of the materialised row group that need not be read at all: see elidable_leaves().
+    // One entry per leaf, recomputed per row group because it is a property of the chunk
+    // statistics rather than of the file.
+    std::vector<uint8_t> _elide;
+    size_t _elide_rg = size_t(-1);
     // Per-reader, never cached: see cached_footer for why the key does not go in the entry.
     std::optional<format::read_crypto> _crypto;
 
@@ -351,7 +356,10 @@ class pq_reader : public mutation_reader::impl {
     bool have_page_index() const;
     // Would the paged path fetch at least as many bytes as one sequential read of the row group,
     // to cover group-local rows [lo, hi)? See the long comment at the call site.
-    bool paged_fetch_is_not_cheaper(int64_t lo, int64_t hi) const;
+    bool paged_fetch_is_not_cheaper(int64_t lo, int64_t hi, std::span<const uint8_t> elide) const;
+    // Which leaves of the materialised row group carry nothing for any row in it, and so need be
+    // neither fetched nor decoded. need_columns(rg) first.
+    const std::vector<uint8_t>& elidable_leaves(size_t rg);
 
     // The plaintext footer, which the cached entry always holds whether or not the file on disk
     // was encrypted. Row-group column metadata is decoded from it on demand.
@@ -683,13 +691,65 @@ future<> pq_reader::load_row_group(size_t rg) {
     _cur_rg = rg;
 }
 
+// Leaves that cannot contribute a cell to any row of this row group, taken from the chunk's own
+// statistics: `null_count == num_values` says every slot in the chunk is null, so a reader that
+// decodes it learns only that -- at the cost of a page walk, a decompress, and (on the paged
+// path) two read operations per window.
+//
+// This is where a working column projection would have paid off, and it pays off here without
+// the query needing to say anything: on Scylla's shredded schemas the leaves that dominate the
+// *operation* count are the metadata channels, and they are all-null except when the data uses
+// them. On the 28-leaf time-series schema of design doc §10.26, 23 leaves -- every `__ttl_*`,
+// `__ldt_*`, `__rt*`, `__pt_*` -- are all-null and cost 23/28 of the per-leaf work while holding
+// 5 % of the bytes. That is the read-operations prize §10.26 identified, and unlike a projection
+// it is also claimed by `SELECT *`, by compaction and by repair, because it is a statement about
+// the file rather than about the query.
+//
+// Restrictions, both of which exist to keep reassembly exact:
+//
+//   * repeated leaves are never elided. `num_values` counts *slots*, and for a repeated leaf a
+//     slot whose definition level says "present but empty" is counted as a null -- so all-null
+//     does not mean absent there, and read_collection() distinguishes the two.
+//   * a leaf inside a collection group is never elided, even when flat: the group's leaves are
+//     consumed together, slot by slot, by one cursor.
+//
+// Key leaves and `__ts` are REQUIRED, so their null_count is zero and they never qualify; that is
+// relied on by reassemble(), which rejects rather than trusts it.
+const std::vector<uint8_t>& pq_reader::elidable_leaves(size_t rg) {
+    if (_elide_rg == rg) { return _elide; }
+    const auto& cols = columns();
+    _elide.assign(cols.size(), false);
+    _elide_rg = rg;
+
+    // Leaves belonging to a collection group, which travel together or not at all.
+    std::vector<bool> in_group(cols.size(), false);
+    for (size_t k = 0; k < _ms.value_is_collection.size(); ++k) {
+        if (!_ms.value_is_collection[k]) { continue; }
+        const size_t v = _ms.value_leaf[k];
+        const size_t n = _ms.value_is_counter[k] ? 6 : 5;
+        for (size_t i = v; i < std::min(v + n, in_group.size()); ++i) { in_group[i] = true; }
+    }
+
+    for (size_t c = 0; c < cols.size(); ++c) {
+        if (in_group[c]) { continue; }
+        if (c < _ms.columns.size() && _ms.columns[c].max_rep > 0) { continue; }
+        const auto& cc = cols[c];
+        if (!cc.meta) { continue; }
+        const auto& cm = *cc.meta;
+        if (!cm.stats || !cm.stats->null_count) { continue; }   // no statistics: read it
+        if (cm.num_values > 0 && *cm.stats->null_count == cm.num_values) { _elide[c] = 1; }
+    }
+    return _elide;
+}
+
 bool pq_reader::have_page_index() const {
     if (_oi.size() != columns().size()) { return false; }
     for (const auto& o : _oi) { if (!o || o->pages.empty()) { return false; } }
     return true;
 }
 
-bool pq_reader::paged_fetch_is_not_cheaper(int64_t lo, int64_t hi) const {
+bool pq_reader::paged_fetch_is_not_cheaper(int64_t lo, int64_t hi,
+                                           std::span<const uint8_t> elide) const {
     const auto [span_lo, span_hi] = row_group_span();
     const int64_t extent = span_lo >= span_hi ? 0 : span_hi - span_lo;
     if (extent <= 0) { return true; }
@@ -703,6 +763,11 @@ bool pq_reader::paged_fetch_is_not_cheaper(int64_t lo, int64_t hi) const {
         const int64_t wend = std::min(hi, w + point_window_rows);
         for (size_t c = 0; c < cols.size(); ++c) {
             if (!cols[c].meta) { continue; }
+            // Leaves the paged path would not fetch do not count against it. Note the asymmetry
+            // this creates in the reader's favour and against streaming: eliding leaves makes
+            // paging cheaper without making the group's extent smaller, because the chunks are
+            // contiguous.
+            if (c < elide.size() && elide[c]) { continue; }
             const auto& pages = _oi[c]->pages;
             const size_t i0 = _oi[c]->page_for_row(w);
             const size_t i1 = _oi[c]->page_for_row(wend > w ? wend - 1 : w);
@@ -768,8 +833,9 @@ future<bool> pq_reader::next_window() {
     } else {
         need_columns(rg);
         co_await load_offset_indexes(rg);
+        const auto& elide = elidable_leaves(rg);
         stream = !have_page_index()
-              || paged_fetch_is_not_cheaper(lo - rg_first, grp_hi - rg_first);
+              || paged_fetch_is_not_cheaper(lo - rg_first, grp_hi - rg_first, elide);
     }
 
     const int64_t win = stream ? scan_window_rows : point_window_rows;
@@ -784,8 +850,13 @@ future<bool> pq_reader::next_window() {
         co_await load_row_group(rg);
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
+        // The whole group is in `img` either way -- eliding a leaf here saves the decode, not
+        // the read, because the chunks are contiguous and splitting the read around them would
+        // cost more operations than it saves.
+        const auto& elide = elidable_leaves(rg);
         colsdata = format::read_row_range(img, _rg_base, _rgmd, 0,
-                                          lo - _rg_start[rg], hi - _rg_start[rg], crypto());
+                                          lo - _rg_start[rg], hi - _rg_start[rg], crypto(),
+                                          elide);
     }
     _rows = reassemble(_ms, _cols, colsdata, size_t(hi - lo));
     _cursor = hi;
@@ -832,7 +903,8 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         co_await load_row_group(rg);
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
-        co_return format::read_row_range(img, _rg_base, _rgmd, 0, lo, hi, crypto());
+        co_return format::read_row_range(img, _rg_base, _rgmd, 0, lo, hi, crypto(),
+                                         elidable_leaves(rg));
     }
 
     // Two extents per column: the dictionary page at the head of the chunk, and the
@@ -853,7 +925,16 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
     want.reserve(cols.size() * 2);
     std::vector<format::column_input> in(cols.size());
 
+    // This is where eliding an all-null leaf pays in read *operations* rather than bytes: two
+    // extents per leaf per window are not issued at all. On the 28-leaf schema of §10.26 that is
+    // 23 of the 28 leaves, so a point read's extent count falls by roughly three quarters.
+    const auto& elide = elidable_leaves(rg);
+
     for (size_t c = 0; c < cols.size(); ++c) {
+        if (c < elide.size() && elide[c]) {
+            in[c].absent = true;
+            continue;
+        }
         const auto& cm = *cols[c].meta;
         const auto& pages = _oi[c]->pages;
         const size_t i0 = _oi[c]->page_for_row(lo);
@@ -1124,9 +1205,26 @@ mutation_reader make_reader(
         streamed_mutation::forwarding fwd,
         mutation_reader::forwarding,
         sstables::read_monitor& mon) {
-    // Column projection is not pushed down yet -- that is where the big scan win
-    // lives (design doc 10.1c) and is tracked separately. The *row* slice is
-    // honoured, in pq_reader::emit_row.
+    // The *row* slice is honoured, in pq_reader::emit_row. The *column* selection deliberately is
+    // not, and this is the one place to record why, because §10.26 named it as a fix and it turns
+    // out to be a fix that cannot be made here.
+    //
+    // A CQL row exists if its marker is live *or* any of its cells is. Scylla's compacting reader
+    // decides that from the fragment it is handed, so a reader that drops the cells of a column
+    // the query did not select turns a live row into an empty one whenever that column was the
+    // only thing keeping it alive -- and a row created by UPDATE has no marker at all, which makes
+    // the case ordinary rather than exotic. `SELECT b` on a partition whose rows only ever had `a`
+    // written must return rows with b = null; dropping `a` returns nothing. Cassandra hits the
+    // same wall and solves it by distinguishing *fetched* from *queried* columns -- it reads every
+    // regular column from storage and projects afterwards -- and mx does the same thing by simply
+    // never consulting the slice. Diverging here would make pq answer differently from every other
+    // format in the tree.
+    //
+    // What §10.26 measured as the prize -- read *operations*, which on a shredded schema are
+    // dominated by the all-null metadata leaves rather than by user columns -- is claimed instead
+    // by pq_reader::elidable_leaves(), which is driven by the file's own statistics and is
+    // therefore both safe and available to every path, including `SELECT *` and compaction.
+    // See test_pq_restricted_slice_still_returns_every_cell for the case that pins this.
     auto rd = make_mutation_reader<pq_reader>(std::move(sst), std::move(query_schema),
                                               std::move(permit), range, slice, mon, true);
     if (fwd) {

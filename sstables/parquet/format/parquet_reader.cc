@@ -216,6 +216,13 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 
     for (size_t c = 0; c < rg.columns.size(); ++c) {
         const auto& cc = rg.columns[c];
+        // Deliberately not read: the caller has established that this leaf is null for every row
+        // of the group, so the reassembler can be told "absent" instead of being handed levels
+        // that say the same thing at the cost of a page walk per leaf per window.
+        if (c < in.size() && in[c].absent) {
+            out[c].skipped = true;
+            continue;
+        }
         if (!cc.meta) { throw decode_error("column chunk without metadata"); }
         const auto& cm = *cc.meta;
         const uint8_t max_def = leaves[c].max_def;
@@ -440,6 +447,7 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
     // row_hi) so the caller gets aligned rows. expand_nulls has already made the
     // value vectors dense, one entry per row, so this is a plain slice.
     for (size_t c = 0; c < out.size(); ++c) {
+        if (out[c].skipped) { continue; }
         const int64_t start = first_row_decoded[c] < 0 ? row_lo : first_row_decoded[c];
         const size_t drop = size_t(row_lo - start);
         const size_t keep = size_t(row_hi - row_lo);
@@ -451,12 +459,17 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
                                         const file_metadata& md, size_t rg_index,
                                         int64_t row_lo, int64_t row_hi,
-                                        const read_crypto* crypto) {
+                                        const read_crypto* crypto,
+                                        std::span<const uint8_t> skip) {
     if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
     const auto& rg = md.row_groups[rg_index];
     std::vector<column_input> in(rg.columns.size());
     for (size_t c = 0; c < rg.columns.size(); ++c) {
         const auto& cc = rg.columns[c];
+        if (c < skip.size() && skip[c]) {
+            in[c].absent = true;
+            continue;
+        }
         if (!cc.meta) { throw decode_error("column chunk without metadata"); }
         const auto& cm = *cc.meta;
         const int64_t start = (cm.dictionary_page_offset ? *cm.dictionary_page_offset

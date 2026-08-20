@@ -72,6 +72,10 @@ struct column_input {
     std::span<const uint8_t> dict;       // dictionary page, header included; may be empty
     std::span<const uint8_t> pages;      // a contiguous run of data pages
     int64_t first_row = 0;               // row index, within the row group, of pages[0]
+    // Do not read this leaf: no bytes were fetched for it, and the decoded column_data comes back
+    // flagged `skipped` for the reassembler to treat as all-null. Distinct from an empty `pages`
+    // span, which is a caller error.
+    bool absent = false;
 };
 
 // Decode rows [row_lo, row_hi) from per-column byte spans. One entry per leaf,
@@ -86,10 +90,15 @@ std::vector<column_data> decode_columns(std::span<const column_input>,
 // matter instead of the whole file. Pages outside the range are stepped over
 // using the V2 header's num_rows without being decompressed -- this is what
 // makes a point read cost one page rather than one file.
+// `skip`, when non-empty, has one byte per leaf: non-zero means do not decode that leaf, and its
+// column_data comes back flagged `skipped`. (Bytes rather than bools because the caller's mask is
+// a vector, and std::vector<bool> is not a range of bools.) The bytes are in `image` either way --
+// the row group is one sequential read -- so this saves the header walk and the decode, not I/O.
 std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t base_offset,
                                         const file_metadata&, size_t row_group_index,
                                         int64_t row_lo, int64_t row_hi,
-                                        const read_crypto* = nullptr);
+                                        const read_crypto* = nullptr,
+                                        std::span<const uint8_t> skip = {});
 
 // Convenience: parse the footer and decode row group 0.
 std::vector<column_data> read_file(std::span<const uint8_t> image);

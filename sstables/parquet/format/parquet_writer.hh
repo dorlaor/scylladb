@@ -122,6 +122,15 @@ struct writer_options {
 // One leaf column of a row group. Exactly one value vector is populated; which
 // one must agree with the declared physical type.
 struct column_data {
+    // Set by the read path when this leaf was deliberately not read: it says "no value in this
+    // leaf, for any row of this window", which is a different statement from "no values here"
+    // and cannot be inferred from the empty vectors below, because a REQUIRED leaf legitimately
+    // has no def_levels. reassemble() must consult it before indexing anything.
+    //
+    // It is only ever set when the file's own statistics prove the chunk all-null, so a skipped
+    // leaf carries exactly the information a read leaf would have (see reader.cc,
+    // elidable_leaves()).
+    bool                     skipped = false;
     // Empty means the column is REQUIRED and every value is present.
     std::vector<uint64_t>    def_levels;
     // Dremel repetition levels. Empty for a column that is not inside a

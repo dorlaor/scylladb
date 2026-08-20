@@ -898,6 +898,11 @@ struct collection_cursor {
 static std::optional<collection_cell> read_collection(
         const std::vector<column_data>& cd, const mapped_schema& ms,
         size_t k, size_t vcol, size_t row_i, collection_cursor& cur) {
+    // A skipped key leaf means no row of this window has the collection at all, which is what
+    // read_collection() reports by returning nullopt. The reader only ever skips a collection
+    // group whole (reader.cc, elidable_leaves()), so the slot-indexed leaves below are either all
+    // present or never reached.
+    if (cd[vcol].skipped) { return std::nullopt; }
     const auto& l_key = cd[vcol];
     const auto& l_val = cd[vcol + 1];
     const auto& l_ts  = cd[vcol + 2];
@@ -984,6 +989,22 @@ std::vector<row> reassemble(const mapped_schema& ms,
     // cannot be derived from the row index.
     std::vector<collection_cursor> coll_cur(reg_idx.size());
 
+    // A leaf the reader chose not to read. It is only ever skipped when the file's statistics
+    // prove the chunk null for every row, so "skipped" and "null in this row" are the same
+    // answer -- but the vectors are empty rather than full of nulls, so every access below has to
+    // ask first. Key leaves and the row-timestamp leaf are never skippable (they are REQUIRED, so
+    // no chunk of them is all-null); this rejects rather than trusts that, because reading past
+    // the end of an empty vector would be a silent misread.
+    auto absent = [&] (size_t leaf) { return cd[leaf].skipped; };
+    auto require_read = [&] (size_t leaf, const char* what) {
+        if (cd[leaf].skipped) {
+            throw std::runtime_error(std::string("reassemble: ") + what +
+                                     " leaf was not read; it is not optional");
+        }
+    };
+    for (size_t k = 0; k < key_idx.size(); ++k) { require_read(k, "key"); }
+    if (ms.ts_index) { require_read(*ms.ts_index, "row timestamp"); }
+
     for (size_t i = 0; i < nrows; ++i) {
         row& r = out[i];
         for (size_t k = 0; k < key_idx.size(); ++k) {
@@ -994,7 +1015,8 @@ std::vector<row> reassemble(const mapped_schema& ms,
 
         // Decode this row's sparse exceptions once, into column -> timestamp.
         std::map<size_t, int64_t> exc;
-        if (ms.tsx_mask_index && cd[*ms.tsx_mask_index].def_levels[i]) {
+        if (ms.tsx_mask_index && !absent(*ms.tsx_mask_index) &&
+            cd[*ms.tsx_mask_index].def_levels[i]) {
             const std::string& mask = cd[*ms.tsx_mask_index].str[i];
             const std::string& vals = cd[*ms.tsx_vals_index].str[i];
             size_t pos = 0;
@@ -1016,10 +1038,12 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 continue;
             }
 
-            const bool present = cd[vcol].def_levels[i] != 0;
+            const bool present = !absent(vcol) && cd[vcol].def_levels[i] != 0;
 
             if (ms.level == folding_level::verbatim) {
                 const size_t b = *ms.meta_base_index[k];
+                require_read(b + 0, "L0 liveness");
+                require_read(b + 1, "L0 cell timestamp");
                 const bool live = cd[b + 0].i32[i] != 0;
                 const int64_t ts = cd[b + 1].i64[i];
                 // A column with no cell at all was written as absent + dead.
@@ -1028,8 +1052,10 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 c.live = live;
                 c.timestamp = ts;
                 if (present) { c.v = read_value(cd[vcol], ms.columns[vcol].type, i); }
-                if (cd[b + 2].def_levels[i]) { c.ttl = cd[b + 2].i32[i]; }
-                if (cd[b + 3].def_levels[i]) { c.local_deletion_time = cd[b + 3].i32[i]; }
+                if (!absent(b + 2) && cd[b + 2].def_levels[i]) { c.ttl = cd[b + 2].i32[i]; }
+                if (!absent(b + 3) && cd[b + 3].def_levels[i]) {
+                    c.local_deletion_time = cd[b + 3].i32[i];
+                }
                 r.cells.emplace(k, std::move(c));
             } else {
                 // L1 and L2 have no per-column live flag -- that is L0's `__live_`
@@ -1044,9 +1070,9 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 // shadowed. `any_deletion` is set by `!c.live`, so the leaf is always
                 // there when something is dead -- the information was on disk all
                 // along and simply was not being read.
-                const bool has_ttl = ms.l1_ttl_index[k] &&
+                const bool has_ttl = ms.l1_ttl_index[k] && !absent(*ms.l1_ttl_index[k]) &&
                                      cd[*ms.l1_ttl_index[k]].def_levels[i] != 0;
-                const bool has_ldt = ms.l1_ldt_index[k] &&
+                const bool has_ldt = ms.l1_ldt_index[k] && !absent(*ms.l1_ldt_index[k]) &&
                                      cd[*ms.l1_ldt_index[k]].def_levels[i] != 0;
                 if (!present && !has_ldt) { continue; }
                 cell c;
@@ -1056,7 +1082,8 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 if (auto e = exc.find(k); e != exc.end()) {
                     c.timestamp = e->second;
                 } else if (ms.exc_encoding == exception_encoding::per_column &&
-                           ms.ts_exc_index[k] && cd[*ms.ts_exc_index[k]].def_levels[i]) {
+                           ms.ts_exc_index[k] && !absent(*ms.ts_exc_index[k]) &&
+                           cd[*ms.ts_exc_index[k]].def_levels[i]) {
                     c.timestamp = cd[*ms.ts_exc_index[k]].i64[i];
                 }
                 if (has_ttl) { c.ttl = cd[*ms.l1_ttl_index[k]].i32[i]; }
@@ -1067,7 +1094,8 @@ std::vector<row> reassemble(const mapped_schema& ms,
 
         // Row marker and the two tombstone groups, inverting shred().
         auto present = [&] (std::optional<size_t> idx) {
-            return idx && !cd[*idx].def_levels.empty() && cd[*idx].def_levels[i];
+            return idx && !cd[*idx].skipped && !cd[*idx].def_levels.empty()
+                   && cd[*idx].def_levels[i];
         };
         if (present(ms.rm_index)) {
             marker_info m;

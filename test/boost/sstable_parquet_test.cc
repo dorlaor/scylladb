@@ -309,6 +309,51 @@ SEASTAR_THREAD_TEST_CASE(test_pq_bounded_range_streams_and_agrees_with_row_forma
     }).get();
 }
 
+// Why the reader does *not* push column projection down, pinned as a test rather than left as a
+// comment, because the natural "optimisation" is a data-loss bug and it would pass every other
+// case in this file.
+//
+// A CQL row is live if its marker is live or any of its cells is. make_muts() writes cells with no
+// row marker -- which is what an UPDATE produces -- so every row here is live only by virtue of
+// its cells. A reader that honoured `with_no_regular_columns()` by not reading them would return
+// rows with nothing in them, the compacting reader above it would judge those rows dead, and a
+// `SELECT count(*)` or a `SELECT other_column` would quietly lose them. mx returns every cell
+// whatever the slice says, and Cassandra reads every regular column from storage for this exact
+// reason, so agreement with the row format is the contract.
+SEASTAR_THREAD_TEST_CASE(test_pq_restricted_slice_still_returns_every_cell) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 8, 30);
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        for (auto&& [what, slice] : std::vector<std::pair<const char*, query::partition_slice>>{
+                {"no regular columns",
+                 partition_slice_builder(*s).with_no_regular_columns().build()},
+                {"one regular column",
+                 partition_slice_builder(*s).with_regular_column(to_bytes("v_int")).build()}}) {
+            auto fw = fragments_in(ref, s, env.make_reader_permit(),
+                                   query::full_partition_range, slice);
+            auto fg = fragments_in(sst, s, env.make_reader_permit(),
+                                   query::full_partition_range, slice);
+            BOOST_TEST_CONTEXT(what) {
+                BOOST_REQUIRE(!fg.empty());
+                BOOST_REQUIRE_EQUAL(fg.size(), fw.size());
+                for (size_t i = 0; i < fg.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(fg[i], fw[i]);
+                }
+                // And the cells really are there: a stream that had dropped them would still
+                // match a row format that had dropped them too, if one ever did.
+                BOOST_REQUIRE(std::ranges::any_of(fg, [] (const sstring& f) {
+                    return f.find("v_txt") != sstring::npos;
+                }));
+            }
+        }
+    }).get();
+}
+
 // A full scan is what compaction and scrub use, and it goes through a separate
 // entry point that had to be taught about pq independently of make_reader.
 SEASTAR_THREAD_TEST_CASE(test_pq_full_scan_reader) {
