@@ -31,6 +31,10 @@ class parquet_key_source : public sstables::parquet::key_source {
     // provider resolves to nothing must fail the write, not fall back to plaintext -- the whole
     // reason this feature exists is that nothing downstream would notice.
     shared_ptr<key_provider> provider_for(const options& opts) const {
+        if (!_ctxt) {
+            throw std::invalid_argument(
+                    "parquet encryption: no encryption context is registered on this node");
+        }
         auto p = _ctxt->get_provider(opts);
         if (!p) {
             throw std::invalid_argument(
@@ -68,6 +72,10 @@ public:
     explicit parquet_key_source(seastar::shared_ptr<encryption_context> ctxt)
         : _ctxt(std::move(ctxt))
     {}
+
+    void rebind(seastar::shared_ptr<encryption_context> ctxt) {
+        _ctxt = std::move(ctxt);
+    }
 
     future<sstables::parquet::resolved_key> key_for_write(
             const sstables::parquet::key_options& kopts) override {
@@ -108,15 +116,26 @@ public:
 } // namespace
 
 void register_parquet_key_source(seastar::shared_ptr<encryption_context> ctxt) {
-    // Leaked on purpose, and the pointer handed over is raw for the same reason: it is read from
-    // every shard for the life of the process, so there must be nothing to race on. See
-    // sstables/parquet/encryption_keys.hh.
+    // One adapter for the life of the process, rebound rather than replaced.
     //
-    // Not freeing the previous one is also deliberate. A test process builds many cql_test_envs
-    // and so calls this many times; deleting the old adapter would risk a shard still holding the
-    // raw pointer, and the object is a single shared_ptr wide. A stale pointer is a crash, a
-    // leaked pointer is a few bytes.
-    sstables::parquet::set_key_source(new parquet_key_source(std::move(ctxt)));
+    // The pointer sstables holds is raw and never freed, because it is read from every shard and
+    // there must be nothing to race on (see sstables/parquet/encryption_keys.hh). But a *new*
+    // adapter per call would accumulate: a test process builds many cql_test_envs and so calls
+    // this many times, and each adapter holds a shared_ptr that would keep a whole
+    // encryption_context alive -- with its per-shard provider caches and their keys. That is a
+    // leak that grows with the number of test environments, not a fixed few bytes, and it showed
+    // up as a bad_alloc partway through a batch of them.
+    //
+    // So: allocate once, and on every later registration just rebind the context, which releases
+    // the previous one. Safe because this runs pre-init, before anything can open or write an
+    // sstable, on the shard that created the context.
+    static parquet_key_source* adapter = nullptr;
+    if (!adapter) {
+        adapter = new parquet_key_source(std::move(ctxt));
+        sstables::parquet::set_key_source(adapter);
+    } else {
+        adapter->rebind(std::move(ctxt));
+    }
 }
 
 }
