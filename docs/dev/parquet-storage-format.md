@@ -4693,12 +4693,22 @@ the same data.
 
 ### 10.17 Encryption at rest, as a Parquet feature — built 2026-08-20
 
-The readiness table used to call this "not applicable to this tree", which conflated two things.
-Scylla's own encryption at rest genuinely does not exist here. **Parquet Modular Encryption** does
-exist -- it is a standard part of parquet-format 2.7+ -- and it is the right layer for this format,
-because encrypting the Data component from outside would make the file opaque to every external
-reader and forfeit the interoperability that is the entire argument for using Parquet. Modular
-encryption keeps it a Parquet file: a reader with the key opens it with a stock library.
+**A correction first, because it shaped the design.** This section previously said Scylla has "no
+encryption-at-rest code in this tree at all -- no `ee/` directory, no such symbols". That is **wrong**.
+The code is in **`ent/encryption/`** — `key_provider`, `key_provider_factory`, `symmetric_key`, and
+providers for local files, replicated keys, **KMIP, AWS KMS, Azure and GCP**. The claim came from
+grepping for `ee/`, finding nothing, and concluding absence rather than checking the directory listing.
+It propagated into the future-work doc and the deck before being caught.
+
+It matters because those providers are exactly what a **BYOK** deployment uses, and because
+`key_provider::key(const key_info&, opt_bytes id)` returns a key *together with an opaque id* to store
+with the data and hand back to retrieve the same key later — which is precisely the role Parquet's
+`FileCryptoMetaData.key_metadata` plays. The two models line up; there was never a need to invent a
+key file.
+
+**Parquet Modular Encryption is still the right layer** for the file itself: encrypting the Data
+component from outside would make it opaque to every external reader and forfeit the interoperability
+that is the whole argument for Parquet.
 
 **Built against a reference implementation, not against the spec text.** Every constant was read
 off files written by parquet-cpp and then pinned by a test that decrypts those files with our code:
@@ -4741,14 +4751,21 @@ path -- without the key the file does not open at all.
 authentication tag, so tampering with one is not detected by the format. It exists because it is
 faster and because other writers produce it.
 
-**One finding about interoperability that is not in the format at all.** `key_metadata` is opaque
-per the spec -- "whatever the reader needs to find the key" -- so the first version wrote the bare
-key id. That file is readable only through a reader's low-level explicit-key API; pyarrow's Python
-API and Spark decrypt *only* through a KMS, and their KMS layer requires parquet-java's "key tools"
-key-material JSON. Since interoperability is the whole point, the writer now emits that JSON, with
-`masterKeyID` carrying our key id and `wrappedDEK` a placeholder -- so a reader's KMS is asked for
-the key by name and no key material is in the file. This is a convention *above* the format, and it
-took a failing interop test to notice it.
+**`key_metadata` is a deployment choice, and the default is now provider-neutral.** The spec says
+only "whatever the reader needs to find the key". Two shapes are supported, selected per table by
+`encryption_key_metadata`:
+
+| value | what is written | who can read it |
+|---|---|---|
+| `provider` *(default)* | the key id verbatim | any provider, **including BYOK** via KMIP/KMS/Azure/GCP; readers using explicit keys |
+| `parquet_kms` | parquet-java's "key tools" key-material JSON | additionally pyarrow's Python API and Spark, which decrypt **only** through a KMS requiring that shape |
+
+The first version emitted the JSON unconditionally, which was wrong: that shape encodes one specific
+key-management model — a `masterKeyID` plus a wrapped DEK — and a BYOK deployment whose keys live in a
+KMIP server or a cloud KMS does not necessarily map onto it. Baking it in bought one reader's
+convenience at the cost of assuming its key management for everyone. It is opt-in now, because that
+trade belongs to the operator. Both shapes are read back correctly; `key_id_from_metadata()` accepts
+either.
 
 **Verified end to end on a running node** (`~/pq-lab/encryption_e2e.py`, 13/13): the three DDL
 rejections; every `Data.db` of a multi-group table begins and ends with `PARE`; no plaintext value
@@ -4784,8 +4801,23 @@ that is true would be the "setting that lies" failure mode this codebase keeps r
 The interop suite prints the gap on every run rather than asserting it, and says what to change when
 it closes.
 
-**Also absent**: plaintext-footer mode, key rotation, and any KMS integration. The key file is
-exactly as strong as its permissions.
+**The remaining alignment work, now that `ent/encryption` is known to exist.** Keys are still
+resolved by `sstables/parquet/encryption_keys.cc` from a local `parquet_encryption_key_file`, which
+duplicates in miniature what `ent/encryption`'s local-file provider already does and supports none of
+the others. The right end state is to drop that registry and call `key_provider::key()`, taking the
+options from Scylla's own `scylla_encryption_options` vocabulary (`cipher_algorithm`,
+`secret_key_strength`, `key_provider`, plus provider options) instead of the bespoke `encryption` /
+`encryption_key` pair, and to store the provider's returned id in `key_metadata`. That would give
+KMIP, KMS, Azure, GCP and BYOK for free.
+
+Two things to get right when doing it, both of which are why it is not a mechanical swap.
+`key_provider::key()` returns a `future`, while the Parquet write path that needs the key is
+synchronous — so the key has to be resolved before the writer is constructed rather than inside it.
+And `cipher_algorithm` in Scylla's EaR is a JCE-style string like `AES/CBC/PKCS5Padding`, whereas
+Parquet Modular Encryption permits only AES-GCM and AES-GCM-CTR; a table configured for CBC cannot be
+honoured and must be **refused at DDL time** rather than silently given a different mode.
+
+**Also absent**: plaintext-footer mode and key rotation.
 
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 

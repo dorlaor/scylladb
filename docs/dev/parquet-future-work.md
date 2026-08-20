@@ -206,9 +206,13 @@ tail**.
 With no filename, that abort may not happen, and the failure mode would be an older node
 mis-reading an object rather than refusing to start. **§10.9 is verified for local storage only.**
 
-**~~Encryption at rest is not a gap in this tree~~ — that answer was wrong, and the work is now
-done.** It conflated two things. Scylla's *own* encryption at rest genuinely does not exist here, so
-that interaction still cannot be tested on this branch. But **Parquet Modular Encryption** is a
+**~~Encryption at rest is not a gap in this tree~~ — that answer was wrong twice over.** First it
+conflated Scylla's own encryption at rest with Parquet's. Then the correction repeated a factual
+error: Scylla's EaR **is** in this tree, in **`ent/encryption/`** (key providers for local files,
+replicated keys, KMIP, AWS KMS, Azure, GCP). The original claim of absence came from grepping for
+`ee/` and not checking the directory listing. Those providers are what a **BYOK** deployment uses, and
+`key_provider::key()` already returns a key plus an opaque id to store with the data — the same role
+Parquet's `key_metadata` plays, so the models line up. But **Parquet Modular Encryption** is a
 standard part of parquet-format 2.7+, and it is the right layer for this format: encrypting the Data
 component from outside would make the file opaque to every external reader and forfeit the
 interoperability that is the whole argument for Parquet. Built and verified end to end on 2026-08-20
@@ -225,8 +229,19 @@ Still open within it:
   encrypts the column metadata, and the envelope layout. Next suspects: `RowGroup.ordinal`, which
   we never emit, and the `ColumnChunk` field 3/8/9 presence rules. Not exposed through CQL until
   this closes.
-- Plaintext-footer mode, key rotation, and any KMS integration. The key file is exactly as strong
-  as its permissions.
+- **Alignment with `ent/encryption` is the main remaining item.** Keys are still resolved from a
+  bespoke `parquet_encryption_key_file`, which reimplements the local-file provider in miniature and
+  supports none of the others. Drop it, call `key_provider::key()`, and take the options from
+  `scylla_encryption_options` (`cipher_algorithm`, `secret_key_strength`, `key_provider`) instead of
+  the bespoke `encryption`/`encryption_key` pair. Not mechanical: `key()` is a future while the
+  Parquet write path is synchronous, so the key must be resolved before the writer is constructed;
+  and `cipher_algorithm` is JCE-style (`AES/CBC/PKCS5Padding`) while Parquet permits only AES-GCM
+  and AES-GCM-CTR, so a CBC-configured table must be refused at DDL time rather than quietly given
+  another mode.
+- `key_metadata` now defaults to the provider's key id verbatim, with parquet-java's key-material
+  JSON as an explicit `encryption_key_metadata: 'parquet_kms'` opt-in. Emitting that JSON
+  unconditionally, as the first version did, assumed one key-management model for everyone.
+- Plaintext-footer mode and key rotation.
 
 ### Downgrade procedure — written 2026-08-19, was "not started"
 §10.9. The load-bearing fact is observed, not reasoned: an older node meeting an sstable version it

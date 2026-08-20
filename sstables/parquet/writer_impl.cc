@@ -376,6 +376,14 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
             }
         } else if (k == ENCRYPTION_KEY) {
             _cfg.encryption_key_id = v;
+        } else if (k == ENCRYPTION_KEY_METADATA) {
+            auto f = parse_key_metadata_format(v);
+            if (!f) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "Unsupported 'encryption_key_metadata' value '{}' in the 'parquet' option; "
+                        "supported: provider, parquet_kms", v));
+            }
+            _cfg.encryption_key_metadata = *f;
         } else if (k.size() > std::strlen(ENCODING_PREFIX)
                    && k.compare(0, std::strlen(ENCODING_PREFIX), ENCODING_PREFIX) == 0) {
             const sstring col = k.substr(std::strlen(ENCODING_PREFIX));
@@ -402,7 +410,8 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                     seastar::format("Unknown sub-option '{}' for the 'parquet' option; supported: "
                                     "row_group_rows, row_group_buffer_bytes, page_rows, compression, "
                                     "compression_level, metadata_folding, dictionary, encryption, "
-                                    "encryption_key, and 'encoding.<column>'", k));
+                                    "encryption_key, encryption_key_metadata, and "
+                                    "'encoding.<column>'", k));
         }
     }
 }
@@ -453,6 +462,11 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
         m[ENCRYPTION] = _cfg.encryption_algo == format::cipher::aes_gcm_v1
                       ? "aes_gcm_v1" : "aes_gcm_ctr_v1";
         m[ENCRYPTION_KEY] = _cfg.encryption_key_id;
+        if (_cfg.encryption_key_metadata != key_metadata_format::provider) {
+            // Qualified: the member to_string(column_encoding) would otherwise hide it.
+            m[ENCRYPTION_KEY_METADATA] =
+                    sstables::parquet::to_string(_cfg.encryption_key_metadata);
+        }
     }
     return m;
 }
@@ -1104,8 +1118,8 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
         // The reader needs to know which key. Wrapped in the key-material JSON that pyarrow and
         // Spark's KMS layers require, so an authorised external reader can open the file; see
         // make_key_metadata() for why the convention beats the minimal encoding here.
-        pcfg.wopt.encryption.key_metadata =
-                std::string(make_key_metadata(pcfg.encryption_key_id));
+        pcfg.wopt.encryption.key_metadata = std::string(
+                make_key_metadata(pcfg.encryption_key_id, pcfg.encryption_key_metadata));
     }
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
                                             std::move(pcfg), enc_stats, shard, nullptr);

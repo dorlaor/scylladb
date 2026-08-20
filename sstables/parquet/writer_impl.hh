@@ -28,6 +28,7 @@
 #include "sstables/metadata_collector.hh"
 #include "sstables/writer_impl.hh"
 #include "sstables/writer.hh"
+#include "sstables/parquet/encryption_keys.hh"
 
 #include <functional>
 #include <memory>
@@ -47,6 +48,7 @@ struct pq_writer_config {
     // config round-trip (to_map) cannot leak key material.
     seastar::sstring encryption_key_id{};
     format::cipher   encryption_algo = format::cipher::aes_gcm_v1;
+    key_metadata_format encryption_key_metadata = key_metadata_format::provider;
     // A row group is cut when either limit trips.
     //
     // `row_group_buffer_bytes` is **buffered shredder memory**, not encoded output, and
@@ -121,6 +123,11 @@ public:
     // schema (which is replicated, stored in system tables and printed by DESCRIBE).
     static constexpr const char* ENCRYPTION            = "encryption";
     static constexpr const char* ENCRYPTION_KEY        = "encryption_key";
+    // What goes into FileCryptoMetaData.key_metadata: 'provider' (the key id verbatim, the
+    // default, and what works with every provider including BYOK) or 'parquet_kms'
+    // (parquet-java's key-material JSON, needed only by pyarrow's and Spark's KMS-mediated
+    // readers). See encryption_keys.hh for why this is the operator's choice.
+    static constexpr const char* ENCRYPTION_KEY_METADATA = "encryption_key_metadata";
 
     // Guard rails. The lower bound on rows is not arbitrary: below ~1 000 rows the
     // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --

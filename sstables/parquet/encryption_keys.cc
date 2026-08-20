@@ -80,9 +80,24 @@ key_registry& keys() {
     return r;
 }
 
-seastar::sstring make_key_metadata(const seastar::sstring& key_id) {
+std::optional<key_metadata_format> parse_key_metadata_format(std::string_view v) {
+    if (v == "provider")    { return key_metadata_format::provider; }
+    if (v == "parquet_kms") { return key_metadata_format::parquet_kms; }
+    return std::nullopt;
+}
+
+const char* to_string(key_metadata_format f) {
+    return f == key_metadata_format::provider ? "provider" : "parquet_kms";
+}
+
+seastar::sstring make_key_metadata(const seastar::sstring& key_id, key_metadata_format fmt) {
+    if (fmt == key_metadata_format::provider) {
+        // Verbatim. The id is whatever the key provider issued, and we do not interpret it -- which
+        // is what lets a BYOK provider define its own.
+        return key_id;
+    }
     // Field order matters to nobody, but the field *set* does: pyarrow rejects the material if
-    // kmsInstanceID or kmsInstanceURL is missing, which is how the first attempt failed.
+    // kmsInstanceID or kmsInstanceURL is missing, which is how the first attempt at this failed.
     return seastar::sstring("{\"keyMaterialType\":\"PKMT1\",\"internalStorage\":true,"
                             "\"isFooterKey\":true,\"kmsInstanceID\":\"DEFAULT\","
                             "\"kmsInstanceURL\":\"DEFAULT\",\"masterKeyID\":\"")

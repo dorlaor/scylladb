@@ -48,19 +48,33 @@ public:
 key_registry& keys();
 
 // FileCryptoMetaData.key_metadata is opaque to the Parquet spec -- "whatever the reader needs to
-// find the key". Writing the bare key id would be the minimal honest choice, and it is what the
-// first version did; it is also unreadable by pyarrow and Spark, whose Python/Java APIs decrypt
-// only through a KMS and require this particular JSON (parquet-java's "key tools" key material).
-// Since interoperability is the entire reason for encrypting inside the format, the convention
-// wins over the minimal encoding.
+// find the key" -- so what goes in it is a deployment choice, not a format one. Two shapes, and the
+// default is deliberately the provider-neutral one.
 //
-// No key material goes into it: `wrappedDEK` is a fixed placeholder and `masterKeyID` carries our
-// key id, so a reader's KMS is asked for the key by name -- which is exactly how an operator
-// would wire this key file to a reader's KMS.
-seastar::sstring make_key_metadata(const seastar::sstring& key_id);
+//  provider    the key's own identifier, verbatim. This is what Scylla's own encryption at rest
+//              deals in: ent/encryption's key_provider::key() returns a key *and* an opaque id to
+//              store with the data and hand back to retrieve the same key later, which is exactly
+//              the role key_metadata plays. Works with every provider, including BYOK through
+//              KMIP/KMS/Azure/GCP, because the provider defines the id and we never interpret it.
+//
+//  parquet_kms parquet-java's "key tools" key-material JSON. pyarrow's Python API and Spark
+//              decrypt *only* through a KMS that requires this shape, so it is the only way those
+//              readers can open the file through their high-level API. But it encodes a specific
+//              key-management model -- a masterKeyID plus a wrapped DEK -- and a BYOK deployment
+//              whose keys live in a KMIP server or a cloud KMS does not necessarily map onto it.
+//              Opt-in for that reason: it buys one reader's convenience at the cost of assuming
+//              its key management, and that trade is the operator's to make, not ours.
+//
+// A reader using explicit keys (the C++/Java low-level API) opens either shape. Only the
+// KMS-mediated high-level path needs `parquet_kms`.
+enum class key_metadata_format { provider, parquet_kms };
 
-// The inverse: pull the key id back out. Accepts a bare id too, so a file written by the earlier
-// form still opens.
+std::optional<key_metadata_format> parse_key_metadata_format(std::string_view);
+const char* to_string(key_metadata_format);
+
+seastar::sstring make_key_metadata(const seastar::sstring& key_id, key_metadata_format);
+
+// The inverse: pull the key id back out of either shape.
 seastar::sstring key_id_from_metadata(const seastar::sstring& key_metadata);
 
 } // namespace sstables::parquet
