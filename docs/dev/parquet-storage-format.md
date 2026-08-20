@@ -4876,8 +4876,8 @@ without the ninety-minute rebuild.
 **The control is the important column.** "Squeezed" is the *same binary and the same data* with
 `components_memory_reclaim_threshold` set to 3 × 10⁻⁵ — about 250 kB on an 8 G shard, below one
 sstable's footer — so the reclaimer takes every entry away as soon as a read publishes it. It
-reproduces §10.21 to within 9 %, which is what makes the improvement attributable to the cache
-rather than to anything else that moved in the tree today.
+reproduces §10.21 to within 10 % arm for arm (+2.5 %, +9.2 %, 0.0 %, −4.1 %), which is what makes the
+improvement attributable to the cache rather than to anything else that moved in the tree today.
 
 | arm | row groups | §10.21 cold | squeezed (control) | cached | cached vs control |
 |---|---:|---:|---:|---:|---:|
@@ -4890,8 +4890,9 @@ rather than to anything else that moved in the tree today.
 All figures µs, cold minimum. Canary min 225–261 µs (16 % spread) on the cached run and 225–253 µs
 (12 %) on the control, against 224–244 µs in §10.21 — so all three are comparable and none of this
 is the machine, which matters on a box whose load average passed 30 earlier in the same hour. The
-cached run was measured twice, on two node restarts, agreeing to within 12 % (946/1 042/1 441/1 672
-against 832/1 030/1 361/1 684).
+cached run was measured twice, on two node restarts, agreeing to within 14 % (946/1 042/1 441/1 672
+against 832/1 030/1 361/1 684) — the widest gap being the 8 001-group arm, which is also the fastest
+and so the most exposed to the 250 µs floor underneath all of this.
 
 **Against the row format, cold: 1.8–3.6× rather than 5.4–23.6×.** The worst case improves most,
 which is the shape to expect from removing a term that scales.
