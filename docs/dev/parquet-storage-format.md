@@ -4784,6 +4784,45 @@ Fewer, larger row groups improve point reads — 402 groups is 5.4× — while s
 size want the opposite (§10.4a). Whoever tunes this is choosing between them explicitly rather than
 finding a setting that is good for both.
 
+### 10.23 Why the whole footer is read for one row group — and how to stop
+
+Raised as an objection and it is a fair one: a point read needs one row group's entry, about
+1 420 bytes, and instead reads the entire footer — up to 2.84 MB at 2 000 row groups
+(`reader.cc:525`, `data_read(len - 8 - flen, flen)`).
+
+**Two reasons, and only the first is forced.**
+
+`FileMetaData` is a single Thrift compact struct. The `row_groups` list is delta-encoded and every
+field is variable-length, so there is no way to seek to entry *N* without walking entries 0…N−1.
+Parquet offers no offset index for the footer itself — telling, since it *does* provide exactly that
+for page-level data, where `ColumnIndex`/`OffsetIndex` live outside the footer and are pointed at by
+offsets. Row-group metadata stayed inside.
+
+The reader already takes the only shortcut the format allows. `metadata_mode::lazy` skips *decoding*
+each group's column list and records its byte extent (`columns_offset` / `columns_length`), so
+`materialise_row_group()` later decodes one group. Decode is already O(1 group). The **read** and the
+**walk** are still O(all groups), and that is what the 3.1 ms/MB fit in §10.21 is measuring.
+
+**The fix is not a cache — it is a persisted side index.** Those extents are immutable for the life
+of the file, and Scylla owns the sstable's other components. Writing `row group → (footer offset,
+length)` into a component beside `Data.db` turns a cold point read into: read the 8-byte tail, read
+the side index, read one 1 420-byte slab. At roughly 8 bytes per row group the index is ~16 kB for
+2 000 groups — one read, no recursion. An O(row groups) cold path becomes O(1).
+
+**And it keeps the file a Parquet file**, which is the constraint that rules the design of everything
+here: the index lives *outside* `Data.db`, so an external reader is unaffected and still parses a
+standard footer. This is the same reasoning that put encryption inside the format (§10.17) and the
+row ordinal in the index rather than a byte offset (§5.4) — Scylla-private acceleration belongs in
+Scylla's components, never in the interchange file.
+
+**This also separates two things §10.4l had conflated.** An in-memory metadata cache helps the
+*second* read of a file; the side index helps the *first*. Productization wants both, and the cache
+alone leaves every cold start paying the full footer — which on a large node after a restart is every
+read.
+
+Cheaper mitigations, both already quantified and neither a substitute: fewer, larger row groups
+(§10.21) and trimming what per-chunk metadata is written at all.
+
 ### 10.22 Footer size, measured per file and per row group
 
 Prerequisite for deciding whether a metadata cache is worth building (§10.4l), measured on the same

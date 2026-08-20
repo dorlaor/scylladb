@@ -278,7 +278,7 @@ class pq_reader : public mutation_reader::impl {
     // The sstable's parsed footer, shared and immutable. Held by shared_ptr rather than looked up
     // per use, so that a reclaim in the middle of a read cannot pull it out from under us: the
     // entry leaves the sstable and stays alive here until this reader is done with it.
-    cached_footer_ptr _cf;
+    seastar::shared_ptr<const cached_footer> _cf;
     // One row group's column metadata, materialised into a reader-local metadata object holding
     // exactly that group at index 0. This is what keeps the shared entry immutable; see
     // cached_footer.
@@ -321,6 +321,20 @@ class pq_reader : public mutation_reader::impl {
 
     future<> init();
     future<> load_footer();             // cache hit, or fetch-decrypt-parse-publish
+    // Ask the key provider for this file's key and build the per-read crypto context around the
+    // envelope the footer declared. Separate from the footer load because the envelope is cached
+    // and the key is not.
+    future<format::read_crypto> read_crypto_for(format::cipher algo,
+                                                std::string_view aad_file_unique,
+                                                std::string_view aad_prefix,
+                                                const seastar::sstring& key_id);
+    void prepare_row_group_metadata() {
+        _rgmd = format::file_metadata{};
+        // walk_leaves() needs the schema tree, not the row groups, so this is the whole of what
+        // the reader-local metadata carries besides the one group it materialises.
+        _rgmd.schema = _cf->md.schema;
+        _rgmd_rg = size_t(-1);
+    }
     future<bool> next_window();         // false at end of the ordinal range
     future<> load_row_group(size_t rg);
     future<> load_offset_indexes(size_t rg);
@@ -420,6 +434,47 @@ public:
     future<> close() noexcept override { return make_ready_future<>(); }
 };
 
+future<format::read_crypto> pq_reader::read_crypto_for(format::cipher algo,
+                                                       std::string_view aad_file_unique,
+                                                       std::string_view aad_prefix,
+                                                       const seastar::sstring& key_id) {
+    // The key id carries what the key provider issued for this file, or nothing at all if the
+    // provider issues no ids. Trusting the file to name its own key is safe: it is an id, not a
+    // capability, and a wrong one simply fails to authenticate.
+    //
+    // The provider *options* come from the schema rather than from the file. That is a real
+    // difference from the whole-component encryption path, which stores them in the sstable's own
+    // extension attributes: changing the key provider on a table with existing sstables will make
+    // them unreadable, where scylla_encryption_options would still open them. Recorded in the
+    // design doc as a known limitation -- key_metadata is a single opaque string, and packing the
+    // option map into it would break the "id, verbatim" contract that makes the provider-neutral
+    // shape work.
+    auto* ksrc = key_source_ptr();
+    if (!ksrc) {
+        throw std::runtime_error(seastar::format(
+                "pq: {} is encrypted, but this node has no encryption key provider registered",
+                _sst->get_filename()));
+    }
+    const auto key_opts = parquet_parameters(_schema->parquet_options()).key_opts();
+    format::read_crypto rc;
+    try {
+        rc.key = co_await ksrc->key_for_read(key_opts, key_id);
+    } catch (...) {
+        std::throw_with_nested(std::runtime_error(seastar::format(
+                "pq: {} is encrypted, but its key could not be obtained from the key provider "
+                "(id '{}')", _sst->get_filename(), key_id)));
+    }
+    if (!rc.key.valid()) {
+        throw std::runtime_error(seastar::format(
+                "pq: {}: the key provider returned a {}-byte key; AES needs 16, 24 or 32",
+                _sst->get_filename(), rc.key.bytes.size()));
+    }
+    rc.algo = algo;
+    rc.aad_file_unique = std::string(aad_file_unique);
+    rc.aad_prefix = std::string(aad_prefix);
+    co_return rc;
+}
+
 // Get the parsed footer into _cf, from the sstable's cache if it is there and by reading,
 // decrypting and parsing the file if it is not.
 //
@@ -434,7 +489,9 @@ future<> pq_reader::load_footer() {
     auto& stats = footer_cache_stats_local();
     if (auto& cached = _sst->pq_footer_cache()) {
         ++stats.hits;
-        _cf = cached;
+        // Downcast rather than dynamic_cast: reader.cc is the only thing that ever publishes an
+        // entry, so there is exactly one concrete type it can be.
+        _cf = seastar::static_pointer_cast<const cached_footer>(cached);
         if (_cf->encrypted) {
             // The envelope was cached; the key was not, on purpose. Fetch it again.
             _crypto = co_await read_crypto_for(_cf->algo, _cf->aad_file_unique, _cf->aad_prefix,
@@ -529,6 +586,7 @@ future<> pq_reader::load_footer() {
     // that missed at the same time simply parsed it too and overwrites this with an identical
     // entry; both are correct, and the loser's copy dies with its reader.
     _sst->set_pq_footer_cache(_cf);
+    prepare_row_group_metadata();
 }
 
 future<> pq_reader::init() {
@@ -536,16 +594,11 @@ future<> pq_reader::init() {
     _init = true;
 
     co_await load_footer();
-    const auto& md = _cf->md;
-
-    _rgmd = format::file_metadata{};
-    _rgmd.schema = md.schema;           // fixed size; walk_leaves() needs the tree, not the groups
-    _rgmd_rg = size_t(-1);
 
     _cols = columns_of(*_schema);
     {
         rtimer _t{rphase::schema_recover};
-        _ms = recover_mapped_schema(md, _cols);
+        _ms = recover_mapped_schema(_cf->md, _cols);
     }
     _n_pk = _schema->partition_key_size();
     _n_ck = _schema->clustering_key_size();
@@ -589,11 +642,12 @@ future<> pq_reader::init() {
 }
 
 future<> pq_reader::load_row_group(size_t rg) {
-    if (_cur_rg == rg) { co_return; }
+    // Before the early return, not after: a fast_forward_to() resets the materialised group while
+    // leaving the buffered bytes in place, and the callers below index columns() either way.
     need_columns(rg);
-    const auto& g = _md.row_groups[rg];
+    if (_cur_rg == rg) { co_return; }
     int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
-    for (const auto& cc : g.columns) {
+    for (const auto& cc : columns()) {
         if (!cc.meta) { continue; }
         const auto& cm = *cc.meta;
         const int64_t s = cm.dictionary_page_offset ? *cm.dictionary_page_offset
@@ -612,10 +666,12 @@ future<bool> pq_reader::next_window() {
     _pos = 0;
     if (_cursor >= _row_hi) { co_return false; }
 
-    // Which row group holds _cursor.
-    size_t rg = 0;
-    while (rg + 1 < _rg_start.size() && _rg_start[rg + 1] <= _cursor) { ++rg; }
-    const int64_t rg_end = _rg_start[rg] + _md.row_groups[rg].num_rows;
+    // Which row group holds _cursor. Binary search rather than a walk: _rg_start has one entry
+    // per row group, and a linear scan of 8 000 of them is not free on a path this hot.
+    const size_t rg = size_t(std::distance(
+            _rg_start.begin(),
+            std::prev(std::upper_bound(_rg_start.begin(), _rg_start.end(), _cursor))));
+    const int64_t rg_end = _rg_start[rg] + _cf->md.row_groups[rg].num_rows;
 
     const int64_t lo = _cursor;
     const bool bounded = _pr->start() || _pr->end();
@@ -631,7 +687,7 @@ future<bool> pq_reader::next_window() {
         co_await load_row_group(rg);
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
-        colsdata = format::read_row_range(img, _rg_base, _md, rg,
+        colsdata = format::read_row_range(img, _rg_base, _rgmd, 0,
                                           lo - _rg_start[rg], hi - _rg_start[rg], crypto());
     }
     _rows = reassemble(_ms, _cols, colsdata, size_t(hi - lo));
@@ -642,13 +698,13 @@ future<bool> pq_reader::next_window() {
 future<> pq_reader::load_offset_indexes(size_t rg) {
     if (_oi_rg == rg) { co_return; }
     need_columns(rg);
-    _oi.assign(_md.row_groups[rg].columns.size(), std::nullopt);
+    _oi.assign(columns().size(), std::nullopt);
     _oi_rg = rg;
 
     // The per-column OffsetIndex blobs sit together near the end of the file, so
     // one read covers all of them.
     int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
-    for (const auto& cc : _md.row_groups[rg].columns) {
+    for (const auto& cc : columns()) {
         if (!cc.offset_index_offset || !cc.offset_index_length) { continue; }
         lo = std::min(lo, *cc.offset_index_offset);
         hi = std::max(hi, *cc.offset_index_offset + *cc.offset_index_length);
@@ -658,7 +714,7 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
     auto buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
     auto img = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
     for (size_t c = 0; c < _oi.size(); ++c) {
-        const auto& cc = _md.row_groups[rg].columns[c];
+        const auto& cc = columns()[c];
         if (!cc.offset_index_offset || !cc.offset_index_length) { continue; }
         try {
             _oi[c] = format::parse_offset_index_blob(
@@ -670,7 +726,7 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
 future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int64_t lo, int64_t hi) {
     co_await load_offset_indexes(rg);
     need_columns(rg);
-    const auto& g = _md.row_groups[rg];
+    const auto& cols = columns();
 
     bool all = true;
     for (const auto& o : _oi) { if (!o || o->pages.empty()) { all = false; break; } }
@@ -679,7 +735,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         co_await load_row_group(rg);
         auto img = std::span<const uint8_t>(
                 reinterpret_cast<const uint8_t*>(_rg_buf.get()), _rg_buf.size());
-        co_return format::read_row_range(img, _rg_base, _md, rg, lo, hi, crypto());
+        co_return format::read_row_range(img, _rg_base, _rgmd, 0, lo, hi, crypto());
     }
 
     // Two extents per column: the dictionary page at the head of the chunk, and the
@@ -697,11 +753,11 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         size_t  len;
     };
     std::vector<extent> want;
-    want.reserve(g.columns.size() * 2);
-    std::vector<format::column_input> in(g.columns.size());
+    want.reserve(cols.size() * 2);
+    std::vector<format::column_input> in(cols.size());
 
-    for (size_t c = 0; c < g.columns.size(); ++c) {
-        const auto& cm = *g.columns[c].meta;
+    for (size_t c = 0; c < cols.size(); ++c) {
+        const auto& cm = *cols[c].meta;
         const auto& pages = _oi[c]->pages;
         const size_t i0 = _oi[c]->page_for_row(lo);
         const size_t i1 = _oi[c]->page_for_row(hi > lo ? hi - 1 : lo);
@@ -742,7 +798,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
     }
 
     rtimer _td{rphase::decode_cpu};
-    co_return format::decode_columns(in, _md, rg, lo, hi, crypto());
+    co_return format::decode_columns(in, _rgmd, 0, lo, hi, crypto());
 }
 
 void pq_reader::close_partition() {
