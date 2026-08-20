@@ -4801,21 +4801,53 @@ that is true would be the "setting that lies" failure mode this codebase keeps r
 The interop suite prints the gap on every run rather than asserting it, and says what to change when
 it closes.
 
-**The remaining alignment work, now that `ent/encryption` is known to exist.** Keys are still
-resolved by `sstables/parquet/encryption_keys.cc` from a local `parquet_encryption_key_file`, which
-duplicates in miniature what `ent/encryption`'s local-file provider already does and supports none of
-the others. The right end state is to drop that registry and call `key_provider::key()`, taking the
-options from Scylla's own `scylla_encryption_options` vocabulary (`cipher_algorithm`,
-`secret_key_strength`, `key_provider`, plus provider options) instead of the bespoke `encryption` /
-`encryption_key` pair, and to store the provider's returned id in `key_metadata`. That would give
-KMIP, KMS, Azure, GCP and BYOK for free.
+**The remaining alignment work, now that `ent/encryption` is known to exist — including a conflict
+that changes the shape of it.**
 
-Two things to get right when doing it, both of which are why it is not a mechanical swap.
-`key_provider::key()` returns a `future`, while the Parquet write path that needs the key is
-synchronous — so the key has to be resolved before the writer is constructed rather than inside it.
-And `cipher_algorithm` in Scylla's EaR is a JCE-style string like `AES/CBC/PKCS5Padding`, whereas
-Parquet Modular Encryption permits only AES-GCM and AES-GCM-CTR; a table configured for CBC cannot be
-honoured and must be **refused at DDL time** rather than silently given a different mode.
+The seam is already there. `encryption_context::get_provider(const options&)` returns a provider for
+an options map, and `get_key_info(options)` parses `cipher_algorithm` / `secret_key_strength` from the
+same map, so:
+
+```cpp
+auto provider = ctx.get_provider(opts);                       // local | replicated | KMIP | KMS | Azure | GCP
+auto [key, id] = co_await provider->key(get_key_info(opts), existing_id);
+```
+
+That is the BYOK entry point, and the id it returns is what belongs in Parquet's `key_metadata`. On
+read, `key_for_read(id)` closes the loop. The context is created by `register_extensions()` during
+startup, so reaching it from `sstables/parquet` needs a process-global accessor of the same shape as
+the `keys()` singleton this code already has.
+
+**The async objection turns out not to bite.** `pq_writer_impl`'s constructor already blocks on
+futures (`sst.create_data().get()`), so it runs somewhere `.get()` is legal and key resolution fits
+there; the reader is a coroutine and can simply `co_await`.
+
+**The conflict, which is the part worth knowing before starting.** Scylla's EaR encrypts the *whole
+Data component* through an sstable file-io extension, keyed off the `scylla_encryption_options`
+schema extension, storing the key id in the sstable's own Scylla-metadata attributes. So a `pq` table
+carrying `scylla_encryption_options` is **already** encrypted at the storage layer — and that file is
+opaque to every external reader, which is the outcome Parquet Modular Encryption exists to avoid.
+Driving Parquet encryption from the same property would therefore double-encrypt and still hand out
+an unreadable file.
+
+So the two layers have to be mutually exclusive per table, and that is a design decision rather than
+a detail:
+
+- keep a Parquet-side selector (`parquet = {'encryption': 'aes_gcm_v1', ...}`) that says *this table
+  encrypts inside the format*, and take the **key** from `ent/encryption`'s provider — reusing its
+  options vocabulary and therefore its BYOK providers, without reusing the property that triggers the
+  storage-layer path;
+- **refuse at DDL time** a table that asks for both, rather than silently applying one or both.
+
+Two further constraints for whoever picks this up. `cipher_algorithm` is a JCE-style string like
+`AES/CBC/PKCS5Padding`, while Parquet permits only AES-GCM and AES-GCM-CTR — a CBC-configured table
+cannot be honoured and must be refused, not quietly given another mode. And the bespoke
+`parquet_encryption_key_file` plus `encryption_keys.cc` registry should be deleted once the provider
+path lands; it reimplements the local-file provider in miniature and supports none of the others.
+
+Until then the current state is: Parquet Modular Encryption works end to end with keys from that local
+file, `key_metadata` is provider-neutral by default so nothing about the file format presumes a key
+manager, and BYOK is reachable only by pointing that file at a key the operator supplied out of band.
 
 **Also absent**: plaintext-footer mode and key rotation.
 
