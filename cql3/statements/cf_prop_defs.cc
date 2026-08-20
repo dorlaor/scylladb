@@ -168,6 +168,28 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     auto tombstone_gc_options = get_tombstone_gc_options(schema_extensions);
     validate_tombstone_gc_options(tombstone_gc_options, db, ks_name);
 
+    // Parquet encryption and whole-component encryption at rest are mutually exclusive, and this
+    // is the only place both are visible at once.
+    //
+    // They are not merely redundant. `scylla_encryption_options` installs an sstable file-io
+    // extension that encrypts the entire Data component, so a pq table carrying it would be
+    // encrypted twice -- and, far worse, the outer layer makes the file opaque to every reader
+    // that is not Scylla. Being openable by an authorised external reader is the entire reason
+    // for encrypting *inside* the Parquet format rather than underneath it, so silently accepting
+    // both would take away the feature while appearing to add security. Both keys still come from
+    // the same providers; it is the property that has to be chosen.
+    if (auto opts = get_map(KW_PARQUET)) {
+        const sstables::parquet::parquet_parameters pp{*opts};
+        if (pp.encryption_enabled() && schema_extensions.contains("scylla_encryption_options")) {
+            throw exceptions::configuration_exception(
+                    "A table cannot set both scylla_encryption_options and parquet = "
+                    "{'encryption': ...}: the first encrypts the whole sstable component, which "
+                    "would encrypt the Parquet file a second time and leave a file no external "
+                    "reader can open -- which is what encrypting inside the format exists to "
+                    "avoid. Pick one; both take their keys from the same key providers");
+        }
+    }
+
     validate_minimum_int(KW_DEFAULT_TIME_TO_LIVE, 0, DEFAULT_DEFAULT_TIME_TO_LIVE);
     validate_minimum_int(KW_PAXOSGRACESECONDS, 0, DEFAULT_GC_GRACE_SECONDS);
 
