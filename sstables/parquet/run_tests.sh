@@ -30,12 +30,12 @@ g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -I. \
        $S/parquet_metadata.cc $S/encryption.cc -lzstd -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_nested_read_t $S/test_nested_read.cc $S/parquet_reader.cc \
-       $S/parquet_metadata.cc $S/page_header.cc -lzstd -lsnappy || FAIL=1
+       $S/parquet_metadata.cc $S/page_header.cc $S/encryption.cc -lzstd -lsnappy -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_levels_tree_t $S/test_levels_tree.cc $S/parquet_metadata.cc || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_rowrange_t $S/test_row_range.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
-       $S/page_header.cc -lzstd -lsnappy || FAIL=1
+       $S/page_header.cc $S/encryption.cc -lzstd -lsnappy -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_shred_t schema_mapping.cc $S/parquet_writer.cc $S/parquet_metadata.cc \
        $S/page_header.cc $S/parquet_reader.cc $S/encryption.cc test_shred.cc \
@@ -44,7 +44,10 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I../..
     -o /tmp/pq_tier_t tiering_policy.cc test_tiering.cc -lfmt || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
     -o /tmp/pq_oi_t $S/test_offset_index.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
-       $S/page_header.cc -lzstd -lsnappy || FAIL=1
+       $S/page_header.cc $S/encryption.cc -lzstd -lsnappy -lcrypto || FAIL=1
+# Every target that links parquet_reader.cc also needs encryption.cc: reading an encrypted footer
+# is part of the reader now (c690d33683), so the four targets above would otherwise fail to link
+# and take the whole suite's build down with them.
 # Modular encryption. Two directions, and both are needed: the conformance test decrypts files
 # written by parquet-cpp, the writer test produces files for pyarrow to open. Either one alone
 # would only prove we agree with ourselves.
@@ -57,7 +60,7 @@ g++ -std=c++20 -O2 -Wall -Wextra -I. -I../.. \
        -lzstd -lsnappy -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
     -o /tmp/pq_xread_t $S/test_crossread.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
-       $S/page_header.cc -lzstd -lsnappy || FAIL=1
+       $S/page_header.cc $S/encryption.cc -lzstd -lsnappy -lcrypto || FAIL=1
 for f in $S/parquet_metadata.cc $S/page_header.cc $S/parquet_writer.cc $S/parquet_reader.cc schema_mapping.cc tiering_policy.cc; do
   # -Werror + -Wunused-private-field mirrors the in-tree Scylla build, which is
   # stricter than the gcc invocations above.
