@@ -4527,11 +4527,26 @@ side to the write side. If the normal runs have no tombstones *at all* — and t
 totalling ~0.7 MB across ~400 leaves is what all-null looks like — then the difference is whether
 those NULLs were bound as deletions in the first place, not whether they were later removed.
 
-**Next steps, both cheap and both specific.** Save a normal file alongside an anomalous one and
-compare `__ldt_*` null counts directly, rather than inferring "all-null" from an aggregate. And check
-the Backblaze slice for duplicate primary keys: the harness logs collapse counts for other datasets
-(pageviews: 176 082 rows to 163 845 distinct keys), and a duplicate row inserted twice under
-different `USING TIMESTAMP` values is a way for a later live cell to shadow an earlier tombstone.
+**The shadowing hypothesis is eliminated too.** A duplicate row inserted twice under different
+`USING TIMESTAMP` values would let a later live cell shadow an earlier tombstone, and the harness
+does log collapse counts for other datasets (pageviews: 176 082 rows to 163 845 distinct keys). The
+Backblaze slice has **no duplicates at all**: 300 000 rows, 300 000 distinct `(serial_number, date)`
+pairs.
+
+**The arithmetic checks out exactly, which is worth stating because it closes the size question.**
+The slice holds **42 448 175 nulls** across 195 data columns — 141.5 per row. Bound as NULLs that is
+42.4 M cell tombstones, and at ~1.4 B each after zstd that is ~60 MB: the anomalous file's 60.1 MB.
+So there is no missing mechanism on the size side. Every run writes those tombstones, and the
+question is entirely what removes them in the other six passes out of seven.
+
+**What is left is narrow and specific.** Tombstone removal here cannot be gc_grace (age 0 against 10
+days), cannot be shadowing (no duplicate keys), and cannot be a difference in the load (identical
+input, identical statements, identical `USING TIMESTAMP` per row). That leaves the tombstone-GC path
+itself — `tombstone_gc` mode and what a compaction is able to prove about coverage — as the thing to
+instrument. The cheap next step is no longer a size comparison but a direct one: keep a normal file
+next to the anomalous one and compare `__ldt_*` null counts leaf by leaf, which distinguishes "the
+tombstones are absent" from "the tombstones are present but cheap" once and for all. Everything above
+assumes the former on the strength of an aggregate.
 
 **No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
 runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
