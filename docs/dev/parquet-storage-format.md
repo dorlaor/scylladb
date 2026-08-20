@@ -5640,6 +5640,20 @@ The shipping arm's cold point read goes **1 930 → 1 149 µs against native's 4
 predicted above: one operation for the group instead of 2 × 28, and then 23 of those 28 leaves not
 decoded at all. Fix 2 is the larger half of that on the arms that page (2 048: 1 375 → 770 cold).
 
+**Confirmed a second time, on a second keyspace, by the harness §10.24 itself used.**
+`pointread_v2.py` rebuilds its own tables rather than probing standing ones, so it is an independent
+sample of the same quantity — different data, different session, same estimator. 8 M rows, native
+plus the `rows_per_row_group = 5 000` arm, canary spread **1 %**:
+
+| arm | §10.24 warm / bypass / cold | now |
+|---|---:|---:|
+| native | 257 / 464 / 481 | 256 / 462 / 458 |
+| `pq`, 5 000 rows per group | 262 / 1 436 / 1 441 | **254 / 1 052 / 1 169** |
+
+Native reproduces to 0.4–4.8 %, which is what makes the `pq` column comparable: **cold 1 441 → 1 169
+µs, 3.00× → 2.55× of native**, agreeing with the `pqps` figure of 1 149 above to 1.7 % across two
+keyspaces and two harnesses. So the improvement is not an artifact of the tables that were standing.
+
 **One conclusion of §10.25 moves, in the direction §10.26 predicted.** The 10 %-ring scan column,
 which §10.25 could not collect at all, now runs and no longer favours small pages: `pq`/native is
 1.06× at the shipping default (22.3 MB), 1.09× at page 20 000 (15.9 MB) and 1.21–1.31× at pages
