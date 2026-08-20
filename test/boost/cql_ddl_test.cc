@@ -14,6 +14,7 @@
 
 #include "test/lib/cql_test_env.hh"
 #include "sstables/sstables.hh"
+#include "sstables/parquet/writer_impl.hh"
 #include "test/lib/cql_assertions.hh"
 
 BOOST_AUTO_TEST_SUITE(cql_ddl_test)
@@ -88,18 +89,18 @@ SEASTAR_TEST_CASE(test_writes_with_caching_enabled) {
 SEASTAR_TEST_CASE(test_parquet_table_property) {
     return do_with_cql_env_thread([] (cql_test_env& e) {
         e.execute_cql("CREATE TABLE ks.pqt (pk int PRIMARY KEY, v int) "
-                      "WITH parquet = {'row_group_rows': '5000'}").get();
+                      "WITH parquet = {'rows_per_row_group': '5000'}").get();
         {
             auto s = e.local_db().find_schema("ks", "pqt");
-            BOOST_REQUIRE_EQUAL(s->parquet_options().at("row_group_rows"), "5000");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("rows_per_row_group"), "5000");
         }
 
         // ALTER replaces the map, and a folding level exercises the round trip that broke.
         e.execute_cql("ALTER TABLE ks.pqt WITH parquet = "
-                      "{'row_group_rows': '20000', 'metadata_folding': 'verbatim'}").get();
+                      "{'rows_per_row_group': '20000', 'metadata_folding': 'verbatim'}").get();
         {
             auto s = e.local_db().find_schema("ks", "pqt");
-            BOOST_REQUIRE_EQUAL(s->parquet_options().at("row_group_rows"), "20000");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("rows_per_row_group"), "20000");
             BOOST_REQUIRE_EQUAL(s->parquet_options().at("metadata_folding"), "verbatim");
         }
 
@@ -110,7 +111,7 @@ SEASTAR_TEST_CASE(test_parquet_table_property) {
         // times and TTLs.
         for (const char* bad : {
                 "{'row_groop_rows': '5000'}",
-                "{'row_group_rows': '100'}",
+                "{'rows_per_row_group': '100'}",
                 "{'compression': 'gzip'}",
                 "{'metadata_folding': 'logical'}"}) {
             BOOST_REQUIRE_THROW(
@@ -121,7 +122,92 @@ SEASTAR_TEST_CASE(test_parquet_table_property) {
 
         // The rejected ALTERs must not have changed anything.
         auto s = e.local_db().find_schema("ks", "pqt");
-        BOOST_REQUIRE_EQUAL(s->parquet_options().at("row_group_rows"), "20000");
+        BOOST_REQUIRE_EQUAL(s->parquet_options().at("rows_per_row_group"), "20000");
+    });
+}
+
+// `row_group_rows`, the pre-rename spelling of `rows_per_row_group`, through CQL.
+//
+// The unit test in parquet_writer_test covers the parser. What it cannot cover is the reason
+// the alias exists: the property is *persisted*, so a table created before the rename has the
+// old key sitting in its schema and reconstructs a parquet_parameters from it on every schema
+// read and every subsequent DDL. The upgrade path is therefore "created with the old name,
+// altered with the new one", and it has to work without an intermediate step.
+SEASTAR_TEST_CASE(test_parquet_rows_per_row_group_alias) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        auto effective_rows = [&e] (const char* cf) {
+            auto s = e.local_db().find_schema("ks", cf);
+            return sstables::parquet::parquet_parameters(s->parquet_options())
+                    .config().rows_per_row_group;
+        };
+
+        // Both spellings must produce the same *effective setting*, which is the only thing
+        // that matters to the writer -- the stored text differs by design (see below).
+        e.execute_cql("CREATE TABLE ks.pqold (pk int PRIMARY KEY, v int) "
+                      "WITH parquet = {'row_group_rows': '20000'}").get();
+        e.execute_cql("CREATE TABLE ks.pqnew (pk int PRIMARY KEY, v int) "
+                      "WITH parquet = {'rows_per_row_group': '20000'}").get();
+        BOOST_REQUIRE_EQUAL(effective_rows("pqold"), 20000u);
+        BOOST_REQUIRE_EQUAL(effective_rows("pqold"), effective_rows("pqnew"));
+
+        // The stored map echoes what the operator wrote, and DESCRIBE echoes the stored map
+        // verbatim (schema.cc), so the old name survives in the schema of a table that used
+        // it. That is deliberate: rewriting an operator's DDL text on their behalf is a worse
+        // surprise than an old name in DESCRIBE, and the alias makes the old text keep working.
+        {
+            auto s = e.local_db().find_schema("ks", "pqold");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("row_group_rows"), "20000");
+            BOOST_REQUIRE(!s->parquet_options().contains("rows_per_row_group"));
+        }
+
+        // DESCRIBE must round-trip: its output has to recreate the table. Rather than trust
+        // that the emitted text is well-formed, feed the stored property back through CREATE
+        // and check the result is the same effective setting. This is the check that would
+        // have caught the "L0" vs "verbatim" bug, applied to the alias.
+        {
+            auto s = e.local_db().find_schema("ks", "pqold");
+            e.execute_cql(seastar::format(
+                    "CREATE TABLE ks.pqcopy (pk int PRIMARY KEY, v int) WITH parquet = "
+                    "{{'row_group_rows': '{}'}}",
+                    s->parquet_options().at("row_group_rows"))).get();
+            BOOST_REQUIRE_EQUAL(effective_rows("pqcopy"), 20000u);
+        }
+
+        // The upgrade path the alias exists for: a table created with the old name is altered
+        // using the new one. The ALTER replaces the map, so the old key is gone afterwards --
+        // an operator can migrate the spelling, they are just never forced to.
+        e.execute_cql("ALTER TABLE ks.pqold WITH parquet = "
+                      "{'rows_per_row_group': '50000'}").get();
+        {
+            auto s = e.local_db().find_schema("ks", "pqold");
+            BOOST_REQUIRE_EQUAL(s->parquet_options().at("rows_per_row_group"), "50000");
+            BOOST_REQUIRE(!s->parquet_options().contains("row_group_rows"));
+            BOOST_REQUIRE_EQUAL(effective_rows("pqold"), 50000u);
+        }
+
+        // ...and back the other way, because a rolled-back deployment script may still be
+        // issuing the old name against a table that has already been migrated.
+        e.execute_cql("ALTER TABLE ks.pqold WITH parquet = {'row_group_rows': '30000'}").get();
+        BOOST_REQUIRE_EQUAL(effective_rows("pqold"), 30000u);
+
+        // Both spellings in one map is a user error: it must be refused, not resolved by map
+        // order. Also checked with equal values, where last-one-wins would look harmless.
+        for (const char* bad : {
+                "{'row_group_rows': '20000', 'rows_per_row_group': '40000'}",
+                "{'rows_per_row_group': '40000', 'row_group_rows': '20000'}",
+                "{'row_group_rows': '20000', 'rows_per_row_group': '20000'}"}) {
+            BOOST_REQUIRE_THROW(
+                    e.execute_cql(seastar::format(
+                            "ALTER TABLE ks.pqold WITH parquet = {}", bad)).get(),
+                    exceptions::configuration_exception);
+        }
+
+        // The old name is still range-checked, and the refused ALTERs changed nothing.
+        BOOST_REQUIRE_THROW(
+                e.execute_cql("ALTER TABLE ks.pqold WITH parquet = "
+                              "{'row_group_rows': '100'}").get(),
+                exceptions::configuration_exception);
+        BOOST_REQUIRE_EQUAL(effective_rows("pqold"), 30000u);
     });
 }
 

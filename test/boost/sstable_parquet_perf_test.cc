@@ -80,7 +80,7 @@ schema_ptr perf_schema() {
     // one default can serve both shapes.
     std::map<sstring, sstring> opts;
     if (const char* e = std::getenv("PQ_PERF_RG_ROWS")) {
-        opts["row_group_rows"] = sstring(e);
+        opts["rows_per_row_group"] = sstring(e);
     }
     // Page size. Worth a knob because it stopped being reachable: the writer uses
     // min(page_values, row group size), and with row groups cut at 5 000 rows the 8 192

@@ -279,7 +279,7 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_key_encoding_and_timestamp_unit) {
 // and write_rows() emits it in one shot when the whole thing fits a single row group. Only the
 // first passed the overrides on. The symptom was not "the option does nothing" but something far
 // more misleading -- the option worked on big tables and silently did nothing on small ones, so
-// raising row_group_rows appeared to *enable* it when all it did was force a cut.
+// raising rows_per_row_group appeared to *enable* it when all it did was force a cut.
 //
 // Both paths are exercised here against the same data for that reason. Asserting through only one
 // of them is what let the gap exist in the first place.
@@ -453,7 +453,7 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
         pp p{};
         BOOST_REQUIRE(p.to_map().empty());          // DESCRIBE stays terse
         const pq::pq_writer_config def;
-        BOOST_REQUIRE_EQUAL(p.config().row_group_rows, def.row_group_rows);
+        BOOST_REQUIRE_EQUAL(p.config().rows_per_row_group, def.rows_per_row_group);
     }
 
     // Accepted values reach the config.
@@ -463,12 +463,12 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
         // that sets the default value would assert against an absent key. It used to
         // set 5 000, which stopped being a non-default when 10.4c's sweep moved the
         // default there.
-        pp p{{{pp::ROW_GROUP_ROWS, "7500"},
+        pp p{{{pp::ROWS_PER_ROW_GROUP, "7500"},
               {pp::ROW_GROUP_BUFFER_BYTES, "32MiB"},
               {pp::PAGE_ROWS, "4096"},
               {pp::COMPRESSION, "none"},
               {pp::METADATA_FOLDING, "verbatim"}}};
-        BOOST_REQUIRE_EQUAL(p.config().row_group_rows, 7500u);
+        BOOST_REQUIRE_EQUAL(p.config().rows_per_row_group, 7500u);
         BOOST_REQUIRE_EQUAL(p.config().row_group_buffer_bytes, 32u * 1024 * 1024);
         BOOST_REQUIRE_EQUAL(p.config().wopt.page_values, 4096u);
         BOOST_REQUIRE(p.config().wopt.compression == pq::format::codec::uncompressed);
@@ -484,9 +484,9 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
 
         // Round-trips through the map form, which is how it is persisted.
         auto m = p.to_map();
-        BOOST_REQUIRE_EQUAL(m[pp::ROW_GROUP_ROWS], "7500");
+        BOOST_REQUIRE_EQUAL(m[pp::ROWS_PER_ROW_GROUP], "7500");
         pp again{m};
-        BOOST_REQUIRE_EQUAL(again.config().row_group_rows, 7500u);
+        BOOST_REQUIRE_EQUAL(again.config().rows_per_row_group, 7500u);
         BOOST_REQUIRE_EQUAL(again.config().wopt.page_values, 4096u);
         BOOST_REQUIRE(again.config().level == pq::folding_level::verbatim);
     }
@@ -496,12 +496,12 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
     };
 
     rejects({{"row_groop_rows", "5000"}});                  // typo, not silently ignored
-    rejects({{pp::ROW_GROUP_ROWS, "not-a-number"}});
-    rejects({{pp::ROW_GROUP_ROWS, "5000rows"}});            // trailing junk
-    rejects({{pp::ROW_GROUP_ROWS, "0"}});
+    rejects({{pp::ROWS_PER_ROW_GROUP, "not-a-number"}});
+    rejects({{pp::ROWS_PER_ROW_GROUP, "5000rows"}});            // trailing junk
+    rejects({{pp::ROWS_PER_ROW_GROUP, "0"}});
     // Below the floor the fixed per-row-group metadata dominates: at 100 rows on a
     // 20-leaf table it is 45 B/row against a 5.2 B/row total (design doc 10.4c).
-    rejects({{pp::ROW_GROUP_ROWS, "100"}});
+    rejects({{pp::ROWS_PER_ROW_GROUP, "100"}});
     rejects({{pp::ROW_GROUP_BUFFER_BYTES, "16"}});          // under the 1 MiB floor
     rejects({{pp::ROW_GROUP_BUFFER_BYTES, "8GiB"}});        // over the 1 GiB ceiling
     rejects({{pp::COMPRESSION, "gzip"}});                   // plausible, unsupported
@@ -512,6 +512,41 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
     rejects({{pp::DICTIONARY, "yes"}});
     rejects({{pp::METADATA_FOLDING, "logical"}});
     rejects({{pp::METADATA_FOLDING, "yes"}});
+
+    // The `row_group_rows` alias. This is the compatibility half of the rename to
+    // `rows_per_row_group`, and it matters more than the rename: the map is persisted in
+    // schema, so tables created before the rename carry the old key and reconstruct a
+    // parquet_parameters from it every time their schema is read. If this stopped parsing,
+    // those tables would stop loading.
+    {
+        pp legacy{{{pp::ROW_GROUP_ROWS_LEGACY, "7500"}}};
+        pp current{{{pp::ROWS_PER_ROW_GROUP, "7500"}}};
+        BOOST_REQUIRE_EQUAL(legacy.config().rows_per_row_group, 7500u);
+        // Same setting, not merely both accepted.
+        BOOST_REQUIRE_EQUAL(legacy.config().rows_per_row_group,
+                            current.config().rows_per_row_group);
+
+        // to_map() emits the canonical name whichever spelling arrived, and its output
+        // parses back to the same config -- which is what makes it safe to feed a
+        // serialized map back through the parser.
+        auto m = legacy.to_map();
+        BOOST_REQUIRE_EQUAL(m.at(pp::ROWS_PER_ROW_GROUP), "7500");
+        BOOST_REQUIRE(!m.contains(pp::ROW_GROUP_ROWS_LEGACY));
+        BOOST_REQUIRE(m == current.to_map());
+        BOOST_REQUIRE_EQUAL(pp{m}.config().rows_per_row_group, 7500u);
+
+        // The alias is a second name, not a second code path: it gets the same bounds.
+        rejects({{pp::ROW_GROUP_ROWS_LEGACY, "100"}});
+        rejects({{pp::ROW_GROUP_ROWS_LEGACY, "not-a-number"}});
+
+        // Both spellings at once is a user error, not a last-one-wins. Asserted in both
+        // map orders even though std::map sorts them, so the check cannot be satisfied by
+        // whichever key happens to come first.
+        rejects({{pp::ROW_GROUP_ROWS_LEGACY, "7500"}, {pp::ROWS_PER_ROW_GROUP, "20000"}});
+        rejects({{pp::ROWS_PER_ROW_GROUP, "20000"}, {pp::ROW_GROUP_ROWS_LEGACY, "7500"}});
+        // Even when they agree: the operator still has to be told the map is ambiguous.
+        rejects({{pp::ROW_GROUP_ROWS_LEGACY, "7500"}, {pp::ROWS_PER_ROW_GROUP, "7500"}});
+    }
 }
 
 SEASTAR_THREAD_TEST_CASE(test_parquet_schema_eligibility) {

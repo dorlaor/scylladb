@@ -304,9 +304,24 @@ bool parquet_parameters::applies_to(column_encoding e, cql_type t) {
 }
 
 parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
+    // Both spellings of the same setting in one map is a mistake worth naming. Letting map
+    // order decide would make the outcome depend on the fact that "row_group_rows" happens
+    // to sort before "rows_per_row_group" -- an operator who wrote both almost certainly
+    // meant the second to replace the first, and would get the first.
+    if (opts.contains(ROWS_PER_ROW_GROUP) && opts.contains(ROW_GROUP_ROWS_LEGACY)) {
+        throw exceptions::configuration_exception(seastar::format(
+                "The 'parquet' option sets both '{}' and '{}', which are two names for the same "
+                "setting ('{}' is the old name, still accepted). Set only '{}'.",
+                ROWS_PER_ROW_GROUP, ROW_GROUP_ROWS_LEGACY, ROW_GROUP_ROWS_LEGACY,
+                ROWS_PER_ROW_GROUP));
+    }
     for (const auto& [k, v] : opts) {
-        if (k == ROW_GROUP_ROWS) {
-            _cfg.row_group_rows = parse_count(k, v, min_row_group_rows, max_row_group_rows);
+        // `row_group_rows` is the pre-rename spelling and stays accepted permanently: it is
+        // persisted in schema, so refusing it would stop existing tables loading. `k` is passed
+        // to parse_count so a bad value is reported against the name the operator actually wrote.
+        if (k == ROWS_PER_ROW_GROUP || k == ROW_GROUP_ROWS_LEGACY) {
+            _cfg.rows_per_row_group =
+                    parse_count(k, v, min_rows_per_row_group, max_rows_per_row_group);
         } else if (k == ROW_GROUP_BUFFER_BYTES) {
             _cfg.row_group_buffer_bytes = parse_bytes(k, v, min_buffer_bytes, max_buffer_bytes);
         } else if (k == PAGE_ROWS) {
@@ -412,7 +427,7 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
         } else {
             throw exceptions::configuration_exception(
                     seastar::format("Unknown sub-option '{}' for the 'parquet' option; supported: "
-                                    "row_group_rows, row_group_buffer_bytes, page_rows, compression, "
+                                    "rows_per_row_group, row_group_buffer_bytes, page_rows, compression, "
                                     "compression_level, metadata_folding, dictionary, encryption, "
                                     "encryption_key_metadata, 'encoding.<column>', and the key "
                                     "provider options ({})",
@@ -519,8 +534,17 @@ void parquet_parameters::validate_key_options() {
 std::map<sstring, sstring> parquet_parameters::to_map() const {
     const pq_writer_config def;
     std::map<sstring, sstring> m;
-    if (_cfg.row_group_rows != def.row_group_rows) {
-        m[ROW_GROUP_ROWS] = seastar::format("{}", _cfg.row_group_rows);
+    // Always the canonical name, never the alias the operator may have written. Two reasons.
+    // First, this is a serializer keyed off the parsed config, not off the input text: it holds
+    // no record of which spelling arrived, and adding one would be state whose only purpose is
+    // to reproduce a name we are trying to retire. Second, the usual objection -- "emitting the
+    // new name rewrites the user's stored property" -- does not apply here, because to_map() is
+    // not on the persistence path. cf_prop_defs stores the raw map the operator wrote and
+    // schema.cc's DESCRIBE echoes that map verbatim (see the comment there), so an ALTER using
+    // the old name keeps the old name in the schema. What to_map() must guarantee is that its
+    // output parses back to an equal config, and the canonical name does.
+    if (_cfg.rows_per_row_group != def.rows_per_row_group) {
+        m[ROWS_PER_ROW_GROUP] = seastar::format("{}", _cfg.rows_per_row_group);
     }
     if (_cfg.row_group_buffer_bytes != def.row_group_buffer_bytes) {
         m[ROW_GROUP_BUFFER_BYTES] = seastar::format("{}", _cfg.row_group_buffer_bytes);
@@ -780,7 +804,7 @@ std::vector<uint8_t> fragment_shredder::to_parquet(const pq_writer_config& cfg) 
     // path when the whole thing fits a single row group -- and for a while only the first passed
     // the overrides on. The effect was that `encoding.<col>` worked on large tables and did
     // nothing on small ones, which reads as an intermittent bug rather than a missing argument:
-    // raising row_group_rows made it "start working" only because it forced a cut. Any per-column
+    // raising rows_per_row_group made it "start working" only because it forced a cut. Any per-column
     // writer setting added later has to travel down both paths for the same reason.
     return write_rows(_cols, _rows, cfg.level, cfg.wopt, cfg.exc, cfg.column_encodings);
 }
@@ -1090,7 +1114,7 @@ stop_iteration pq_writer_impl::consume_end_of_partition() {
     // A partition boundary is the only place a cut is allowed, so this is where the
     // budget is checked.
     if (_shredder.buffered_bytes() >= _pcfg.row_group_buffer_bytes ||
-        _shredder.size() >= _pcfg.row_group_rows) {
+        _shredder.size() >= _pcfg.rows_per_row_group) {
         cut_row_group();
     }
     return stop_iteration::no;

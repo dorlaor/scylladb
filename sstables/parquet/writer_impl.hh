@@ -64,12 +64,18 @@ struct pq_writer_config {
     // to stop a shard running out of memory (R-13), so it is charged against
     // fragment_shredder::buffered_bytes(), which errs ~4% high on purpose.
     //
-    // `row_group_rows` is the read-granularity knob, and at 5 000 it is the one that
+    // `rows_per_row_group` is the read-granularity knob, and at 5 000 it is the one that
     // actually cuts: a row group is then about 9 MB of shredder buffer, far under the
     // byte budget, which reverts to being purely a safety net against a pathological
-    // partition. That is the right division of labour -- bytes protects the shard, rows
-    // tunes read cost -- and it is the opposite of the original default, where the byte
-    // budget did all the cutting at an incidental ~35 600 rows.
+    // partition. That is the right division of labour -- bytes is a guard rail that
+    // protects the shard, rows is the dial that tunes read cost -- and it is the opposite
+    // of the original default, where the byte budget did all the cutting at an incidental
+    // ~35 600 rows.
+    //
+    // Note the direction: this is rows *per group*, so raising it makes row groups larger
+    // and therefore *fewer*. 8 M rows at 1 000 gives ~8 000 groups; at 20 000, ~400. The
+    // setting and the row-group count move opposite ways, which is what the older name
+    // `row_group_rows` obscured (see ROWS_PER_ROW_GROUP below).
     //
     // 5 000 comes from the sweep in design doc 10.4c (20 000 partitions x 5 rows, 2 000
     // random point reads): against one row group per file it is **2.1x lower point-read
@@ -81,7 +87,7 @@ struct pq_writer_config {
     //
     // Going further costs disproportionately: 1 000 rows buys another 14 % of latency for
     // another 26 % of size. Per-table override via the `parquet` property (5.5a, 8.2).
-    size_t row_group_rows         = 5'000;
+    size_t rows_per_row_group     = 5'000;
     size_t row_group_buffer_bytes = 64u << 20;
 };
 
@@ -103,7 +109,22 @@ cql_type cql_type_of(const abstract_type&);
 
 class parquet_parameters {
 public:
-    static constexpr const char* ROW_GROUP_ROWS         = "row_group_rows";
+    // How many rows go into one row group. Named for the ratio it sets, because the
+    // previous name -- `row_group_rows`, kept below as an alias -- reads as if it set the
+    // row-group *count*, and was in fact misread that way. The two move in opposite
+    // directions: 8 M rows at 1 000 rows/group is ~8 000 groups, at 20 000 it is ~400, so
+    // a reader who has the direction backwards tunes the wrong way and concludes the knob
+    // does nothing.
+    static constexpr const char* ROWS_PER_ROW_GROUP     = "rows_per_row_group";
+    // The old spelling of ROWS_PER_ROW_GROUP. **Permanent, not deprecated-with-a-removal-
+    // date.** The `parquet` map is persisted in schema (schema::parquet_options(), stored
+    // by db/schema_tables.cc) and echoed verbatim by DESCRIBE, so tables created before
+    // the rename carry this key in their stored property. Dropping it from the parser
+    // would not merely warn -- parquet_parameters is constructed when the schema is read
+    // back (writer_impl.cc, reader.cc, compaction_manager.cc) and on every subsequent
+    // DDL, so those tables would fail to load. Both spellings therefore parse to the same
+    // setting, for as long as any such table can exist.
+    static constexpr const char* ROW_GROUP_ROWS_LEGACY  = "row_group_rows";
     static constexpr const char* ROW_GROUP_BUFFER_BYTES = "row_group_buffer_bytes";
     static constexpr const char* PAGE_ROWS              = "page_rows";
     static constexpr const char* COMPRESSION            = "compression";
@@ -153,8 +174,8 @@ public:
     // fixed per-row-group metadata (~225 B per leaf) starts to dominate the file --
     // at 100 rows on a 20-leaf table it is 45 B/row against a 5.2 B/row total, so the
     // file grows about ninefold (design doc 10.4c).
-    static constexpr size_t min_row_group_rows = 1'000;
-    static constexpr size_t max_row_group_rows = 100'000'000;
+    static constexpr size_t min_rows_per_row_group = 1'000;
+    static constexpr size_t max_rows_per_row_group = 100'000'000;
     static constexpr size_t min_buffer_bytes   = 1u << 20;    // 1 MiB
     static constexpr size_t max_buffer_bytes   = 1024ull << 20; // 1 GiB
 
