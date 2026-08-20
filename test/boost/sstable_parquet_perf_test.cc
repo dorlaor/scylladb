@@ -139,6 +139,12 @@ struct result {
     sstring   label;
     double    write_ms = 0;
     double    scan_ms = 0;
+    // Same rows as scan_ms, read through a partition range that carries explicit bounds
+    // instead of query::full_partition_range. Nothing else differs -- same schema, same
+    // slice, same sstable, same process -- so the gap between the two is the cost of the
+    // *path* the bound selects, which is what design doc 10.26 exists to measure.
+    double    bscan_ms = 0;
+    size_t    bscan_rows = 0;
     double    point_us = 0;      // mean per point read
     double    point_p50 = 0, point_p95 = 0, point_p99 = 0;
     size_t    point_n = 0;
@@ -175,6 +181,29 @@ result measure(sstables::test_env& env, schema_ptr s,
     }
     r.scan_ms = duration<double, std::milli>(clk::now() - t0).count();
     r.scan_peak_kb = peak / 1024;
+
+    // The same scan again, over a bounded range that spans every partition in the file.
+    // `muts` is sorted by decorated key, so [front, back] is the whole ring segment the
+    // sstable holds and this reads exactly the rows the unbounded scan just read.
+    //
+    // It exists because a token-restricted CQL scan -- `WHERE token(pk) >= a AND token(pk) < b`,
+    // and every page of a paged range query after the first -- arrives at the sstable reader as
+    // a *bounded* range, and pq_reader::next_window() forks on precisely that: a bounded read
+    // takes the point-read machinery (512-row windows, per-window page fetch and decode) while
+    // an unbounded one streams whole row groups in 16 384-row windows. Any scan figure that does
+    // not say which of the two it measured is unreadable, which is how 10.4c and 10.25 ended up
+    // contradicting each other.
+    {
+        auto pr = dht::partition_range::make({muts.front().decorated_key(), true},
+                                             {muts.back().decorated_key(), true});
+        t0 = clk::now();
+        auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+        auto close = deferred_close(rd);
+        while (auto m = read_mutation_from_mutation_reader(rd).get()) {
+            ++r.bscan_rows;
+        }
+        r.bscan_ms = duration<double, std::milli>(clk::now() - t0).count();
+    }
 
     // Point reads, each on a fresh reader so nothing is carried over.
     //
@@ -264,14 +293,15 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         BOOST_REQUIRE_EQUAL(pq.rows, size_t(n_part));
 
         auto line = [] (const result& r) {
-            std::printf("  %-14s  %9.0f  %9.0f  %11.1f  %12llu  %10lld\n",
-                        r.label.c_str(), r.write_ms, r.scan_ms, r.point_us,
+            std::printf("  %-14s  %9.0f  %9.0f  %9.0f  %11.1f  %12llu  %10lld\n",
+                        r.label.c_str(), r.write_ms, r.scan_ms, r.bscan_ms, r.point_us,
                         (unsigned long long)r.bytes, (long long)r.scan_peak_kb);
         };
         std::printf("\n=== pq vs default: %d partitions x %d rows = %d rows ===\n",
                     n_part, n_rows, n_part * n_rows);
-        std::printf("  %-14s  %9s  %9s  %11s  %12s  %10s\n",
-                    "format", "write ms", "scan ms", "point us", "data bytes", "scan kB");
+        std::printf("  %-14s  %9s  %9s  %9s  %11s  %12s  %10s\n",
+                    "format", "write ms", "scan ms", "bscan ms", "point us", "data bytes",
+                    "scan kB");
         line(def);
         line(pq);
         std::printf("\n  point-read distribution over %zu uniformly random partitions:\n",
@@ -288,9 +318,17 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         std::printf("  point ratios: mean %.1fx  p50 %.1fx  p95 %.1fx  p99 %.1fx\n",
                     pq.point_us / def.point_us, pq.point_p50 / def.point_p50,
                     pq.point_p95 / def.point_p95, pq.point_p99 / def.point_p99);
-        std::printf("  ratios (pq/default): write %.2fx  scan %.2fx  point %.2fx  size %.3fx\n\n",
+        std::printf("  ratios (pq/default): write %.2fx  scan %.2fx  bscan %.2fx  point %.2fx"
+                    "  size %.3fx\n",
                     pq.write_ms / def.write_ms, pq.scan_ms / def.scan_ms,
+                    pq.bscan_ms / def.bscan_ms,
                     pq.point_us / def.point_us, double(pq.bytes) / double(def.bytes));
+        // What the bound costs each format on its own terms. The row format's index makes a
+        // bounded range no harder than an unbounded one; pq's fork makes it a different reader.
+        std::printf("  bounded/unbounded, same rows: default %.2fx  pq %.2fx"
+                    "  (rows %zu vs %zu)\n\n",
+                    def.bscan_ms / def.scan_ms, pq.bscan_ms / pq.scan_ms,
+                    pq.rows, pq.bscan_rows);
     }).get();
 }
 
