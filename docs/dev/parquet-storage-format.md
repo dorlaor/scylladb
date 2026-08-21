@@ -431,6 +431,16 @@ side-channel, not per-column leaves — see §10.3c.*
 - `local_deletion_time` / `marked_for_delete_at` / TTL columns materialise **only if
   the row group contains any non-trivial value**. A row group with no TTLs and no
   tombstones carries zero deletion columns.
+- *Amended 2026-08-21: deletion times are folded too — see §10.28.* A **dead** cell's
+  deletion time goes to a row-level channel of four leaves, independent of table width:
+  `__ldt` (the row's deletion time, the one most of its dead cells agree on), `__dmask`
+  (which regular columns are dead in this row), and `__ldtx_mask`/`__ldtx_vals` (the dead
+  cells that disagree, and their deltas). `__dmask` is load-bearing rather than
+  redundant: it carries the dead-vs-absent distinction that `__ldt_<col>`'s presence used
+  to imply, and losing it resurrects deleted data.
+  `__ldt_<col>` remains, for the one thing that is genuinely per column — the **expiry of
+  a live cell with a TTL**. Collections are excluded: their per-element `__ldt` lives
+  inside the MAP group and keeps the per-element layout.
 - `flags`/`extended_flags` are reconstructed from definition levels plus the folded
   metadata rather than stored.
 
@@ -2392,6 +2402,16 @@ major-compact, read the native `-Data.db`; then `ALTER TABLE ... WITH storage_fo
 'parquet'`, major-compact again so the creator converts (§6.2a), assert every remaining
 sstable is version `pq`, and sum them. Production output against production output. Each
 dataset converted to exactly **one** `pq` sstable.
+
+**Ingest mode: bind-NULL, and it does not affect these figures.** Every row here was loaded by the
+harness as it then stood, which bound every column and passed NULL for anything missing — writing a
+cell tombstone per absent value (42 448 175 of them on Backblaze alone). The loader now binds
+`UNSET_VALUE` instead, so a later re-run will not reproduce that; `PQ_BIND_NULL=1` restores it. The
+table is unaffected either way, and this was checked rather than assumed: re-measured both ways on
+2026-08-21, the two modes produce byte-identical native sstables under this pipeline, because its
+default `tombstone_gc` mode is `repair` and at RF=1 that purges every cell tombstone during the
+major compaction before anything is read. See §10.18. What the ingest mode *does* change is any
+measurement that retains tombstones — §10.28 is that measurement.
 
 | Dataset | Rows | Cols | Native (me, Zstd+dicts) | Parquet (`pq`) | Ratio | Saved |
 |---|---:|---:|---:|---:|---:|---:|
@@ -4765,9 +4785,32 @@ what the same load stores on a replicated cluster. `harness.py` now takes `PQ_TO
 default, so no published figure moves) to pin the mode; `PQ_TOMBSTONE_GC=timeout` is the setting that
 makes a bind-NULL dataset measure what a cluster would keep. The wider point is not about Backblaze:
 **any dataset loaded by binding NULL for absent values carries one cell tombstone per null**, and on
-a replicated cluster those are stored until a repair runs. That is a property of the load, shared by
-both storage formats — native moves 21.8 -> 32.5 MB with it — and it is the reason this dataset's
-absolute bytes were never comparable across runs.
+a replicated cluster those are stored until a repair runs. That is a property of the load, and it is
+the reason this dataset's absolute bytes were never comparable across runs.
+
+*Amended 2026-08-21, twice.*
+
+**First: this section said the tombstone cost was "shared by both storage formats". It was not.**
+Native moved 21.8 -> 32.5 MB with the tombstones retained, about 10.7 MB; `pq` moved 20.8 -> 84.5 MB,
+about 63.7 MB. Nearly 6× worse in the format that is supposed to store this kind of thing better. The
+asymmetry was not inherent to columnar storage — it was one unfinished piece of the L1 mapping, since
+fixed: **§10.28**. Deletion times were the only cell metadata the fold had never been extended to.
+With the fold, the same 42 448 175 tombstones cost `pq` roughly what they cost the row format.
+
+**Second: the loader no longer manufactures them, and the published corpus figure is unaffected.**
+`harness.py` bound every column and passed NULL for anything missing, which *deletes* that cell — so
+it manufactured 42 448 175 tombstones on this dataset for no semantic reason. It now binds
+`UNSET_VALUE` by default, which writes nothing; bind-NULL stays reachable through `PQ_BIND_NULL=1`
+because the published figures were measured with it. Re-measured both ways, and the result matters
+for how this section reads: under the corpus pipeline's default `tombstone_gc` mode — `repair` at
+RF=1 — the two ingest modes produce **byte-identical** native sstables (uncompressed 179 736 035,
+LZ4 59 351 983, Zstd 41 080 872, both ways), and the probe reads **zero** tombstones in both. The
+manufactured tombstones were purged before anything was measured, exactly as this section explains.
+So the eight-dataset corpus figure was never contaminated by the ingest pattern; what the ingest
+pattern contaminates is any measurement that *retains* tombstones, which is the one a replicated
+cluster cares about. The dictionary codecs differ by ~1.7 % between the two runs (21 991 386 vs
+22 373 663 for Zstd+dicts), which is the known uncontrolled-dictionary variance and not tombstones —
+the identical non-dictionary figures are what prove the underlying data is the same.
 
 **Still unresolved, stated as such.** Two things, neither affecting the verdict:
 
@@ -6229,6 +6272,124 @@ enough to cut. Either the conservative leaf set should be able to express L2, or
 refuse `uniform` for tables that will cut. That is a design decision, not a bug fix, so it is
 recorded here rather than guessed at.
 
+### 10.28 The deletion channel was never folded — measured and fixed 2026-08-21
+
+§10.18 closed the Backblaze size swing as legitimate tombstone GC and left one sentence that was
+too generous to the format: that carrying a cell tombstone per null is *"a property of the load,
+shared by both storage formats"*. It is a property of the load. It was not shared. Retaining the
+same 42 448 175 tombstones moved native from 21.8 to 32.5 MB — about 10.7 MB — and `pq` from 20.8
+to 84.5 MB, about 63.7 MB. Nearly 6× worse in the format whose whole claim is that it stores this
+kind of thing better.
+
+That ratio was not a property of Parquet. It was one unfinished piece of the L1 mapping.
+
+**What the three cell states cost.** L1 folds the *write* time of every cell in a row into one
+`__ts` leaf for the row (§5.3), because a row usually comes from one statement and its cells
+therefore agree; the few that disagree go to a two-leaf sparse side-channel (§10.3c). Deletion
+times got none of that. Every dead cell wrote into its own column's `__ldt_<col>` leaf:
+
+| state | how `pq` stored it | cost, 300 000 rows x 197 cols |
+|---|---|---:|
+| absent | a definition level on the value leaf | ~1 bit |
+| live | value + write time, **folded** into one `__ts` per *row* | 1 leaf, 1.9 MB |
+| dead | deletion time in `__ldt_<column>`, **not folded** | 195 leaves, 60.7 MB |
+
+Same information shape, ~32× the cost. Storing the data was never the defect — a dead cell is
+**not** an absent one. It has to keep shadowing older data on another replica, so it cannot be
+written as a Parquet null and the deletion time has to be preserved. The defect was that the fold
+stopped at timestamps.
+
+**The fold.** Four leaves now, independent of table width, mirroring `__ts`/`__tsx`:
+
+| leaf | type | holds |
+|---|---|---|
+| `__ldt` | INT32, optional | the row's deletion time — the one most of its dead cells agree on |
+| `__dmask` | BYTE_ARRAY, optional | bitmap of which regular columns are dead in this row |
+| `__ldtx_mask` | BYTE_ARRAY, optional | which of those disagree with the row's deletion time |
+| `__ldtx_vals` | BYTE_ARRAY, optional | their zigzag-varint deltas from it |
+
+A bind-NULL `INSERT` is the ideal case and it is also the common one: one statement carries one
+timestamp, so every tombstone it writes shares a deletion time, the mode is the only value present,
+and both `__ldtx` leaves are null for the whole file.
+
+**`__dmask` is not redundant, and this is the part to be careful about.** `__ldt_<col>`'s *presence*
+was doing two jobs: carrying the deletion time, and being the only thing that distinguished **dead**
+from **absent**. The value leaf's definition level says "no value" for both. That three-way
+discriminator is the constraint recorded at §11 open question 12(a) — value present means live, no
+value with an `__ldt_` means dead, neither means absent — and dropping it does not lose a byte of
+payload, it *resurrects deleted data*: the deletion stops shadowing what it hides, so the old value
+reappears on the next merge. `__dmask` carries that bit explicitly, which is why the channel is four
+leaves and not three.
+
+**`__ldt_<col>` survives, for the one thing that is genuinely per column.** A live cell with a TTL
+stores its expiry there. Two columns of one row can expire at different times, so there is nothing
+row-shaped to fold. The two uses were always disjoint — the discriminator is whether the cell has a
+value — so `any_deletion` split into `any_live_expiry` and `any_dead_cell`. A table with tombstones
+and no TTLs, which is every bind-NULL load, now materialises **no** per-column deletion leaves at
+all on the derived leaf set.
+
+**Not applied to collections, deliberately.** A non-frozen collection's per-element `__ldt` lives
+*inside* its MAP group, where there is no row-level leaf to fold into and the element count varies
+per row; `__dmask` indexes regular columns and a collection never sets its bit. This is the same
+exclusion, for the same reason, as §10.26's statistics-based leaf elision: a repeated slot that is
+"present but empty" is not the same as absent. Collections keep the per-element layout unchanged.
+
+**Measured.** Real `pq` sstables written by the node — not `harness.py`'s pyarrow model of the
+mapping, which cannot see a deletion time at all (see the measurement-method item in
+parquet-future-work.md). Backblaze, 300 000 rows x 197 columns, bind-NULL ingest,
+`tombstone_gc = {'mode':'timeout'}` so the tombstones are retained as a replicated cluster would
+retain them, loaded into a `storage_format='parquet'` table and major-compacted. Identical pipeline
+on both sides; the only difference is the binary.
+
+| | total | deletion channel | leaves | share of file |
+|---|---:|---:|---:|---:|
+| before the fold | 87 532 117 | 60 741 794 | 390 | 69.4 % |
+| after the fold | 28 246 463 | 1 506 371 | 398 | 5.3 % |
+
+**3.10× smaller overall, and the deletion channel is 40.3× smaller.** The `data` channel is
+byte-identical across the two runs (16 614 224 B both times), which is the check that says only the
+deletion channel moved.
+
+Of the 1 506 371 B remaining, only 610 931 B is the folded channel itself (`__ldt` 406 102,
+`__dmask` 195 645, `__ldtx` 9 184 — all-null, as predicted, because bind-NULL rows do not diverge).
+The other 895 440 B is 390 all-null `__ldt_<col>` leaves that the **conservative leaf set** emits
+because the cutting path must fix its leaves before it has seen every row (§5.5a). Against the
+per-column layout the folded channel proper is a **99×** reduction.
+
+**What it costs when there are no tombstones:** +22 464 B on the same dataset loaded with UNSET,
+19 823 441 -> 19 845 905, or +0.11 % — four extra all-null leaves per row group that the
+conservative set materialises anyway.
+
+**Compatibility, stated explicitly.** Files written before this read unchanged, and the mechanism is
+not incidental. `recover_mapped_schema()` reads the layout off the leaf names: no `__dmask` means the
+pre-fold layout, where `__ldt_<col>` carried both a live cell's expiry and a dead cell's deletion
+time. `reassemble()` keeps the per-column clause as a second dead-cell test, and the two cannot
+collide — a file written after the fold never puts a dead cell's time in `__ldt_<col>`, so the legacy
+clause is unreachable on a new file, and a live cell with an expiry has a value and is matched by
+neither. There is no migration, no rewrite and no version gate. A `__dmask` bit on a column that also
+has a value is contradictory and throws rather than guessing which to believe.
+
+**How losslessness was established.** `shred()` -> `reassemble()` over 6 480 cases (widths x
+timestamp divergence x null rate x TTL x deletion rate x **deletion divergence** x folding level x
+exception encoding x leaf set), 0 failures. The deletion-divergence dimension is new, and its absence
+was not neutral: the generator drew every deletion time independently, so the corpus was 100 %
+divergent and the *shared* case — the one the fold optimises — had never been generated. The run
+asserts both arms were populated (953 056 rows carried dead cells, 313 328 needed an exception),
+because a dimension that never exercises the channel passes while proving nothing, which is exactly
+how the dead-cell data-loss bug of §11 open question 12(a) looked correct for 540 cases. Two further gaps closed: the generator now
+emits a live cell with a TTL *and* its expiry, which is what the write path actually produces and
+which the live-expiry half of `__ldt_<col>` now depends on; and the recovery suite now generates cell
+tombstones, having previously set only `row_del_rate`. A dedicated `legacy` suite builds a pre-fold
+file, writes it, and recovers its schema from the footer alone. On the sstable side, one test asserts
+the channel on **both** write paths from one body of rows — the divergence that produced §8.2b and
+§10.15 — with the per-column leaves proven *gone* on the derived leaf set and proven *all-null* on the
+conservative one.
+
+**What this does to the framing.** The tombstone cost of a bind-NULL load is real and belongs to the
+load, not to the format; §10.18 is right about that. But the *asymmetry* was the format's, and it was
+a missing fold rather than an inherent cost of columnar storage. With the fold, retaining 42 448 175
+tombstones costs `pq` roughly what it costs the row format instead of six times as much.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
@@ -6696,7 +6857,10 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
-| Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it. |
+| Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
+| **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
+| **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |
+| **Harness "Parquet" figures are a model** | **measurement-method debt** | `harness.py` re-encodes rows read back over CQL with pyarrow and never writes a `pq` sstable (every probe line shows `pq=0`). It models the leaf set, not our writer — and it cannot see cell metadata a `SELECT` does not return, which is why the 60.7 MB per-column deletion channel was invisible to it (§10.28). **§10.1f-prod, the table to quote, is unaffected**: it uses the real `ALTER TABLE ... storage_format = 'parquet'` and sums actual `pq` sstables. What is not yet established is which other published tables are harness output cited as format measurements; the **folding-level L0/L1/L2 comparison behind §10.3's headline** is the significant candidate and wants re-measuring through the real write path, not relabelling. |
 | Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). Not covered: key rotation (unexercised), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
