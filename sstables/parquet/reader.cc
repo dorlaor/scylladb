@@ -113,8 +113,20 @@ static atomic_cell_or_collection build_counter(const collection_cell& cc) {
 // element is stored the way the rest of Scylla stores it.
 atomic_cell_or_collection build_collection(const column_definition& cdef,
                                            const collection_cell& cc) {
-    const auto& ctype = dynamic_cast<const collection_type_impl&>(*cdef.type);
-    auto vtype = ctype.value_comparator();
+    // Not every multi-cell column is a collection. A non-frozen UDT is multi-cell -- columns_of()
+    // marks it so as `!is_atomic() || is_counter()` -- and is shredded and reassembled by this same
+    // path, with the field index standing in for the element key. But `user_type_impl` derives from
+    // `tuple_type_impl`, not from `collection_type_impl`, so the reference dynamic_cast this line
+    // used to be threw `std::bad_cast` on one: every read of a pq sstable holding a non-frozen UDT
+    // column failed outright.
+    //
+    // The type is wanted only for atomic_cell::make_live() below, which ignores it entirely
+    // (mutation/atomic_cell.cc:18 -- the parameter is unnamed and unused), so there is nothing to
+    // reconstruct for the UDT case and no need for a per-field lookup: the fix is to stop demanding
+    // a cast that a correct caller can fail. It stays the collection's value_comparator() where
+    // there is one, so the call below reads the same as it does everywhere else in the tree.
+    const auto* ctype = dynamic_cast<const collection_type_impl*>(cdef.type.get());
+    auto vtype = ctype ? ctype->value_comparator() : cdef.type;
 
     tombstone t;
     if (cc.tomb) {

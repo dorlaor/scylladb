@@ -52,6 +52,7 @@
 #include "types/map.hh"
 #include "types/set.hh"
 #include "types/list.hh"
+#include "types/user.hh"
 #include "utils/UUID_gen.hh"
 
 #include <cstdio>
@@ -978,6 +979,1256 @@ SEASTAR_THREAD_TEST_CASE(test_hybrid_compaction_merges_native_and_parquet) {
                 }
                 BOOST_REQUIRE_EQUAL(count_dead_cells(*s, got_m), dead_ref);
                 BOOST_REQUIRE_EQUAL(count_rows(got_m), rows_ref);
+            }
+        }
+    }).get();
+}
+
+// Counters and non-frozen collections, merged across formats.
+//
+// The two hybrid cases above carry every tombstone shape, but every cell in them is an atomic
+// scalar. Counters and multi-cell collections are the two kinds of cell whose merge is *not* "the
+// newer one wins", so those cases cannot speak for them, and they fail differently:
+//
+//   * A counter cell is a set of per-replica shards, and merging two of them means taking, per
+//     shard id, the shard with the higher **logical clock** -- not the one from the newer cell
+//     (`counter_cell_view::apply`, `mutation/counters.cc:128`). A shard from the *older* sstable
+//     therefore survives into the result whenever its clock is higher. Counters are not
+//     idempotent, so dropping or duplicating a shard yields a wrong *total* rather than a missing
+//     row: the failure is silent and arithmetic, and the sum is the only thing that shows it.
+//   * A collection cell is a collection-wide tombstone plus a list of per-element cells, merged
+//     element by element. "The tombstone is in one format and the elements it must not delete are
+//     in the other" is therefore a real ordering question, and it has no analogue among atomic
+//     cells, where a tombstone and the value it shadows can never both survive.
+//
+// Both cases below assert twice, and the second assertion is the point. The first is the one the
+// rest of this family uses: the same merge with native sstables on both sides. The second is
+// against an expectation computed from the fixture itself -- the merged shard totals for counters,
+// the surviving element sets for collections. A merge rule broken for *both* formats at once
+// passes the first and fails the second, which is what makes these tests of counter and collection
+// semantics rather than of pq-equals-native.
+
+namespace {
+
+// The query path over a format-mixed sstable set: one make_reader() per sstable, combined. The two
+// hybrid cases above predate these and keep their own local copies; new cases share these.
+mutation_reader merge_readers(sstables::test_env& env, schema_ptr s,
+                              std::vector<shared_sstable> ssts) {
+    std::vector<mutation_reader> rds;
+    for (auto& sst : ssts) {
+        rds.push_back(sst->make_reader(s, env.make_reader_permit(),
+                                       query::full_partition_range, s->full_slice()));
+    }
+    return make_combined_reader(s, env.make_reader_permit(), std::move(rds));
+}
+
+utils::chunked_vector<mutation> merged_mutations(sstables::test_env& env, schema_ptr s,
+                                                std::vector<shared_sstable> ssts) {
+    auto rd = merge_readers(env, s, std::move(ssts));
+    auto close = deferred_close(rd);
+    utils::chunked_vector<mutation> out;
+    while (auto m = read_mutation_from_mutation_reader(rd).get()) {
+        out.push_back(std::move(*m));
+    }
+    return out;
+}
+
+std::vector<sstring> merged_fragments(sstables::test_env& env, schema_ptr s,
+                                     std::vector<shared_sstable> ssts) {
+    auto rd = merge_readers(env, s, std::move(ssts));
+    auto close = deferred_close(rd);
+    std::vector<sstring> out;
+    while (auto mf = rd().get()) {
+        out.push_back(seastar::format("{}", mutation_fragment_v2::printer(*s, *mf)));
+    }
+    return out;
+}
+
+// A compaction of a format-mixed input set, writing `out_v`: the merge happens through
+// make_full_scan_reader and its result goes back out through the writer, so anything lost here is
+// lost permanently.
+shared_sstable compact_into(sstables::test_env& env, schema_ptr s,
+                            std::vector<shared_sstable> in, sstable_version_types out_v,
+                            size_t n_part) {
+    auto out = env.make_sstable(s, out_v);
+    std::vector<mutation_reader> rds;
+    for (auto& sst : in) {
+        rds.push_back(sst->make_full_scan_reader(s, env.make_reader_permit(), nullptr,
+                                                default_read_monitor()));
+    }
+    auto merged = make_combined_reader(s, env.make_reader_permit(), std::move(rds));
+    auto cfg = env.manager().configure_writer("test");
+    out->write_components(std::move(merged), n_part, s, cfg, encoding_stats{}).get();
+    out->open_data().get();
+    return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Counters
+
+constexpr int ctr_parts = 7;
+constexpr int ctr_deleted_part = 4;     // the overlay deletes this partition outright
+constexpr int ctr_base_only_part = 5;   // absent from the overlay
+constexpr int ctr_over_only_part = 6;   // absent from the base
+
+// Counter and non-counter regular columns cannot coexist in one table -- Scylla rejects it -- so
+// every column here is a counter and there is no scalar to fall back on.
+schema_ptr counter_hybrid_schema() {
+    return schema_builder(1, "ks", "hyb_ctr")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("c", counter_type)
+        .with_column("c2", counter_type)
+        .with_column("sc", counter_type, column_kind::static_column)
+        .build();
+}
+
+partition_key ctr_pk(const schema& s, int p) {
+    return partition_key::from_single_value(s, utf8_type->decompose(sstring(format("cp{:04d}", p))));
+}
+
+clustering_key ctr_ck(const schema& s, int r) {
+    return clustering_key::from_single_value(s, int32_type->decompose(r));
+}
+
+// Deterministic shard ids, and invertible: the assertions name shards by the fixture's small
+// index, so a failure says "shard 2" rather than printing a UUID.
+counter_id ctr_shard_id(int n) {
+    return counter_id(utils::UUID(0x1000000000000000LL + n, 0x2000000000000000LL + n * 7));
+}
+
+int ctr_shard_index(counter_id id) {
+    return int(id.uuid().get_most_significant_bits() - 0x1000000000000000LL);
+}
+
+struct ctr_shard { int id; int64_t value; int64_t clock; };
+
+// What the two generations hold for one clustering row. `base`/`over` are column `c`'s shard sets
+// and `base2`/`over2` are `c2`'s; the flags cover the shapes a shard list cannot express.
+struct ctr_case {
+    int row;
+    std::vector<ctr_shard> base;
+    std::vector<ctr_shard> over;
+    std::vector<ctr_shard> base2;
+    std::vector<ctr_shard> over2;
+    bool base_dead = false;
+    bool over_dead = false;
+    bool over_row_tombstone = false;
+    const char* why;
+};
+
+std::vector<ctr_case> counter_cases() {
+    return {
+        // Disjoint and overlapping shard ids in one cell: s0 comes from the base alone, s1 keeps
+        // the base's shard because its clock is higher, s2 takes the overlay's, s3 is new. The
+        // merged total (102) is neither generation's (60 and 93), so taking either side wholesale
+        // is arithmetically visible.
+        {0, {{0,10,3},{1,20,9},{2,30,4}}, {{1,21,6},{2,31,8},{3,41,1}}, {}, {},
+         false, false, false, "shard union, one winner from each side"},
+        // Every shard superseded: the overlay wins outright, which is the case a last-write-wins
+        // merge also gets right. It is here so the fixture is not made only of the hard shapes.
+        {1, {{0,10,7},{1,20,7}}, {{0,11,9},{1,21,9}}, {}, {},
+         false, false, false, "overlay wins every shard"},
+        // The case that separates a counter merge from last-write-wins. The base's cell is older
+        // by timestamp, but its s0 shard has the higher *logical clock*, so s0's value must come
+        // from the older sstable. Merged 31 against 30 in the base and 32 in the overlay: a merge
+        // that takes the newer cell whole is off by one and nothing else notices.
+        {2, {{0,10,10},{1,20,1}}, {{0,11,2},{1,21,5}}, {{5,500,1}}, {{5,501,9},{6,600,1}},
+         false, false, false, "an older shard with a higher clock wins"},
+        // A counter cell deleted by the overlay: nothing may survive from the base.
+        {3, {{0,10,2},{1,20,3}}, {}, {}, {},
+         false, true, false, "cell deleted by the overlay"},
+        // The reverse -- dead in the *base*, live in the overlay -- and the surprise. A counter
+        // tombstone is not timestamp-ordered: it wins whichever side it is on (see ctr_merge).
+        // So the overlay's newer live cell does not resurrect the column, and a merge that
+        // resolved this by timestamp like any other atomic cell would silently bring a deleted
+        // counter back.
+        {4, {}, {{0,11,1},{1,21,2},{2,31,3}}, {}, {},
+         true, false, false, "dead in the base, live in the overlay"},
+        // A row tombstone over a row full of counters.
+        {5, {{0,10,4},{1,20,5},{2,30,6},{3,40,7}}, {}, {{5,500,2}}, {},
+         false, false, true, "row tombstone over a counter row"},
+        // Untouched by the overlay: the base's cell must come through unchanged, shards and all.
+        {6, {{0,10,3},{1,20,4}}, {}, {}, {},
+         false, false, false, "base only"},
+        // Present only in the overlay.
+        {7, {}, {{0,11,5},{1,21,6}}, {}, {{5,501,7}},
+         false, false, false, "overlay only"},
+    };
+}
+
+// The static counter's two generations. The overlay's arm rotates with the partition so that
+// updated, deleted and untouched all occur, and partition 2 is absent from the base -- which,
+// since 2 % 3 == 2 leaves the overlay silent too, is the never-written case.
+std::vector<ctr_shard> ctr_static_base(int p) {
+    if (p == 2) { return {}; }
+    return {{0, 700 + p, 5}, {1, 800 + p, 5}};
+}
+
+std::vector<ctr_shard> ctr_static_over(int p) {
+    if (p % 3 == 0) { return {{1, 801 + p, 4}, {2, 900 + p, 6}}; }
+    return {};
+}
+
+bool ctr_static_over_dead(int p) { return p % 3 == 1; }
+
+atomic_cell make_ctr_cell(api::timestamp_type ts, const std::vector<ctr_shard>& shards) {
+    counter_cell_builder b{shards.size()};
+    for (const auto& sh : shards) {
+        b.add_maybe_unsorted_shard(counter_shard(ctr_shard_id(sh.id), sh.value, sh.clock));
+    }
+    b.sort_and_remove_duplicates();
+    return b.build(ts);
+}
+
+void ctr_sort(utils::chunked_vector<mutation>& muts) {
+    std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+        return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+    });
+}
+
+utils::chunked_vector<mutation> counter_base(schema_ptr s) {
+    const auto& cdef  = *s->get_column_definition(to_bytes("c"));
+    const auto& c2def = *s->get_column_definition(to_bytes("c2"));
+    const auto& scdef = *s->get_column_definition(to_bytes("sc"));
+    const auto cases = counter_cases();
+
+    utils::chunked_vector<mutation> muts;
+    for (int p = 0; p < ctr_parts; ++p) {
+        if (p == ctr_over_only_part) { continue; }
+        mutation m(s, ctr_pk(*s, p));
+        const api::timestamp_type ts = 1000 + p;
+        if (auto sh = ctr_static_base(p); !sh.empty()) {
+            m.set_static_cell(scdef, make_ctr_cell(ts, sh));
+        }
+        for (const auto& c : cases) {
+            auto ck = ctr_ck(*s, c.row);
+            if (c.base_dead) {
+                m.set_clustered_cell(ck, cdef, atomic_cell::make_dead(
+                        ts, gc_clock::time_point(gc_clock::duration(60000 + p))));
+            } else if (!c.base.empty()) {
+                m.set_clustered_cell(ck, cdef, make_ctr_cell(ts, c.base));
+            }
+            if (!c.base2.empty()) {
+                m.set_clustered_cell(ck, c2def, make_ctr_cell(ts, c.base2));
+            }
+        }
+        muts.push_back(std::move(m));
+    }
+    ctr_sort(muts);
+    return muts;
+}
+
+utils::chunked_vector<mutation> counter_overlay(schema_ptr s) {
+    const auto& cdef  = *s->get_column_definition(to_bytes("c"));
+    const auto& c2def = *s->get_column_definition(to_bytes("c2"));
+    const auto& scdef = *s->get_column_definition(to_bytes("sc"));
+    const auto cases = counter_cases();
+
+    utils::chunked_vector<mutation> muts;
+    for (int p = 0; p < ctr_parts; ++p) {
+        if (p == ctr_base_only_part) { continue; }
+        mutation m(s, ctr_pk(*s, p));
+        const api::timestamp_type ts = 2000 + p;
+        const auto ldt = gc_clock::time_point(gc_clock::duration(70000 + p));
+
+        if (p == ctr_deleted_part) {
+            m.partition().apply(tombstone(ts, ldt));
+            muts.push_back(std::move(m));
+            continue;
+        }
+
+        if (ctr_static_over_dead(p)) {
+            m.set_static_cell(scdef, atomic_cell::make_dead(ts, ldt));
+        } else if (auto sh = ctr_static_over(p); !sh.empty()) {
+            m.set_static_cell(scdef, make_ctr_cell(ts, sh));
+        }
+
+        for (const auto& c : cases) {
+            auto ck = ctr_ck(*s, c.row);
+            if (c.over_row_tombstone) {
+                m.partition().clustered_row(*s, ck).apply(row_tombstone(tombstone(ts, ldt)));
+                continue;
+            }
+            if (c.over_dead) {
+                m.set_clustered_cell(ck, cdef, atomic_cell::make_dead(ts, ldt));
+            } else if (!c.over.empty()) {
+                m.set_clustered_cell(ck, cdef, make_ctr_cell(ts, c.over));
+            }
+            if (!c.over2.empty()) {
+                m.set_clustered_cell(ck, c2def, make_ctr_cell(ts, c.over2));
+            }
+        }
+        muts.push_back(std::move(m));
+    }
+    ctr_sort(muts);
+    return muts;
+}
+
+// A counter cell's shard set, either as the fixture predicts it or as the merge produced it.
+struct ctr_expect {
+    bool present = false;      // some cell is there, live or dead
+    bool live = false;
+    int64_t total = 0;         // sum of the winning shards' values
+    std::vector<int> ids;      // shard indices, ascending
+};
+
+// The merge rule applied to the fixture rather than read off the product: per shard id, the shard
+// with the higher logical clock, across both generations.
+//
+// Deadness, though, is *not* resolved by timestamp -- which is the one thing about counters this
+// test did not expect and had to be corrected on. `counter_cell_view::apply`
+// (`mutation/counters.cc:94`) keeps the dead cell whenever either side is dead, without consulting
+// timestamps at all: a live cell merged with a tombstone yields the tombstone even when the live
+// cell is strictly newer. That is deliberate -- a counter's shards cannot be safely resurrected,
+// because the shards a delete removed would be re-added by the next increment and double-count --
+// but it means a counter tombstone behaves unlike every other atomic cell tombstone in the system,
+// and the design doc does not say so anywhere.
+ctr_expect ctr_merge(const std::vector<ctr_shard>& base, bool base_dead,
+                     const std::vector<ctr_shard>& over, bool over_dead) {
+    ctr_expect e;
+    const bool has_base = base_dead || !base.empty();
+    const bool has_over = over_dead || !over.empty();
+    if (!has_base && !has_over) { return e; }
+    e.present = true;
+    if (base_dead || over_dead) { return e; }
+    std::map<int, ctr_shard> won;
+    for (const auto& sh : base) { won.emplace(sh.id, sh); }
+    for (const auto& sh : over) {
+        auto it = won.find(sh.id);
+        if (it == won.end()) {
+            won.emplace(sh.id, sh);
+        } else if (it->second.clock < sh.clock) {
+            it->second = sh;
+        }
+    }
+    if (won.empty()) { return e; }
+    e.live = true;
+    for (const auto& [id, sh] : won) {
+        e.total += sh.value;
+        e.ids.push_back(id);
+    }
+    return e;
+}
+
+ctr_expect ctr_read(const column_definition& def, const row& cells) {
+    ctr_expect got;
+    const auto* c = cells.find_cell(def.id);
+    if (!c) { return got; }
+    got.present = true;
+    auto av = c->as_atomic_cell(def);
+    if (!av.is_live()) { return got; }
+    got.live = true;
+    counter_cell_view ccv(av);
+    for (auto&& cs : ccv.shards()) {
+        got.total += cs.value();
+        got.ids.push_back(ctr_shard_index(cs.id()));
+    }
+    std::sort(got.ids.begin(), got.ids.end());
+    return got;
+}
+
+} // namespace
+
+SEASTAR_THREAD_TEST_CASE(test_hybrid_merge_of_counters_across_formats) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = counter_hybrid_schema();
+        const auto& cdef  = *s->get_column_definition(to_bytes("c"));
+        const auto& c2def = *s->get_column_definition(to_bytes("c2"));
+        const auto& scdef = *s->get_column_definition(to_bytes("sc"));
+        const auto cases = counter_cases();
+
+        auto base = counter_base(s);
+        auto over = counter_overlay(s);
+        const auto nat = sstables::get_highest_sstable_version();
+        const size_t n_part = std::max(base.size(), over.size());
+
+        auto mk = [&] (sstable_version_types v, const utils::chunked_vector<mutation>& ms) {
+            return make_sstable_containing(env.make_sstable(s, v), ms).get();
+        };
+        auto nat_base = mk(nat, base), nat_over = mk(nat, over);
+        auto pq_base = mk(sstable_version_types::pq, base);
+        auto pq_over = mk(sstable_version_types::pq, over);
+
+        // Keys back to the fixture's indices, compared as the serialised bytes rather than parsed
+        // out of a string, so a mis-encoded key fails the lookup instead of being accepted.
+        std::map<bytes, int> p_of;
+        for (int p = 0; p < ctr_parts; ++p) {
+            p_of[utf8_type->decompose(sstring(format("cp{:04d}", p)))] = p;
+        }
+        std::map<bytes, const ctr_case*> case_of;
+        for (const auto& c : cases) {
+            case_of[int32_type->decompose(c.row)] = &c;
+        }
+
+        struct stats {
+            size_t live = 0, dead = 0, multi_shard = 0, statics = 0;
+            size_t neither_side = 0;   // rows whose total is neither generation's
+            size_t row_tombs = 0;
+        };
+
+        // Every counter cell in a merged result, against ctr_merge() -- the fixture's own rule,
+        // not the reference format's behaviour. The deleted partition is excluded because a merge
+        // does not garbage-collect: its rows survive shadowed by the partition tombstone, and
+        // modelling what a shadowed row still holds is not what this test is for. Its contents are
+        // covered by the reference comparison below.
+        auto check = [&] (const utils::chunked_vector<mutation>& ms) {
+            stats st;
+            for (const auto& m : ms) {
+                auto pit = p_of.find(m.key().explode(*s).at(0));
+                BOOST_REQUIRE(pit != p_of.end());
+                const int p = pit->second;
+                if (p == ctr_deleted_part) {
+                    BOOST_REQUIRE(m.partition().partition_tombstone());
+                    continue;
+                }
+                const bool in_base = p != ctr_over_only_part;
+                const bool in_over = p != ctr_base_only_part;
+                const std::vector<ctr_shard> none;
+
+                BOOST_TEST_CONTEXT("partition " << p) {
+                    auto want_st = ctr_merge(in_base ? ctr_static_base(p) : none, false,
+                                             in_over ? ctr_static_over(p) : none,
+                                             in_over && ctr_static_over_dead(p));
+                    auto got_st = ctr_read(scdef, m.partition().static_row().get());
+                    BOOST_TEST_CONTEXT("static counter") {
+                        BOOST_REQUIRE_EQUAL(got_st.present, want_st.present);
+                        BOOST_REQUIRE_EQUAL(got_st.live, want_st.live);
+                        if (want_st.live) {
+                            BOOST_REQUIRE_EQUAL(got_st.total, want_st.total);
+                            BOOST_REQUIRE(got_st.ids == want_st.ids);
+                            ++st.statics;
+                        }
+                    }
+
+                    for (const rows_entry& re : m.partition().clustered_rows()) {
+                        auto cit = case_of.find(re.key().explode(*s).at(0));
+                        BOOST_REQUIRE(cit != case_of.end());
+                        const ctr_case& c = *cit->second;
+                        BOOST_TEST_CONTEXT("row " << c.row << ": " << c.why) {
+                            if (c.over_row_tombstone && in_over) {
+                                // Same reason as the deleted partition: the row survives the merge
+                                // shadowed rather than removed, so what is asserted is that the
+                                // tombstone arrived at all.
+                                BOOST_REQUIRE(bool(re.row().deleted_at()));
+                                ++st.row_tombs;
+                                continue;
+                            }
+                            struct arm { const char* name; const column_definition& def;
+                                         const std::vector<ctr_shard>& b;
+                                         const std::vector<ctr_shard>& o; bool bd; bool od; };
+                            for (const auto& a : {arm{"c", cdef, c.base, c.over, c.base_dead,
+                                                      c.over_dead},
+                                                  arm{"c2", c2def, c.base2, c.over2, false,
+                                                      false}}) {
+                                BOOST_TEST_CONTEXT("column " << a.name) {
+                                    auto want = ctr_merge(in_base ? a.b : none,
+                                                          in_base && a.bd,
+                                                          in_over ? a.o : none,
+                                                          in_over && a.od);
+                                    auto got = ctr_read(a.def, re.row().cells());
+                                    BOOST_REQUIRE_EQUAL(got.present, want.present);
+                                    BOOST_REQUIRE_EQUAL(got.live, want.live);
+                                    if (!want.live) {
+                                        if (want.present) { ++st.dead; }
+                                        continue;
+                                    }
+                                    BOOST_REQUIRE_EQUAL(got.total, want.total);
+                                    BOOST_REQUIRE(got.ids == want.ids);
+                                    ++st.live;
+                                    if (want.ids.size() > 1) { ++st.multi_shard; }
+                                    // The non-vacuity guard that is specific to counters: a total
+                                    // that matches neither generation on its own cannot have been
+                                    // produced by taking one side wholesale.
+                                    auto b_only = ctr_merge(in_base ? a.b : none,
+                                                            in_base && a.bd, none, false);
+                                    auto o_only = ctr_merge(none, false,
+                                                            in_over ? a.o : none,
+                                                            in_over && a.od);
+                                    if ((!b_only.live || b_only.total != want.total) &&
+                                        (!o_only.live || o_only.total != want.total)) {
+                                        ++st.neither_side;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return st;
+        };
+
+        // The reference: native on both sides. Checking the fixture's rule against it first is
+        // what establishes that the rule is Scylla's and not this test's invention -- if these
+        // fail, the expectation is wrong rather than pq.
+        const auto want_f = merged_fragments(env, s, {nat_base, nat_over});
+        const auto want_m = merged_mutations(env, s, {nat_base, nat_over});
+        const auto ref_st = check(want_m);
+        BOOST_REQUIRE_GT(ref_st.live, 0u);
+        BOOST_REQUIRE_GT(ref_st.dead, 0u);
+        BOOST_REQUIRE_GT(ref_st.multi_shard, 0u);
+        BOOST_REQUIRE_GT(ref_st.statics, 0u);
+        BOOST_REQUIRE_GT(ref_st.row_tombs, 0u);
+        // Two rows per partition have a total that is neither generation's on its own (rows 0 and
+        // 2, plus row 2's second counter column), over the partitions that have both generations.
+        BOOST_REQUIRE_GE(ref_st.neither_side, 6u);
+
+        struct arm { const char* what; shared_sstable lo; shared_sstable hi; };
+        for (auto a : {arm{"native base + parquet overlay", nat_base, pq_over},
+                       arm{"parquet base + native overlay", pq_base, nat_over},
+                       arm{"parquet base + parquet overlay (control)", pq_base, pq_over},
+                       arm{"native base + native overlay (control)", nat_base, nat_over}}) {
+            BOOST_TEST_CONTEXT("counter read merge: " << a.what) {
+                auto got_f = merged_fragments(env, s, {a.lo, a.hi});
+                BOOST_REQUIRE_EQUAL(got_f.size(), want_f.size());
+                for (size_t i = 0; i < got_f.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(got_f[i], want_f[i]);
+                }
+                auto got_m = merged_mutations(env, s, {a.lo, a.hi});
+                BOOST_REQUIRE_EQUAL(got_m.size(), want_m.size());
+                for (size_t i = 0; i < got_m.size(); ++i) {
+                    assert_that(got_m[i]).is_equal_to(want_m[i]);
+                }
+                const auto st = check(got_m);
+                BOOST_REQUIRE_EQUAL(st.live, ref_st.live);
+                BOOST_REQUIRE_EQUAL(st.dead, ref_st.dead);
+                BOOST_REQUIRE_EQUAL(st.multi_shard, ref_st.multi_shard);
+                BOOST_REQUIRE_EQUAL(st.statics, ref_st.statics);
+                BOOST_REQUIRE_EQUAL(st.neither_side, ref_st.neither_side);
+            }
+        }
+
+        // And through compaction, where the merged counter cells are written back out. A shard set
+        // that survives a read but cannot be re-shredded loses data permanently here, because the
+        // older sstable is gone afterwards.
+        struct carm { const char* what; shared_sstable lo; shared_sstable hi;
+                      sstable_version_types out; };
+        for (auto a : {carm{"mixed in, parquet out", nat_base, pq_over,
+                            sstable_version_types::pq},
+                       carm{"mixed in reversed, parquet out", pq_base, nat_over,
+                            sstable_version_types::pq},
+                       carm{"mixed in, native out", nat_base, pq_over, nat},
+                       carm{"parquet in, parquet out (control)", pq_base, pq_over,
+                            sstable_version_types::pq}}) {
+            BOOST_TEST_CONTEXT("counter compaction: " << a.what) {
+                auto out = compact_into(env, s, {a.lo, a.hi}, a.out, n_part);
+                BOOST_REQUIRE(out->get_version() == a.out);
+                auto got_m = read_all(out, s, env.make_reader_permit());
+                BOOST_REQUIRE_EQUAL(got_m.size(), want_m.size());
+                for (size_t i = 0; i < got_m.size(); ++i) {
+                    assert_that(got_m[i]).is_equal_to(want_m[i]);
+                }
+                const auto st = check(got_m);
+                BOOST_REQUIRE_EQUAL(st.live, ref_st.live);
+                BOOST_REQUIRE_EQUAL(st.dead, ref_st.dead);
+                BOOST_REQUIRE_EQUAL(st.neither_side, ref_st.neither_side);
+            }
+        }
+    }).get();
+}
+
+namespace {
+
+// ---------------------------------------------------------------------------------------------
+// Collections
+
+constexpr int coll_parts = 7;
+constexpr int coll_deleted_part = 4;    // the overlay deletes this partition outright
+constexpr int coll_base_only_part = 5;  // absent from the overlay
+constexpr int coll_over_only_part = 6;  // absent from the base
+
+data_type coll_map_type()    { return map_type_impl::get_instance(utf8_type, int32_type, true); }
+data_type coll_set_type()    { return set_type_impl::get_instance(int32_type, true); }
+data_type coll_list_type()   { return list_type_impl::get_instance(int32_type, true); }
+data_type coll_frozen_type() { return map_type_impl::get_instance(utf8_type, int32_type, false); }
+
+// One non-frozen collection of each kind, one frozen one, and a static non-frozen one. The three
+// non-frozen kinds differ in their key space -- text, the element itself, and an opaque time UUID
+// -- which is the part of the encoding that the shredder has to carry verbatim.
+schema_ptr collection_hybrid_schema() {
+    return schema_builder(1, "ks", "hyb_coll")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("v", int32_type)
+        .with_column("m", coll_map_type())
+        .with_column("t", coll_set_type())
+        .with_column("l", coll_list_type())
+        .with_column("fm", coll_frozen_type())
+        .with_column("sm", coll_map_type(), column_kind::static_column)
+        .build();
+}
+
+partition_key coll_pk(const schema& s, int p) {
+    return partition_key::from_single_value(s, utf8_type->decompose(sstring(format("lp{:04d}", p))));
+}
+
+clustering_key coll_ck(const schema& s, int r) {
+    return clustering_key::from_single_value(s, int32_type->decompose(r));
+}
+
+// One clustering row's arrangement, applied identically to the map, the set and the list, so one
+// fixture covers a keyed, a keyless and an opaquely-keyed multi-cell collection.
+struct coll_case {
+    int row;
+    std::vector<int> base;         // live elements in the base
+    bool over_tomb = false;        // the overlay carries a collection-wide tombstone
+    std::vector<int> over;         // live elements the overlay writes, above its tombstone
+    std::vector<int> over_dead;    // per-element deletes in the overlay
+    bool over_row_tombstone = false;
+    const char* why;
+};
+
+std::vector<coll_case> collection_cases() {
+    return {
+        {0, {0,1,2}, false, {3},   {1},   false, "per-element delete plus an addition"},
+        {1, {0,1},   true,  {},    {},    false, "whole-collection delete"},
+        // The ordering case, and the reason this test exists: the collection-wide tombstone is in
+        // one format and the elements that must survive it are in the other. Everything the base
+        // holds is below the tombstone and must go; everything the overlay adds is above it and
+        // must stay. Getting the two the wrong way round either resurrects a cleared collection or
+        // swallows the elements that replaced it.
+        {2, {0,1},   true,  {2,3}, {},    false, "tombstone below the surviving elements"},
+        {3, {0,1,2}, false, {},    {0,2}, false, "two per-element deletes, one element left"},
+        {4, {},      true,  {},    {},    false, "a tombstone with nothing to delete"},
+        {5, {0,1,2}, false, {},    {},    true,  "row tombstone over a row of collections"},
+        {6, {0,1},   false, {},    {},    false, "base only -- untouched by the overlay"},
+        {7, {},      false, {2,3}, {},    false, "overlay only"},
+    };
+}
+
+// The static collection's arm rotates with the partition, and partition 2 -- whose arm leaves the
+// overlay silent -- is also absent from the base, so `sm` is never written there at all.
+coll_case coll_static_case(int p) {
+    if (p % 3 == 0) { return {0, {0,1}, true,  {2}, {},  false, "static: cleared, then refilled"}; }
+    if (p % 3 == 1) { return {0, {0,1}, false, {},  {0}, false, "static: per-element delete"}; }
+    return                   {0, {0,1}, false, {},  {},  false, "static: untouched"};
+}
+
+bool coll_static_in_base(int p) { return p != coll_over_only_part && p != 2; }
+
+// Timestamp bands. The overlay's elements sit strictly *above* its collection tombstone, which is
+// what makes case 2 mean anything; its per-element deletes sit above the base's elements and below
+// its own additions.
+api::timestamp_type coll_base_ts(int p)      { return 1000 + p; }
+api::timestamp_type coll_tomb_ts(int p)      { return 2000 + p; }
+api::timestamp_type coll_over_dead_ts(int p) { return 2050 + p; }
+api::timestamp_type coll_over_ts(int p)      { return 2100 + p; }
+
+bytes coll_map_key(int i)  { return utf8_type->decompose(sstring(format("k{}", i))); }
+bytes coll_set_key(int i)  { return int32_type->decompose(i); }
+bytes coll_list_key(int i) {
+    // Deterministic and monotone in `i`: min_time_UUID pins the clock-sequence half, so ordering
+    // is the timestamp's, which is the order the elements are pushed in below.
+    return timeuuid_type->decompose(data_value(
+            utils::UUID_gen::min_time_UUID(utils::UUID_gen::decimicroseconds(10'000'000 + i))));
+}
+
+int coll_map_key_index(bytes_view b) {
+    return std::stoi(std::string(reinterpret_cast<const char*>(b.data()), b.size()).substr(1));
+}
+int coll_set_key_index(bytes_view b) {
+    return value_cast<int32_t>(int32_type->deserialize(b));
+}
+int coll_list_key_index(bytes_view b) {
+    for (int i = 0; i < 16; ++i) {
+        if (coll_list_key(i) == bytes(b)) { return i; }
+    }
+    return -1;
+}
+
+bytes coll_frozen_value(int salt) {
+    return make_map_value(coll_frozen_type(),
+            map_type_impl::native_type({{sstring(format("f{}", salt)), int32_t(salt * 3)}}))
+            .serialize_nonnull();
+}
+
+// One multi-cell collection cell: the named elements in ascending index order, which is the key
+// comparator's order for all three key kinds here, under an optional collection-wide tombstone.
+atomic_cell_or_collection coll_cell(const std::function<bytes(int)>& key_of,
+                                    const abstract_type& value_type,
+                                    const std::function<bytes(int)>& value_of,
+                                    api::timestamp_type live_ts, api::timestamp_type dead_ts,
+                                    std::optional<api::timestamp_type> tomb_ts,
+                                    const std::vector<int>& live, const std::vector<int>& dead) {
+    collection_mutation_writer w(tomb_ts
+            ? tombstone(*tomb_ts, gc_clock::time_point(gc_clock::duration(70000)))
+            : tombstone());
+    std::set<int> live_set(live.begin(), live.end());
+    std::set<int> all(live.begin(), live.end());
+    all.insert(dead.begin(), dead.end());
+    for (int i : all) {
+        auto k = key_of(i);
+        auto kb = managed_bytes(reinterpret_cast<const int8_t*>(k.data()), k.size());
+        if (live_set.contains(i)) {
+            auto v = value_of(i);
+            w.push_back(managed_bytes_view(kb),
+                        atomic_cell::make_live(value_type, live_ts, bytes_view(v)));
+        } else {
+            w.push_back(managed_bytes_view(kb), atomic_cell::make_dead(
+                    dead_ts, gc_clock::time_point(gc_clock::duration(60000))));
+        }
+    }
+    return atomic_cell_or_collection(std::move(w).finish());
+}
+
+// The three non-frozen collections, written from one case. `which` picks the column.
+struct coll_col { const char* name; std::function<bytes(int)> key_of;
+                  const abstract_type* value_type; std::function<bytes(int)> value_of;
+                  std::function<int(bytes_view)> key_index; };
+
+std::vector<coll_col> coll_cols() {
+    return {
+        {"m", coll_map_key, int32_type.get(),
+         [] (int i) { return int32_type->decompose(i * 10); }, coll_map_key_index},
+        // A set element carries liveness and nothing else, so its value is empty -- the shape that
+        // makes "absent" and "present but valueless" easy to conflate.
+        {"t", coll_set_key, bytes_type.get(),
+         [] (int) { return bytes(); }, coll_set_key_index},
+        {"l", coll_list_key, int32_type.get(),
+         [] (int i) { return int32_type->decompose(i * 100); }, coll_list_key_index},
+    };
+}
+
+void coll_sort(utils::chunked_vector<mutation>& muts) {
+    std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+        return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+    });
+}
+
+utils::chunked_vector<mutation> collection_base(schema_ptr s) {
+    const auto& vdef  = *s->get_column_definition(to_bytes("v"));
+    const auto& fmdef = *s->get_column_definition(to_bytes("fm"));
+    const auto& smdef = *s->get_column_definition(to_bytes("sm"));
+    const auto cases = collection_cases();
+    const auto cols = coll_cols();
+
+    utils::chunked_vector<mutation> muts;
+    for (int p = 0; p < coll_parts; ++p) {
+        if (p == coll_over_only_part) { continue; }
+        mutation m(s, coll_pk(*s, p));
+        const auto ts = coll_base_ts(p);
+        if (coll_static_in_base(p)) {
+            const auto sc = coll_static_case(p);
+            m.set_static_cell(smdef, coll_cell(coll_map_key, *int32_type,
+                    [] (int i) { return int32_type->decompose(i * 10); },
+                    ts, ts, std::nullopt, sc.base, {}));
+        }
+        for (const auto& c : cases) {
+            if (c.row == 7) { continue; }       // exists only in the overlay
+            auto ck = coll_ck(*s, c.row);
+            m.set_clustered_cell(ck, vdef, atomic_cell::make_live(
+                    *int32_type, ts, int32_type->decompose(c.row)));
+            m.set_clustered_cell(ck, fmdef, atomic_cell::make_live(
+                    *fmdef.type, ts, bytes_view(coll_frozen_value(c.row))));
+            if (c.base.empty()) { continue; }
+            for (const auto& col : cols) {
+                m.set_clustered_cell(ck, *s->get_column_definition(to_bytes(col.name)),
+                        coll_cell(col.key_of, *col.value_type, col.value_of,
+                                  ts, ts, std::nullopt, c.base, {}));
+            }
+        }
+        muts.push_back(std::move(m));
+    }
+    coll_sort(muts);
+    return muts;
+}
+
+utils::chunked_vector<mutation> collection_overlay(schema_ptr s) {
+    const auto& vdef  = *s->get_column_definition(to_bytes("v"));
+    const auto& fmdef = *s->get_column_definition(to_bytes("fm"));
+    const auto& smdef = *s->get_column_definition(to_bytes("sm"));
+    const auto cases = collection_cases();
+    const auto cols = coll_cols();
+
+    utils::chunked_vector<mutation> muts;
+    for (int p = 0; p < coll_parts; ++p) {
+        if (p == coll_base_only_part) { continue; }
+        mutation m(s, coll_pk(*s, p));
+        const auto ldt = gc_clock::time_point(gc_clock::duration(70000 + p));
+
+        if (p == coll_deleted_part) {
+            m.partition().apply(tombstone(coll_tomb_ts(p), ldt));
+            muts.push_back(std::move(m));
+            continue;
+        }
+
+        {
+            const auto sc = coll_static_case(p);
+            if (sc.over_tomb || !sc.over.empty() || !sc.over_dead.empty()) {
+                m.set_static_cell(smdef, coll_cell(coll_map_key, *int32_type,
+                        [] (int i) { return int32_type->decompose(i * 10); },
+                        coll_over_ts(p), coll_over_dead_ts(p),
+                        sc.over_tomb ? std::optional(coll_tomb_ts(p)) : std::nullopt,
+                        sc.over, sc.over_dead));
+            }
+        }
+
+        for (const auto& c : cases) {
+            auto ck = coll_ck(*s, c.row);
+            if (c.over_row_tombstone) {
+                m.partition().clustered_row(*s, ck).apply(
+                        row_tombstone(tombstone(coll_tomb_ts(p), ldt)));
+                continue;
+            }
+            if (c.row != 6) {       // row 6 is untouched by the overlay
+                m.set_clustered_cell(ck, vdef, atomic_cell::make_live(
+                        *int32_type, coll_over_ts(p), int32_type->decompose(c.row + 1000)));
+                // A frozen collection is a single atomic cell, so its whole-collection delete is a
+                // *cell* tombstone -- the shape a pq file stores in `__dmask` rather than in a
+                // collection tombstone slot, and the one that must not come back as absent.
+                if (c.over_tomb) {
+                    m.set_clustered_cell(ck, fmdef, atomic_cell::make_dead(
+                            coll_tomb_ts(p), ldt));
+                } else if (!c.over_dead.empty()) {
+                    m.set_clustered_cell(ck, fmdef, atomic_cell::make_live(
+                            *fmdef.type, coll_over_ts(p),
+                            bytes_view(coll_frozen_value(c.row + 50))));
+                }
+            }
+            if (!c.over_tomb && c.over.empty() && c.over_dead.empty()) { continue; }
+            for (const auto& col : cols) {
+                m.set_clustered_cell(ck, *s->get_column_definition(to_bytes(col.name)),
+                        coll_cell(col.key_of, *col.value_type, col.value_of,
+                                  coll_over_ts(p), coll_over_dead_ts(p),
+                                  c.over_tomb ? std::optional(coll_tomb_ts(p)) : std::nullopt,
+                                  c.over, c.over_dead));
+            }
+        }
+        muts.push_back(std::move(m));
+    }
+    coll_sort(muts);
+    return muts;
+}
+
+// The surviving live element set, computed from the fixture. The base's elements are all below the
+// overlay's tombstone, and the overlay's own additions are all above it.
+std::vector<int> coll_expect(const coll_case& c, bool in_base, bool in_over) {
+    std::set<int> live;
+    if (in_base) { live.insert(c.base.begin(), c.base.end()); }
+    if (in_over) {
+        if (c.over_tomb) { live.clear(); }
+        for (int k : c.over_dead) { live.erase(k); }
+        live.insert(c.over.begin(), c.over.end());
+    }
+    return {live.begin(), live.end()};
+}
+
+struct coll_readback {
+    bool present = false;
+    bool tomb = false;
+    std::vector<int> live;
+    size_t dead = 0;
+    // Live cells the collection-wide tombstone already covers. Counted separately and asserted to
+    // be zero rather than quietly filtered out of `live`: a merge that stopped applying the
+    // tombstone to the *other* side's elements (`filter_cells`, mutation/collection_mutation.cc)
+    // would leave them here, and a reader that hid them would be blind to it -- and so would the
+    // reference comparison, because a broken merge rule breaks both formats identically.
+    size_t shadowed = 0;
+};
+
+// A multi-cell collection as the merge left it.
+coll_readback coll_read(const column_definition& def, const row& cells,
+                        const std::function<int(bytes_view)>& key_index) {
+    coll_readback out;
+    const auto* c = cells.find_cell(def.id);
+    if (!c) { return out; }
+    out.present = true;
+    auto cmv = c->as_collection_mutation();
+    const auto t = cmv.tomb();
+    out.tomb = bool(t);
+    for (auto&& kv : cmv) {
+        auto kb = linearized(kv.first);
+        if (!kv.second.is_live()) { ++out.dead; continue; }
+        if (t && kv.second.timestamp() <= t.timestamp) { ++out.shadowed; continue; }
+        const int i = key_index(bytes_view(kb));
+        BOOST_REQUIRE_GE(i, 0);
+        out.live.push_back(i);
+    }
+    std::sort(out.live.begin(), out.live.end());
+    return out;
+}
+
+} // namespace
+
+SEASTAR_THREAD_TEST_CASE(test_hybrid_merge_of_collections_across_formats) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = collection_hybrid_schema();
+        const auto& fmdef = *s->get_column_definition(to_bytes("fm"));
+        const auto& smdef = *s->get_column_definition(to_bytes("sm"));
+        const auto cases = collection_cases();
+        const auto cols = coll_cols();
+
+        auto base = collection_base(s);
+        auto over = collection_overlay(s);
+        const auto nat = sstables::get_highest_sstable_version();
+        const size_t n_part = std::max(base.size(), over.size());
+
+        auto mk = [&] (sstable_version_types v, const utils::chunked_vector<mutation>& ms) {
+            return make_sstable_containing(env.make_sstable(s, v), ms).get();
+        };
+        auto nat_base = mk(nat, base), nat_over = mk(nat, over);
+        auto pq_base = mk(sstable_version_types::pq, base);
+        auto pq_over = mk(sstable_version_types::pq, over);
+
+        std::map<bytes, int> p_of;
+        for (int p = 0; p < coll_parts; ++p) {
+            p_of[utf8_type->decompose(sstring(format("lp{:04d}", p)))] = p;
+        }
+        std::map<bytes, const coll_case*> case_of;
+        for (const auto& c : cases) {
+            case_of[int32_type->decompose(c.row)] = &c;
+        }
+
+        struct stats {
+            size_t live_elems = 0, dead_elems = 0, tombs = 0, shadowed = 0;
+            size_t shrunk = 0;        // collections the merge made strictly smaller than the union
+            size_t frozen_live = 0, frozen_dead = 0, frozen_absent = 0;
+            size_t statics = 0, row_tombs = 0;
+        };
+
+        auto check = [&] (const utils::chunked_vector<mutation>& ms) {
+            stats st;
+            for (const auto& m : ms) {
+                auto pit = p_of.find(m.key().explode(*s).at(0));
+                BOOST_REQUIRE(pit != p_of.end());
+                const int p = pit->second;
+                if (p == coll_deleted_part) {
+                    BOOST_REQUIRE(m.partition().partition_tombstone());
+                    continue;
+                }
+                const bool in_base = p != coll_over_only_part;
+                const bool in_over = p != coll_base_only_part;
+
+                BOOST_TEST_CONTEXT("partition " << p) {
+                    {
+                        const auto sc = coll_static_case(p);
+                        const auto want = coll_expect(sc, in_base && coll_static_in_base(p),
+                                                      in_over);
+                        auto got = coll_read(smdef, m.partition().static_row().get(),
+                                             coll_map_key_index);
+                        BOOST_TEST_CONTEXT("static collection: " << sc.why) {
+                            BOOST_REQUIRE(got.live == want);
+                            st.shadowed += got.shadowed;
+                            if (!want.empty()) { ++st.statics; }
+                        }
+                    }
+
+                    for (const rows_entry& re : m.partition().clustered_rows()) {
+                        auto cit = case_of.find(re.key().explode(*s).at(0));
+                        BOOST_REQUIRE(cit != case_of.end());
+                        const coll_case& c = *cit->second;
+                        BOOST_TEST_CONTEXT("row " << c.row << ": " << c.why) {
+                            if (c.over_row_tombstone && in_over) {
+                                BOOST_REQUIRE(bool(re.row().deleted_at()));
+                                ++st.row_tombs;
+                                continue;
+                            }
+                            const auto want = coll_expect(c, in_base, in_over);
+                            std::set<int> union_of(c.base.begin(), c.base.end());
+                            if (in_over) { union_of.insert(c.over.begin(), c.over.end()); }
+
+                            for (const auto& col : cols) {
+                                const auto& def = *s->get_column_definition(to_bytes(col.name));
+                                BOOST_TEST_CONTEXT("column " << col.name) {
+                                    auto got = coll_read(def, re.row().cells(), col.key_index);
+                                    BOOST_REQUIRE(got.live == want);
+                                    st.live_elems += got.live.size();
+                                    st.dead_elems += got.dead;
+                                    st.shadowed += got.shadowed;
+                                    if (got.tomb) { ++st.tombs; }
+                                    if (want.size() < union_of.size()) { ++st.shrunk; }
+                                }
+                            }
+
+                            // The frozen collection, whose merge is a plain atomic-cell merge --
+                            // included because its *delete* is a cell tombstone rather than a
+                            // collection tombstone, and that is a different channel on disk.
+                            BOOST_TEST_CONTEXT("column fm") {
+                                const auto* fc = re.row().cells().find_cell(fmdef.id);
+                                const bool want_dead = in_over && c.over_tomb;
+                                const bool want_new  = in_over && !c.over_tomb
+                                                       && !c.over_dead.empty();
+                                const bool want_base = in_base && c.row != 7;
+                                if (!want_dead && !want_new && !want_base) {
+                                    BOOST_REQUIRE(!fc);
+                                    ++st.frozen_absent;
+                                } else {
+                                    BOOST_REQUIRE(fc);
+                                    auto av = fc->as_atomic_cell(fmdef);
+                                    if (want_dead) {
+                                        BOOST_REQUIRE(!av.is_live());
+                                        ++st.frozen_dead;
+                                    } else {
+                                        BOOST_REQUIRE(av.is_live());
+                                        const auto expect = want_new
+                                                ? coll_frozen_value(c.row + 50)
+                                                : coll_frozen_value(c.row);
+                                        BOOST_REQUIRE(av.value().linearize() == expect);
+                                        ++st.frozen_live;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return st;
+        };
+
+        const auto want_f = merged_fragments(env, s, {nat_base, nat_over});
+        const auto want_m = merged_mutations(env, s, {nat_base, nat_over});
+        const auto ref_st = check(want_m);
+        BOOST_REQUIRE_GT(ref_st.live_elems, 0u);
+        // Per-element tombstones survive a merge that does not garbage-collect, so this is not a
+        // tautology: it is what stops the element-delete arm of the fixture from quietly becoming
+        // a no-op.
+        BOOST_REQUIRE_GT(ref_st.dead_elems, 0u);
+        BOOST_REQUIRE_GT(ref_st.tombs, 0u);
+        BOOST_REQUIRE_GT(ref_st.shrunk, 0u);
+        BOOST_REQUIRE_GT(ref_st.statics, 0u);
+        BOOST_REQUIRE_GT(ref_st.row_tombs, 0u);
+        BOOST_REQUIRE_GT(ref_st.frozen_live, 0u);
+        BOOST_REQUIRE_GT(ref_st.frozen_dead, 0u);
+        BOOST_REQUIRE_GT(ref_st.frozen_absent, 0u);
+        // A collection-wide tombstone removes the elements it covers rather than merely hiding
+        // them, on both sides of the merge. Asserted rather than assumed, because it is the fact
+        // that lets `live` above be the whole truth about what survived.
+        BOOST_REQUIRE_EQUAL(ref_st.shadowed, 0u);
+
+        struct arm { const char* what; shared_sstable lo; shared_sstable hi; };
+        for (auto a : {arm{"native base + parquet overlay", nat_base, pq_over},
+                       arm{"parquet base + native overlay", pq_base, nat_over},
+                       arm{"parquet base + parquet overlay (control)", pq_base, pq_over},
+                       arm{"native base + native overlay (control)", nat_base, nat_over}}) {
+            BOOST_TEST_CONTEXT("collection read merge: " << a.what) {
+                auto got_f = merged_fragments(env, s, {a.lo, a.hi});
+                BOOST_REQUIRE_EQUAL(got_f.size(), want_f.size());
+                for (size_t i = 0; i < got_f.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(got_f[i], want_f[i]);
+                }
+                auto got_m = merged_mutations(env, s, {a.lo, a.hi});
+                BOOST_REQUIRE_EQUAL(got_m.size(), want_m.size());
+                for (size_t i = 0; i < got_m.size(); ++i) {
+                    assert_that(got_m[i]).is_equal_to(want_m[i]);
+                }
+                const auto st = check(got_m);
+                BOOST_REQUIRE_EQUAL(st.live_elems, ref_st.live_elems);
+                BOOST_REQUIRE_EQUAL(st.dead_elems, ref_st.dead_elems);
+                BOOST_REQUIRE_EQUAL(st.tombs, ref_st.tombs);
+                BOOST_REQUIRE_EQUAL(st.shadowed, 0u);
+                BOOST_REQUIRE_EQUAL(st.frozen_live, ref_st.frozen_live);
+                BOOST_REQUIRE_EQUAL(st.frozen_dead, ref_st.frozen_dead);
+            }
+        }
+
+        struct carm { const char* what; shared_sstable lo; shared_sstable hi;
+                      sstable_version_types out; };
+        for (auto a : {carm{"mixed in, parquet out", nat_base, pq_over,
+                            sstable_version_types::pq},
+                       carm{"mixed in reversed, parquet out", pq_base, nat_over,
+                            sstable_version_types::pq},
+                       carm{"mixed in, native out", nat_base, pq_over, nat},
+                       carm{"parquet in, parquet out (control)", pq_base, pq_over,
+                            sstable_version_types::pq}}) {
+            BOOST_TEST_CONTEXT("collection compaction: " << a.what) {
+                auto out = compact_into(env, s, {a.lo, a.hi}, a.out, n_part);
+                BOOST_REQUIRE(out->get_version() == a.out);
+                auto got_m = read_all(out, s, env.make_reader_permit());
+                BOOST_REQUIRE_EQUAL(got_m.size(), want_m.size());
+                for (size_t i = 0; i < got_m.size(); ++i) {
+                    assert_that(got_m[i]).is_equal_to(want_m[i]);
+                }
+                const auto st = check(got_m);
+                BOOST_REQUIRE_EQUAL(st.live_elems, ref_st.live_elems);
+                BOOST_REQUIRE_EQUAL(st.tombs, ref_st.tombs);
+                BOOST_REQUIRE_EQUAL(st.shadowed, 0u);
+                BOOST_REQUIRE_EQUAL(st.frozen_dead, ref_st.frozen_dead);
+            }
+        }
+    }).get();
+}
+
+// A non-frozen user-defined type, which is multi-cell and therefore travels the collection path --
+// but is *not* a collection type.
+//
+// `columns_of()` marks a column multi_cell as `!is_atomic() || is_counter()`, so a non-frozen UDT is
+// shredded like a map, with the field index as the element key. That half works. The read back did
+// not: `build_collection()` opened with
+//
+//     const auto& ctype = dynamic_cast<const collection_type_impl&>(*cdef.type);
+//
+// and `user_type_impl` derives from `tuple_type_impl`, not from `collection_type_impl`, so that
+// reference cast throws `std::bad_cast`. Every read of a `pq` sstable holding a non-frozen UDT
+// column therefore failed outright -- not wrong data, an exception out of the read path.
+//
+// It stayed hidden because every fixed-schema pq test in the tree uses collections and counters and
+// no non-frozen UDT, and the one suite that generates UDT columns at random
+// (`test_sstable_bytes_on_disk_correctness`, via `make_random_schema_specification`) took the
+// version-less `env.make_sstable(schema)` overload and so never ran as `pq`.
+SEASTAR_THREAD_TEST_CASE(test_pq_non_frozen_udt_round_trips) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        // (a int, b text, c bigint), multi-cell -- the `false` arm is the frozen one, which is an
+        // ordinary atomic cell and was never affected.
+        auto udt = user_type_impl::get_instance("ks", to_bytes("pq_ut"),
+                {to_bytes("a"), to_bytes("b"), to_bytes("c")},
+                {int32_type, utf8_type, long_type}, true);
+        auto frozen_udt = user_type_impl::get_instance("ks", to_bytes("pq_fut"),
+                {to_bytes("a"), to_bytes("b")}, {int32_type, utf8_type}, false);
+
+        auto s = schema_builder(1, "ks", "pq_udt")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("u", udt)
+            .with_column("fu", frozen_udt)
+            .with_column("su", udt, column_kind::static_column)
+            .build();
+
+        const auto& udef  = *s->get_column_definition(to_bytes("u"));
+        const auto& fudef = *s->get_column_definition(to_bytes("fu"));
+        const auto& sudef = *s->get_column_definition(to_bytes("su"));
+        BOOST_REQUIRE(!udef.is_atomic());       // the property that routes it here
+        BOOST_REQUIRE(fudef.is_atomic());
+
+        // One UDT cell. `live` names the fields that are set, `dead` those with a field-level
+        // tombstone; field-index keys are pushed ascending, which is their comparator's order.
+        auto udt_cell = [&] (api::timestamp_type ts, std::optional<api::timestamp_type> tomb_ts,
+                             const std::vector<int>& live, const std::vector<int>& dead) {
+            collection_mutation_writer w(tomb_ts
+                    ? tombstone(*tomb_ts, gc_clock::time_point(gc_clock::duration(70000)))
+                    : tombstone());
+            std::set<int> live_set(live.begin(), live.end());
+            std::set<int> all(live.begin(), live.end());
+            all.insert(dead.begin(), dead.end());
+            for (int f : all) {
+                auto k = serialize_field_index(size_t(f));
+                auto kb = managed_bytes(reinterpret_cast<const int8_t*>(k.data()), k.size());
+                if (!live_set.contains(f)) {
+                    w.push_back(managed_bytes_view(kb), atomic_cell::make_dead(
+                            ts, gc_clock::time_point(gc_clock::duration(60000))));
+                    continue;
+                }
+                bytes v = f == 0 ? int32_type->decompose(f * 7 + 1)
+                        : f == 1 ? utf8_type->decompose(sstring(format("f{}", f)))
+                                 : long_type->decompose(int64_t(f) * 1000);
+                w.push_back(managed_bytes_view(kb),
+                            atomic_cell::make_live(*udt->type(size_t(f)), ts, bytes_view(v)));
+            }
+            return atomic_cell_or_collection(std::move(w).finish());
+        };
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < 6; ++p) {
+            auto pk = partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("ukey{:04d}", p))));
+            mutation m(s, pk);
+            const api::timestamp_type ts = 3000 + p;
+            if (p % 3 != 2) {
+                m.set_static_cell(sudef, udt_cell(ts, std::nullopt, {0, 2}, {}));
+            }
+            for (int r = 0; r < 4; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.partition().clustered_row(*s, ck).apply(row_marker(ts));
+                switch ((p + r) % 4) {
+                case 0: m.set_clustered_cell(ck, udef, udt_cell(ts, std::nullopt, {0, 1, 2}, {}));
+                        break;
+                // A field-level tombstone: the shape that must not read back as an unset field.
+                case 1: m.set_clustered_cell(ck, udef, udt_cell(ts, std::nullopt, {0}, {1}));
+                        break;
+                // A whole-UDT delete, which is a collection-wide tombstone, plus one field
+                // written above it.
+                case 2: m.set_clustered_cell(ck, udef, udt_cell(ts + 1, ts, {2}, {}));
+                        break;
+                // Nothing at all for `u`; the frozen twin carries the row instead.
+                default: m.set_clustered_cell(ck, fudef, atomic_cell::make_live(
+                                *frozen_udt, ts, bytes_view(
+                                        make_user_value(frozen_udt, user_type_impl::native_type({
+                                                data_value(int32_t(r)),
+                                                data_value(sstring(format("z{}", r)))}))
+                                        .serialize_nonnull())));
+                        break;
+                }
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
+
+        // And the fields are really there, so this cannot pass on two uniformly empty UDT cells.
+        size_t live_fields = 0, dead_fields = 0, tombs = 0;
+        for (const auto& m : got) {
+            for (const rows_entry& re : m.partition().clustered_rows()) {
+                const auto* c = re.row().cells().find_cell(udef.id);
+                if (!c) { continue; }
+                auto cmv = c->as_collection_mutation();
+                if (cmv.tomb()) { ++tombs; }
+                for (auto&& kv : cmv) {
+                    BOOST_REQUIRE_LT(deserialize_field_index(kv.first), 3u);
+                    kv.second.is_live() ? ++live_fields : ++dead_fields;
+                }
+            }
+        }
+        BOOST_REQUIRE_GT(live_fields, 0u);
+        BOOST_REQUIRE_GT(dead_fields, 0u);
+        BOOST_REQUIRE_GT(tombs, 0u);
+    }).get();
+}
+
+// `bytes_on_disk()`, checked against the sizes the storage layer actually reports.
+//
+// The accounting matters beyond bookkeeping: `ondisk_data_size()` is what mixed-format candidate
+// sets are bucketed on (design doc 10.3i), so a `pq` sstable that mis-reports its footprint
+// mis-buckets. And `pq`'s component set is unlike any mx version's -- the Index component carries
+// no promoted index, and the whole Parquet image including its footer lives inside Data.db -- so it
+// is summing a different set of files from the one the existing check was written against.
+//
+// That existing check is `test_sstable_bytes_on_disk_correctness`
+// (`sstable_datafile_test.cc:3199`), the only place in the tree that compares the reported number
+// against real file sizes. It takes the version-less `env.make_sstable(schema)` overload, which
+// resolves to `get_highest_sstable_version()` -- and that deliberately steps back past `pq`
+// (`version.hh:87`), so it has never run this format. Pointing it at `pq` is a two-line change and
+// was tried; see the note below for why it is not the change made here.
+SEASTAR_THREAD_TEST_CASE(test_pq_bytes_on_disk_matches_the_storage_layer) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 10, 30);
+
+        // Both formats, because the assertion is only interesting if it is capable of *not* being
+        // trivially true, and the native arm is the control that says the summation itself works.
+        for (auto v : {sstables::get_highest_sstable_version(), sstable_version_types::pq}) {
+            BOOST_TEST_CONTEXT("version " << fmt::to_string(v)) {
+                auto sst = make_sstable_containing(env.make_sstable(s, v), muts).get();
+
+                uint64_t summed = 0;
+                size_t components = 0;
+                auto& storage = const_cast<sstables::storage&>(sst->get_storage());
+                for (auto& ct : sstables::test(sst).get_components()) {
+                    auto f = storage.open_component(*sst, ct, open_flags::ro, file_open_options{},
+                                                    true).get();
+                    summed += f.size().get();
+                    ++components;
+                }
+                // A pq sstable still carries TOC, Index, Summary, Filter, Statistics and Digest
+                // beside Data, so a count this low would mean the loop above summed almost nothing.
+                BOOST_REQUIRE_GT(components, 3u);
+                BOOST_REQUIRE_EQUAL(sst->bytes_on_disk(), summed);
+
+                // ondisk_data_size() is the Data component alone -- the number tiering buckets on --
+                // so it must be a strict part of the total rather than the total itself.
+                BOOST_REQUIRE_GT(sst->ondisk_data_size(), 0u);
+                BOOST_REQUIRE_LT(sst->ondisk_data_size(), sst->bytes_on_disk());
             }
         }
     }).get();

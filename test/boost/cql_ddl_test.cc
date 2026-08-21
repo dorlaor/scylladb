@@ -360,19 +360,89 @@ SEASTAR_TEST_CASE(test_storage_format_honoured_by_streaming_writes) {
         // Staging is about view building, and must not be lost to the format change.
         BOOST_REQUIRE(staging->state() == sstables::sstable_state::staging);
 
-        // A table that has not opted in must be untouched: the fix honours an explicit
-        // 'parquet' only, and 'hybrid' deliberately streams native because streamed data has
-        // just arrived and is not bottom-tier.
+        // A table that has not opted in must be untouched.
         e.execute_cql("CREATE TABLE ks.strm_plain (pk int PRIMARY KEY, v int)").get();
         auto& p = e.local_db().find_column_family("ks", "strm_plain");
         BOOST_REQUIRE(p.make_streaming_sstable_for_write()->get_version()
                       != sstables::sstable_version_types::pq);
 
+        // 'hybrid' under a size-tiered strategy streams native: streamed data has just arrived and
+        // is not bottom-tier, so C1 would decline it anyway. The strategy is pinned rather than
+        // left to the build's default, because this arm is only meaningful as the *counterpart* of
+        // the TWCS one below -- with the default in play, a default that moved to TWCS would turn
+        // this line from "hybrid+STCS streams native" into a contradiction of it.
         e.execute_cql("CREATE TABLE ks.strm_hybrid (pk int PRIMARY KEY, v int) "
-                      "WITH storage_format = 'hybrid'").get();
+                      "WITH storage_format = 'hybrid' "
+                      "AND compaction = {'class': 'SizeTieredCompactionStrategy'}").get();
         auto& h = e.local_db().find_column_family("ks", "strm_hybrid");
         BOOST_REQUIRE(h.make_streaming_sstable_for_write()->get_version()
                       != sstables::sstable_version_types::pq);
+
+        // Under TWCS, 'hybrid' means the whole table (design doc 6.4), and the streaming path is
+        // one of the three callers that has to agree with the other two or the table never
+        // converges. `writes_parquet_unconditionally()` has covered this case since it was
+        // introduced and `streaming_version_for()` consults it, but nothing asserted the pairing
+        // for TWCS: the streaming test only had a hybrid table under the default strategy, and
+        // `test_twcs_hybrid_is_parquet_for_the_whole_table` only asserts the predicate. That is
+        // exactly the arrangement that let the sibling defect on the reshape-on-load path live --
+        // predicate right, one caller not asking it -- so this asks the caller.
+        //
+        // One thing this arm cannot see, established by mutating each rule in turn:
+        // `streaming_version_for()` is **redundant** as the code stands. When it answers nullopt,
+        // `make_streaming_sstable_for_write()` falls back to `make_sstable(state)`, which asks
+        // `writes_parquet_unconditionally()` itself (`replica/table.cc:542`, the flush-path rule
+        // added later for §10.7). Reverting `streaming_version_for()` to its pre-fix
+        // `storage_format() == parquet` form leaves every assertion here passing. So this asserts
+        // the *outcome* of the streaming path, which is what matters, but it cannot tell which of
+        // the two rules produced it -- and a refactor that deleted either one would still be
+        // green. The mutation that does fail this is removing the TWCS arm from
+        // `writes_parquet_unconditionally()`, the rule both paths share.
+        e.execute_cql("CREATE TABLE ks.strm_hybrid_twcs (pk int, ck timestamp, v int, "
+                      "PRIMARY KEY (pk, ck)) WITH storage_format = 'hybrid' "
+                      "AND compaction = {'class': 'TimeWindowCompactionStrategy'}").get();
+        auto& ht = e.local_db().find_column_family("ks", "strm_hybrid_twcs");
+        BOOST_REQUIRE(ht.make_streaming_sstable_for_write()->get_version()
+                      == sstables::sstable_version_types::pq);
+        BOOST_REQUIRE(ht.make_streaming_staging_sstable()->get_version()
+                      == sstables::sstable_version_types::pq);
+
+        // And TWCS on its own is not the trigger -- otherwise the arm above would pass on a build
+        // that had stopped reading `storage_format` at all.
+        e.execute_cql("CREATE TABLE ks.strm_plain_twcs (pk int, ck timestamp, v int, "
+                      "PRIMARY KEY (pk, ck)) WITH compaction = "
+                      "{'class': 'TimeWindowCompactionStrategy'}").get();
+        auto& pt = e.local_db().find_column_family("ks", "strm_plain_twcs");
+        BOOST_REQUIRE(pt.make_streaming_sstable_for_write()->get_version()
+                      != sstables::sstable_version_types::pq);
+
+        // Everything above reads the version off the sstable *object* the creator returned. That
+        // is the creator's contract, but it is not the file, and a version mislabelled in memory
+        // would carry every one of those assertions. So drive one of them all the way: write a
+        // partition through the sstable the streaming creator handed back, and read the format off
+        // the component that lands on disk, where local storage puts the version in the name.
+        {
+            auto s = ht.schema();
+            auto keys = tests::generate_partition_keys(1, s);
+            mutation m(s, keys[0]);
+            auto ck = clustering_key::from_single_value(
+                    *s, timestamp_type->decompose(data_value(db_clock::now())));
+            m.set_clustered_cell(ck, to_bytes("v"), data_value(int32_t(7)), api::new_timestamp());
+            make_sstable_containing(ht.make_streaming_sstable_for_write(),
+                                    utils::chunked_vector<mutation>{std::move(m)}).get();
+
+            size_t data_components = 0;
+            for (const auto& entry : std::filesystem::directory_iterator(tests::table_dir(ht))) {
+                auto name = entry.path().filename().string();
+                if (!name.ends_with("-Data.db")) {
+                    continue;
+                }
+                ++data_components;
+                BOOST_REQUIRE_EQUAL(name.substr(0, 3), "pq-");
+            }
+            // Nothing else has written to this table, so a count of zero would mean the loop above
+            // asserted nothing at all.
+            BOOST_REQUIRE_EQUAL(data_components, 1u);
+        }
     });
 }
 
