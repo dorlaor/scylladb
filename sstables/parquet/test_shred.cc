@@ -57,6 +57,15 @@ struct gen_opts {
     double divergence_rate = 0.0;   // fraction of rows with per-cell timestamps
     double ttl_rate = 0.0;
     double delete_rate = 0.0;
+    // Fraction of rows whose dead cells get *per-cell* deletion times rather than one
+    // shared by the row. 0 is the common case and the one the fold is for: a bind-NULL
+    // INSERT is a single statement, so every tombstone it writes shares one deletion time.
+    // 1 is the adversarial case, where every dead cell needs an exception entry.
+    //
+    // This dimension did not exist before, and its absence was not neutral: the generator
+    // drew every deletion time independently, so the corpus was 100 % divergent and the
+    // *shared* case -- the one the fold actually optimises -- was never generated at all.
+    double del_divergence_rate = 1.0;
     // Row-level metadata. Markers are the common case -- almost every CQL INSERT
     // makes one -- so the default is "most rows have one".
     double marker_rate = 0.0;
@@ -94,6 +103,20 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
             row_ts = extremes[rng() % 3];
         }
         const bool diverge = unit() < o.divergence_rate;
+        // The row's own deletion time, shared by all of its dead cells unless this row is
+        // drawn as divergent. Extremes included because the exception channel stores a
+        // *delta* between two of these, and int32's ends are where that arithmetic is
+        // easiest to get wrong.
+        const bool del_diverge = unit() < o.del_divergence_rate;
+        auto draw_ldt = [&] {
+            switch (rng() % 8) {
+            case 0:  return std::numeric_limits<int32_t>::max();
+            case 1:  return std::numeric_limits<int32_t>::min() + 1;
+            case 2:  return int32_t(0);
+            default: return int32_t(rng() % 100000);
+            }
+        };
+        const int32_t row_ldt = draw_ldt();
 
         for (size_t k = 0; k < nreg; ++k) {
             if (unit() < o.null_rate) { continue; }   // column absent for this row
@@ -123,9 +146,25 @@ std::vector<row> generate(const std::vector<cql_column>& cols, const gen_opts& o
             case cql_type::dbl:    c.v = double(rng() % 100000) / 100.0; break;
             default:               c.v = std::string(WORDS[rng() % 7]); break;
             }
-            if (unit() < o.ttl_rate)    { c.ttl = int32_t(rng() % 86400); }
-            if (unit() < o.delete_rate) { c.live = false; c.v.reset();
-                                          c.local_deletion_time = int32_t(rng() % 100000); }
+            if (unit() < o.ttl_rate) {
+                c.ttl = int32_t(rng() % 86400);
+                // A live cell with a TTL also carries its expiry, because that is what the
+                // write path produces: writer_impl sets local_deletion_time = av.expiry()
+                // whenever is_live_and_has_ttl(). The generator never did, so the
+                // live-expiry half of `__ldt_<col>` was never exercised -- which matters
+                // now that the leaf carries *only* that case and dead cells go to the
+                // folded channel instead.
+                c.local_deletion_time = draw_ldt();
+            }
+            if (unit() < o.delete_rate) {
+                // Now a tombstone: no value, and the ldt means deletion time rather than
+                // expiry. Any TTL drawn above is deliberately left in place -- the write
+                // path cannot produce that combination, but the mapping must not silently
+                // lose a field just because the writer happens not to set it.
+                c.live = false;
+                c.v.reset();
+                c.local_deletion_time = del_diverge ? draw_ldt() : row_ldt;
+            }
             r.cells.emplace(k, std::move(c));
         }
         if (unit() < o.marker_rate) {
@@ -246,17 +285,29 @@ bool compare(const std::vector<row>& in, const std::vector<row>& out,
 
 int roundtrip() {
     size_t cases = 0, fails = 0, wider = 0, derived_leaves = 0;
+    // How many cases actually populated each arm of the folded deletion channel. Without
+    // these the new dimension could be a no-op -- every case below would still pass and
+    // prove nothing, which is exactly how a real data-loss bug once looked correct for
+    // 540 cases.
+    size_t del_shared_rows = 0, del_exc_rows = 0;
     const double divs[] = {0.0, 0.05, 0.25, 0.5, 1.0};
     const double nulls[] = {0.0, 0.25, 0.6};
     const double ttls[] = {0.0, 0.3};
     const double dels[] = {0.0, 0.2};
+    // Deletion-time divergence: all of a row's dead cells share one time, half the rows
+    // diverge, or every dead cell has its own. The fold's whole premise is that the first
+    // is the common case, so it has to be generated -- and the last is what the exception
+    // channel exists for.
+    const double ddels[] = {0.0, 0.5, 1.0};
     const size_t widths[] = {1, 5, 40};
 
     for (size_t w : widths) {
         auto cols = make_schema(w);
-        for (double d : divs) for (double nl : nulls) for (double tt : ttls) for (double dl : dels) {
+        for (double d : divs) for (double nl : nulls) for (double tt : ttls) for (double dl : dels)
+        for (double dd : ddels) {
             gen_opts o; o.rows = 800; o.n_regular = w;
             o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = tt; o.delete_rate = dl;
+            o.del_divergence_rate = dd;
             o.marker_rate = 0.9; o.marker_ttl_rate = tt; o.row_del_rate = dl; o.part_del_rate = 0.1;
             o.extreme_ts_rate = 0.3;
             auto rows = generate(cols, o);
@@ -286,12 +337,26 @@ int roundtrip() {
                     if (ms.columns.size() > derived_leaves) { ++wider; }
                 }
                 auto data = shred(ms, cols, rows);
+                // Count what the folded deletion channel actually carried, so the
+                // dimension cannot pass by never being populated. A row with a dead cell
+                // has a __dmask entry; a row whose dead cells disagree also has an
+                // __ldtx_mask entry.
+                if (ms.dmask_index) {
+                    for (auto dl_ : data[*ms.dmask_index].def_levels) {
+                        if (dl_) { ++del_shared_rows; }
+                    }
+                }
+                if (ms.ldtx_mask_index) {
+                    for (auto dl_ : data[*ms.ldtx_mask_index].def_levels) {
+                        if (dl_) { ++del_exc_rows; }
+                    }
+                }
                 auto back = reassemble(ms, cols, data, rows.size());
                 std::string why;
                 if (!compare(rows, back, ms.level, why)) {
                     ++fails;
-                    std::printf("  FAIL w=%zu div=%.2f null=%.2f ttl=%.2f del=%.2f %s(->%s) exc=%s leaves=%s: %s\n",
-                                w, d, nl, tt, dl, to_string(lvl), to_string(ms.level),
+                    std::printf("  FAIL w=%zu div=%.2f null=%.2f ttl=%.2f del=%.2f ddel=%.2f %s(->%s) exc=%s leaves=%s: %s\n",
+                                w, d, nl, tt, dl, dd, to_string(lvl), to_string(ms.level),
                                 exc == exception_encoding::sparse ? "sparse" : "per-col",
                                 ls == leaf_set::derived ? "derived" : "conservative", why.c_str());
                     if (fails > 8) { std::printf("  (stopping after 8)\n"); goto done; }
@@ -304,6 +369,20 @@ done:
                 cases, fails, wider);
     if (!wider) {
         std::printf("  FAIL conservative leaf set was never wider -- the flag is a no-op\n");
+        ++fails;
+    }
+    std::printf("  folded deletion channel: %zu rows carried dead cells, %zu of them needed "
+                "an exception entry\n", del_shared_rows, del_exc_rows);
+    // Both arms, or the dimension proves nothing. Rows with dead cells exercise the fold;
+    // rows needing an exception exercise the divergent path. Passing with either at zero
+    // would mean the deletion channel was never written, or never written with divergence.
+    if (!del_shared_rows) {
+        std::printf("  FAIL no row ever carried a dead cell -- the deletion channel is untested\n");
+        ++fails;
+    }
+    if (!del_exc_rows) {
+        std::printf("  FAIL no row ever needed a deletion exception -- the divergent path "
+                    "is untested\n");
         ++fails;
     }
     std::printf("%s\n", fails ? "SHRED ROUNDTRIP FAIL" : "SHRED ROUNDTRIP PASS");
@@ -332,6 +411,10 @@ int filetrip() {
             // happened to line up, which hid a ragged row group for years'
             // worth of cases.
             o.delete_rate = 0.15;
+            // Mostly-shared deletion times with a divergent minority, so a single file
+            // carries both arms of the folded channel through the real encoders, page
+            // layout and compressor -- not just the in-memory shred/reassemble pair.
+            o.del_divergence_rate = 0.3;
             o.marker_rate = 0.9; o.marker_ttl_rate = 0.1;
             o.row_del_rate = 0.05; o.part_del_rate = 0.1;
             auto rows = generate(cols, o);
@@ -485,6 +568,11 @@ int recovery() {
                 gen_opts o; o.rows = 800; o.n_regular = w;
                 o.divergence_rate = d; o.null_rate = nl; o.ttl_rate = ttl;
                 o.marker_rate = 0.9; o.marker_ttl_rate = ttl > 0 ? 0.2 : 0.0;
+                // Cell tombstones, which this test never generated: `row_del_rate` is a
+                // *row* tombstone. So the folded deletion channel was absent from every
+                // recovered schema here, and recovery of it was untested. Both divergence
+                // arms, so __dmask and the __ldtx pair all have to be recovered by name.
+                o.delete_rate = 0.2; o.del_divergence_rate = d;
                 o.row_del_rate = 0.05; o.part_del_rate = 0.1;
                 o.extreme_ts_rate = 0.3;
                 auto rows = generate(cols, o);
@@ -551,6 +639,156 @@ int recovery() {
 
     std::printf("schema recovery: %zu cases, %zu failures\n", cases, fails);
     std::printf("%s\n", fails ? "RECOVERY FAIL" : "RECOVERY PASS");
+    return fails ? 1 : 0;
+}
+
+// ------------------------------------------------- pre-fold files must still read
+//
+// Before the deletion channel was folded, a dead cell's deletion time went into its own
+// column's `__ldt_<col>` leaf, and reassemble() decided deadness by "no value, but
+// `__ldt_<col>` has one". Files written that way exist on disk and must keep reading
+// exactly, or upgrading the binary resurrects every deleted cell in them.
+//
+// This builds such a file deliberately rather than checking one in as a fixture: the
+// legacy schema comes from build_mapped_schema() with the folded channel switched off, and
+// the row data is shredded here by the pre-fold rule -- `__ldt_<col>` carries the deletion
+// time regardless of liveness. Then it goes through a real Parquet file and is recovered
+// from its footer alone, which is the actual compatibility path: the reader sees no
+// `__dmask`, infers the legacy layout, and reassemble()'s per-column clause reads the dead
+// cells back.
+int legacy() {
+    size_t fails = 0;
+
+    // Four bigint regular columns, so every value leaf is INT64 and the hand-shredding
+    // below stays readable. The point here is the deletion channel, not type coverage.
+    std::vector<cql_column> cols;
+    cols.push_back({"pk", cql_type::bigint, column_kind::partition_key});
+    cols.push_back({"ck", cql_type::timestamp, column_kind::clustering_key});
+    for (int i = 0; i < 4; ++i) {
+        cols.push_back({"c" + std::to_string(i), cql_type::bigint, column_kind::regular});
+    }
+    const size_t nreg = 4;
+
+    // Every combination of the three cell states across four columns, plus the two things
+    // that used to share the `__ldt_<col>` leaf: a live cell with a TTL (ldt = expiry) and
+    // a dead cell (ldt = deletion time). Deletion times deliberately both shared within a
+    // row and divergent.
+    const int64_t base_ts = 1700000000000000LL;
+    std::vector<row> rows;
+    for (size_t i = 0; i < 200; ++i) {
+        row r;
+        r.key.push_back(int64_t(i));
+        r.key.push_back(base_ts + int64_t(i) * 1000);
+        for (size_t k = 0; k < nreg; ++k) {
+            const size_t state = (i / (k + 1) + k) % 4;
+            if (state == 0) { continue; }                    // absent
+            cell c;
+            c.timestamp = base_ts;                           // no divergence: keeps __tsx out
+            if (state == 1) {                                // live, no TTL
+                c.live = true;
+                c.v = int64_t(i * 10 + k);
+            } else if (state == 2) {                          // live with a TTL: ldt = expiry
+                c.live = true;
+                c.v = int64_t(i * 10 + k);
+                c.ttl = int32_t(3600 + k);
+                c.local_deletion_time = int32_t(50000 + i);
+            } else {                                          // dead: ldt = deletion time
+                c.live = false;
+                c.local_deletion_time = (i % 3 == 0)
+                        ? int32_t(90000 + i)                  // shared across the row
+                        : int32_t(90000 + i + int(k) * 7);    // divergent within the row
+            }
+            r.cells.emplace(k, std::move(c));
+        }
+        rows.push_back(std::move(r));
+    }
+
+    // The legacy leaf set: TTL and per-column deletion leaves present, folded channel
+    // absent. This is what build_mapped_schema() produced before the fold existed.
+    schema_flags f;
+    f.col_diverges.assign(nreg, false);
+    f.any_ttl = true;
+    f.any_live_expiry = true;    // materialises __ldt_<col>
+    f.any_dead_cell = false;     // and no __dmask / __ldt / __ldtx_*
+    f.all_same_ts = false;
+    auto ms = build_mapped_schema(cols, folding_level::row_folded, f);
+    if (ms.dmask_index || ms.ldt_index) {
+        std::printf("  FAIL legacy schema materialised the folded channel\n");
+        ++fails;
+    }
+
+    // Hand-shred by the pre-fold rule.
+    std::vector<column_data> data(ms.columns.size());
+    for (const auto& r : rows) {
+        data[0].i64.push_back(std::get<int64_t>(r.key[0]));
+        data[1].i64.push_back(std::get<int64_t>(r.key[1]));
+        for (size_t k = 0; k < nreg; ++k) {
+            const size_t vcol = ms.value_leaf[k];
+            auto it = r.cells.find(k);
+            const bool present = it != r.cells.end() && it->second.v.has_value();
+            data[vcol].def_levels.push_back(present ? 1 : 0);
+            data[vcol].i64.push_back(present ? std::get<int64_t>(*it->second.v) : 0);
+            const size_t t = *ms.l1_ttl_index[k];
+            const bool has_ttl = it != r.cells.end() && it->second.ttl.has_value();
+            data[t].def_levels.push_back(has_ttl ? 1 : 0);
+            data[t].i32.push_back(has_ttl ? *it->second.ttl : 0);
+            // THE LEGACY RULE: one leaf per column, carrying both a live cell's expiry
+            // and a dead cell's deletion time, told apart only by whether the value is
+            // present.
+            const size_t l = *ms.l1_ldt_index[k];
+            const bool has_ldt = it != r.cells.end() &&
+                                 it->second.local_deletion_time.has_value();
+            data[l].def_levels.push_back(has_ldt ? 1 : 0);
+            data[l].i32.push_back(has_ldt ? *it->second.local_deletion_time : 0);
+        }
+        data[*ms.ts_index].i64.push_back(base_ts);
+    }
+
+    // Through a real file, and recovered from the footer alone -- no write-side schema.
+    format::writer_options wo;
+    wo.page_values = 64;                 // several pages per chunk
+    std::vector<std::optional<format::encoding>> hints;
+    for (const auto& c : ms.columns) { hints.push_back(c.preferred); }
+    format::parquet_file_writer fw(
+            format::parquet_file_writer::nested_schema{ms.tree, std::move(hints)}, wo);
+    fw.add_key_value("scylla.folding_level", to_string(ms.level));
+    fw.add_row_group(data);
+    auto img = fw.finish();
+
+    try {
+        auto fm = format::parse_footer(img);
+        auto rec = recover_mapped_schema(fm, cols);
+        if (rec.dmask_index) {
+            std::printf("  FAIL recovered a folded channel from a pre-fold file\n");
+            ++fails;
+        }
+        auto back = format::read_file(img);
+        auto rt = reassemble(rec, cols, back, size_t(fm.num_rows));
+        std::string why;
+        if (!compare(rows, rt, rec.level, why)) {
+            std::printf("  FAIL pre-fold file did not round-trip: %s\n", why.c_str());
+            ++fails;
+        }
+    } catch (const std::exception& e) {
+        std::printf("  FAIL pre-fold file threw: %s\n", e.what());
+        ++fails;
+    }
+
+    // Count what was actually at stake, so a silently-empty case cannot pass.
+    size_t dead = 0, expiry = 0;
+    for (const auto& r : rows) {
+        for (const auto& [k, c] : r.cells) {
+            if (!c.v && c.local_deletion_time) { ++dead; }
+            if (c.v && c.local_deletion_time) { ++expiry; }
+        }
+    }
+    std::printf("pre-fold compatibility: %zu dead cells, %zu live-with-expiry cells, "
+                "%zu failures\n", dead, expiry, fails);
+    if (!dead || !expiry) {
+        std::printf("  FAIL the fixture did not contain both cases\n");
+        ++fails;
+    }
+    std::printf("%s\n", fails ? "LEGACY FAIL" : "LEGACY PASS");
     return fails ? 1 : 0;
 }
 
@@ -749,7 +987,7 @@ int collections() {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|recovery|collections|cost}\n", argv[0]); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|recovery|legacy|collections|cost}\n", argv[0]); return 2; }
     try {
         std::string c = argv[1];
         if (c == "roundtrip") { return roundtrip(); }
@@ -757,6 +995,7 @@ int main(int argc, char** argv) {
         if (c == "filetrip")  { return filetrip(); }
         if (c == "logical")   { return logical(); }
         if (c == "recovery")  { return recovery(); }
+        if (c == "legacy")    { return legacy(); }
         if (c == "collections") { return collections(); }
         std::fprintf(stderr, "unknown command\n"); return 2;
     } catch (const std::exception& e) {
