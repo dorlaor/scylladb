@@ -631,17 +631,26 @@ conservative set is modest even on the corpus's widest table. And the default re
 **20 803 872 exactly**, the same value every controlled run gives, with size growing smoothly as
 row groups shrink. **No row-group setting produces 84.5 MB**, so the mechanism is not this.
 
-**Where that leaves it.** Backblaze at the shipped defaults is 20 803 872 bytes against a
-~21.7 MB native, i.e. 95.8 %, established by repeated isolated runs and now by a controlled sweep
-that lands on the same number. The 84.5 MB and 32.5 MB readings have only ever occurred inside
-**full-corpus batch runs**, where Backblaze runs after five other datasets, and never in an
-isolated run. Since `pq` output does not depend on the compression dictionary at all, a
-batch-polluted dictionary cannot explain the `pq` figure either.
+**Where that leaves it — closed 2026-08-21, and the remaining "anomaly" was never one.** Backblaze
+at the shipped defaults is 20 803 872 bytes against a ~21.7 MB native, i.e. 95.8 %, established by
+repeated isolated runs and by a controlled sweep that lands on the same number. The 84.5 MB and
+32.5 MB readings are a *different quantity*, not a fault: the dataset is loaded by binding every
+column with NULL for a missing reading, which writes one cell tombstone per null — 42 448 175 of them
+— and those readings are the runs in which the tombstones had not been purged yet.
 
-So: the controlled value is trustworthy and is what the corpus should quote; the batch anomaly is
-real, unexplained, and confined to a setting no published figure depends on. Not worth more
-iterations until it reproduces in isolation — **if it does, capture the sstable and diff its footer
-against a good one**, which is the one diagnostic not yet tried.
+§10.18 of the design doc settles it. A table created without a `tombstone_gc` property gets mode
+`repair`, not `timeout` (`tombstone_gc.cc:325`), and under RF=1 `repair` short-circuits `gc_before` to
+*now* (`tombstone_gc.cc:188`) — `gc_grace_seconds` is never read. So on this single-node lab every
+cell tombstone is purgeable the moment it is written, and whether a given compaction has got to it is
+a commitlog-release race. Measured: 4/4 purged at the default mode, 0/4 under `timeout`, 0/4 under
+`disabled`; and on a four-node cluster with the default mode, RF=1 purges while RF=3 retains every
+one. Which inverts the framing — **the ~84 MB reading is what a replicated cluster stores, and
+20 803 872 is what RF=1 purges down to.** The "batch-only" claim was also wrong; it was never about
+batch context, only about timing.
+
+Nothing here was a footer or a format problem, so the footer diff this section proposed as the next
+diagnostic would have found nothing. `harness.py` now accepts `PQ_TOMBSTONE_GC` (unset by default) to
+pin the mode, which is what makes a bind-NULL dataset reproducible either way.
 
 **Two conclusions I published and then had to withdraw**, worth recording because both were
 confidently argued from a broken selector: that the stable 59 351 983 was a fossil (it was the
