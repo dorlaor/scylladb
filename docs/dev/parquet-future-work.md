@@ -226,6 +226,92 @@ real gap was `add_compression_ratio`, now fixed: the writer records it from the 
 `CompressionInfo` component. Measured 0.0732 through the REST API, corroborated to within 0.2
 points by the independent raw measurement in §10.1f-raw.
 
+### 7a. ~~The deletion channel was never folded~~ — closed 2026-08-21
+
+Not previously an item here, which is part of why it survived so long: the cost showed up as a
+Backblaze *measurement* anomaly and was filed as measurement methodology (§10.18), so nothing pointed
+at the format.
+
+L1 folded every cell's write time into one `__ts` per row from the beginning. A dead cell's deletion
+time never got the same treatment — it went into its own column's `__ldt_<col>` leaf, 195 leaves and
+60.7 MB on Backblaze's 197 columns against 1.9 MB for the same rows' write times. That ~32× gap is
+the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB.
+
+Now four leaves independent of table width: `__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`.
+Measured on real `pq` sstables, tombstones retained, identical pipeline both sides: **87 532 117 ->
+28 246 463 B**. §10.28 has the design, the losslessness argument, the compatibility story and what is
+deliberately excluded (collections, for §10.26's reason).
+
+**Still open, and small:** `__ldt` is emitted PLAIN. Deletion times are a narrow, heavily repeating
+range of int32, which is what dictionary and `DELTA_BINARY_PACKED` are for, and the leaf is now
+406 102 B of a 28 MB file. Worth a look, but note the warning attached to `__ts` in
+`build_mapped_schema()`: asking for delta on a folded metadata leaf produced a real correctness
+failure there and was reverted for ~4 KB. Measure before changing.
+
+---
+
+## Measurement-method debt
+
+Not defects — the numbers below are all real. They answer a different question from the one their
+label implies, which is easier to overlook than a wrong number and worse for a reader who trusts the
+label. Each item is a relabelling-and-scoping job, not a re-engineering one.
+
+### 15. Every "cold" figure in §10.21, §10.24, §10.25 and §10.26 is a warm reading
+
+Those figures are `min` over 400 probes after a single restart. The first probe pays whatever
+per-sstable one-time cost exists, so the *minimum* can only be a footer-cache hit — by construction it
+is the one reading that cannot be cold.
+
+The two numbers, both real, both measured:
+
+| | at shipping defaults |
+|---|---:|
+| labelled "cold" (min of 400 after a restart) | 1 149 µs |
+| genuine first read of an sstable | **3 680 µs** |
+
+They answer different questions — steady-state-after-warmup versus first contact — and both are worth
+having. §10.27 established this and drew the right conclusion from it (it is why the side index was
+decided against: 2.5 ms paid once per sstable per restart does not move steady state). What it did not
+do is go back and relabel the four sections whose tables still say "cold".
+
+**The job:** relabel them, and state at each which question the figure answers. A GA reader sizing a
+latency budget will read "cold" as cold. Where a section's argument depends on the distinction, say
+which number the argument uses.
+
+### 16. `harness.py`'s "Parquet" figures are pyarrow re-encodings, not `pq` sstables
+
+`harness.py` reads rows back over CQL and re-encodes them with `pyarrow.parquet.write_table`,
+synthesising the metadata leaves itself. Every probe line in a harness run shows `pq=0` — it never
+writes a `pq` sstable. It is a *model* of the mapping, and a useful one, but it is not a measurement
+of Scylla's Parquet writer, and two of its limits matter:
+
+* It cannot see cell metadata a `SELECT` does not return. It emits `__ldt_<col>` as an all-null
+  column, so the 60.7 MB the per-column deletion channel actually cost never appeared in any harness
+  figure at all (§10.28) — the defect was invisible to the instrument most often pointed at it.
+* It models the leaf *set*, not the writer's encoding choices, page layout, statistics or footer.
+
+**Partly established, 2026-08-21.** Two boundaries are now known and neither should be re-litigated:
+
+* **§10.1f-prod — the eight-dataset corpus table, "the table to quote" — is NOT affected.** It comes
+  from `measure_native_vs_pq.sh`, which performs the real `ALTER TABLE ... WITH storage_format =
+  'parquet'` and sums actual `pq` sstables. Verified by reading the script.
+* **`bb_ldt_fold.py` and `bb_investigate.py` are the real-write-path tools.** Prefer them for any
+  format claim.
+
+**What is not established, and is the job.** Which *other* published tables are harness output cited
+as format measurements. The candidates, by line in `parquet-storage-format.md`, are the ones whose
+column headers say "Parquet L1" or "Parquet L1/zstd-3": the codec matrix (~2041), the token-order
+comparison (~2065), the superseded §10.1f export table (~2615, already marked superseded), the
+variant tables (~2740, ~2751), the row-count sweep (~2972), and the **folding-level comparison
+(~2989)**.
+
+**Flagging the last one specifically, because it is the significant case.** The L0/L1/L2 table — the
+source of §10.3's headline folding claim — is pyarrow model output. The model does represent the leaf
+*counts* the mapping produces, which is the mechanism the claim is about, so the claim is probably
+sound; but a structural claim about our writer currently rests on a re-encoding that is not our
+writer, and §10.28 is a concrete instance of that model being blind to a real 60 MB cost. This
+deserves a re-measurement through the real write path rather than a relabelling.
+
 ---
 
 ## Hybrid tiering — trimmed to three criteria, further items open
