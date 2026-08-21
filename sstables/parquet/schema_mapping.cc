@@ -58,6 +58,45 @@ std::optional<int64_t> modal_timestamp(const row& r) {
     return best;
 }
 
+// The two ways a cell can carry a local_deletion_time, told apart by whether it has a
+// value. They are disjoint, which is what lets the deletion time be folded while the
+// expiry stays per column.
+//
+//   dead cell   -- a tombstone. No value, and an ldt that is the deletion time.
+//   live expiry -- a live cell with a TTL, whose ldt is when it will expire.
+//
+// `is_dead_cell` is deliberately exactly the set the per-column layout round-tripped as
+// dead: reassemble() decided deadness by "no value, but `__ldt_<col>` has one". So the
+// fold preserves that set precisely rather than widening it. A cell with no value and no
+// deletion time is not representable at L1 in either layout -- a tombstone with no
+// deletion time has nothing to store and no meaning -- and the write path cannot produce
+// one: writer_impl sets local_deletion_time on every dead cell it builds.
+inline bool is_dead_cell(const cell& c) {
+    return !c.v.has_value() && c.local_deletion_time.has_value();
+}
+inline bool is_live_expiry(const cell& c) {
+    return c.v.has_value() && c.local_deletion_time.has_value();
+}
+
+// The deletion time a row folds to: the one most of its dead cells agree on. Same choice
+// as modal_timestamp() and for the same reason -- the mode minimises how many cells need
+// an exception entry. A bind-NULL INSERT is one statement, so all of its tombstones share
+// one deletion time, the mode is the only value present, and the exception channel stays
+// empty. Ties break to the smaller value so the choice is deterministic.
+std::optional<int32_t> modal_deletion_time(const row& r) {
+    std::unordered_map<int32_t, int> freq;
+    for (const auto& [i, c] : r.cells) {
+        if (is_dead_cell(c)) { ++freq[*c.local_deletion_time]; }
+    }
+    if (freq.empty()) { return std::nullopt; }
+    int32_t best = freq.begin()->first;
+    int bestn = 0;
+    for (auto& [ldt, n] : freq) {
+        if (n > bestn || (n == bestn && ldt < best)) { best = ldt; bestn = n; }
+    }
+    return best;
+}
+
 void push_value(column_data& cd, phys_type pt, const value& v) {
     switch (pt) {
     case phys_type::int32:      cd.i32.push_back(std::get<int32_t>(v)); break;
@@ -134,7 +173,8 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
         if (r.rtc)      { f.any_rtc = true; }
         for (const auto& [ci, c] : r.cells) {
             if (c.ttl) { f.any_ttl = true; }
-            if (c.local_deletion_time || !c.live) { f.any_deletion = true; }
+            if (is_live_expiry(c)) { f.any_live_expiry = true; }
+            if (is_dead_cell(c))   { f.any_dead_cell = true; }
             if (mt && c.timestamp != *mt) {
                 f.col_diverges[ci] = true;
                 f.all_same_ts = false;
@@ -146,7 +186,7 @@ schema_flags scan_rows(const std::vector<cql_column>& cols, const std::vector<ro
         // writer has to fix the leaf set before its first row group, and by then it has
         // seen only a prefix of the rows -- so anything a later row might need has to
         // exist already. Unused leaves are all-null and cost a fixed ~225 B each.
-        f.any_ttl = f.any_deletion = true;
+        f.any_ttl = f.any_live_expiry = f.any_dead_cell = true;
         f.any_marker = f.any_marker_ttl = true;
         f.any_row_del = f.any_part_del = f.any_rtc = true;
         // Forces the divergence channel on: without it a later row whose cell timestamp
@@ -288,12 +328,16 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
     ms.l1_ttl_index.assign(reg_idx.size(), std::nullopt);
     ms.l1_ldt_index.assign(reg_idx.size(), std::nullopt);
 
-    const bool any_ttl = flags.any_ttl, any_deletion = flags.any_deletion;
+    const bool any_ttl = flags.any_ttl;
+    const bool any_live_expiry = flags.any_live_expiry, any_dead_cell = flags.any_dead_cell;
     const std::vector<bool>& col_diverges = flags.col_diverges;
     const std::optional<int64_t>& single_ts = flags.single_ts;
 
+    // L2 keeps one timestamp for the whole row group and no per-cell metadata at all, so
+    // *either* kind of deletion time breaks its precondition -- as before, when the two
+    // were one flag.
     if (requested == folding_level::uniform &&
-        !(flags.all_same_ts && !any_ttl && !any_deletion &&
+        !(flags.all_same_ts && !any_ttl && !any_live_expiry && !any_dead_cell &&
           !flags.any_marker && !flags.any_row_del && !flags.any_part_del &&
           !flags.any_no_ck && !flags.any_rtc)) {
         // Precondition broken -- fall back rather than lose information.
@@ -477,13 +521,33 @@ mapped_schema build_mapped_schema(const std::vector<cql_column>& cols,
                                       repetition::optional, std::nullopt, std::nullopt});
             }
         }
-        if (any_deletion) {
+        // Per column, and only for the expiry of a *live* cell. A TTL is a property of the
+        // individual cell -- two columns of one row can expire at different times -- so
+        // there is nothing row-shaped to fold here.
+        if (any_live_expiry) {
             for (size_t k = 0; k < reg_idx.size(); ++k) {
                 if (ms.value_is_collection[k]) { continue; }
                 ms.l1_ldt_index[k] = ms.columns.size();
                 ms.columns.push_back({"__ldt_" + cols[reg_idx[k]].name, phys_type::int32,
                                       repetition::optional, std::nullopt, std::nullopt});
             }
+        }
+        // The folded deletion channel: three leaves for the whole table, where the
+        // per-column layout spent one leaf per column. See mapped_schema for what each
+        // carries and why __dmask cannot be dropped.
+        if (any_dead_cell) {
+            ms.ldt_index = ms.columns.size();
+            ms.columns.push_back({"__ldt", phys_type::int32, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.dmask_index = ms.columns.size();
+            ms.columns.push_back({"__dmask", phys_type::byte_array, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.ldtx_mask_index = ms.columns.size();
+            ms.columns.push_back({"__ldtx_mask", phys_type::byte_array, repetition::optional,
+                                  std::nullopt, std::nullopt});
+            ms.ldtx_vals_index = ms.columns.size();
+            ms.columns.push_back({"__ldtx_vals", phys_type::byte_array, repetition::optional,
+                                  std::nullopt, std::nullopt});
         }
         // Row marker, row tombstone, partition tombstone. Each group appears only
         // if some row uses it, so a table that never deletes pays nothing.
@@ -632,10 +696,22 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
         // number of leaves.
         for (size_t k = 0; k < reg_idx.size(); ++k) {
             if (cols[reg_idx[k]].multi_cell) { continue; }
-            f.any_ttl      = has("__ttl_" + cols[reg_idx[k]].name);
-            f.any_deletion = has("__ldt_" + cols[reg_idx[k]].name);
+            f.any_ttl = has("__ttl_" + cols[reg_idx[k]].name);
+            // `__ldt_<col>` means different things in the two layouts, and the file says
+            // which by whether the folded channel is there:
+            //
+            //   __dmask present  -- written with the fold. __ldt_<col>, if it exists at
+            //                       all, holds only live cells' expiry times.
+            //   __dmask absent   -- written before the fold. __ldt_<col> holds both, and
+            //                       reassemble()'s per-column clause reads the dead ones.
+            //
+            // Either way the flag reproduces the same leaf *layout*, which is all the
+            // builder needs; the leaf-name check at the end of this function is what
+            // proves the reproduction was exact.
+            f.any_live_expiry = has("__ldt_" + cols[reg_idx[k]].name);
             break;
         }
+        f.any_dead_cell  = has("__dmask");
         f.any_marker     = has("__rm");
         f.any_marker_ttl = has("__rm_ttl");
         f.any_row_del    = has("__rt_ts");
@@ -813,9 +889,11 @@ std::vector<column_data> shred(const mapped_schema& ms,
                     out[b].i32.push_back(has_ttl ? *it->second.ttl : 0);
                 }
                 if (ms.l1_ldt_index[k]) {
+                    // Live cells only. A dead cell's deletion time goes to the folded
+                    // channel below, so this leaf stays null for it -- and on a table
+                    // that never uses a TTL the leaf is not materialised at all.
                     const size_t b = *ms.l1_ldt_index[k];
-                    bool has_ldt = it != r.cells.end() &&
-                                   it->second.local_deletion_time.has_value();
+                    bool has_ldt = it != r.cells.end() && is_live_expiry(it->second);
                     out[b].def_levels.push_back(has_ldt ? 1 : 0);
                     out[b].i32.push_back(has_ldt ? *it->second.local_deletion_time : 0);
                 }
@@ -839,6 +917,49 @@ std::vector<column_data> shred(const mapped_schema& ms,
             out[*ms.tsx_vals_index].str.push_back(any ? vals : std::string());
         }
         if (ms.ts_index) { out[*ms.ts_index].i64.push_back(mt.value_or(0)); }
+
+        // The folded deletion channel, built the same way as __tsx above: one pass over the
+        // row's columns in column order, a bitmap of which are dead, and deltas only for the
+        // ones that disagree with the row's deletion time.
+        //
+        // Written once per row and unconditionally when the leaves exist -- every leaf must
+        // get exactly one slot per row or the row group is ragged, which is the failure
+        // 10.15 and the __ttl_/__ldt_ pairing bug were both about.
+        if (ms.dmask_index) {
+            const auto mdt = modal_deletion_time(r);
+            const size_t nbytes = (reg_idx.size() + 7) / 8;
+            std::string dmask(nbytes, '\0'), xmask(nbytes, '\0'), xvals;
+            bool any_dead = false, any_exc = false;
+            for (size_t k = 0; k < reg_idx.size(); ++k) {
+                // A collection column never participates: its per-element deletion times
+                // live inside its MAP group. r.collections is a separate map from r.cells,
+                // so this is already true -- stated here because the bitmap is indexed by
+                // regular-column position and a stray bit would be read as a dead scalar.
+                if (ms.value_is_collection[k]) { continue; }
+                auto it = r.cells.find(k);
+                if (it == r.cells.end() || !is_dead_cell(it->second)) { continue; }
+                dmask[k / 8] = char(uint8_t(dmask[k / 8]) | uint8_t(1u << (k % 8)));
+                any_dead = true;
+                const int32_t ldt = *it->second.local_deletion_time;
+                if (mdt && ldt != *mdt) {
+                    xmask[k / 8] = char(uint8_t(xmask[k / 8]) | uint8_t(1u << (k % 8)));
+                    // Deltas as int64 through the same zigzag helper the timestamp channel
+                    // uses. int32 differences cannot overflow when widened, so no unsigned
+                    // trick is needed here -- unlike ts_delta, which subtracts two int64s
+                    // that legitimately span the whole range.
+                    put_zigzag(xvals, int64_t(ldt) - int64_t(*mdt));
+                    any_exc = true;
+                }
+            }
+            out[*ms.ldt_index].def_levels.push_back(any_dead ? 1 : 0);
+            out[*ms.ldt_index].i32.push_back(any_dead ? *mdt : 0);
+            out[*ms.dmask_index].def_levels.push_back(any_dead ? 1 : 0);
+            out[*ms.dmask_index].str.push_back(any_dead ? dmask : std::string());
+            out[*ms.ldtx_mask_index].def_levels.push_back(any_exc ? 1 : 0);
+            out[*ms.ldtx_mask_index].str.push_back(any_exc ? xmask : std::string());
+            out[*ms.ldtx_vals_index].def_levels.push_back(any_exc ? 1 : 0);
+            out[*ms.ldtx_vals_index].str.push_back(any_exc ? xvals : std::string());
+        }
 
         // Row marker as a delta against the row's own timestamp: an INSERT sets
         // both from the same write, so this is almost always zero.
@@ -1035,6 +1156,40 @@ std::vector<row> reassemble(const mapped_schema& ms,
             }
         }
 
+        // This row's dead cells, decoded once from the folded deletion channel into
+        // column -> deletion time. Empty for a file written before the channel existed;
+        // the per-column fallback below covers those.
+        std::map<size_t, int32_t> dead;
+        if (ms.dmask_index && !absent(*ms.dmask_index) && cd[*ms.dmask_index].def_levels[i]) {
+            if (!ms.ldt_index) {
+                throw std::runtime_error("reassemble: __dmask without __ldt");
+            }
+            require_read(*ms.ldt_index, "row deletion time");
+            const int32_t row_ldt = cd[*ms.ldt_index].i32[i];
+            const std::string& dm = cd[*ms.dmask_index].str[i];
+            // The exception pair is written together, and only ever alongside a live
+            // __dmask, so a live mask beside an elided vals is impossible. Rejecting it
+            // costs one branch and turns "impossible" into a loud failure rather than a
+            // wrong deletion time -- the same reasoning as the __tsx pair above.
+            const std::string* xm = nullptr;
+            const std::string* xv = nullptr;
+            if (ms.ldtx_mask_index && !absent(*ms.ldtx_mask_index) &&
+                cd[*ms.ldtx_mask_index].def_levels[i]) {
+                require_read(*ms.ldtx_vals_index, "deletion exception values");
+                xm = &cd[*ms.ldtx_mask_index].str[i];
+                xv = &cd[*ms.ldtx_vals_index].str[i];
+            }
+            size_t pos = 0;
+            for (size_t k = 0; k < reg_idx.size(); ++k) {
+                if (!(k / 8 < dm.size() && (uint8_t(dm[k / 8]) & (1u << (k % 8))))) { continue; }
+                int32_t ldt = row_ldt;
+                if (xm && k / 8 < xm->size() && (uint8_t((*xm)[k / 8]) & (1u << (k % 8)))) {
+                    ldt = int32_t(int64_t(row_ldt) + get_zigzag(*xv, pos));
+                }
+                dead.emplace(k, ldt);
+            }
+        }
+
         for (size_t k = 0; k < reg_idx.size(); ++k) {
             // Recorded, not computed: a collection column contributes five leaves
             // rather than one, so leaf positions no longer follow from k.
@@ -1080,9 +1235,37 @@ std::vector<row> reassemble(const mapped_schema& ms,
                 // along and simply was not being read.
                 const bool has_ttl = ms.l1_ttl_index[k] && !absent(*ms.l1_ttl_index[k]) &&
                                      cd[*ms.l1_ttl_index[k]].def_levels[i] != 0;
-                const bool has_ldt = ms.l1_ldt_index[k] && !absent(*ms.l1_ldt_index[k]) &&
+                const bool has_percol_ldt = ms.l1_ldt_index[k] &&
+                                     !absent(*ms.l1_ldt_index[k]) &&
                                      cd[*ms.l1_ldt_index[k]].def_levels[i] != 0;
-                if (!present && !has_ldt) { continue; }
+                const auto dit = dead.find(k);
+                const bool folded_dead = dit != dead.end();
+                // A __dmask bit on a column that also has a value is contradictory: the
+                // same cell cannot be both live and a tombstone. It means the mask is
+                // being read against the wrong columns, so the deletion times would land
+                // on the wrong cells. Fail rather than pick one.
+                if (folded_dead && present) {
+                    throw std::runtime_error("reassemble: __dmask marks column " +
+                            std::to_string(k) + " dead but it has a value");
+                }
+                // Three states, and they have to stay three:
+                //
+                //   value present                     -> live (per-column ldt is its expiry)
+                //   __dmask bit set                   -> DEAD, time from the folded channel
+                //   no value but a per-column __ldt   -> DEAD, pre-fold file
+                //   none of the above                 -> absent, never written
+                //
+                // Collapsing dead into absent is what resurrects data: the deletion stops
+                // shadowing whatever it was hiding, so the old value reappears on the next
+                // merge. That bug cost 540 test cases' worth of false confidence once
+                // already.
+                //
+                // Both dead clauses are needed, and they cannot collide. A file written
+                // before the folded channel has no __dmask and put every deletion time in
+                // __ldt_<col>; a file written after it never puts a dead cell's time
+                // there, so the legacy clause is unreachable on a new file. A live cell
+                // with a TTL has present == true and is untouched by either.
+                if (!present && !folded_dead && !has_percol_ldt) { continue; }
                 cell c;
                 c.live = present;
                 if (present) { c.v = read_value(cd[vcol], ms.columns[vcol].type, i); }
@@ -1095,7 +1278,12 @@ std::vector<row> reassemble(const mapped_schema& ms,
                     c.timestamp = cd[*ms.ts_exc_index[k]].i64[i];
                 }
                 if (has_ttl) { c.ttl = cd[*ms.l1_ttl_index[k]].i32[i]; }
-                if (has_ldt) { c.local_deletion_time = cd[*ms.l1_ldt_index[k]].i32[i]; }
+                if (folded_dead) {
+                    c.local_deletion_time = dit->second;
+                } else if (has_percol_ldt) {
+                    // A live cell's expiry, or a dead cell's time in a pre-fold file.
+                    c.local_deletion_time = cd[*ms.l1_ldt_index[k]].i32[i];
+                }
                 r.cells.emplace(k, std::move(c));
             }
         }

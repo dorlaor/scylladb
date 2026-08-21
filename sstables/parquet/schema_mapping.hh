@@ -307,7 +307,43 @@ struct mapped_schema {
     // individually rather than as base + k, because the groups are skipped for
     // collection columns (their per-element metadata lives inside the group) and
     // because writing only one of the two silently produced a ragged row group.
+    //
+    // `l1_ldt_index` now carries only the *expiry of a live cell* -- a cell that has a
+    // value and a TTL. A **dead** cell's deletion time goes to the folded channel below.
+    // The two are disjoint by construction: the discriminator is whether the cell has a
+    // value, so no cell writes to both.
     std::vector<std::optional<size_t>> l1_ttl_index, l1_ldt_index;
+    // L1, the folded deletion channel. The same trick as __ts/__tsx, applied to the
+    // other half of the cell metadata.
+    //
+    // Before this existed, every dead cell wrote its deletion time into its own column's
+    // `__ldt_<col>` leaf: one leaf per column, 195 of them on the Backblaze corpus slice,
+    // 60.1 MB for 42 448 175 tombstones, where the same rows' *write* times cost 1.9 MB in
+    // a single folded `__ts`. Same information shape, ~32x the cost, and the reason `pq`
+    // paid ~63 MB where the row format paid ~10 MB for the same tombstones. The fold was
+    // never extended; the data itself is not the defect.
+    //
+    // Three leaves, independent of table width:
+    //
+    //   __ldt        the row's deletion time -- the one most of its dead cells agree on.
+    //   __dmask      a per-row bitmap of which regular columns are dead in this row. This
+    //                also carries what `__ldt_<col>`'s *presence* used to mean, and it has
+    //                to: "dead" and "absent" are different states (a dead cell must keep
+    //                shadowing older data on another replica, so it cannot be written as a
+    //                Parquet null), and the value leaf's definition level cannot tell them
+    //                apart. Losing this distinction resurrects deleted data.
+    //   __ldtx_mask  which of those dead cells disagree with the row's deletion time, and
+    //   __ldtx_vals  their zigzag-varint deltas from it. Both null for a row whose dead
+    //                cells all share one deletion time -- which is exactly what a
+    //                bind-NULL INSERT produces, since one statement carries one timestamp.
+    //
+    // NOT applied to collections. A non-frozen collection's per-element `__ldt` lives
+    // inside its MAP group, where there is no row-level leaf to fold into and the element
+    // count varies per row; `__dmask` indexes regular columns, and a collection column
+    // never sets its bit. Same exclusion, for the same reason, as the statistics-based
+    // leaf elision in design doc 10.26: a repeated slot that is "present but empty" is not
+    // the same as absent.
+    std::optional<size_t> ldt_index, dmask_index, ldtx_mask_index, ldtx_vals_index;
     // Row marker, row tombstone and partition tombstone leaves. Each group is
     // materialised only when the data needs it.
     std::optional<size_t> rm_index, rm_ttl_index, rm_ldt_index;
@@ -346,7 +382,18 @@ struct mapped_schema {
 // can recover the same answers from a file it did not write.
 struct schema_flags {
     bool any_ttl = false;
-    bool any_deletion = false;
+    // The two halves of what used to be one `any_deletion` flag. They drive different
+    // leaves now, so a table with TTLs but no tombstones no longer materialises a
+    // deletion channel, and the far more common reverse -- tombstones but no TTLs, which
+    // is every bind-NULL load -- no longer materialises one leaf per column.
+    //
+    //   any_live_expiry -- some cell has a value *and* a local_deletion_time, i.e. a live
+    //                      cell with a TTL, whose ldt is its expiry time. Per column, so
+    //                      it keeps the `__ldt_<col>` leaves.
+    //   any_dead_cell   -- some cell has no value but does have a local_deletion_time,
+    //                      i.e. a tombstone. Folded into the row-level channel.
+    bool any_live_expiry = false;
+    bool any_dead_cell = false;
     bool all_same_ts = true;
     bool any_marker = false;
     bool any_marker_ttl = false;
