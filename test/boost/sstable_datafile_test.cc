@@ -3196,47 +3196,164 @@ SEASTAR_TEST_CASE(find_first_position_in_partition_from_sstable_test) {
     });
 }
 
+// One randomly generated fixture, written and read back.
+//
+// `version` defaults to what `env.make_sstable(schema)` would have picked on its own,
+// `get_highest_sstable_version()`, which deliberately steps back past `pq` (`sstables/version.hh:87`)
+// -- so passing `pq` explicitly is the whole difference between this running against the native
+// format and running against Parquet, and it is one argument.
+//
+// Most of the coverage here is not the `bytes_on_disk()` assertion at the bottom: it is
+// `make_sstable_containing()`, which reads every sstable it builds back and compares it against the
+// input (`test/lib/sstable_utils.cc:83`). A codec that loses data therefore fails at *construction*,
+// which is why no comparison logic is written here and none should be added -- see
+// `test_pq_random_schema_fixed_seeds` below.
+static void check_sstable_bytes_correctness(test_env& env, sstring tname,
+        sstable_version_types version = sstables::get_highest_sstable_version()) {
+    auto random_spec = tests::make_random_schema_specification(
+            tname,
+            std::uniform_int_distribution<size_t>(1, 4),
+            std::uniform_int_distribution<size_t>(2, 4),
+            std::uniform_int_distribution<size_t>(2, 8),
+            std::uniform_int_distribution<size_t>(2, 8));
+    auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
+    auto schema = random_schema.schema();
+
+    testlog.info("Random schema:\n{}", random_schema.cql());
+
+    const auto muts = tests::generate_random_mutations(random_schema, 20).get();
+
+    auto sst = make_sstable_containing(env.make_sstable(schema, version), muts).get();
+
+    auto free_space = sst->get_storage().free_space().get();
+    BOOST_REQUIRE(free_space > 0);
+    testlog.info("prefix: {}, free space: {}", sst->get_storage().prefix(), free_space);
+
+    auto get_bytes_on_disk_from_storage = [&] (const sstables::shared_sstable& sst) {
+        uint64_t bytes_on_disk = 0;
+        auto& underlying_storage = const_cast<sstables::storage&>(sst->get_storage());
+        for (auto& component_type : sstables::test(sst).get_components()) {
+            file f = underlying_storage.open_component(*sst, component_type, open_flags::ro, file_open_options{}, true).get();
+            bytes_on_disk += f.size().get();
+        }
+        return bytes_on_disk;
+    };
+
+    auto expected_bytes_on_disk = get_bytes_on_disk_from_storage(sst);
+
+    testlog.info("expected={}, actual={}", expected_bytes_on_disk, sst->bytes_on_disk());
+
+    BOOST_REQUIRE(sst->bytes_on_disk() == expected_bytes_on_disk);
+}
+
 future<> test_sstable_bytes_correctness(sstring tname, test_env_config cfg) {
     return test_env::do_with_async([tname] (test_env& env) {
-        auto random_spec = tests::make_random_schema_specification(
-                tname,
-                std::uniform_int_distribution<size_t>(1, 4),
-                std::uniform_int_distribution<size_t>(2, 4),
-                std::uniform_int_distribution<size_t>(2, 8),
-                std::uniform_int_distribution<size_t>(2, 8));
-        auto random_schema = tests::random_schema{tests::random::get_int<uint32_t>(), *random_spec};
-        auto schema = random_schema.schema();
-
-        testlog.info("Random schema:\n{}", random_schema.cql());
-
-        const auto muts = tests::generate_random_mutations(random_schema, 20).get();
-
-        auto sst = make_sstable_containing(env.make_sstable(schema), muts).get();
-
-        auto free_space = sst->get_storage().free_space().get();
-        BOOST_REQUIRE(free_space > 0);
-        testlog.info("prefix: {}, free space: {}", sst->get_storage().prefix(), free_space);
-
-        auto get_bytes_on_disk_from_storage = [&] (const sstables::shared_sstable& sst) {
-            uint64_t bytes_on_disk = 0;
-            auto& underlying_storage = const_cast<sstables::storage&>(sst->get_storage());
-            for (auto& component_type : sstables::test(sst).get_components()) {
-                file f = underlying_storage.open_component(*sst, component_type, open_flags::ro, file_open_options{}, true).get();
-                bytes_on_disk += f.size().get();
-            }
-            return bytes_on_disk;
-        };
-
-        auto expected_bytes_on_disk = get_bytes_on_disk_from_storage(sst);
-
-        testlog.info("expected={}, actual={}", expected_bytes_on_disk, sst->bytes_on_disk());
-
-        BOOST_REQUIRE(sst->bytes_on_disk() == expected_bytes_on_disk);
+        check_sstable_bytes_correctness(env, tname);
     }, std::move(cfg));
 }
 
 SEASTAR_TEST_CASE(test_sstable_bytes_on_disk_correctness) {
     return test_sstable_bytes_correctness(get_name() + "_disk", {});
+}
+
+// Randomly generated schemas against `pq`, over a *fixed, checked-in* set of seeds.
+//
+// Why this exists. Until 2026-08-21 nothing in the tree ever pointed a randomly generated schema at
+// `pq`: every fixed-schema `pq` test hand-writes its columns, and every random-schema suite takes
+// the version-less `env.make_sstable(schema)` overload, which steps past `pq` by construction. The
+// consequence was a data-loss defect that survived the whole project and was found by hand, once --
+// the bit-packing accumulator in `DELTA_BINARY_PACKED` and in the RLE/bit-packed hybrid was a
+// `uint64_t`, one value too narrow for the 0..7 bits of the previous value it carries in flight, so
+// any residual width above 57 lost bits on the write side *and* the read side. It reached only the
+// `bigint`/`timestamp` **key** columns `schema_mapping.cc` delta-encodes, and only via a partition
+// key, whose value repeats within a partition and then jumps by an arbitrary 64-bit amount at the
+// boundary -- a near-full-width residual beside a run of zeros in one miniblock. Nothing but a
+// randomly generated schema had ever put a `bigint` in a `pq` key. Design doc 9.6b diagnoses the
+// defect; 9.6c records the choices made here and what they do not cover.
+//
+// Why fixed seeds and not `--random-seed`. The first attempt at this coverage was a single fixture
+// on the framework's seed, and it was correctly kept out of the tree: it failed about 1 seed in 4,
+// and flaky coverage is worse than none. Determinism is the answer, not randomness. Each seed below
+// is a literal, reseeding the engine `--random-seed` feeds, so a regression names a specific seed
+// that reproduces on demand instead of appearing intermittently one run in four.
+//
+// The comparison is `make_sstable_containing()`'s own read-back validation and nothing else. That is
+// deliberate: a reimplemented comparison harness has already, in this project, *been* the divergence
+// it was built to find, and a data-losing codec fails at construction here anyway.
+namespace {
+
+// The three seeds recorded as failing before the accumulator fix (design doc 9.6, 9.6b). Two put a
+// `bigint` in the partition key (`pk0` on 459189882, `pk2` on 12469992), the third a `bigint` in the
+// clustering key (`ck0` on 3262034951), which is why that one failed differently -- the partition
+// sequence matched and only the content diverged. These are the regression guard proper.
+const std::vector<uint32_t> pq_random_schema_regression_seeds = {
+    459189882,
+    12469992,
+    3262034951,
+};
+
+// Breadth on top of those three: enough low integers to bring the set to this size. 64 is the size
+// of the wider sweep the fix was validated against, and the added seeds are 1, 2, 3, ... rather than
+// anything selected, so the set cannot be read as cherry-picked around one defect.
+//
+// 64 was chosen after measuring rather than before, and the measurement changed the answer. One seed
+// is ~0.10 s -- a 20-partition fixture written once and read back once -- so the whole sweep is
+// **6.6 s** in a dev build. There is therefore no reason to split this into a cheap per-commit set
+// and a nightly wide one: 64 is affordable on every commit, and a nightly-only sweep is coverage
+// nobody reads. Widening it costs 0.1 s per seed, and this constant is the only thing to change.
+constexpr size_t pq_random_schema_seed_count = 64;
+
+std::vector<uint32_t> pq_random_schema_seeds() {
+    auto seeds = pq_random_schema_regression_seeds;
+    for (uint32_t i = 1; seeds.size() < pq_random_schema_seed_count; ++i) {
+        seeds.push_back(i);
+    }
+    return seeds;
+}
+
+// Reseeding the engine `--random-seed` feeds is what makes a literal seed here mean the same thing
+// as `--random-seed=<n>` on the command line, which is how the three known-bad seeds were recorded.
+// Deriving the schema and mutation seeds some other way would reproduce different schemas and those
+// three numbers would stop meaning anything.
+//
+// Note for anyone reproducing by hand: `--random-seed` must follow the `--` separator. Placed before
+// it, Boost silently ignores it and prints "No errors detected".
+void run_pq_random_schema_seeds(test_env& env, sstring tname, const std::vector<uint32_t>& seeds) {
+    const auto saved_engine = seastar::testing::local_random_engine;
+    auto restore = defer([&] () noexcept { seastar::testing::local_random_engine = saved_engine; });
+
+    std::vector<uint32_t> failed;
+    for (const uint32_t seed : seeds) {
+        BOOST_TEST_CONTEXT("pq random schema seed " << seed) {
+            testlog.info("--- pq random schema seed {} ---", seed);
+            seastar::testing::local_random_engine.seed(seed);
+            // A failing seed must not hide the seeds after it, and BOOST_REQUIRE aborts by
+            // throwing. The assertion has already been logged with the context above by the time it
+            // gets here, so the case still fails; this only keeps the sweep going. It only works
+            // because `make_sstable_containing` now closes its reader on the exception path
+            // (`test/lib/sstable_utils.cc`); before that the leaked permit aborted the process and
+            // the sweep could name the first failing seed and no more.
+            try {
+                check_sstable_bytes_correctness(env, format("{}_{}", tname, seed),
+                                                sstable_version_types::pq);
+            } catch (...) {
+                testlog.error("pq random schema seed {} FAILED: {}", seed, std::current_exception());
+                failed.push_back(seed);
+            }
+        }
+    }
+    // Named explicitly and together, because "which seeds" is the whole point of fixing them.
+    BOOST_TEST_CONTEXT("failing seeds: " << fmt::format("{}", failed)) {
+        BOOST_REQUIRE_EQUAL(failed.size(), 0u);
+    }
+}
+
+} // anonymous namespace
+
+SEASTAR_TEST_CASE(test_pq_random_schema_fixed_seeds) {
+    return test_env::do_with_async([tname = get_name(), seeds = pq_random_schema_seeds()] (test_env& env) {
+        run_pq_random_schema_seeds(env, tname, seeds);
+    });
 }
 
 SEASTAR_TEST_CASE(test_sstable_bytes_on_s3_correctness) {

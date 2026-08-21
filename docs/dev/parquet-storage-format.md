@@ -2163,7 +2163,21 @@ one-liner. The deterministic UDT bug above came out of the same exercise and is 
 failure rate. This is now the largest known correctness gap for the format and it is recorded in
 §11.1. **Superseded — see §9.6b immediately below**, which diagnoses all four seeds to one product
 bug and closes this. The guess in the paragraph above, that the shared factor is somewhere among
-`decimal` / `vector` / `frozen<udt>`, is wrong; it is a `bigint` in the key.
+`decimal` / `vector` / `frozen<udt>`, is wrong; it is a `bigint` in the key. And the conclusion that a
+random-schema test could not be left in the tree is superseded by **§9.6c**: what could not be left in
+the tree was a test on a *random* seed, and the fix for that is a fixed seed set, not abandonment.
+`test_sstable_bytes_on_disk_correctness`'s body now runs against `pq` over 64 checked-in seeds.
+
+**Added 2026-08-21 (fourth pass).** The coverage that would have caught the §9.6b defect, made
+permanent. Detail in §9.6c.
+
+| Case | What it covers that nothing did |
+|---|---|
+| `test_pq_random_schema_fixed_seeds` (`sstable_datafile_test.cc`) | Randomly generated schemas against `pq` at all — the axis whose absence hid a data-loss defect for the whole project. A **fixed, checked-in set of 64 seeds** including the three recorded as failing pre-fix, run as one deterministic case in 6.6 s, sharing `test_sstable_bytes_on_disk_correctness`'s body with the sstable version as its one new argument. Confirmed to fail against the pre-fix codec, naming **10 of 64** seeds; against the encoder half alone, 9. |
+
+| Fix to shared test infra | Why |
+|---|---|
+| `test/lib/sstable_utils.cc` — close the reader on `make_sstable_containing`'s exception path | A validation mismatch aborted the *process* on a leaked reader permit instead of failing the assertion, in every test using the helper. See §9.6c. |
 
 ### 9.6b The random-schema failures, diagnosed — 2026-08-21 (third pass)
 
@@ -2235,10 +2249,12 @@ keeping the interop check, and for not treating a green round-trip suite as evid
 | `test_pq_bigint_key_partition_sequence_round_trips` (`sstable_parquet_test.cc`) | The product symptom, end to end: `Unable to retrieve metadata for first and last keys` followed by `Mutations differ` out of `make_sstable_containing`, with the partition read back holding **2 of its 12 rows**. Fixed schema, `bigint` partition *and* clustering key, no randomness. |
 
 `make_random_schema_specification` against `pq` now passes **16 of 16** on the seed set that
-previously failed 4 (which includes all three reported seeds), and **64 of 64** on a wider sweep. The
-random-schema harness is still deliberately **not** in the tree: the three tests above are
-deterministic and pin the mechanism, and the accounting coverage that motivated the original attempt
-is already held by `test_pq_bytes_on_disk_matches_the_storage_layer`.
+previously failed 4 (which includes all three reported seeds), and **64 of 64** on a wider sweep.
+Those sweeps were run by hand and left out of the tree, on the reasoning that the three tests above
+pin the mechanism deterministically. **Superseded the same day — see §9.6c below**, which puts the
+sweep in the tree as a fixed seed set rather than leaving the only random-schema coverage of `pq` to
+a hand run nobody will repeat. The reasoning above is right about the *mechanism* being pinned and
+wrong about what that buys: the three tests pin this bug, and the sweep is what finds the next one.
 
 **One consequence for anything already written.** Because the on-disk stream was wrong and not just
 the reader, a `pq` sstable containing a `bigint` or `timestamp` key column written before this fix
@@ -2301,6 +2317,95 @@ here and are worth the paragraph:
    what makes on-disk assertions worth writing: they are the only thing that catches a file
    that is wrong while remaining self-consistent — and it is why proving an on-disk
    assertion can fail requires a *round-trip-neutral* mutation, not just any bug.
+
+### 9.6c Random schemas against `pq`, permanently — added 2026-08-21 (fourth pass)
+
+§9.6b closed the defect and left the coverage that found it out of the tree. That is the gap this
+closes. The bug in §9.6b survived the entire project **because nothing ever pointed a randomly
+generated schema at `pq`**, and it was then found by hand, once. Three deterministic tests pin *that*
+bug; none of them would find the next one of its class. The sweep is what finds the next one.
+
+The constraint was real: a random-seed fixture was correctly kept out of the tree at a 25 % failure
+rate, because flaky coverage is worse than none. **The answer is determinism, not randomness.**
+
+`test_pq_random_schema_fixed_seeds` (`sstable_datafile_test.cc`) runs a **fixed, checked-in set of 64
+seeds** as one deterministic case. It is the existing `test_sstable_bytes_on_disk_correctness` body
+pointed at `pq` — the body is now shared with it as `check_sstable_bytes_correctness()`, whose one new
+argument is the sstable version — and the comparison is `make_sstable_containing`'s own read-back
+validation and nothing else. That is deliberate. In this project a reimplemented comparison harness
+has already *been* the divergence it was built to find, and a data-losing codec fails at construction
+here anyway.
+
+| Decision | Why |
+| --- | --- |
+| The three seeds `459189882`, `12469992`, `3262034951` are in the set by name | They are the ones recorded as failing before the fix. They are the regression guard proper; everything else is breadth. |
+| Plus seeds `1`..`61`, for **64 total** | 64 is the size of the hand sweep the fix was validated against. The added seeds are the low integers rather than anything selected, so the set cannot be read as cherry-picked around one defect. |
+| Not split into a per-commit set and a nightly one | **Measured before deciding, and the measurement changed the answer.** One seed is ~0.10 s, so 64 seeds is **6.6 s** — 6.4 s of it inside the case, in a binary whose 69 collected cases take ~44 s wall under `test.py`. There is nothing to save by splitting, and a nightly-only sweep is coverage nobody reads. Widening costs 0.1 s per seed; `pq_random_schema_seed_count` is the only thing to change. |
+| Seeds are literals that reseed `seastar::testing::local_random_engine`, not `--random-seed` | A seed taken from the framework is not a deterministic case. Reseeding the engine `--random-seed` feeds is also what makes a literal here mean the same fixture as `--random-seed=<n>` did, which is how those three numbers were recorded in the first place — deriving the schema and mutation seeds any other way would reproduce different schemas and the three numbers would stop meaning anything. Confirmed: seed 12469992 fails at `token: -8391661812190664140`, the same token §9.6 recorded by hand. |
+
+**Confirmed able to fail, and it names every failing seed.** Narrowing the accumulator back to
+`uint64_t` at the one live encoder site (`encoders.hh`, the `bitpack_acc acc` in `flush_block()`)
+makes the case fail with
+
+```
+test/lib/mutation_assertions.cc(61): fatal error: Mutations differ, expected {table:
+  'test_pq_random_schema_fixed_seeds_459189882.table107', key: {'pk0': 5998643611329458451, ...
+Failure occurred in a following context:
+    pq random schema seed 459189882
+...
+test/boost/sstable_datafile_test.cc(3343): fatal error: critical check failed.size() == 0u has failed [9 != 0]
+Failure occurred in a following context:
+    failing seeds: [459189882, 12469992, 1, 4, 5, 12, 25, 33, 43]
+```
+
+Reverting the *whole* codec fix (all four sites) gives **10 of 64**:
+`[459189882, 12469992, 3262034951, 1, 4, 5, 12, 25, 33, 43]` — all three recorded seeds plus seven of
+the breadth seeds, a 15.6 % sensitivity against the 25 % the original 16-seed sample showed. The
+codec was then restored and verified byte-identical to `HEAD` by hash, with the sweep back to 64/64.
+
+**Two things that came out of this and were not expected.**
+
+1. **The encoder half alone does not catch seed 3262034951; the decoder half does.** With only
+   `encoders.hh` narrowed, 9 seeds fail and 3262034951 passes. It needs the `decoders.hh` site too.
+   That is consistent with §9.6b's account — that seed's `bigint` is in the *clustering* key, so its
+   partition sequence matched and only the content diverged — and it is a concrete reason not to
+   treat any one of the four sites as representative of the others when mutation-testing this area.
+2. **A validation mismatch used to kill the process instead of failing.** `make_sstable_containing`'s
+   read-back compares by *throwing* — `BOOST_REQUIRE` and `BOOST_FAIL` both abort that way — and the
+   exception unwound straight past `co_await rd.close()`. The reader's permit was then destroyed
+   unclosed, which seastar treats as fatal, so **every** validation mismatch in **every** test using
+   this helper died with `permit ... was not closed before destruction` and a hundred-line seastar
+   backtrace on top of the assertion that had actually failed. Under a sweep it was worse than
+   cosmetic: it stopped the case at the first failing fixture, so the sweep could name one seed and
+   not the set. Fixed in `test/lib/sstable_utils.cc` by closing the reader on the exception path and
+   rethrowing after, which is what makes the ten-seed list above possible.
+
+**The pyarrow interop arm is deliberately *not* run over these fixtures, and the reason is not cost.**
+It is that there is almost nothing in a random schema for it to interoperate *on*. `cql_type_of()`
+(`writer_impl.cc:44`) recognises exactly five CQL types — `int`, `bigint`, `timestamp`, `double`,
+`text`/`ascii` — and everything else falls to `cql_type::blob`, i.e. `phys_type::byte_array` carrying
+Scylla's own serialised form. Of the 26 type generators `tests::type_generator` draws from, **20 land
+in that fallback**: `tinyint`, `smallint`, `boolean`, the legacy `DateType`, `timeuuid`, `date`,
+`time`, `uuid`, `inet`, `float`, `varint`, `decimal`, `duration`, `blob`, and every `tuple`, `udt`,
+`list`, `set`, `map` and `vector`. pyarrow reads those leaves as `binary` and can say nothing about
+their contents without a Python reimplementation of Scylla's serialisation *and* of
+`tests::random_schema`'s 26 generators and value-size distributions — which is exactly the
+reimplemented-harness trap this section keeps warning about. The five expressible types are already
+covered by the 16 interop shapes (§10.3i) and by `format/writer_interop.py`. Mechanically, too, every
+interop script in the tree runs in the **standalone** codec build driven by
+`sstables/parquet/run_tests.sh` — no Seastar, no Scylla headers — paired with a C++ writer that emits
+a manifest and a Python mirror of the exact value stream; these fixtures are built by a Seastar boost
+test through the full sstable write path, on the other side of that boundary.
+
+**What that leaves uncovered, stated rather than hidden.** §9.6b's own argument for keeping the
+interop check still stands: the two halves of this bug were broken *asymmetrically*, so the round trip
+caught it, and a **symmetric** codec bug would round-trip losslessly and be invisible to this sweep by
+construction. Only an independent reader can see that class. The check that would catch it needs no
+reimplementation and is value-agnostic — the number of distinct consecutive runs across the
+partition-key leaves must equal the partition count, which is precisely how the bug was spotted by
+hand (pyarrow read `pk0` as 254 distinct values in 313 runs where 20 partitions were written). It is
+not built here, because building it means crossing from a Seastar boost test into Python, which
+nothing in `test/boost` does. It is the right next step for this area if one is wanted.
 
 ### 9.6a Python/CQL-level coverage — added 2026-08-21
 
@@ -7338,7 +7443,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Bounded memory | Writer streams row groups: 98 % → 19 % buffered, byte-identical output. Scan memory asserted flat (1.01× for 8× rows). |
 | Size accounting | Mixed candidate sets bucket on `ondisk_data_size()`; all-native sets untouched (§10.3i). |
 | Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. |
-| Write-path correctness | `pq` is in `writable_sstable_versions`, so the standard mutation-source battery and every `writable_sstable_versions` loop across `sstable_mutation_test`, `sstable_datafile_test`, `sstable_3_x_test`, `sstable_compaction_test` and `sstable_resharding_test` already run against it, unguarded. The only `pq` exclusions are the 12 sites that load checked-in legacy fixtures. Reads and compactions over **format-mixed** sstable sets are now covered in both orders — including counters, whose merge is per-shard rather than last-write-wins, and multi-cell collections, whose tombstone can sit in one format with the elements it must not delete in the other — and `dead` vs `absent` is asserted **in the file** via `__dmask` counts rather than only through the reader (§9.6). Randomly generated schemas, which used to fail about 1 seed in 4, now pass: that was a single product bug — a bit-packing accumulator one value too narrow, corrupting `bigint`/`timestamp` **key** columns — fixed with three deterministic tests (§9.6b). |
+| Write-path correctness | `pq` is in `writable_sstable_versions`, so the standard mutation-source battery and every `writable_sstable_versions` loop across `sstable_mutation_test`, `sstable_datafile_test`, `sstable_3_x_test`, `sstable_compaction_test` and `sstable_resharding_test` already run against it, unguarded. The only `pq` exclusions are the 12 sites that load checked-in legacy fixtures. Reads and compactions over **format-mixed** sstable sets are now covered in both orders — including counters, whose merge is per-shard rather than last-write-wins, and multi-cell collections, whose tombstone can sit in one format with the elements it must not delete in the other — and `dead` vs `absent` is asserted **in the file** via `__dmask` counts rather than only through the reader (§9.6). Randomly generated schemas, which used to fail about 1 seed in 4, now pass: that was a single product bug — a bit-packing accumulator one value too narrow, corrupting `bigint`/`timestamp` **key** columns — fixed with three deterministic tests (§9.6b). And that coverage is now **permanent rather than a hand run**: `test_pq_random_schema_fixed_seeds` runs random schemas against `pq` over a fixed, checked-in set of **64 seeds** in 6.6 s, including the three recorded as failing pre-fix, confirmed to name 10 of the 64 against the pre-fix codec (§9.6c). |
 | CQL-level correctness | The layer a user touches, covered at last (§9.6a): 38 pytest cases over CQL DDL, `system_schema.scylla_tables`, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints. Each DML case flushes, asserts the files are `pq`, then reads with `BYPASS CACHE`, so it cannot pass on a build that quietly wrote the native format. Every case confirmed to fail under a product mutation. |
 | Scale | GB-scale three-way measurement on real NOAA ISD-Lite under TWCS (§10.6). |
 
@@ -7352,7 +7457,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. Note this is a *bucketing* gap: mixed-set **correctness** — reads and compactions across both formats, with every tombstone shape — is now covered by unit tests (§9.6), which it was not when this row was written. |
-| Correctness coverage gaps | known | Enumerated in §9.6. **Closed 2026-08-21**: the Python/pytest gap, which was the load-bearing one — `test/cqlpy/test_parquet_storage_format.py` (33 cases) and `test/rest_api/test_parquet.py` (5) now cover the property through CQL DDL, the schema tables, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints, with every case confirmed to fail against a deliberately mutated build (§9.6a). Two findings from that exercise are worth carrying: distinguishing a dead cell from an absent one requires a **merge** even at CQL level, so the test flushes between the live write and the tombstone and asserts two Data components — without the flush it passes even with dead collapsed into absent; and one estimator assertion was **dropped as unfalsifiable** after it survived a build with the per-row normalisation re-broken. Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; **Closed 2026-08-21 (second pass)**: counters and collections merged across formats (`test_hybrid_merge_of_counters_across_formats`, `test_hybrid_merge_of_collections_across_formats` — both orders, all-`pq` and all-native controls, read path and compaction, asserted against a merge rule computed from the fixture as well as against the native reference), and hybrid+TWCS on the *streaming* path (`test_storage_format_honoured_by_streaming_writes`, extended, with the format read off the `pq-` component the creator's sstable produced). `mutation_test.cc` and `sstable_set_test.cc` were assessed for version-parameterisation and **declined** with reasons in §9.6 — the first writes no sstable at all and its one flushing case takes its version from the schema, the second's assertions are interval-map algebra over first/last key and self-referential size sums. **Also closed 2026-08-21 (third pass), and it was the largest known correctness gap**: `pq` failed `make_random_schema_specification` fixtures on roughly 1 seed in 4, with the partition sequence misaligned. Diagnosed to a **single product bug of the data-loss class** and fixed (§9.6b): the bit-packing accumulator in `DELTA_BINARY_PACKED` and in the RLE hybrid was a `uint64_t`, one value too narrow for the 0..7 bits of the previous value it carries, so any residual width above 57 lost bits — on the write side *and* the read side, asymmetrically. It reached only `bigint` and `timestamp` **key** columns, which are the ones `schema_mapping.cc` delta-encodes, and only via a partition key, whose value repeats within a partition and then jumps 64 bits at the boundary. None of the exotic types in the failing schemas mattered. The file on disk was wrong, not just the reader: pyarrow read 254 distinct values where 20 were written, which is also how the harness was ruled out. Now 16/16 on the seed set that failed 4, and 64/64 on a wider sweep; pinned by three deterministic tests, each confirmed to fail against the pre-fix codec. A second instance out of the same exercise — a non-frozen UDT column throwing `std::bad_cast` out of `build_collection()`, i.e. **every** read of a `pq` sstable holding one — was fixed earlier the same day with a test. Two smaller items also closed: `bytes_on_disk()` for `pq` is now checked against the storage layer's own file sizes, and the counter-tombstone rule (a counter tombstone wins regardless of timestamp) is recorded. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. |
+| Correctness coverage gaps | known | Enumerated in §9.6. **Closed 2026-08-21**: the Python/pytest gap, which was the load-bearing one — `test/cqlpy/test_parquet_storage_format.py` (33 cases) and `test/rest_api/test_parquet.py` (5) now cover the property through CQL DDL, the schema tables, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints, with every case confirmed to fail against a deliberately mutated build (§9.6a). Two findings from that exercise are worth carrying: distinguishing a dead cell from an absent one requires a **merge** even at CQL level, so the test flushes between the live write and the tombstone and asserts two Data components — without the flush it passes even with dead collapsed into absent; and one estimator assertion was **dropped as unfalsifiable** after it survived a build with the per-row normalisation re-broken. Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; **Closed 2026-08-21 (second pass)**: counters and collections merged across formats (`test_hybrid_merge_of_counters_across_formats`, `test_hybrid_merge_of_collections_across_formats` — both orders, all-`pq` and all-native controls, read path and compaction, asserted against a merge rule computed from the fixture as well as against the native reference), and hybrid+TWCS on the *streaming* path (`test_storage_format_honoured_by_streaming_writes`, extended, with the format read off the `pq-` component the creator's sstable produced). `mutation_test.cc` and `sstable_set_test.cc` were assessed for version-parameterisation and **declined** with reasons in §9.6 — the first writes no sstable at all and its one flushing case takes its version from the schema, the second's assertions are interval-map algebra over first/last key and self-referential size sums. **Also closed 2026-08-21 (third pass), and it was the largest known correctness gap**: `pq` failed `make_random_schema_specification` fixtures on roughly 1 seed in 4, with the partition sequence misaligned. Diagnosed to a **single product bug of the data-loss class** and fixed (§9.6b): the bit-packing accumulator in `DELTA_BINARY_PACKED` and in the RLE hybrid was a `uint64_t`, one value too narrow for the 0..7 bits of the previous value it carries, so any residual width above 57 lost bits — on the write side *and* the read side, asymmetrically. It reached only `bigint` and `timestamp` **key** columns, which are the ones `schema_mapping.cc` delta-encodes, and only via a partition key, whose value repeats within a partition and then jumps 64 bits at the boundary. None of the exotic types in the failing schemas mattered. The file on disk was wrong, not just the reader: pyarrow read 254 distinct values where 20 were written, which is also how the harness was ruled out. Now 16/16 on the seed set that failed 4, and 64/64 on a wider sweep; pinned by three deterministic tests, each confirmed to fail against the pre-fix codec. **Closed further 2026-08-21 (fourth pass)**: those sweeps were hand runs, so the *axis* that found the bug — random schemas against `pq` — was still not in the tree, and the next defect of the class would have hidden the same way. `test_pq_random_schema_fixed_seeds` now runs it as a deterministic case over a fixed, checked-in set of **64 seeds** (the three known-bad plus 1..61) in **6.6 s**, reusing `test_sstable_bytes_on_disk_correctness`'s body with the sstable version as its one new argument and `make_sstable_containing`'s own read-back as the only comparison. Confirmed to fail against the pre-fix codec, naming **10 of 64** seeds — with the finding that the encoder half alone catches 9 of them and seed 3262034951 needs the decoder half too, so no one of the four sites stands in for the others. The pyarrow interop arm is deliberately *not* pointed at these fixtures: 20 of the 26 types `tests::type_generator` draws from fall to `cql_type::blob` and reach the file as opaque BYTE_ARRAY, so pyarrow could only re-derive Scylla's serialisation in Python — the reimplemented-harness trap. What that leaves genuinely uncovered is a **symmetric** codec bug, invisible to any round trip by construction; §9.6c names the value-agnostic check that would catch it and why it was not built. One shared-test-infra defect was fixed on the way: a `make_sstable_containing` validation mismatch aborted the process on a leaked reader permit rather than failing the assertion, which is why the sweep could previously name only the first failing seed. A second instance out of the same exercise — a non-frozen UDT column throwing `std::bad_cast` out of `build_collection()`, i.e. **every** read of a `pq` sstable holding one — was fixed earlier the same day with a test. Two smaller items also closed: `bytes_on_disk()` for `pq` is now checked against the storage layer's own file sizes, and the counter-tombstone rule (a counter tombstone wins regardless of timestamp) is recorded. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. |
 | Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
 | **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |
@@ -7373,15 +7478,19 @@ a running node rather than only in a unit test. What is left is genuinely narrow
   21.3 MB read against native's 234 MB. So the corrected claim is **parity with an order of magnitude
   less read I/O** — not the advantage 0.82× promised, which was never real, and not the 2.3× penalty
   either. Point reads improved as a side effect (shipping arm, cold min 1 930 → 1 149 µs).
-- **One newly-found correctness gap, and it is the one to fix next**: `pq` does not survive
-  randomly generated schemas. Enabling a `make_random_schema_specification` fixture against it
-  fails about 1 seed in 4, with the partition sequence misaligned rather than a single value
-  wrong, reproducible under `--random-seed` (§9.6). This was invisible because every
-  fixed-schema `pq` test hand-writes its schema and the random-schema suites all take the
-  version-less `make_sstable` overload, which steps past `pq` by construction. One instance out
-  of it — a non-frozen UDT column throwing out of the read path — is diagnosed and fixed; the
-  rest is not. Until it is, "the standard mutation-source battery runs against `pq`" should be
-  read as covering the shapes that battery's fixed schemas contain, not the type system.
+- **One newly-found correctness gap, now closed, and it was the largest**: `pq` did not survive
+  randomly generated schemas — about 1 seed in 4 failed, with the partition sequence misaligned
+  rather than a single value wrong. It was invisible because every fixed-schema `pq` test
+  hand-writes its schema and every random-schema suite takes the version-less `make_sstable`
+  overload, which steps past `pq` by construction, so **nothing in the tree had ever pointed a
+  random schema at this format**. All of it was one product bug of the data-loss class: a
+  bit-packing accumulator one value too narrow, silently dropping everything past bit 63 and so
+  corrupting `bigint`/`timestamp` **key** columns on disk (§9.6b). Fixed, with three deterministic
+  tests on the mechanism, and the *axis* is now permanent too — 64 checked-in seeds run against
+  `pq` on every commit, confirmed to name 10 of them against the pre-fix codec (§9.6c). What
+  remains true is narrower than the old wording: the type system is now exercised against `pq`,
+  but 20 of the 26 generated types reach the file as opaque BYTE_ARRAY, so what is covered is that
+  they **round-trip**, not that an external reader can interpret them.
 - **One accepted trade**: TWCS converts without a gain check, so a schema Parquet stores worse
   converts anyway. `storage_format = 'sstable'` is the only guard and it is manual.
 - **One half-measurement**: mixed-format bucketing at scale showed the right shape but over too
