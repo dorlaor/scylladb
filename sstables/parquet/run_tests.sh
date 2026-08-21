@@ -99,6 +99,7 @@ echo; echo "### 10. OffsetIndex: row -> page lookup ###"
 /tmp/pq_oi_t $DATA/wout/*.parquet || FAIL=1
 echo; echo "### 11. L3 logical export (lossy, export-only) ###"; /tmp/pq_shred_t logical || FAIL=1
 echo; echo "### 13. schema recovery from the file alone ###"; /tmp/pq_shred_t recovery || FAIL=1
+echo; echo "### 13a. pre-fold files still read (per-column __ldt) ###"; /tmp/pq_shred_t legacy || FAIL=1
 echo; echo "### 18. non-frozen collections, in memory and through a file ###"
 /tmp/pq_shred_t collections || FAIL=1
 echo; echo "### 15. Dremel levels from the schema tree, vs pyarrow ###"
