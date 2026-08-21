@@ -1457,6 +1457,233 @@ SEASTAR_THREAD_TEST_CASE(test_pq_folded_deletion_channel_on_both_write_paths) {
     }).get();
 }
 
+// `dead` and `absent` told apart on disk, per row group, with statistics-based leaf elision in
+// play.
+//
+// Everything else in this file establishes that a deletion survives a round trip. That is necessary
+// and not sufficient: a deletion stored as an absent cell round-trips perfectly through the pq
+// reader, because there is nothing in the file to contradict it. It only becomes wrong when an
+// older sstable supplies the value it should have shadowed -- which the hybrid merge tests now
+// cover from above, and which this test covers from below, by asserting what is actually in the
+// file rather than what comes back out of it.
+//
+// `__dmask` is the only thing in the format that distinguishes the two states: an absent cell
+// contributes no def-level to it, a dead one contributes a set bit. So the count of non-null
+// `__dmask` entries, summed over row groups, must equal the number of rows carrying at least one
+// dead cell -- a quantity this test's generator knows exactly. Comparing against a total rather
+// than per row group is deliberate: cut_row_group() cuts on partition boundaries and overshoots
+// its budget, so which rows land in which group is the writer's business, and pinning it would
+// make this a change-detector.
+//
+// It also pins the interaction between the fold and leaf elision, which is the one coupling in the
+// read path where a lost tombstone would be silent. The reader elides a leaf whose statistics say
+// it is null in every row of the group (`null_count == num_values`) and substitutes "no value for
+// any row", so an all-null `__dmask` row group is skipped entirely and every column in it resolves
+// to absent. That is correct exactly when the group really holds no dead cell. Partitions 20-59
+// carry none, which at 50 rows each is 2 000 rows against a 1 000-row budget and therefore
+// guarantees at least one wholly elidable group; partitions 0-19 and 60-79 do carry them, so at
+// least one group is not elidable. Both states have to occur in the same file for the pairing of
+// the two to be exercised at all.
+SEASTAR_THREAD_TEST_CASE(test_pq_dead_and_absent_are_distinguishable_on_disk) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = schema_builder(1, "ks", "pq_deadmask")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("a", int32_type)
+            .with_column("b", int32_type)
+            .with_column("c", utf8_type)
+            .with_column("st", int32_type, column_kind::static_column)
+            .set_parquet_options({{"rows_per_row_group", "1000"}})
+            .build();
+        const auto& adef = *s->get_column_definition(to_bytes("a"));
+        const auto& bdef = *s->get_column_definition(to_bytes("b"));
+        const auto& cdef = *s->get_column_definition(to_bytes("c"));
+        const auto& stdef = *s->get_column_definition(to_bytes("st"));
+
+        constexpr int parts = 80, rows = 50;
+        // The quiet band, wide enough to contain a whole row group with nothing dead in it.
+        //
+        // Banded by position in *token* order, not by key. The writer lays partitions out in token
+        // order and cuts row groups on partition boundaries, so a band that is contiguous in the
+        // key is scattered through the file and no row group comes out wholly quiet -- which is
+        // exactly what the first run of this test found. So the empty partitions are built and
+        // sorted first, and the band is a contiguous run of the sorted sequence.
+        auto quiet = [] (size_t i) { return i >= 20 && i < 60; };
+        // One partition in the noisy band has its static cell deleted. A static is shredded as a
+        // regular column replayed onto every row, so this sets a __dmask bit on all 50 of them --
+        // and if that bit is lost the value comes back on every row, not just one.
+        constexpr size_t dead_static_part = 65;
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < parts; ++p) {
+            muts.emplace_back(s, partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("dk{:04d}", p)))));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        // Rows carrying at least one dead cell, counted the way the shredder sees them: a deleted
+        // static counts for every row of its partition.
+        size_t expect_rows_with_dead = 0;
+        for (size_t p = 0; p < muts.size(); ++p) {
+            mutation& m = muts[p];
+            const api::timestamp_type ts = 8000 + p;
+            const auto ldt = gc_clock::time_point(gc_clock::duration(60000 + p));
+
+            const bool dead_static = (p == dead_static_part);
+            if (dead_static) {
+                m.set_static_cell(stdef, atomic_cell::make_dead(ts, ldt));
+            } else if (p % 7 == 0) {
+                m.set_static_cell(stdef, atomic_cell::make_live(
+                        *int32_type, ts, int32_type->decompose(int32_t(p))));
+            }
+
+            for (int r = 0; r < rows; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                bool row_has_dead = dead_static;
+
+                // `b` is always live, so no row is ever empty and the row count is not itself
+                // what carries the signal.
+                m.set_clustered_cell(ck, bdef, atomic_cell::make_live(
+                        *int32_type, ts, int32_type->decompose(r)));
+
+                if (quiet(p)) {
+                    // Live and absent only. `a` present, `c` absent on odd rows -- so the quiet
+                    // band still exercises absence, which is the state a lost tombstone decays
+                    // into and must therefore be distinguishable from.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_live(
+                            *int32_type, ts, int32_type->decompose(r * 3)));
+                    if (r % 2 == 0) {
+                        m.set_clustered_cell(ck, cdef, atomic_cell::make_live(
+                                *utf8_type, ts, utf8_type->decompose(sstring(format("q{}", r)))));
+                    }
+                } else {
+                    switch (r % 4) {
+                    case 0:
+                        // `a` dead, `c` absent: the pair that must not be conflated.
+                        m.set_clustered_cell(ck, adef, atomic_cell::make_dead(ts, ldt));
+                        row_has_dead = true;
+                        break;
+                    case 1:
+                        // `c` dead with its own deletion time, so the exception channel is used.
+                        m.set_clustered_cell(ck, cdef, atomic_cell::make_dead(
+                                ts, gc_clock::time_point(gc_clock::duration(60000 + p + r))));
+                        row_has_dead = true;
+                        break;
+                    case 2:
+                        // Both dead, sharing the row's deletion time.
+                        m.set_clustered_cell(ck, adef, atomic_cell::make_dead(ts, ldt));
+                        m.set_clustered_cell(ck, cdef, atomic_cell::make_dead(ts, ldt));
+                        row_has_dead = true;
+                        break;
+                    default:
+                        // Nothing dead: `a` live, `c` absent. Interleaving these among the dead
+                        // rows means __dmask's def-levels are genuinely sparse rather than a
+                        // constant, which is what makes the null count meaningful.
+                        m.set_clustered_cell(ck, adef, atomic_cell::make_live(
+                                *int32_type, ts, int32_type->decompose(r * 5)));
+                        break;
+                    }
+                }
+                if (row_has_dead) { ++expect_rows_with_dead; }
+            }
+        }
+        BOOST_REQUIRE_GT(expect_rows_with_dead, 0u);
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        // ---- on disk ----
+        const uint64_t len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+        std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+        auto md = sstables::parquet::format::parse_footer(img);
+
+        // The premise of the whole test: more than one row group, so "elidable in one group and
+        // not in another" is a state this file can actually be in.
+        BOOST_REQUIRE_GT(md.row_groups.size(), 1u);
+
+        size_t dmask_live = 0, dmask_groups = 0, all_null_groups = 0, partial_groups = 0;
+        for (const auto& rg : md.row_groups) {
+            for (const auto& cc : rg.columns) {
+                if (!cc.meta || cc.meta->path() != "__dmask") { continue; }
+                ++dmask_groups;
+                // Statistics must be present, or elision is off and this test proves nothing
+                // about it.
+                BOOST_REQUIRE(cc.meta->stats && cc.meta->stats->null_count);
+                const int64_t nulls = *cc.meta->stats->null_count;
+                const int64_t n = cc.meta->num_values;
+                BOOST_REQUIRE_GE(nulls, 0);
+                BOOST_REQUIRE_LE(nulls, n);
+                dmask_live += size_t(n - nulls);
+                if (n > 0 && nulls == n) { ++all_null_groups; } else { ++partial_groups; }
+            }
+        }
+        BOOST_REQUIRE_EQUAL(dmask_groups, md.row_groups.size());
+
+        // The assertion this test exists for: exactly one non-null __dmask entry per row carrying
+        // a dead cell, and none for a row whose columns are merely absent. A tombstone written as
+        // an absent cell lowers this; nothing else does.
+        BOOST_REQUIRE_EQUAL(dmask_live, expect_rows_with_dead);
+
+        // Both elision states occur, so the read-back below exercises the elided path and the
+        // decoded path in one file.
+        BOOST_REQUIRE_GT(all_null_groups, 0u);
+        BOOST_REQUIRE_GT(partial_groups, 0u);
+
+        // The fold's own invariant, cheap to re-check here: no dead cell's deletion time went to a
+        // per-column leaf. There are no TTLs in this schema's data, so any value in a
+        // `__ldt_<col>` leaf would have to be a dead cell's.
+        for (const auto& rg : md.row_groups) {
+            for (const auto& cc : rg.columns) {
+                if (!cc.meta || cc.meta->path().rfind("__ldt_", 0) != 0) { continue; }
+                BOOST_REQUIRE(cc.meta->stats && cc.meta->stats->null_count);
+                BOOST_REQUIRE_EQUAL(*cc.meta->stats->null_count, cc.meta->num_values);
+            }
+        }
+
+        // ---- through the reader ----
+        auto want = read_all(ref, s, env.make_reader_permit());
+        auto got  = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), want.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(want[i]);
+        }
+
+        // And the counts, so this cannot pass by both sides losing the same thing. `absent` is
+        // counted as well as `dead`: a dead cell wrongly stored as absent lowers the dead count,
+        // while an absent cell wrongly materialised as dead raises it, and only checking both
+        // pins the distinction in the direction that matters.
+        auto tally = [&] (const utils::chunked_vector<mutation>& ms) {
+            size_t dead = 0, live = 0;
+            for (const auto& m : ms) {
+                auto scan = [&] (const row& cells, column_kind kind) {
+                    cells.for_each_cell([&] (column_id id,
+                                            const atomic_cell_or_collection& acoc) {
+                        const auto& def = s->column_at(kind, id);
+                        if (!def.is_atomic()) { return; }
+                        if (acoc.as_atomic_cell(def).is_live()) { ++live; } else { ++dead; }
+                    });
+                };
+                scan(m.partition().static_row().get(), column_kind::static_column);
+                for (const rows_entry& re : m.partition().clustered_rows()) {
+                    scan(re.row().cells(), column_kind::regular_column);
+                }
+            }
+            return std::pair<size_t, size_t>{dead, live};
+        };
+        const auto [dead_w, live_w] = tally(want);
+        const auto [dead_g, live_g] = tally(got);
+        BOOST_REQUIRE_GT(dead_w, 0u);
+        BOOST_REQUIRE_GT(live_w, 0u);
+        BOOST_REQUIRE_EQUAL(dead_g, dead_w);
+        BOOST_REQUIRE_EQUAL(live_g, live_w);
+    }).get();
+}
+
 // `metadata_folding = 'uniform'` is silently not honoured once an sstable cuts a row group.
 //
 // This started as a hunt for a bug that turned out not to be reachable, and the real finding is
