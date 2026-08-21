@@ -2375,13 +2375,14 @@ in its codec sweep so it is the reference point rather than an afterthought. Unc
 are the `-Data.db` size of the same table, same rows, rewritten with compression off, read through
 `live_table_dir.py` like every other figure here.
 
-**Backblaze is excluded from the table above** because its uncompressed figure came from a batch
-run that also produced an anomalous `pq` size. Its raw volume, 242 357 583, is plausible on its
-face — 807 B/row across 197 columns — but the same run reported `pq` 84 538 396 where every
-controlled run gives 20 803 872. A subsequent `rows_per_row_group` sweep on one loaded table lands on
-20 803 872 at the default and varies only 18.0–26.9 MB across settings, so no configuration
-produces 84.5 MB. The anomaly has appeared only inside full-corpus batches and never in isolation;
-it is recorded in parquet-future-work.md and no figure here depends on it.
+**Backblaze is excluded from the table above** because its two regimes measure two different
+things. Its raw volume, 242 357 583, is plausible on its face — 807 B/row across 197 columns — but
+the same run reported `pq` 84 538 396 where other runs give 20 803 872. That is not a measurement
+fault: the dataset is loaded by binding every column, NULL for a missing reading, which writes one
+cell tombstone per null, and whether those 42 448 175 tombstones are still present when the run
+measures depends on tombstone GC rather than on anything about Parquet. §10.18 settles it — the
+larger figure is the one a replicated cluster keeps, and the smaller is what the lab's RF=1 purges —
+so neither is wrong and the two are not comparable. No figure here depends on either.
 
 ### 10.1f-prod The corpus as ScyllaDB actually writes it (2026-08-18)
 
@@ -4603,195 +4604,165 @@ result: the ISD shape holds up under a different station sample.
 
 So the deterministic baseline costs nothing in published figures, and §10.1f-prod stands as written.
 **This closes the corpus re-measurement gap.** What it does not close is Backblaze's absolute
-numbers: both batch runs land in the anomalous regime (§10.17), so that row's 95.8 % rests on the
-standalone runs, not on these.
+numbers: both batch runs land in the tombstone-bearing regime (§10.17), so that row's 95.8 % rests on
+the standalone runs, not on these. §10.18 explains why that split exists and why it is not a fault —
+the two regimes differ by whether 42 448 175 cell tombstones have been purged, which on this RF=1 lab
+is a timing race.
 
-### 10.18 The Backblaze 4x anomaly, localised — 2026-08-20
+### 10.18 The Backblaze 4x anomaly — resolved 2026-08-21: legitimate tombstone GC, and the rule was misidentified
 
-Not solved, but no longer "cause unknown". Two claims in the previous write-up were wrong and the
-mechanism is now identified.
+**Verdict: nothing was dropping tombstones it was not entitled to drop.** The drops are correct, the
+code path is named below, and the condition is `tombstone_gc` mode `repair` on a table whose
+effective replication factor is 1. Not a bug, not a GA blocker, and not about Parquet at all.
 
-**It is not batch-only.** §10.1f said the anomaly "has appeared only inside full-corpus batches and
-never in isolation". `out/bbv_A.tsv` is a standalone run with native 32 472 881 and pq 85 683 469 --
-so it happens in isolation too. Measured rate under one binary with the autotrainer disabled: **1 in
-7 standalone passes**, against **2 of 2 batch runs**. Batch context makes it much more likely
-without being necessary.
+The previous version of this section reasoned its way to the opposite conclusion and left it open as
+a possible correctness bug. It was wrong for one reason, and the reason is worth recording because
+every downstream mistake followed from it: **it assumed the tables under test ran `tombstone_gc` mode
+`timeout`.** They do not. That single false premise made a normal, tested, upstream behaviour look
+like an unexplained disappearance of 42.4 million tombstones, and sent six instrumented
+reproductions and a five-arm bisect looking for a culprit that does not exist.
 
-**The two regimes are each internally deterministic**, which is what makes the split so odd:
+**What survives re-measurement.** Both kept artifacts were re-opened directly (`pyarrow`, per-leaf
+aggregation over all row groups, not size arithmetic):
 
-| | native | parquet | ratio | row groups | rows/group | synthetic `__*` leaves |
-|---|---:|---:|---:|---:|---:|---:|
-| normal (6 of 7 passes) | ~21.8 M | **20 803 872** (byte-identical every time) | 95 % | 60 | 5 000 | 2 695 885 (14.9 %) |
-| anomalous (1 of 7) | ~32.3 M | 84 196 292 | 261 % | 163 | 1 840 | **60 102 010 (78.4 %)** |
+| | `__ldt_*` leaves | values | non-null | bytes | data-column nulls |
+|---|---:|---:|---:|---:|---:|
+| `out/bb_normal_reference.parquet` (20 803 872 B) | 195 | 58 500 000 | **0** | 327 600 | 42 448 175 |
+| `out/bb_anomalous_pass6.parquet` (84 280 629 B) | 195 | 58 500 000 | **42 448 175** | 57 327 020 | 42 448 175 |
 
-**The mechanism is the per-cell metadata channel, not row-group overhead.** That was the obvious
-hypothesis -- 604 leaves at ~225 B of metadata per leaf per row group would explain 84 MB at ~600
-row groups -- and it is wrong. The file has 163 row groups, and the growth is in the data: all **407
-synthetic leaves** grow together, from ~6.6 kB each to ~148 kB each, 22x. `__ts` itself barely moves
-(2.01 M → 1.89 M). The row groups are cut *earlier* because the rows are bigger, so that is a
-consequence rather than the cause.
+The localisation holds exactly: the `__ldt_*` (local deletion time) channel is the whole difference,
+the data columns are identical in both (16 651 825 non-null, 42 448 175 null), and the non-null
+`__ldt` count is precisely the source slice's null count. Read cell by cell in row group 0,
+`__ldt_smart_189_raw` is non-null in exactly the 1 670 of 1 847 rows where `smart_189_raw` is null —
+1 847/1 847 agreement. And `__ldt` really is wall clock while `__ts` is back-dated:
+`__ts = 1700346220936144` (2023-11-18) against `__ldt = 1787184561` (2026-08-20T00:09:21Z) on the same
+row. So the *observations* in the previous account were all sound. The *rule* applied to them was not.
 
-Those 407 leaves are the deletion and timestamp-exception channels for 195 mostly-null columns. The
-dataset is bound with every column present and NULL for a missing reading, which writes a cell
-tombstone per null -- roughly 58 M of them across 300 000 rows. At about a byte each that is
-~58 MB, which is the 60 MB observed almost exactly. So the anomalous file is the one that **stores
-the tombstone metadata**, and the normal one is the one where it has collapsed. Native moving with
-it (21.8 → 32.3 M) fits: the row format stores the same tombstones.
+**The premise that was false.** `gc_grace_seconds` is not what the default consults. Every
+CQL-created table that does not name a `tombstone_gc` property has one installed for it by
+`cf_prop_defs::apply_to_builder` (`cql3/statements/cf_prop_defs.cc:447`), and
+`get_default_tombstone_gc_mode` (`tombstone_gc.cc:325`) returns:
 
-**The channel is now named, from the anomalous file itself** (caught on the 6th of 7 passes and
-kept: `out/bb_anomalous_pass6.parquet`). It is not the timestamp-exception channel, as the
-size arithmetic suggested — it is `__ldt_<column>`, **local deletion time**:
-
-| leaf | bytes | values | nulls |
-|---|---:|---:|---:|
-| `__ts` | 1 893 064 | 300 000 | 0 |
-| `__ldt_smart_27_raw` | 394 255 | 300 000 | 4 818 |
-| `__ldt_smart_189_raw` | 393 854 | 300 000 | 23 872 |
-| ~390 more `__ldt_*` | ~390 kB each | 300 000 | varies |
-
-`__ts` barely moves between the two regimes; the `__ldt_*` leaves are the entire 60 MB. Each holds a
-deletion time for ~295 000 of 300 000 rows, and the null counts differ per column in step with how
-often that column actually has a reading. So this is exactly what binding every column with NULL for
-a missing value produces: **a cell tombstone per null**, ~58 M of them, and the anomalous file is the
-one that stores them.
-
-**And the obvious explanation is wrong.** The natural guess was purge eligibility: the mutation
-timestamps are back-dated to 2023 and `gc_grace_seconds` is the default 10 days, so the tombstones
-would be droppable and a compaction might or might not drop them. Read out of the file directly, the
-write timestamps *are* 2023 — but `local_deletion_time` is **wall-clock at write time**, minutes old:
-
-```
-__ts   1700346220936144  ->  2023-11-18T22:23:40Z   (the USING TIMESTAMP)
-__ldt  1787184561        ->  2026-08-20T00:09:21Z   (wall clock, ~7 minutes before the read)
+```cpp
+return {{"mode", !supports_repair || is_local_replication_table(rs) ? "timeout" : "repair"}};
 ```
 
-At 0 days against a 10-day grace these tombstones are **not purgeable in either regime**, so
-compaction dropping them cannot be what distinguishes the runs. That eliminates the first hypothesis
-rather than confirming it, which is worth more than it sounds: it moves the question from the read
-side to the write side. If the normal runs have no tombstones *at all* — and their `__ldt_*` leaves
-totalling ~0.7 MB across ~400 leaves is what all-null looks like — then the difference is whether
-those NULLs were bound as deletions in the first place, not whether they were later removed.
+`repair`, for any keyspace whose replication strategy is not `local`. Read back off the node rather
+than assumed — `system_schema.tables.extensions` for a brand-new table in a brand-new keyspace, with
+no options given, carries `tombstone_gc = {'mode': 'repair', 'propagation_delay_in_seconds': '3600'}`,
+and so does every table in `pqlab`. The in-file comment at `tombstone_gc.cc:168` ("if mode = timeout
+// default option, if user does not specify tombstone_gc options") is stale and is what the previous
+account was effectively trusting.
 
-**The shadowing hypothesis is eliminated too.** A duplicate row inserted twice under different
-`USING TIMESTAMP` values would let a later live cell shadow an earlier tombstone, and the harness
-does log collapse counts for other datasets (pageviews: 176 082 rows to 163 845 distinct keys). The
-Backblaze slice has **no duplicates at all**: 300 000 rows, 300 000 distinct `(serial_number, date)`
-pairs.
+**The code path, and the condition.** In `repair` mode, `tombstone_gc.cc:187` (and `:102` for the
+range form):
 
-**The arithmetic checks out exactly, which is worth stating because it closes the size question.**
-The slice holds **42 448 175 nulls** across 195 data columns — 141.5 per row. Bound as NULLs that is
-42.4 M cell tombstones, and at ~1.4 B each after zstd that is ~60 MB: the anomalous file's 60.1 MB.
-So there is no missing mechanism on the size side. Every run writes those tombstones, and the
-question is entirely what removes them in the other six passes out of seven.
-
-**The absent-versus-cheap question is now settled, on the files rather than on an aggregate**
-(`bb_compare_ldt.py`, comparing a kept normal file against the kept anomalous one):
-
-| | `__ldt_*` leaves | values | non-null | bytes |
-|---|---:|---:|---:|---:|
-| normal | 195 | 58 500 000 | **0 (0.00 %)** | 327 600 (1 680 B per leaf) |
-| anomalous | 195 | 58 500 000 | **42 448 175 (72.56 %)** | 57 327 020 |
-
-1 680 bytes per leaf is what an all-null column costs: definition levels and nothing else. And
-42 448 175 is *exactly* the null count of the source slice — so the anomalous file carries precisely
-one tombstone per source null and the normal file carries none. The data columns are identical in
-both, same per-column null counts and sizes to within 0.1 %, so the `__ldt_*` channel is the only
-difference between a 20.8 MB file and an 84.3 MB one.
-
-**So the tombstones are genuinely absent in six runs out of seven, and the cause is upstream of the
-Parquet writer.** Two things follow. The Parquet side is exonerated: it faithfully records what it is
-given, and `pq_bytes` is byte-identical (20 803 872) across all six normal passes, which is what
-identical input looks like. And the native sstable moves with it — 21.9 MB normal against 32.3 MB
-anomalous — so the divergence already exists *before* the format conversion.
-
-**What remains genuinely puzzling, stated as such.** Every explanation checked is eliminated: not
-gc_grace (the deletion times are wall-clock and minutes old against a 10-day grace), not shadowing
-(no duplicate keys), not the load (identical input, identical statements, identical `USING TIMESTAMP`
-per row). Yet a bind-NULL insert must write a dead cell, and in most runs no dead cell survives to
-the first measurable sstable.
-
-**The write path is exonerated too: it emits the tombstones every time.** Measured as tightly as it
-can be — table created with `storage_format='parquet'` and **auto-compaction disabled**, so the first
-memtable flush is itself a pq file with nothing between the write path and the bytes read back
-(`bb_writepath.py`):
-
-| pass | pq files | `__ldt` values | non-null | populated |
-|---|---:|---:|---:|---:|
-| 1 | 34 | 58 500 000 | 42 448 175 | 72.56 % |
-| 2 | 33 | 58 500 000 | 42 448 175 | 72.56 % |
-| 3 | 33 | 58 500 000 | 42 448 175 | 72.56 % |
-
-Identical to the digit across three passes, and identical to the anomalous corpus file. So the load
-is not the variable, and neither is the Parquet writer. **Something downstream removes ~42.4 M cell
-tombstones in six corpus runs out of seven** — one of the harness's five codec-sweep rewrites, or the
-conversion compaction.
-
-Disabling auto-compaction was not a convenience: ICS began compacting the instant the flush landed,
-which both raced the read and would have made the measured file something other than what the write
-path produced. The first attempt at this experiment died on a half-written footer, which is the only
-reason the race was noticed at all.
-
-**Whether that removal is legitimate is deliberately left open here.** Their `local_deletion_time` is
-wall-clock and minutes old against a 10-day `gc_grace`, so the timeout rule should not make them
-droppable — but a cell tombstone that shadows nothing may be droppable under rules this project has
-not verified, and asserting a Scylla-wide correctness claim on the strength of a size measurement
-would be exactly the overreach the rest of this section avoids.
-
-**The next step is a bisect, not another hypothesis, and the instrument exists.** Native sstable size
-cannot be the signal — the codec sweep moves it from 242 MB to 32 MB, which buries a ~10 MB tombstone
-effect. But the sstable Statistics carry `estimated_tombstone_drop_time`
-(`sstables/types.hh`), and the in-tree tool reads it without needing a running node or a schema file,
-autodetecting the schema from the sstable's own path:
-
-```bash
-scylla sstable dump-statistics <path>/me-...-Data.db   # -> stats.estimated_tombstone_drop_time
+```cpp
+case tombstone_gc_mode::repair:
+    ...
+    if (_shared_state && _shared_state->is_table_rf_one(s->id())) {
+        gc_before = query_time;
 ```
 
-Empty means no tombstones; populated means they are there. Verified against a table known to have
-none, which returns `{}`. So the bisect is six invocations — after the flush and after each of the
-five codec rewrites — and it names the compaction that drops the tombstones without any further
-guesswork. From there the question becomes a specific one about that compaction's purge decision.
+`gc_grace_seconds` is not read on that branch at all. `gc_before` becomes *now*, which is the same
+answer `tombstone_gc_mode::immediate` gives. `row::compact_and_expire`
+(`mutation/mutation_partition.cc:1642`) then erases a dead cell when
+`cell.deletion_time() < gc_before && can_gc(...)`, and a tombstone written a second ago satisfies it.
 
-If it turns out they are droppable by design, the anomaly is fully explained and Backblaze's corpus
-figure should be taken from a run with `tombstone_gc` pinned so it stops varying between runs.
+Which is correct. `repair` mode exists to hold a tombstone until a repair has reconciled it across
+replicas, because dropping it earlier could let a replica that never saw it re-expose the value it
+shadows. With one replica there is no such replica, so there is nothing to wait for — and the
+other-sstable case is still guarded independently by `max_purgeable`
+(`compaction/compaction.cc:200`). `replica/table.cc:3984 update_tombstone_gc_rf_one()` maintains the
+registry, calling `set_table_rf_n()` the moment the effective replication factor stops being 1.
+Upstream asserts this behaviour directly in `test_tombstone_gc_rf_one`
+(`test/boost/database_test.cc:2202`): "With RF=1, tombstone-gc should act as if configured in
+'immediate' mode."
 
-**The bisect ran, and it eliminated more than it identified — including my own reimplementation.**
-`bb_bisect.py` walks flush → none → lz4 → zstd → lz4_dict → zstd_dict → parquet, measuring
-`estimated_tombstone_drop_time` after each step. The calibration gate passed exactly: the first
-flush reports **42 448 175 histogram points**, the precise tombstone count, so the probe provably
-counts dead atomic cells and every later reading means something.
+**Measured, not argued: the mode is the variable.** `~/pq-lab/tomb_min.py` reduces the pipeline to
+the thing under test — a bind-NULL insert with a back-dated `USING TIMESTAMP`, then major compactions
+— so a pass costs seconds instead of eleven minutes, and the probe is self-calibrating on every pass
+(`estimated_tombstone_drop_time` point count must equal rows x null-columns exactly, or the pass is
+rejected). `~/pq-lab/tomb_verdict.py`, four passes per arm, RF=1, `gc_grace_seconds` at its 10-day
+default throughout, everything else identical:
 
-Then all **five** runs kept every tombstone at every stage:
+| `tombstone_gc` mode | purged |
+|---|---:|
+| unset (i.e. `repair`) | **4/4** |
+| `timeout` — the mode the previous account assumed | **0/4** |
+| `disabled` | **0/4** |
 
-| stage | bytes | tombstones |
-|---|---:|---:|
-| flush | 66 682 357 | 42 448 175 |
-| none | 242 357 702 | 42 448 175 |
-| lz4 | 67 781 169 | 42 448 175 |
-| zstd | 49 003 336 | 42 448 175 |
-| lz4_dict | 52 507 015 | 42 448 175 |
-| zstd_dict | 32 234 454 | 42 448 175 |
-| parquet | 85 986 241 | 42 448 175 (72.56 % of `__ldt`) |
+The `timeout` and `disabled` arms were each compacted eight further times after the load and never
+lost a tombstone, which is exactly what the previous account predicted for *every* arm. So had the
+tables actually been running `timeout`, its worry would have been justified; they were not.
 
-Five anomalous runs in a row, against the harness's rate of roughly one in seven, is about a
-1-in-17 000 coincidence — so this is systematic, not luck. **The removal is therefore not in the
-load, not in the codec rewrites, and not in the conversion**, because this pipeline performs all of
-those and never loses a tombstone.
+**And RF is the other variable — measured on four nodes, not inferred.** A single-node lab cannot
+place two replicas (`ALTER KEYSPACE ... datacenter1:2` is refused outright), so this was run on
+`cluster_setup.sh`'s cluster, two keyspaces differing only in RF, default `tombstone_gc` in both
+(`~/pq-lab/tomb_cluster_rf.py`):
 
-**What it is, is a difference between the harness and my reimplementation of it**, and that is the
-lesson worth keeping. The harness does considerably more compaction than the bisect copied:
-`flush_and_compact()` before each codec, `rewrite(); flush_and_compact()` **twice** for the two
-dictionary codecs (the second pass exists so the freshly trained dictionary is actually used), and a
-full-table read afterwards — roughly twelve major compactions per run against the bisect's five.
+| | mode | tombstones after load | after 7 rounds of flush + major |
+|---|---|---:|---|
+| RF=1 | repair | 9 000 | **0 — purged in one round** |
+| RF=3 | repair | 27 000 (3 replicas) | **27 000 — retained** |
 
-So the next step is not another hypothesis, and not a better reimplementation: **instrument the
-harness itself**, probing tombstone counts between its real stages. Reimplementing a pipeline in
-order to bisect it introduced the very divergence that made the bisect inconclusive, which is a
-cheaper lesson here than it usually is.
+That is the whole answer, and it inverts the naming. With RF > 1 and no repair history, `repair` mode
+yields `gc_clock::time_point::min()` and *nothing* is purgeable. **So the tombstone-bearing ~84 MB
+file is what a real cluster produces, and the ~20.8 MB file is an artifact of the lab's RF=1.** The
+section previously called the first "anomalous" and the second "normal"; on any supported deployment
+it is the other way round.
 
-**No published figure depends on this.** Backblaze's row in §10.1f-prod comes from the standalone
-runs that land in the normal regime, and §10.16 excluded its absolute numbers from the corpus
-re-measurement for exactly this reason.
+**Why it looked random — 1 pass in 7 rather than every pass.** `gc_before` is additionally clamped by
+`check_min` to `commitlog::min_gc_time()` for the table (the source is installed at `main.cc:2102`),
+so a tombstone whose commitlog segment has not been released yet is not *yet* purgeable even under
+`repair` + RF=1. A node trace confirms the clamp binding rather than the mode failing: at a compaction
+running 11:47:28, `mode=repair, repair_timestamp=-9223372036854775808, gc_before=1787305647` — the
+*write* second, not the compaction second — and `get_max_purgeable_timestamp` was never reached,
+because `deletion_time < gc_before` short-circuited false. Forcing the segments to be discardable
+collapses the delay: flushing every keyspace before each major purges in **1** round, against **4**
+rounds when only the table itself is flushed (`~/pq-lab/tomb_clamp.py`). That is a wall-clock/IO race,
+which is the shape of a fault that lands on either side of the same question from identical input.
+
+**Where the previous account was wrong, itemised.** Worth more than a tidy narrative:
+
+* "Cell tombstones here are never purgeable against the default 10-day `gc_grace_seconds`" — false.
+  The default mode does not consult `gc_grace_seconds`.
+* "Retention is correct and the *small* files are what need explaining" — backwards. Retention is what
+  RF > 1 does; the small files are what RF = 1 does, and both are correct.
+* "The write path emits them every time, so the load is not the variable" — the conclusion is true
+  (every `tomb_min.py` pass reads exactly rows x null-columns after the load) but the evidence did not
+  support it. All three `bb_writepath.py` passes reported 72.56 %, i.e. all three landed in the
+  retaining regime; no instrumented run ever observed the other regime, so nothing could be
+  eliminated by their agreement.
+* "Five bisect runs keeping every tombstone at every stage is a 1-in-17 000 coincidence, so the
+  removal is not in the load, the codec rewrites or the conversion" — the arithmetic assumes
+  independent draws from a fixed rate. The outcome is a timing race, and instrumenting the pipeline
+  changes its timing, so the runs are not independent of the instrument. The bisect eliminated
+  nothing; there was never a single stage to find, because *any* compaction will purge once the clamp
+  lifts.
+* "Reimplementing the harness introduced the divergence" — plausible at the time, and the general
+  lesson stands, but it was not the cause here. Both the harness and the reimplementation were
+  correct; they sat on different sides of a race.
+
+**What this means for the corpus figure.** Backblaze's 20 803 872 B / 95.8 % is a measurement of an
+RF=1 table that has purged its cell tombstones. It is reproducible and it is not wrong, but it is not
+what the same load stores on a replicated cluster. `harness.py` now takes `PQ_TOMBSTONE_GC` (unset by
+default, so no published figure moves) to pin the mode; `PQ_TOMBSTONE_GC=timeout` is the setting that
+makes a bind-NULL dataset measure what a cluster would keep. The wider point is not about Backblaze:
+**any dataset loaded by binding NULL for absent values carries one cell tombstone per null**, and on
+a replicated cluster those are stored until a repair runs. That is a property of the load, shared by
+both storage formats — native moves 21.8 -> 32.5 MB with it — and it is the reason this dataset's
+absolute bytes were never comparable across runs.
+
+**Still unresolved, stated as such.** Two things, neither affecting the verdict:
+
+* Why the *instrumented* runs sat 6-for-6 on the retaining side while uninstrumented ones retained
+  roughly 1 in 7. Calling `scylla sstable dump-statistics` between stages adds seconds, which should
+  make purging *more* likely, not less. The mechanism is settled; this particular skew is not, and
+  settling it would need commitlog-segment-lifetime instrumentation the lab does not have.
+* The commitlog clamp is inferred from `gc_before` landing on the write second and from the
+  global-flush acceleration, not from reading `commitlog::min_gc_time()` directly. A trace point
+  inside `check_min` would confirm it outright.
 
 ### 10.19 Mixed-format bucketing at scale — measured 2026-08-20, and it is only half an answer
 
@@ -6710,7 +6681,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
-| Backblaze 4× anomaly | **localised, not solved** | Mechanism found (§10.18): the per-cell tombstone/exception channel is sometimes stored (60 MB across 407 synthetic leaves) and sometimes collapsed (2.7 MB). Not batch-only as previously claimed -- 1 in 7 standalone passes, 2 of 2 batch runs. Why it collapses is open. No published figure depends on it. |
+| Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it. |
 | Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). Not covered: key rotation (unexercised), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
@@ -6731,8 +6702,10 @@ a running node rather than only in a unit test. What is left is genuinely narrow
   converts anyway. `storage_format = 'sstable'` is the only guard and it is manual.
 - **One half-measurement**: mixed-format bucketing at scale showed the right shape but over too
   small a share of the bytes to be evidence (§10.19).
-- **One localised-but-unexplained anomaly**: Backblaze's per-cell metadata channel sometimes
-  collapses and sometimes does not (§10.18). No published figure depends on it.
+- **One former anomaly, now closed**: Backblaze's per-cell tombstone channel is present or purged
+  depending on tombstone GC, which under the lab's RF=1 makes every cell tombstone immediately
+  purgeable (§10.18). Legitimate behaviour, verified against a four-node cluster; the earlier
+  suspicion of a tombstone-retention bug rested on a misread default.
 
 Everything else on the old list is closed. Encryption at rest is built as Parquet Modular Encryption
 with its keys taken from Scylla's own encryption-at-rest providers, so BYOK works, and verified end to
