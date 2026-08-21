@@ -2013,6 +2013,95 @@ Note that `cassandra-stress` and `scylla-bench` profiles are the right tools for
 (throughput and latency) but are **not** valid for compression measurement — their
 generated values are effectively random.
 
+### 9.6 Write-path correctness coverage — surveyed 2026-08-21
+
+§7.3 calls the version-parameterised mutation-source suite "the single highest-value test".
+It is, and it was already wired up — which is worth stating plainly, because the obvious
+next move is to go and wire it up again.
+
+**`pq` is a member of `writable_sstable_versions`** (`sstables/version.hh:66`), and the
+comment there explains why membership in `all_sstable_versions` alone is impossible:
+`check_sstable_versions()` requires anything at or after `oldest_writable_sstable_format`
+to be writable. The consequence is that `pq` is already live in **every** loop of the form
+`for (auto v : writable_sstable_versions)` — 13 in `sstable_mutation_test.cc`, 14 in
+`sstable_datafile_test.cc`, 6 in `sstable_3_x_test.cc`, 3 in `sstable_compaction_test.cc`,
+2 in `sstable_resharding_test.cc` — with no `pq` guards in any of them. It is *not* in
+`get_highest_sstable_version()` (`version.hh:87`, which steps back one element when the
+last is `pq`), so unparameterised tests still get `mt`.
+
+`sstable_conforms_to_mutation_source_test.cc:172` runs the full battery against `pq`.
+
+**What is deliberately excluded, and why.** Exactly one exclusion mechanism exists,
+`has_reference_fixture()` (`sstable_test.cc:475`, duplicated at
+`sstable_datafile_test.cc:479`), used at 12 sites. All 12 load a checked-in sstable from
+`test/resource/sstables`; the fixtures were generated for the kl and m families and `pq`
+has none. This is a missing-fixture exclusion, not a missing-functionality one.
+
+**A coverage axis that looked real and is not.** The conformance suite runs mc/md/ms/mt at
+three `promoted_index_block_size` values and `pq` at one, which reads like an obvious gap.
+It is not: `promoted_index_block_size` is consumed only by `sstables/mx/writer.cc`, and the
+`pq` writer emits no promoted index at all — `write_vint(*_index_writer, uint64_t(0)); //
+no promoted index` (`writer_impl.cc:877`), because Parquet's own ColumnIndex provides
+intra-partition seeking. Adding `_pq_medium` and `_pq_large` cases would run the same
+battery three times for the same cost as running it once. Not done, on purpose.
+
+**Added 2026-08-21.** Three cases, all in `test/boost/sstable_parquet_test.cc`:
+
+| Case | What it covers that nothing did |
+|---|---|
+| `test_hybrid_read_merges_native_and_parquet` | A read whose sstable set is format-mixed, in both orders, with an all-`pq` control. |
+| `test_hybrid_compaction_merges_native_and_parquet` | A compaction taking one native and one `pq` input, writing each output format in turn. |
+| `test_pq_dead_and_absent_are_distinguishable_on_disk` | `__dmask` entry counts read from the footer, so `dead` and `absent` are told apart in the file rather than through the reader; plus the fold/elision pairing, with both an elidable and a non-elidable row group in one file. |
+| `test_pq_reads_cross_a_window_seam_inside_a_row_group` | A row group wider than the 16 384-row scan window, so a read decodes one group in two windows — geometry no data-writing test had ever produced. |
+
+The merge cases are the significant ones, and the reason is worth keeping. Every
+single-format round-trip test in this file is blind to a tombstone stored as an absent
+cell: it round-trips perfectly, because nothing in the file contradicts it. It only becomes
+wrong when an older sstable supplies the value it should have shadowed. So the merge is the
+**first place `dead` and `absent` are distinguishable at all** through the reader, and the
+on-disk `__dmask` count is the only way to distinguish them without one. Before this, the
+suite built a native sstable beside a `pq` one in eight places and never merged them, and
+the one place a mixed compaction actually happens (`cql_ddl_test.cc:283`) asserts neither
+that the input set was mixed nor the rows that came through the native input.
+
+**Two traps that make storage-level tombstone tests pass vacuously.** Both cost real time
+here and are worth the paragraph:
+
+1. **Tombstones are purged on any compaction at RF=1.** A table created without an explicit
+   `tombstone_gc` gets mode `repair`, which at RF=1 short-circuits `gc_before` to *now*, so
+   `gc_grace_seconds` is never consulted (§10.18, §10.28). A "delete, flush, inspect" test
+   finds nothing and looks like a pass. Set `tombstone_gc = {'mode':'timeout'}`, or flush
+   without compacting. The unit tests above sidestep this by writing sstables directly
+   rather than through a node.
+2. **`make_sstable_containing` already validates.** It reads every sstable it builds back
+   and compares against the input (`test/lib/sstable_utils.cc:83`), so an encoding bug that
+   loses data fails at *construction*, before any assertion in the test body runs. That is
+   what makes on-disk assertions worth writing: they are the only thing that catches a file
+   that is wrong while remaining self-consistent — and it is why proving an on-disk
+   assertion can fail requires a *round-trip-neutral* mutation, not just any bug.
+
+**Still uncovered.** Named rather than implied:
+
+- **No Python-level coverage at all.** Zero of 629 files under `test/*.py` mention
+  `storage_format` or `parquet`. The REST endpoints `column_family/storage_format/{name}`
+  and `storage_service/estimate_parquet_ratios` have no `test/rest_api` coverage.
+- **`sstables/parquet/test_tiering.cc` is not in `configure.py`** — the only per-criterion
+  test of the C1/C5/C6 policy is built solely by the hand-run `run_tests.sh`, so CI never
+  executes it.
+- **Hybrid + TWCS on the streaming path** is untested: `cql_ddl_test.cc:363` covers hybrid
+  under size-tiered only, where the answer is "not `pq`".
+- **`distributed_loader.cc:415` tests `storage_format() == parquet` rather than
+  `writes_parquet_unconditionally()`**, so reshape/reshard on load writes native sstables
+  into a hybrid+TWCS table whose flushes, streams and compactions all write `pq`. Nothing
+  asserts either behaviour. This is a real inconsistency with the single-home rule
+  `tiering_context.hh` states, not just a test gap.
+- **TWCS never sets `parquet_ctx.bottom_tier`**, so C1 would read `false` for every TWCS
+  compaction. Harmless only while the hybrid+TWCS short-circuit exists ahead of it.
+- **Counters in a mixed-format merge**, and non-frozen collections in one. Both round-trip
+  under `pq` alone; neither has been merged across formats.
+- **A real cluster.** All of the above is single-process. Mixed-set reads at scale were
+  verified by hand on a live node (§10.19) and remain unautomated.
+
 ---
 
 ## 10. Configuration results
@@ -6845,6 +6934,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Bounded memory | Writer streams row groups: 98 % → 19 % buffered, byte-identical output. Scan memory asserted flat (1.01× for 8× rows). |
 | Size accounting | Mixed candidate sets bucket on `ondisk_data_size()`; all-native sets untouched (§10.3i). |
 | Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. |
+| Write-path correctness | `pq` is in `writable_sstable_versions`, so the standard mutation-source battery and every `writable_sstable_versions` loop across `sstable_mutation_test`, `sstable_datafile_test`, `sstable_3_x_test`, `sstable_compaction_test` and `sstable_resharding_test` already run against it, unguarded. The only `pq` exclusions are the 12 sites that load checked-in legacy fixtures. Reads and compactions over **format-mixed** sstable sets are now covered in both orders, and `dead` vs `absent` is asserted **in the file** via `__dmask` counts rather than only through the reader (§9.6). |
 | Scale | GB-scale three-way measurement on real NOAA ISD-Lite under TWCS (§10.6). |
 
 ### Remaining
@@ -6856,7 +6946,8 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Production-scale re-measurement | **done for point reads and scans** | §10.21 re-measured point reads at 8 M rows with a canary and `BYPASS CACHE`, and retired every warm ratio in §10.4 as a measurement of the client round trip. §10.24 then measured the footer cache against a squeezed-cache control on the same data. §10.26 did the same for scans, and it moved a conclusion rather than scaling one. Write figures are still from 200–300 k-row sstables. |
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
-| Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. |
+| Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. Note this is a *bucketing* gap: mixed-set **correctness** — reads and compactions across both formats, with every tombstone shape — is now covered by unit tests (§9.6), which it was not when this row was written. |
+| Correctness coverage gaps | known | Enumerated in §9.6. The load-bearing ones: **no Python/pytest coverage of `storage_format` at all** (0 of 629 files under `test/*.py` mention it, and the two REST endpoints have none either); **`sstables/parquet/test_tiering.cc` is absent from `configure.py`**, so the only per-criterion test of C1/C5/C6 never runs in CI; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. Also a genuine inconsistency rather than a gap: `distributed_loader.cc:415` gates on `storage_format() == parquet` instead of `writes_parquet_unconditionally()`, so reshape-on-load writes native sstables into a hybrid+TWCS table that writes `pq` everywhere else, and nothing asserts either way. |
 | Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
 | **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |
