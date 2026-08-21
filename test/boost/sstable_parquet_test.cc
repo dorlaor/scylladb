@@ -609,6 +609,380 @@ SEASTAR_THREAD_TEST_CASE(test_pq_sstables_compact_into_one) {
     }).get();
 }
 
+// ---------------------------------------------------------------------------
+// Mixed-format (hybrid) tables.
+//
+// `storage_format = 'hybrid'` means native and pq sstables coexist in one table, so every read
+// merges across both and every compaction can take one of each as input. Until now nothing tested
+// that. The pq suite built a native sstable beside a pq one in eight places, but always to compare
+// two *separate* readers -- never to merge them -- and the one place a mixed compaction actually
+// happens (cql_ddl_test's test_storage_format_converts_on_compaction) neither asserts that the
+// input set was mixed nor reads back the rows that came through the native input.
+//
+// That gap matters more than the single-format round trip, because merging is where a wrong
+// encoding turns into wrong data rather than a wrong file. A tombstone that pq stores as an absent
+// cell reads back correctly from the pq sstable alone -- there is nothing there to contradict it --
+// and only resurrects the value it was meant to shadow when an older sstable supplies one. The
+// merge is the first place the difference between `dead` and `absent` is observable at all.
+//
+// The reference in all of these is the same merge with both inputs in the native format: the
+// question is whether pq behaves like the row format under merge, not whether either matches some
+// hand-written expectation.
+
+namespace {
+
+// A static column is included deliberately: statics are shredded as regular `__s_<name>` columns
+// replayed onto every row and split back out on read, so a static cell deleted in the overlay is
+// the case where a lost `__dmask` bit resurrects a value on *every* row of the partition.
+schema_ptr hybrid_schema() {
+    return schema_builder(1, "ks", "hyb_tbl")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("a", int32_type)
+        .with_column("b", int32_type)
+        .with_column("c", utf8_type)
+        .with_column("st", int32_type, column_kind::static_column)
+        .build();
+}
+
+constexpr int hyb_parts = 8;
+constexpr int hyb_rows = 10;
+
+partition_key hyb_pk(const schema& s, int p) {
+    return partition_key::from_single_value(s, utf8_type->decompose(sstring(format("hk{:04d}", p))));
+}
+
+clustering_key hyb_ck(const schema& s, int r) {
+    return clustering_key::from_single_value(s, int32_type->decompose(r));
+}
+
+void hyb_sort(utils::chunked_vector<mutation>& muts) {
+    std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+        return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+    });
+}
+
+// The older generation: every row fully populated, one low timestamp band. Partition 6 is absent,
+// so the merge has a partition that exists only in the overlay.
+utils::chunked_vector<mutation> hybrid_base(schema_ptr s) {
+    const auto& adef = *s->get_column_definition(to_bytes("a"));
+    const auto& bdef = *s->get_column_definition(to_bytes("b"));
+    const auto& cdef = *s->get_column_definition(to_bytes("c"));
+    const auto& stdef = *s->get_column_definition(to_bytes("st"));
+
+    utils::chunked_vector<mutation> muts;
+    for (int p = 0; p < hyb_parts; ++p) {
+        if (p == 6) { continue; }
+        mutation m(s, hyb_pk(*s, p));
+        const api::timestamp_type ts = 1000 + p;
+        m.set_static_cell(stdef, atomic_cell::make_live(*int32_type, ts,
+                                                        int32_type->decompose(p * 11)));
+        for (int r = 0; r < hyb_rows; ++r) {
+            if (r == 9) { continue; }   // row 9 exists only in the overlay
+            auto ck = hyb_ck(*s, r);
+            // Row 8's marker is deliberately *newer* than its cells, and newer than the
+            // shadowable tombstone the overlay puts on it. That is the only arrangement under
+            // which the shadowable and regular halves of a row tombstone are distinguishable:
+            // the marker cancels a shadowable tombstone but not a regular one, so a pq reader
+            // that collapses the two halves deletes cells that must survive. It is observable
+            // only against an older generation -- from the overlay alone there are no cells for
+            // the difference to act on -- which is why it lives here and not in the
+            // single-sstable round-trip tests.
+            m.partition().clustered_row(*s, ck).apply(row_marker(r == 8 ? ts + 2000 : ts));
+            m.set_clustered_cell(ck, adef, atomic_cell::make_live(
+                    *int32_type, ts, int32_type->decompose(r)));
+            m.set_clustered_cell(ck, bdef, atomic_cell::make_live(
+                    *int32_type, ts, int32_type->decompose(r * 100)));
+            m.set_clustered_cell(ck, cdef, atomic_cell::make_live(
+                    *utf8_type, ts, utf8_type->decompose(sstring(format("base{}", r)))));
+        }
+        muts.push_back(std::move(m));
+    }
+    hyb_sort(muts);
+    return muts;
+}
+
+// The newer generation: one of every tombstone and update shape, at a strictly higher timestamp
+// band so it always wins the merge. Partition 5 is absent, so the merge also has a partition that
+// exists only in the base.
+utils::chunked_vector<mutation> hybrid_overlay(schema_ptr s) {
+    const auto& adef = *s->get_column_definition(to_bytes("a"));
+    const auto& cdef = *s->get_column_definition(to_bytes("c"));
+    const auto& stdef = *s->get_column_definition(to_bytes("st"));
+
+    utils::chunked_vector<mutation> muts;
+    for (int p = 0; p < hyb_parts; ++p) {
+        if (p == 5) { continue; }
+        mutation m(s, hyb_pk(*s, p));
+        const api::timestamp_type ts = 2000 + p;
+        const auto ldt = gc_clock::time_point(gc_clock::duration(70000 + p));
+
+        // Partition 7 is deleted outright: everything the base holds for it must disappear.
+        if (p == 7) {
+            m.partition().apply(tombstone(ts, ldt));
+            muts.push_back(std::move(m));
+            continue;
+        }
+
+        // A static cell updated, deleted, or left alone -- the deleted arm is the one that must
+        // not come back as absent.
+        if (p % 3 == 0) {
+            m.set_static_cell(stdef, atomic_cell::make_live(*int32_type, ts,
+                                                           int32_type->decompose(p * 11 + 1)));
+        } else if (p % 3 == 1) {
+            m.set_static_cell(stdef, atomic_cell::make_dead(ts, ldt));
+        }
+
+        // Row 0: a cell updated, with `b` untouched, so the merge must take `a` from the overlay
+        // and `b` from the base. A cell wrongly written as absent is indistinguishable from
+        // "untouched" here, which is exactly the confusion being tested.
+        m.set_clustered_cell(hyb_ck(*s, 0), adef, atomic_cell::make_live(
+                *int32_type, ts, int32_type->decompose(999)));
+
+        // Row 1: a cell deleted. `b` and `c` must survive from the base, `a` must not.
+        m.set_clustered_cell(hyb_ck(*s, 1), adef, atomic_cell::make_dead(ts, ldt));
+
+        // Row 2: a row tombstone.
+        m.partition().clustered_row(*s, hyb_ck(*s, 2)).apply(row_tombstone(tombstone(ts, ldt)));
+
+        // Row 3: a shadowable tombstone plus a marker -- what an UPDATE produces. The regular half
+        // must stay empty; collapsing the two would delete cells that should survive.
+        {
+            auto& dr = m.partition().clustered_row(*s, hyb_ck(*s, 3));
+            dr.apply(row_marker(ts));
+            dr.apply(shadowable_tombstone(ts, ldt));
+        }
+
+        // Rows 4-6: a range tombstone over a band the base populated. If pq loses the bound weight
+        // or the tombstone itself, three rows come back from the dead.
+        m.partition().apply_delete(*s, range_tombstone(
+                clustering_key_prefix::from_single_value(*s, int32_type->decompose(4)),
+                bound_kind::incl_start,
+                clustering_key_prefix::from_single_value(*s, int32_type->decompose(6)),
+                bound_kind::incl_end,
+                tombstone(ts, ldt)));
+
+        // Row 7: an expiring cell. A live cell with a TTL carries a deletion time too, so it is
+        // the case that must *not* be read as dead.
+        m.set_clustered_cell(hyb_ck(*s, 7), cdef, atomic_cell::make_live(
+                *utf8_type, ts, utf8_type->decompose(sstring("ttl")),
+                gc_clock::time_point(gc_clock::duration(90000 + p)), gc_clock::duration(600)));
+
+        // Row 8: a shadowable tombstone with no regular half, sitting *below* the base row's
+        // marker. The marker cancels it, so every base cell on row 8 must survive. If pq rebuilds
+        // the row tombstone with its regular half as strong as its shadowable one, those cells are
+        // deleted instead -- a silent data loss that no single-format round trip can see.
+        m.partition().clustered_row(*s, hyb_ck(*s, 8)).apply(shadowable_tombstone(ts, ldt));
+
+        // Row 9 exists only in the overlay.
+        m.partition().clustered_row(*s, hyb_ck(*s, 9)).apply(row_marker(ts));
+        m.set_clustered_cell(hyb_ck(*s, 9), adef, atomic_cell::make_live(
+                *int32_type, ts, int32_type->decompose(9)));
+
+        muts.push_back(std::move(m));
+    }
+    hyb_sort(muts);
+    return muts;
+}
+
+// Dead atomic cells, regular and static, in a reassembled result. The merge assertions compare
+// against a native reference, so they would pass just as well if *both* sides lost every
+// tombstone; this is what stops that.
+size_t count_dead_cells(const schema& s, const utils::chunked_vector<mutation>& ms) {
+    size_t n = 0;
+    auto scan = [&] (const row& cells, column_kind kind) {
+        cells.for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
+            const auto& def = s.column_at(kind, id);
+            if (def.is_atomic() && !acoc.as_atomic_cell(def).is_live()) { ++n; }
+        });
+    };
+    for (const auto& m : ms) {
+        scan(m.partition().static_row().get(), column_kind::static_column);
+        for (const rows_entry& re : m.partition().clustered_rows()) {
+            scan(re.row().cells(), column_kind::regular_column);
+        }
+    }
+    return n;
+}
+
+size_t count_rows(const utils::chunked_vector<mutation>& ms) {
+    size_t n = 0;
+    for (const auto& m : ms) {
+        n += std::distance(m.partition().clustered_rows().begin(),
+                           m.partition().clustered_rows().end());
+    }
+    return n;
+}
+
+} // namespace
+
+// A read that spans a native and a pq sstable in the same table, in both orders.
+//
+// The three arms are the two mixed orders plus an all-pq control. The control matters: if pq lost a
+// tombstone, the all-pq arm would lose it on both sides of the merge and could still agree with
+// itself -- it is the *mixed* arms that catch it, and having the control in the same test makes it
+// obvious which one failed.
+SEASTAR_THREAD_TEST_CASE(test_hybrid_read_merges_native_and_parquet) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = hybrid_schema();
+        auto base = hybrid_base(s);
+        auto over = hybrid_overlay(s);
+        const auto nat = sstables::get_highest_sstable_version();
+
+        auto mk = [&] (sstable_version_types v, const utils::chunked_vector<mutation>& ms) {
+            return make_sstable_containing(env.make_sstable(s, v), ms).get();
+        };
+        auto nat_base = mk(nat, base), nat_over = mk(nat, over);
+        auto pq_base = mk(sstable_version_types::pq, base);
+        auto pq_over = mk(sstable_version_types::pq, over);
+
+        // The query path: two make_reader()s over the full range, combined. This is what a
+        // coordinator read of a hybrid table does.
+        auto merged = [&] (shared_sstable x, shared_sstable y) {
+            std::vector<mutation_reader> rds;
+            rds.push_back(x->make_reader(s, env.make_reader_permit(),
+                                         query::full_partition_range, s->full_slice()));
+            rds.push_back(y->make_reader(s, env.make_reader_permit(),
+                                         query::full_partition_range, s->full_slice()));
+            return make_combined_reader(s, env.make_reader_permit(), std::move(rds));
+        };
+        auto merged_frags = [&] (shared_sstable x, shared_sstable y) {
+            auto rd = merged(x, y);
+            auto close = deferred_close(rd);
+            std::vector<sstring> out;
+            while (auto mf = rd().get()) {
+                out.push_back(seastar::format("{}", mutation_fragment_v2::printer(*s, *mf)));
+            }
+            return out;
+        };
+        auto merged_muts = [&] (shared_sstable x, shared_sstable y) {
+            auto rd = merged(x, y);
+            auto close = deferred_close(rd);
+            utils::chunked_vector<mutation> out;
+            while (auto m = read_mutation_from_mutation_reader(rd).get()) {
+                out.push_back(std::move(*m));
+            }
+            return out;
+        };
+
+        const auto want_f = merged_frags(nat_base, nat_over);
+        const auto want_m = merged_muts(nat_base, nat_over);
+
+        // Preconditions on the reference, so none of the comparisons below can pass by being
+        // uniformly empty. The row count is the range-tombstone check: the base wrote 9 rows for
+        // each of 7 partitions and the overlay adds row 9, but rows 4-6 are deleted in every
+        // partition the overlay touches and partition 7 is deleted whole.
+        const size_t dead_ref = count_dead_cells(*s, want_m);
+        BOOST_REQUIRE_GT(dead_ref, 0u);
+        BOOST_REQUIRE_GT(want_m.size(), 0u);
+        const size_t rows_ref = count_rows(want_m);
+        BOOST_REQUIRE_GT(rows_ref, 0u);
+        BOOST_REQUIRE_LT(rows_ref, size_t(hyb_parts * hyb_rows));
+
+        struct arm { const char* what; shared_sstable lo; shared_sstable hi; };
+        for (auto a : {arm{"native base + parquet overlay", nat_base, pq_over},
+                       arm{"parquet base + native overlay", pq_base, nat_over},
+                       arm{"parquet base + parquet overlay (control)", pq_base, pq_over}}) {
+            BOOST_TEST_CONTEXT("mixed set: " << a.what) {
+                // Fragments first: reassembling into mutations normalises range-tombstone bounds,
+                // which is precisely what a lost bound weight would hide.
+                auto got_f = merged_frags(a.lo, a.hi);
+                BOOST_REQUIRE_EQUAL(got_f.size(), want_f.size());
+                for (size_t i = 0; i < got_f.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(got_f[i], want_f[i]);
+                }
+
+                auto got_m = merged_muts(a.lo, a.hi);
+                BOOST_REQUIRE_EQUAL(got_m.size(), want_m.size());
+                for (size_t i = 0; i < got_m.size(); ++i) {
+                    assert_that(got_m[i]).is_equal_to(want_m[i]);
+                }
+                BOOST_REQUIRE_EQUAL(count_dead_cells(*s, got_m), dead_ref);
+                BOOST_REQUIRE_EQUAL(count_rows(got_m), rows_ref);
+            }
+        }
+    }).get();
+}
+
+// A compaction whose input set is mixed, writing each output format in turn.
+//
+// This is the ICS-under-hybrid steady state and the duration of any ALTER between formats: the
+// merge happens through make_full_scan_reader rather than make_reader, and its result is written
+// back out, so a tombstone lost here is lost *permanently* -- the next compaction has no older
+// sstable left to contradict. Both output formats are covered because the hybrid decision can go
+// either way for the same input set depending on tiering.
+SEASTAR_THREAD_TEST_CASE(test_hybrid_compaction_merges_native_and_parquet) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = hybrid_schema();
+        auto base = hybrid_base(s);
+        auto over = hybrid_overlay(s);
+        const auto nat = sstables::get_highest_sstable_version();
+        const size_t n_part = std::max(base.size(), over.size());
+
+        auto mk = [&] (sstable_version_types v, const utils::chunked_vector<mutation>& ms) {
+            return make_sstable_containing(env.make_sstable(s, v), ms).get();
+        };
+        auto nat_base = mk(nat, base), nat_over = mk(nat, over);
+        auto pq_base = mk(sstable_version_types::pq, base);
+        auto pq_over = mk(sstable_version_types::pq, over);
+
+        // Compact `x` and `y` into one sstable of version `out_v`, the way compaction does.
+        auto compact = [&] (shared_sstable x, shared_sstable y, sstable_version_types out_v) {
+            auto out = env.make_sstable(s, out_v);
+            std::vector<mutation_reader> rds;
+            rds.push_back(x->make_full_scan_reader(s, env.make_reader_permit(), nullptr,
+                                                  default_read_monitor()));
+            rds.push_back(y->make_full_scan_reader(s, env.make_reader_permit(), nullptr,
+                                                  default_read_monitor()));
+            auto merged = make_combined_reader(s, env.make_reader_permit(), std::move(rds));
+            auto cfg = env.manager().configure_writer("test");
+            out->write_components(std::move(merged), n_part, s, cfg, encoding_stats{}).get();
+            out->open_data().get();
+            return out;
+        };
+
+        // The reference: native inputs, native output -- the pre-existing behaviour.
+        auto want_sst = compact(nat_base, nat_over, nat);
+        const auto want_m = read_all(want_sst, s, env.make_reader_permit());
+        const auto want_f = fragments_of(want_sst, s, env.make_reader_permit());
+        const size_t dead_ref = count_dead_cells(*s, want_m);
+        const size_t rows_ref = count_rows(want_m);
+        BOOST_REQUIRE_GT(dead_ref, 0u);
+        BOOST_REQUIRE_GT(rows_ref, 0u);
+        BOOST_REQUIRE_LT(rows_ref, size_t(hyb_parts * hyb_rows));
+
+        struct arm { const char* what; shared_sstable lo; shared_sstable hi;
+                     sstable_version_types out; };
+        for (auto a : {arm{"mixed in, parquet out", nat_base, pq_over,
+                           sstable_version_types::pq},
+                       arm{"mixed in, native out", nat_base, pq_over, nat},
+                       arm{"mixed in reversed, parquet out", pq_base, nat_over,
+                           sstable_version_types::pq},
+                       arm{"mixed in reversed, native out", pq_base, nat_over, nat},
+                       arm{"parquet in, parquet out (control)", pq_base, pq_over,
+                           sstable_version_types::pq}}) {
+            BOOST_TEST_CONTEXT("compaction: " << a.what) {
+                auto out = compact(a.lo, a.hi, a.out);
+                BOOST_REQUIRE(out->get_version() == a.out);
+
+                auto got_f = fragments_of(out, s, env.make_reader_permit());
+                BOOST_REQUIRE_EQUAL(got_f.size(), want_f.size());
+                for (size_t i = 0; i < got_f.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(got_f[i], want_f[i]);
+                }
+
+                auto got_m = read_all(out, s, env.make_reader_permit());
+                BOOST_REQUIRE_EQUAL(got_m.size(), want_m.size());
+                for (size_t i = 0; i < got_m.size(); ++i) {
+                    assert_that(got_m[i]).is_equal_to(want_m[i]);
+                }
+                BOOST_REQUIRE_EQUAL(count_dead_cells(*s, got_m), dead_ref);
+                BOOST_REQUIRE_EQUAL(count_rows(got_m), rows_ref);
+            }
+        }
+    }).get();
+}
+
 // Intra-partition forwarding. The reader itself cannot seek by clustering
 // position, so make_reader() wraps it in the forwardable adapter rather than
 // accepting forwarding::yes and ignoring the position range -- which is what it
