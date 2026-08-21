@@ -45,6 +45,13 @@ bool writes_parquet_unconditionally(const ::schema& s) {
     return false;
 }
 
+// Same predicate as flush, streaming and compaction -- see the header for why the load path
+// needs no tiering context to answer this.
+sstables::sstable_version_types version_for_rewrite_on_load(const ::schema& s,
+                                                            sstables::sstable_version_types native_choice) {
+    return writes_parquet_unconditionally(s) ? sstables::sstable_version_types::pq : native_choice;
+}
+
 // Exact, unlike the leaf count it replaces. The number of Parquet *leaves* a table produces
 // is data-dependent -- per-column deletion and TTL leaves appear in L1 only when cells carry
 // them, which is why the old `columns + 3` estimate read 13 for a table the exporter reports

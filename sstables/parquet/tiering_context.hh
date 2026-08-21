@@ -18,6 +18,7 @@
 
 #include "sstables/parquet/tiering_policy.hh"
 #include "sstables/shared_sstable.hh"
+#include "sstables/version.hh"
 #include "schema/schema_fwd.hh"
 
 #include <optional>
@@ -51,6 +52,28 @@ bool schema_is_parquet_eligible(const ::schema&);
 // The single home for this rule matters: it is consulted by compaction, by memtable flush and by
 // streaming, and a table whose flushes disagree with its compactions never converges.
 bool writes_parquet_unconditionally(const ::schema&);
+
+// The version that reshard and reshape **on load** must write for this table.
+//
+// `native_choice` is what the native machinery picked -- in practice
+// `sstables_manager::get_safe_sstable_version_for_rewrites()`, which chooses among the native
+// versions from config and knows nothing about `pq`. Left to itself it would silently rewrite a
+// Parquet table's sstables as native during boot-time reshard/reshape, so the decision is
+// wrapped here instead.
+//
+// This exists as a named function rather than an `if` at the call site for one reason: the call
+// site is `table_populator::process_subdir()`, a class local to `distributed_loader.cc`, so the
+// version it picks is not observable from any test. Reshape-on-load is the one write path with
+// no seam -- flush, streaming and compaction all pick their version through a function a test
+// can call -- and it is exactly the path that drifted, gating on `storage_format == parquet`
+// while the other three asked `writes_parquet_unconditionally()`. That made hybrid + TWCS write
+// native here and `pq` everywhere else.
+//
+// Note that needing no tiering context is the whole point: both unconditional cases are decided
+// by schema properties alone (`storage_format` and the compaction strategy), which is why "we are
+// on the load path and know nothing about tiering yet" does not argue for a different answer here.
+sstables::sstable_version_types version_for_rewrite_on_load(const ::schema&,
+                                                            sstables::sstable_version_types native_choice);
 
 // CQL columns, which is what C5 bounds. Deliberately not the Parquet leaf count: that is
 // data-dependent (per-column deletion and TTL leaves materialise only when cells carry them),

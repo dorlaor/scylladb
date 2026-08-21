@@ -2704,6 +2704,68 @@ SEASTAR_THREAD_TEST_CASE(test_twcs_hybrid_is_parquet_for_the_whole_table) {
     BOOST_REQUIRE(!unconditional(build(storage_format_type::sstable, ct::incremental)));
 }
 
+// Reshape and reshard **on load** must write the same format as every other write path.
+//
+// This was the one write path that did not. `table_populator::process_subdir()` gated on
+// `storage_format() == parquet` while flush (`table::make_sstable`), streaming
+// (`table::make_streaming_sstable_for_write`) and compaction (`compaction_manager.cc`) all asked
+// `writes_parquet_unconditionally()`. A **hybrid + TWCS** table therefore wrote `pq` on every path
+// except boot-time reshape/reshard, which wrote native -- and since reshape on boot rewrites files
+// that are already there, that path can undo what the other three just converged on.
+//
+// The defence for the old gate was that reshaping happens on load, "where nothing is known about
+// tiering yet". That is true and irrelevant: `writes_parquet_unconditionally()` reads nothing but
+// the schema -- `storage_format` and the compaction strategy are both table properties, both known
+// at load -- and the two cases it covers are exactly the ones defined to skip the tiering criteria.
+// There was never any tiering context to be missing.
+//
+// Asserted on `version_for_rewrite_on_load()` because that is the only seam there is: the decision
+// lives in `table_populator`, a class local to `distributed_loader.cc`, whose reshard/reshape
+// creators are the only in-tree callers. `distributed_loader_for_tests::reshard()` takes the
+// creator as a parameter, so a test driving it supplies the version itself and would assert its
+// own argument back. Extracting the function is what made the choice observable at all.
+SEASTAR_THREAD_TEST_CASE(test_reshape_on_load_writes_parquet_for_hybrid_twcs) {
+    auto build = [] (storage_format_type fmt, compaction::compaction_strategy_type cs) {
+        auto b = schema_builder(1, "ks", "reshape_fmt_tbl")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", timestamp_type, column_kind::clustering_key)
+            .with_column("v", int32_type);
+        b.set_storage_format(fmt);
+        b.set_compaction_strategy(cs);
+        return b.build();
+    };
+    using ct = compaction::compaction_strategy_type;
+    using v = sstables::sstable_version_types;
+
+    // What get_safe_sstable_version_for_rewrites() would have returned. Two different values, so
+    // that "passed the native choice through" is distinguishable from "happened to return mt".
+    for (auto native : {v::me, v::mt}) {
+        // Formatted rather than compared as the raw enum: sstable_version_types has no
+        // operator<<, so BOOST_REQUIRE_EQUAL on it does not compile, and a failure that printed
+        // two integers would not say which versions they were.
+        const auto version_of = [native, &build] (storage_format_type fmt, ct cs) {
+            return fmt::to_string(sstables::parquet::version_for_rewrite_on_load(*build(fmt, cs), native));
+        };
+        const auto expect_pq = fmt::to_string(v::pq);
+        const auto expect_native = fmt::to_string(native);
+
+        // The bug: hybrid + TWCS is unconditionally Parquet, so reshape on load writes `pq` too.
+        // Under the old gate this returned `native` and this line is what fails.
+        BOOST_REQUIRE_EQUAL(version_of(storage_format_type::hybrid, ct::time_window), expect_pq);
+
+        // Hybrid under a size-tiered strategy is still decided per compaction, so on load -- where
+        // there is no compaction to decide about -- it keeps the native choice. This is the case
+        // the old comment was really describing, and it is unchanged.
+        BOOST_REQUIRE_EQUAL(version_of(storage_format_type::hybrid, ct::incremental), expect_native);
+
+        // Explicit opt-in is `pq` under either strategy; explicit opt-out never is.
+        BOOST_REQUIRE_EQUAL(version_of(storage_format_type::parquet, ct::time_window), expect_pq);
+        BOOST_REQUIRE_EQUAL(version_of(storage_format_type::parquet, ct::incremental), expect_pq);
+        BOOST_REQUIRE_EQUAL(version_of(storage_format_type::sstable, ct::time_window), expect_native);
+        BOOST_REQUIRE_EQUAL(version_of(storage_format_type::sstable, ct::incremental), expect_native);
+    }
+}
+
 // An unknown sstable version must be an error, not a silently skipped file.
 //
 // This is the primitive that two different downgrade-safety paths rest on, which is why it is worth a

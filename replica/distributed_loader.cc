@@ -29,6 +29,7 @@
 #include "sstables/sstables.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstable_directory.hh"
+#include "sstables/parquet/tiering_context.hh"
 #include "auth/common.hh"
 #include "tracing/trace_keyspace_helper.hh"
 #include "db/view/view_update_checks.hh"
@@ -402,7 +403,6 @@ future<> table_populator::process_subdir(sharded<sstables::sstable_directory>& d
     // at least not downgrade any files. If we already know that we support a higher
     // format than the one we see then we use that.
     auto sst_version = co_await highest_version_seen(directory, sstables::oldest_writable_sstable_format);
-    _version_for_reshaping = _global_table->get_sstables_manager().get_safe_sstable_version_for_rewrites(sst_version);
 
     // get_safe_sstable_version_for_rewrites() picks among the *native* versions from config and
     // knows nothing about `pq`, so reshard and reshape on load would silently rewrite a Parquet
@@ -410,11 +410,16 @@ future<> table_populator::process_subdir(sharded<sstables::sstable_directory>& d
     // table::make_streaming_sstable_for_write): a write path that does not go through compaction
     // and therefore never consulted storage_format.
     //
-    // Explicit opt-in only, matching everywhere else. 'hybrid' keeps the native choice here
-    // because reshaping happens on load, where nothing is known about tiering yet.
-    if (_global_table->schema()->storage_format() == storage_format_type::parquet) {
-        _version_for_reshaping = sstables::sstable_version_types::pq;
-    }
+    // Explicit opt-in only, matching everywhere else -- and, now, the same predicate as everywhere
+    // else. This used to test `storage_format() == parquet` directly, on the grounds that reshaping
+    // happens on load where nothing is known about tiering yet. That reasoning does not hold:
+    // writes_parquet_unconditionally() is a schema-only predicate, and both cases it covers are
+    // precisely the ones defined to skip the tiering criteria. The result was that a hybrid + TWCS
+    // table wrote native here while its flushes, streams and compactions all wrote `pq` -- the
+    // format drift the single-predicate rule exists to prevent.
+    _version_for_reshaping = sstables::parquet::version_for_rewrite_on_load(
+            *_global_table->schema(),
+            _global_table->get_sstables_manager().get_safe_sstable_version_for_rewrites(sst_version));
 }
 
 sstables::shared_sstable make_sstable(replica::table& table, sstables::sstable_state state, sstables::generation_type generation, sstables::sstable_version_types v) {
