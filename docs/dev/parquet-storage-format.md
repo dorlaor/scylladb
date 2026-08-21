@@ -4723,6 +4723,21 @@ collapses the delay: flushing every keyspace before each major purges in **1** r
 rounds when only the table itself is flushed (`~/pq-lab/tomb_clamp.py`). That is a wall-clock/IO race,
 which is the shape of a fault that lands on either side of the same question from identical input.
 
+**Confirmed at the original scale, in the direction that would have falsified it.** The reduced
+probe could be answering a different question than the 300 000-row pipeline, so the model was made to
+predict that pipeline's output before being believed: pinning `tombstone_gc = {'mode': 'timeout'}` on
+the corpus table should make the tombstone-bearing outcome *deterministic*, because `timeout` never
+purges a deletion time this fresh. Run through the unmodified `bb_investigate.py` path with
+`PQ_TOMBSTONE_GC=timeout`:
+
+| | native | `pq` | ratio | row groups | rows/group | synthetic share |
+|---|---:|---:|---:|---:|---:|---:|
+| pinned `timeout` | 32 374 539 | **84 527 839** | 261.1 % | 163 | 1 840 | 78.4 % |
+| the kept "anomalous" file | ~32.4 M | 84 280 629 | 261 % | 163 | 1 840 | 78.4 % |
+
+Same regime, same row-group count, same synthetic share — reproduced on demand rather than caught
+once in seven passes. `out/bb_pinned_timeout.log`.
+
 **Where the previous account was wrong, itemised.** Worth more than a tidy narrative:
 
 * "Cell tombstones here are never purgeable against the default 10-day `gc_grace_seconds`" — false.
