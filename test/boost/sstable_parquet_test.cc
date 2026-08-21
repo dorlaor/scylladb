@@ -889,6 +889,200 @@ SEASTAR_THREAD_TEST_CASE(test_pq_dead_cells_are_not_lost) {
     }).get();
 }
 
+// The folded deletion channel, on both write paths, from one body of data.
+//
+// A dead cell's deletion time used to go into its own column's `__ldt_<col>` leaf: one leaf per
+// column, where the same rows' *write* times were folded into a single `__ts` for the whole row.
+// On the corpus's 197-column Backblaze slice that was 195 leaves and 60.1 MB against 1.9 MB for
+// the write times -- the same information shape at ~32x the cost, and the reason `pq` paid ~63 MB
+// where the row format paid ~10 MB for the same tombstones. `__ldt` + `__dmask` + the `__ldtx`
+// pair replace it with four leaves regardless of table width.
+//
+// Asserted on both paths in one test, deliberately. An sstable is written either by
+// cut_row_group() once it outgrows the row-group budget or by write_rows() in one shot when it
+// fits, the choice is a function of data size and invisible to the operator, and that divergence
+// has already produced two separate bugs here (design doc 8.2b: per-column encodings applied only
+// on the cutting path; 10.15: the L2 footer key written only on the other). The two paths also
+// differ in leaf set -- the cutting path must fix its leaves before it has seen all the rows, so
+// it uses the conservative set -- which is exactly the kind of asymmetry that hides a bug, so the
+// same rows go down both and the expectations differ only where they must.
+//
+// No TTLs anywhere here, on purpose: a live cell with a TTL legitimately keeps a per-column
+// `__ldt_<col>` for its expiry, and leaving that case out is what lets this test assert the strong
+// thing -- that on the derived path the per-column deletion leaves are *gone*, not merely empty.
+// The mixed case is covered by test_pq_dead_cells_are_not_lost and by test_shred's matrix.
+SEASTAR_THREAD_TEST_CASE(test_pq_folded_deletion_channel_on_both_write_paths) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        constexpr int NCOL = 8;
+        auto build = [] (const char* name, std::optional<int> rows_per_rg) {
+            auto sb = schema_builder(1, "ks", name)
+                .with_column("pk", utf8_type, column_kind::partition_key)
+                .with_column("ck", int32_type, column_kind::clustering_key);
+            for (int i = 0; i < NCOL; ++i) {
+                sb.with_column(to_bytes(format("v{}", i)), int32_type);
+            }
+            if (rows_per_rg) {
+                sb.set_parquet_options({{"rows_per_row_group", format("{}", *rows_per_rg)}});
+            }
+            return sb.build();
+        };
+        // Same shape, same data; the only difference is the row-group budget, which is what
+        // selects the write path. 1 000 is the minimum the option accepts.
+        auto s_cut   = build("pq_fold_cut", 1000);
+        auto s_whole = build("pq_fold_whole", std::nullopt);
+
+        // 3 000 rows: three row groups under a 1 000-row budget, one under the 5 000 default.
+        constexpr int PARTS = 150, ROWS = 20;
+        auto make_muts = [&] (const schema_ptr& s) {
+            std::vector<const column_definition*> defs;
+            for (int i = 0; i < NCOL; ++i) {
+                defs.push_back(s->get_column_definition(to_bytes(format("v{}", i))));
+            }
+            utils::chunked_vector<mutation> muts;
+            muts.reserve(PARTS);
+            for (int p = 0; p < PARTS; ++p) {
+                auto pk = partition_key::from_single_value(
+                        *s, utf8_type->decompose(sstring(format("key{:06d}", p))));
+                mutation m(s, pk);
+                for (int r = 0; r < ROWS; ++r) {
+                    auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                    const api::timestamp_type ts = 1700000000000000 + p * 100 + r;
+                    // The row's deletion time, shared by its dead cells -- which is what a
+                    // bind-NULL INSERT produces, since one statement carries one timestamp.
+                    const auto row_ldt = gc_clock::time_point(gc_clock::duration(40000 + p));
+                    for (int i = 0; i < NCOL; ++i) {
+                        switch ((p + r + i) % 5) {
+                        case 0:
+                        case 1:
+                            // Dead, sharing the row's deletion time. The common case, and the
+                            // one the fold collapses.
+                            m.set_clustered_cell(ck, *defs[i],
+                                                 atomic_cell::make_dead(ts, row_ldt));
+                            break;
+                        case 2:
+                            // Dead, but with its own deletion time -- an exception entry, as a
+                            // cell deleted by a separate statement would be.
+                            m.set_clustered_cell(ck, *defs[i], atomic_cell::make_dead(
+                                    ts, gc_clock::time_point(
+                                            gc_clock::duration(40000 + p + i * 13 + 1))));
+                            break;
+                        case 3:
+                            m.set_clustered_cell(ck, *defs[i], atomic_cell::make_live(
+                                    *int32_type, ts, int32_type->decompose(r * 7 + i)));
+                            break;
+                        default:
+                            break;   // absent: never written, and must stay that way
+                        }
+                    }
+                }
+                muts.push_back(std::move(m));
+            }
+            std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+                return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+            });
+            return muts;
+        };
+
+        auto count_dead = [] (const schema_ptr& s,
+                              const utils::chunked_vector<mutation>& ms) {
+            size_t n = 0;
+            for (const auto& m : ms) {
+                for (const rows_entry& re : m.partition().clustered_rows()) {
+                    re.row().cells().for_each_cell([&] (column_id id,
+                                                       const atomic_cell_or_collection& acoc) {
+                        const auto& def = s->regular_column_at(id);
+                        if (def.is_atomic() && !acoc.as_atomic_cell(def).is_live()) { ++n; }
+                    });
+                }
+            }
+            return n;
+        };
+
+        // The reference is a native-format sstable over the same mutations: it is what the rows
+        // must still be after a pq round trip, deletion times included.
+        auto ref_muts = make_muts(s_whole);
+        auto ref = make_sstable_containing(
+                env.make_sstable(s_whole, sstables::get_highest_sstable_version()),
+                ref_muts).get();
+        auto want = read_all(ref, s_whole, env.make_reader_permit());
+        const size_t dead_ref = count_dead(s_whole, ref_muts);
+        BOOST_REQUIRE_GT(dead_ref, 0u);
+
+        struct arm { const char* what; schema_ptr s; bool expect_cut; };
+        for (auto a : {arm{"cut_row_group", s_cut, true},
+                       arm{"write_rows", s_whole, false}}) {
+            BOOST_TEST_CONTEXT("write path: " << a.what) {
+                auto muts = make_muts(a.s);
+                auto sst = make_sstable_containing(
+                        env.make_sstable(a.s, sstable_version_types::pq), std::move(muts)).get();
+
+                const uint64_t len = sst->ondisk_data_size();
+                auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+                std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+                auto md = sstables::parquet::format::parse_footer(img);
+
+                // The arm is only meaningful if it actually took the path it names.
+                if (a.expect_cut) {
+                    BOOST_REQUIRE_GT(md.row_groups.size(), 1u);
+                } else {
+                    BOOST_REQUIRE_EQUAL(md.row_groups.size(), 1u);
+                }
+
+                std::vector<std::string> leaves;
+                for (size_t i = 1; i < md.schema.size(); ++i) {
+                    if (md.schema[i].is_leaf()) { leaves.push_back(md.schema[i].name); }
+                }
+                auto has = [&] (const std::string& n) {
+                    return std::find(leaves.begin(), leaves.end(), n) != leaves.end();
+                };
+                // The folded channel, on both paths. This is the assertion the two prior
+                // divergence bugs would have failed.
+                BOOST_REQUIRE(has("__ldt"));
+                BOOST_REQUIRE(has("__dmask"));
+                BOOST_REQUIRE(has("__ldtx_mask"));
+                BOOST_REQUIRE(has("__ldtx_vals"));
+
+                // And the per-column deletion leaves must carry nothing. On the derived leaf
+                // set they are not emitted at all -- with no TTLs there is no live expiry to
+                // hold -- which is the leaf-count collapse the fold is for. On the
+                // conservative set they exist because the writer had to fix its leaves before
+                // seeing every row, but every chunk of them must be all-null: a value there
+                // would mean a dead cell's deletion time still went per column.
+                size_t percol = 0, percol_values = 0;
+                for (int i = 0; i < NCOL; ++i) {
+                    if (has(format("__ldt_v{}", i))) { ++percol; }
+                }
+                for (const auto& rg : md.row_groups) {
+                    for (const auto& cc : rg.columns) {
+                        if (!cc.meta) { continue; }
+                        const std::string p = cc.meta->path();
+                        if (p.rfind("__ldt_", 0) != 0) { continue; }
+                        const int64_t nulls = cc.meta->stats && cc.meta->stats->null_count
+                                ? *cc.meta->stats->null_count : -1;
+                        BOOST_REQUIRE_EQUAL(nulls, cc.meta->num_values);
+                        percol_values += size_t(cc.meta->num_values) - size_t(nulls);
+                    }
+                }
+                BOOST_REQUIRE_EQUAL(percol_values, 0u);
+                if (a.expect_cut) {
+                    BOOST_REQUIRE_EQUAL(percol, size_t(NCOL));   // conservative: present, empty
+                } else {
+                    BOOST_REQUIRE_EQUAL(percol, 0u);             // derived: gone entirely
+                }
+
+                // Losslessness is the point of all of it: the rows, and every deletion time in
+                // them, must match the native-format reference exactly.
+                auto got = read_all(sst, a.s, env.make_reader_permit());
+                BOOST_REQUIRE_EQUAL(got.size(), want.size());
+                for (size_t i = 0; i < got.size(); ++i) {
+                    assert_that(got[i]).is_equal_to(want[i]);
+                }
+                BOOST_REQUIRE_EQUAL(count_dead(a.s, got), dead_ref);
+            }
+        }
+    }).get();
+}
+
 // `metadata_folding = 'uniform'` is silently not honoured once an sstable cuts a row group.
 //
 // This started as a hunt for a bug that turned out not to be reachable, and the real finding is
