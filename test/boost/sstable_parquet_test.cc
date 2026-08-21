@@ -4169,3 +4169,113 @@ SEASTAR_THREAD_TEST_CASE(test_pq_footer_cache_is_reclaimed_by_the_manager) {
         .available_memory = 0
     }).get();
 }
+
+// A bigint partition key, end to end: the partition sequence must survive the round trip.
+//
+// The bug this pins is described in full at `test_delta_binary_packed_wide_residual_widths`
+// (parquet_writer_test.cc) -- a 64-bit bit-packing accumulator that could not hold a value of more
+// than 57 bits plus the 0..7 bits of the previous one still in flight. This case is the *product*
+// symptom rather than the codec one, and it is here because the two look nothing alike. A key
+// column that decodes to a different value on every row does not read back as "wrong data": the
+// reader groups consecutive rows into partitions by comparing the decoded key, so one partition
+// comes back as a run of partitions, at tokens nobody wrote. Under a random schema that presented
+// as `Mutations differ` with the partition sequence misaligned (§9.6b).
+//
+// The schema is what makes it reachable, and none of it is incidental:
+//
+//   * the key columns are `bigint`, which is what schema_mapping.cc gives DELTA_BINARY_PACKED. Every
+//     other pq test in this file has a `text` partition key and an `int` clustering key, so none of
+//     them encodes a single value through the packer.
+//   * the partition-key values are spread across the int64 range, so the jump at each partition
+//     boundary needs ~61 bits. Inside a partition the value repeats, delta 0. A near-full-width
+//     residual next to a run of zeros in one miniblock is the precondition; an *ascending*
+//     clustering key -- the case the encoding was chosen for -- never produces it.
+//   * the clustering key alternates a small step with a huge one for the same reason, so the
+//     failure is pinned for a clustering key as well as a partition key. With a constant stride
+//     min_delta absorbs the whole thing and the residual width is zero.
+//
+// make_sstable_containing validates what it writes (test/lib/sstable_utils.cc:83), so on a broken
+// build this fails at *construction*, before the assertions below. Both are kept: the assertions
+// say what the test is actually about, and they are also what would catch a regression that
+// validation's compacted comparison normalises away.
+SEASTAR_THREAD_TEST_CASE(test_pq_bigint_key_partition_sequence_round_trips) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = schema_builder(1, "ks", "pq_bigint_key")
+            .with_column("pk", long_type, column_kind::partition_key)
+            .with_column("ck", long_type, column_kind::clustering_key)
+            .with_column("v", int32_type)
+            .build();
+
+        // Spread across the int64 range: every pairwise difference needs at least 59 bits, so
+        // whatever order the token hash puts them in, each partition boundary is a wide delta.
+        const std::vector<int64_t> pks = {
+            1LL, 1LL << 59, 1LL << 60, 3LL << 59, 1LL << 61, 5LL << 59, 3LL << 60, 7LL << 59,
+        };
+        // A small step, then a wide one, repeatedly: min_delta stays 1 and the residual is ~2^60.
+        auto ck_at = [] (int r) -> int64_t {
+            return int64_t(r / 2) * (int64_t(1) << 60) + int64_t(r % 2);
+        };
+        constexpr int rows_per_partition = 12;
+
+        utils::chunked_vector<mutation> muts;
+        for (int64_t pk : pks) {
+            mutation m(s, partition_key::from_single_value(*s, long_type->decompose(pk)));
+            for (int r = 0; r < rows_per_partition; ++r) {
+                auto ck = clustering_key::from_single_value(*s, long_type->decompose(ck_at(r)));
+                m.set_clustered_cell(ck, *s->get_column_definition(to_bytes("v")),
+                                     atomic_cell::make_live(*int32_type, 1000 + r,
+                                                            int32_type->decompose(r)));
+            }
+            muts.push_back(std::move(m));
+        }
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        // One partition per input partition, at the token that was written, in ring order, with
+        // every row present. Pre-fix, the first partition read back holding 2 of its 12 rows
+        // (`Mutations differ` out of the validation above) because the clustering key stopped
+        // decoding correctly after the first wide delta; the rest of its rows landed under
+        // mis-decoded keys.
+        auto got = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), muts.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            BOOST_TEST_CONTEXT("partition " << i) {
+                BOOST_REQUIRE(got[i].decorated_key().equal(*s, muts[i].decorated_key()));
+                assert_that(got[i]).is_equal_to(muts[i]);
+            }
+        }
+
+        // The sstable's own first/last-key metadata, which is the second symptom of the same bug:
+        // load() resolves the first and last key against the data it can read, and when the key
+        // column decodes to something else that lookup finds nothing and logs "Unable to retrieve
+        // metadata for first and last keys". Asserting the positions were populated catches it
+        // without depending on a log line.
+        BOOST_REQUIRE(sst->get_first_decorated_key().equal(*s, muts.front().decorated_key()));
+        BOOST_REQUIRE(sst->get_last_decorated_key().equal(*s, muts.back().decorated_key()));
+        const auto first_ck = clustering_key::from_single_value(*s, long_type->decompose(ck_at(0)));
+        const auto last_ck = clustering_key::from_single_value(
+                *s, long_type->decompose(ck_at(rows_per_partition - 1)));
+        BOOST_REQUIRE(position_in_partition::equal_compare(*s)(
+                sst->first_partition_first_position(),
+                position_in_partition::for_key(first_ck)));
+        BOOST_REQUIRE(position_in_partition::equal_compare(*s)(
+                sst->last_partition_last_position(),
+                position_in_partition::for_key(last_ck)));
+
+        // And a point read of each partition, because the index path resolves the key
+        // independently of the sequential scan above.
+        for (const auto& m : muts) {
+            auto pr = dht::partition_range::make_singular(m.decorated_key());
+            auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+            auto close = deferred_close(rd);
+            auto one = read_mutation_from_mutation_reader(rd).get();
+            BOOST_REQUIRE(one);
+            assert_that(*one).is_equal_to(m);
+            BOOST_REQUIRE(!read_mutation_from_mutation_reader(rd).get());
+        }
+    }).get();
+}

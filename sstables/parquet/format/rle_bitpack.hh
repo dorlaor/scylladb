@@ -37,6 +37,21 @@
 
 namespace sstables::parquet::format {
 
+// The accumulator every bit-packing loop in this directory shifts values through -- here and in
+// encoders.hh / decoders.hh -- and it has to be *wider* than the widest value it packs.
+//
+// The loops all hold a partial byte between values: after emitting or consuming whole bytes, 0..7
+// bits of the previous value are still in flight. So a value of `w` bits enters the accumulator at
+// an offset of up to 7 and occupies bit positions up to `w + 6`. With w up to 64 that is 71 bits,
+// and a uint64_t accumulator silently discarded everything past bit 63 -- losing the top bits of
+// the value on the write side and the top bits of the *next* value on the read side.
+//
+// This was not theoretical: it corrupted `bigint` and `timestamp` key columns, which are the ones
+// DELTA_BINARY_PACKED is applied to (schema_mapping.cc), whenever a miniblock's delta range needed
+// more than 57 bits -- which is the normal case for a partition key, where deltas are zero inside a
+// partition and an arbitrary 64-bit jump between partitions. See §9.6 of the design doc.
+using bitpack_acc = unsigned __int128;
+
 class rle_error : public std::runtime_error {
 public:
     explicit rle_error(const std::string& w) : std::runtime_error("parquet/rle: " + w) {}
@@ -72,15 +87,16 @@ class rle_decoder {
     void unpack8() {
         size_t need = (size_t(_bit_width) * 8 + 7) / 8;   // == bit_width bytes
         if (size_t(_end - _p) < need) { throw rle_error("truncated bit-packed group"); }
-        uint64_t acc = 0;
+        bitpack_acc acc = 0;
         int acc_bits = 0;
         const uint8_t* q = _p;
         for (int i = 0; i < 8; ++i) {
             while (acc_bits < _bit_width) {
-                acc |= uint64_t(*q++) << acc_bits;
+                acc |= bitpack_acc(*q++) << acc_bits;
                 acc_bits += 8;
             }
-            _group[i] = _bit_width == 64 ? acc : (acc & ((uint64_t(1) << _bit_width) - 1));
+            _group[i] = uint64_t(acc)
+                    & (_bit_width == 64 ? ~uint64_t(0) : ((uint64_t(1) << _bit_width) - 1));
             acc >>= _bit_width;
             acc_bits -= _bit_width;
         }
@@ -175,9 +191,10 @@ class rle_encoder {
     void put_packed(const uint64_t* v, size_t groups) {
         put_uvarint((groups << 1) | 1);
         for (size_t g = 0; g < groups; ++g) {
-            uint64_t acc = 0; int bits = 0;
+            bitpack_acc acc = 0; int bits = 0;
             for (int i = 0; i < 8; ++i) {
-                acc |= (v[g * 8 + i] & ((_bit_width == 64) ? ~0ull : ((1ull << _bit_width) - 1))) << bits;
+                acc |= bitpack_acc(v[g * 8 + i]
+                                & ((_bit_width == 64) ? ~0ull : ((1ull << _bit_width) - 1))) << bits;
                 bits += _bit_width;
                 while (bits >= 8) { _out.push_back(uint8_t(acc)); acc >>= 8; bits -= 8; }
             }

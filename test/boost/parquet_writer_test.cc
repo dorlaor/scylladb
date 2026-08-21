@@ -808,3 +808,122 @@ SEASTAR_THREAD_TEST_CASE(test_delta_byte_array_after_compression) {
                 "-- delta/dict = {:.1f}%", pz, kz, dz, 100.0 * dz / kz));
     }
 }
+
+// DELTA_BINARY_PACKED with wide deltas, which is the shape a *key* column has.
+//
+// This is a regression test for a data-loss bug, and the class matters more than the arithmetic.
+// Both the packer (encoders.hh) and the unpacker (decoders.hh) shifted values through a `uint64_t`
+// accumulator that carries 0..7 bits of the previous value between values -- so a w-bit value
+// straddles up to w+6 bit positions, and everything past bit 63 was silently dropped. The packer
+// lost the top bits of the value it was writing; the unpacker lost the top bits of the byte it
+// over-read, which belong to the *next* value. Neither was symmetric with the other, so the two did
+// not cancel: the round trip below actually comes back wrong, and a third-party reader (pyarrow)
+// read the on-disk file as a third, different answer again. The file was wrong *and* the reader was
+// wrong.
+//
+// It survived because of which data reaches this encoding and which data the tests used.
+// schema_mapping.cc gives DELTA_BINARY_PACKED to `bigint` and `timestamp` *key* columns, on the
+// argument that a clustering key ascends. A clustering key does, in small steps, and every
+// fixed-schema test in the tree has one: residual widths stay far below 57 and nothing breaks. A
+// **partition key** does not. Partitions arrive in token order, so the value is repeated for every
+// row of a partition (delta 0) and then jumps by an arbitrary amount at the boundary -- which puts
+// a near-full-width residual and a run of zeros in the same miniblock, the exact combination that
+// needs more than 57 bits. That is why this only ever showed up under
+// `make_random_schema_specification`, and there as a *misaligned partition sequence*: with the
+// first key component decoded differently on every row, one partition read back as one partition
+// per row, at different tokens (§9.6b).
+//
+// So the sweep below is the point of the test: for every residual width 1..64, one miniblock holding
+// a near-full-width delta next to a run of zeros. It has to be built that way. Stepping the values
+// by 2^(w-1) instead -- the obvious way to write a width sweep -- makes the deltas *uniform*, so
+// min_delta absorbs the whole magnitude and every iteration exercises a residual width of about
+// zero. That version of this sweep reported "all ok" against the broken codec.
+SEASTAR_THREAD_TEST_CASE(test_delta_binary_packed_wide_residual_widths) {
+    using namespace sstables::parquet::format;
+
+    // A run of equal values, one jump of exactly `w` significant bits, then more equal values.
+    // min_delta is 0 (the zeros), so the miniblock's residual width is exactly w -- and the values
+    // after the jump are the ones the unpacker's over-read corrupts.
+    for (int w = 1; w <= 64; ++w) {
+        const uint64_t jump = (w == 64) ? ~0ull : ((1ull << w) - 1);
+        std::vector<int64_t> vals;
+        for (int i = 0; i < 4; ++i) { vals.push_back(7); }
+        for (int i = 0; i < 40; ++i) { vals.push_back(int64_t(uint64_t(7) + jump)); }
+
+        std::vector<uint8_t> buf;
+        encode_delta_binary_packed(buf, vals);
+        auto back = decode_delta_binary_packed(buf, vals.size());
+
+        BOOST_TEST_CONTEXT("residual width " << w) {
+            BOOST_REQUIRE_EQUAL(back.size(), vals.size());
+            for (size_t i = 0; i < vals.size(); ++i) {
+                BOOST_REQUIRE_EQUAL(back[i], vals[i]);
+            }
+        }
+    }
+
+    // And the shape as it actually arrives from a partition-key column: 20 distinct 64-bit values,
+    // each repeated for the rows of its partition, in token order rather than value order. The
+    // run *structure* is asserted as well as the values, because that is what the sstable reader
+    // uses to decide where one partition ends and the next begins -- pre-fix this decoded as 401
+    // runs instead of 20, and the reader duly produced 401 partitions from 20.
+    const int64_t pk[] = {4740290627562976600LL, 5998643611329458451LL, 703819757810541764LL,
+                          7173038666208164016LL, 8919275973775401134LL, 8055964333455730004LL,
+                          5080213989483021976LL, 1421901242253940379LL, 3846349041273635051LL,
+                          5061911113147656751LL, 7114177250487671933LL, 4021343193883838991LL,
+                          7828961378139819765LL, 2717804964377853169LL, 95684721799680348LL,
+                          1662694454617476799LL, 899588727426460270LL, 2047525607341836494LL,
+                          2059496691679083758LL, 8235181314010893001LL};
+    const int rows[] = {78, 66, 97, 50, 36, 20, 17, 22, 49, 69, 51, 49, 34, 10, 72, 46, 31, 35, 31, 23};
+    static_assert(std::size(pk) == std::size(rows));
+
+    std::vector<int64_t> col;
+    for (size_t p = 0; p < std::size(pk); ++p) {
+        for (int r = 0; r < rows[p]; ++r) { col.push_back(pk[p]); }
+    }
+
+    std::vector<uint8_t> buf;
+    encode_delta_binary_packed(buf, col);
+    auto back = decode_delta_binary_packed(buf, col.size());
+    BOOST_REQUIRE_EQUAL(back.size(), col.size());
+
+    size_t runs = 0;
+    for (size_t i = 0; i < back.size(); ++i) {
+        if (i == 0 || back[i] != back[i - 1]) { ++runs; }
+        BOOST_REQUIRE_EQUAL(back[i], col[i]);
+    }
+    BOOST_REQUIRE_EQUAL(runs, std::size(pk));
+}
+
+// The same defect, in the other bit-packing loop in the same directory.
+//
+// rle_bitpack.hh packs and unpacks through the identical `uint64_t` accumulator, so it had the
+// identical bug. This one is **latent rather than live**: in production the RLE/bit-packed hybrid
+// carries definition and repetition levels and dictionary indices, and `bit_width_for()` never
+// asks for more than 32 bits on any of them. But the code special-cases `bit_width == 64`, so it
+// claims to support the full range, and the claim was false. Fixed with the encoding above and
+// pinned here so the two do not drift apart.
+SEASTAR_THREAD_TEST_CASE(test_rle_bit_packing_full_width_round_trip) {
+    using namespace sstables::parquet::format;
+
+    for (int w = 1; w <= 64; ++w) {
+        const uint64_t top = (w == 64) ? ~0ull : ((1ull << w) - 1);
+        std::vector<uint64_t> vals;
+        // Derived from the widest representable value, so the high bits are set wherever the width
+        // allows -- those are the bits a too-narrow accumulator drops. Masked back to w bits,
+        // because a value that does not fit in its own bit width is not a legal input.
+        for (int i = 0; i < 24; ++i) { vals.push_back((top ^ uint64_t(i)) & top); }
+
+        rle_encoder enc{uint8_t(w)};
+        enc.encode(vals);
+        rle_decoder dec(enc.bytes(), uint8_t(w));
+        auto back = dec.decode_all(vals.size());
+
+        BOOST_TEST_CONTEXT("bit width " << w) {
+            BOOST_REQUIRE_EQUAL(back.size(), vals.size());
+            for (size_t i = 0; i < vals.size(); ++i) {
+                BOOST_REQUIRE_EQUAL(back[i], vals[i]);
+            }
+        }
+    }
+}

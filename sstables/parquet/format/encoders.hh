@@ -125,11 +125,14 @@ class delta_binary_packed_encoder {
             uint8_t w = width_of(maxv);
             _out[width_at + m] = w;
             if (w == 0) { continue; }
-            // Miniblock bodies are plain bit-packed (no RLE hybrid header).
-            uint64_t acc = 0; int bits = 0;
+            // Miniblock bodies are plain bit-packed (no RLE hybrid header). The accumulator is
+            // `bitpack_acc`, not uint64_t: between values it holds up to 7 bits of the previous
+            // one, so a w-bit value straddles up to w+6 bit positions -- 71 at w == 64. See the
+            // comment on bitpack_acc in rle_bitpack.hh for what the narrow accumulator lost.
+            bitpack_acc acc = 0; int bits = 0;
             for (size_t i = 0; i < MINI; ++i) {
                 uint64_t v = uint64_t(_deltas[m * MINI + i]) - uint64_t(min_delta);
-                acc |= (w == 64 ? v : (v & ((1ull << w) - 1))) << bits;
+                acc |= bitpack_acc(w == 64 ? v : (v & ((1ull << w) - 1))) << bits;
                 bits += w;
                 while (bits >= 8) { _out.push_back(uint8_t(acc)); acc >>= 8; bits -= 8; }
             }

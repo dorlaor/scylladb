@@ -210,15 +210,16 @@ inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> 
             }
             const size_t need = size_t(mini) * w / 8;
             if (p + need > in.size()) { throw decode_error("truncated miniblock body"); }
-            // Plain bit-packing, LSB first -- no RLE hybrid header here.
-            uint64_t acc = 0; int bits = 0; size_t q = p;
+            // Plain bit-packing, LSB first -- no RLE hybrid header here. `bitpack_acc` rather than
+            // uint64_t because the refill below overshoots: it stops on a byte boundary at or past
+            // `w`, so with up to 7 bits already in flight it can hold w+7 bits at once. A uint64_t
+            // dropped the overshooting byte's top bits, which belonged to the *next* value. See the
+            // comment on bitpack_acc in rle_bitpack.hh.
+            bitpack_acc acc = 0; int bits = 0; size_t q = p;
             for (uint64_t i = 0; i < mini; ++i) {
-                while (bits < w) { acc |= uint64_t(in[q++]) << bits; bits += 8; }
-                const uint64_t v = (w == 64) ? acc : (acc & ((1ull << w) - 1));
-                // Shifting a 64-bit value by 64 is undefined, and w == 64 happens
-                // whenever a block's deltas wrapped; the accumulator is fully
-                // consumed in that case, so clear it instead.
-                if (w == 64) { acc = 0; } else { acc >>= w; }
+                while (bits < w) { acc |= bitpack_acc(in[q++]) << bits; bits += 8; }
+                const uint64_t v = uint64_t(acc) & ((w == 64) ? ~0ull : ((1ull << w) - 1));
+                acc >>= w;
                 bits -= w;
                 if (out.size() < count && out.size() < total) {
                     // Unsigned throughout, to undo the encoder's wrap exactly rather
