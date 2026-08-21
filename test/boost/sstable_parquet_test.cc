@@ -2535,7 +2535,7 @@ SEASTAR_THREAD_TEST_CASE(test_pq_dead_cells_are_not_lost) {
 // No TTLs anywhere here, on purpose: a live cell with a TTL legitimately keeps a per-column
 // `__ldt_<col>` for its expiry, and leaving that case out is what lets this test assert the strong
 // thing -- that on the derived path the per-column deletion leaves are *gone*, not merely empty.
-// The mixed case is covered by test_pq_dead_cells_are_not_lost and by test_shred's matrix.
+// The mixed case is covered by test_pq_dead_cells_are_not_lost and by parquet_shred_test's matrix.
 SEASTAR_THREAD_TEST_CASE(test_pq_folded_deletion_channel_on_both_write_paths) {
     sstables::test_env::do_with_async([] (sstables::test_env& env) {
         constexpr int NCOL = 8;

@@ -85,9 +85,16 @@ g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
     -o /tmp/pq_rowrange_t $S/test_row_range.cc $S/parquet_reader.cc $S/parquet_metadata.cc \
        $S/page_header.cc $S/encryption.cc -lzstd -lsnappy -lcrypto || FAIL=1
-g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. \
+# The shred/reassemble matrix now lives at test/unit/parquet_shred_test.cc, so that
+# CI runs it too (configure.py target test/unit/parquet_shred_test, one case per
+# subcommand in test/unit/test_config.yaml). It is still built and run from here --
+# there is one copy of the matrix, not two -- but its includes are now repo-root
+# relative like the rest of the tree, hence -I../.. alongside the -I. that the
+# format headers' sibling-relative includes need.
+g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I. -I../.. \
     -o /tmp/pq_shred_t schema_mapping.cc $S/parquet_writer.cc $S/parquet_metadata.cc \
-       $S/page_header.cc $S/parquet_reader.cc $S/encryption.cc test_shred.cc \
+       $S/page_header.cc $S/parquet_reader.cc $S/encryption.cc \
+       ../../test/unit/parquet_shred_test.cc \
        -lzstd -lsnappy -lcrypto || FAIL=1
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -I../.. \
     -o /tmp/pq_tier_t tiering_policy.cc test_tiering.cc -lfmt || FAIL=1

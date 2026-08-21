@@ -21,12 +21,36 @@
 //      unmeasured. This sweeps the divergence rate from 0% to 100% and reports
 //      what folding actually costs.
 //
-//   test_shred roundtrip   -- losslessness
-//   test_shred cost        -- divergence sweep, CSV on stdout
+// This used to live at `sstables/parquet/test_shred.cc`, where it was built and run
+// only by the hand-run `sstables/parquet/run_tests.sh`. Nothing in the project's own
+// test wiring executed it, so a regression in folding losslessness -- the property
+// that the whole format rests on -- could not fail any CI job. It now lives here, as
+// a `test/unit` target, because that suite is exactly the shape this program already
+// had: a standalone `main()` judged by its exit code, with one CI case per entry in
+// the `custom_args` list for it in `test/unit/test_config.yaml`. `run_tests.sh` still
+// builds and runs this same file, so there is one copy of the matrix, not two.
+//
+// The seven subcommands, and which of them CI runs:
+//
+//   roundtrip     -- losslessness across folding levels        RUN IN CI
+//   filetrip      -- rows -> parquet -> rows, through a file   RUN IN CI
+//   logical       -- L3 logical export is lossy, and says so   RUN IN CI
+//   recovery      -- mapped_schema recovered from the file     RUN IN CI
+//   legacy        -- pre-fold files still read (per-column __ldt)  RUN IN CI
+//   collections   -- non-frozen collections                    RUN IN CI
+//   cost          -- divergence sweep, CSV on stdout           NOT IN CI
+//
+// `cost` is deliberately excluded. It is a measurement, not an assertion: it prints a
+// CSV and returns 0 unconditionally, so wiring it would add a CI case that cannot
+// fail -- green whatever folding does to the data. A case that cannot go red is worse
+// than no case, because it reads as coverage. It stays in `run_tests.sh` (suite 7),
+// where a human reads the numbers it emits, which is what it is for. The other six
+// were each checked for the same defect before being wired: all six count failures
+// from real comparisons against expected values and return non-zero when any trips.
 
-#include "schema_mapping.hh"
-#include "format/parquet_metadata.hh"
-#include "format/parquet_reader.hh"
+#include "sstables/parquet/schema_mapping.hh"
+#include "sstables/parquet/format/parquet_metadata.hh"
+#include "sstables/parquet/format/parquet_reader.hh"
 
 #include <cstdio>
 #include <limits>
@@ -986,19 +1010,57 @@ int collections() {
     return fails ? 1 : 0;
 }
 
+namespace {
+
+const char* const k_usage = "{roundtrip|filetrip|logical|recovery|legacy|collections|cost}";
+
+struct subcommand {
+    const char* name;
+    int (*fn)();
+};
+
+const subcommand k_subcommands[] = {
+    {"roundtrip",   roundtrip},
+    {"filetrip",    filetrip},
+    {"logical",     logical},
+    {"recovery",    recovery},
+    {"legacy",      legacy},
+    {"collections", collections},
+    {"cost",        cost},
+};
+
+} // namespace
+
+// The subcommand is found by scanning the whole argv rather than by reading argv[1].
+//
+// That is not defensive over-engineering, it is what the test/unit harness requires.
+// `test/pylib/cpp/base.py` builds the command line as
+//
+//     [exe] + DEFAULT_SCYLLA_ARGS + shlex.split(custom_args_entry)
+//
+// and DEFAULT_SCYLLA_ARGS is a hardcoded six-flag seastar list (--overprovisioned,
+// --unsafe-bypass-fsync=1, ...) that no suite config can switch off. So under CI
+// argv[1] is "--overprovisioned" and the subcommand is last. Reading argv[1] would
+// make every CI case exit 2 -- which would at least be loudly red, but reading the
+// last argument instead would silently couple us to that flag list's shape. Scanning
+// for the one token we recognise works identically under `run_tests.sh`, which passes
+// the subcommand as argv[1] and nothing else.
+//
+// Not finding a subcommand is exit 2, not exit 0: a harness change that stopped
+// passing one must fail, not quietly pass having tested nothing.
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s {roundtrip|filetrip|logical|recovery|legacy|collections|cost}\n", argv[0]); return 2; }
-    try {
-        std::string c = argv[1];
-        if (c == "roundtrip") { return roundtrip(); }
-        if (c == "cost")      { return cost(); }
-        if (c == "filetrip")  { return filetrip(); }
-        if (c == "logical")   { return logical(); }
-        if (c == "recovery")  { return recovery(); }
-        if (c == "legacy")    { return legacy(); }
-        if (c == "collections") { return collections(); }
-        std::fprintf(stderr, "unknown command\n"); return 2;
-    } catch (const std::exception& e) {
-        std::fprintf(stderr, "error: %s\n", e.what()); return 1;
+    for (int i = 1; i < argc; ++i) {
+        for (const auto& s : k_subcommands) {
+            if (std::string(argv[i]) != s.name) { continue; }
+            try {
+                return s.fn();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "error: %s\n", e.what());
+                return 1;
+            }
+        }
     }
+    std::fprintf(stderr, "usage: %s %s\n", argv[0], k_usage);
+    std::fprintf(stderr, "no recognised subcommand in %d argument(s)\n", argc - 1);
+    return 2;
 }
