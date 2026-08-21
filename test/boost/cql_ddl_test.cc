@@ -12,10 +12,18 @@
 #undef SEASTAR_TESTING_MAIN
 #include <seastar/testing/test_case.hh>
 
+#include <filesystem>
+#include <set>
+
 #include "test/lib/cql_test_env.hh"
 #include "sstables/sstables.hh"
 #include "sstables/parquet/writer_impl.hh"
 #include "test/lib/cql_assertions.hh"
+#include "test/lib/key_utils.hh"
+#include "test/lib/sstable_utils.hh"
+#include "test/lib/test_utils.hh"
+#include "replica/distributed_loader.hh"
+#include "mutation/mutation.hh"
 
 BOOST_AUTO_TEST_SUITE(cql_ddl_test)
 
@@ -365,6 +373,129 @@ SEASTAR_TEST_CASE(test_storage_format_honoured_by_streaming_writes) {
         auto& h = e.local_db().find_column_family("ks", "strm_hybrid");
         BOOST_REQUIRE(h.make_streaming_sstable_for_write()->get_version()
                       != sstables::sstable_version_types::pq);
+    });
+}
+
+// `nodetool refresh` must write the table's format too. This is the other half of the
+// reshape-on-load hole, and the wider half.
+//
+// The boot path -- `table_populator::process_subdir()` -- was fixed to ask
+// `sstables::parquet::version_for_rewrite_on_load()`. `distributed_loader::process_upload_dir()`,
+// the refresh reshard/reshape path, builds its own creator and was left asking
+// `sstables_manager::get_preferred_sstable_version()`, which chooses among the *native* versions
+// from config and cluster features and has never heard of `pq`. Every sstable that reshard or
+// reshape rewrote while loading `upload/` therefore came out native. Unlike the boot hole, which
+// only mis-formatted hybrid + TWCS, this one hit a table with an explicit
+// `storage_format = 'parquet'`.
+//
+// Why §10.12's snapshot -> truncate -> refresh round trip did not catch it, despite looking like
+// exactly this scenario: it ran `refresh` in **load-and-stream** mode, which re-streams the
+// snapshot's partitions through `table::make_streaming_sstable_for_write()` rather than adopting
+// its files, so it exercises the streaming creator (fixed separately) and never reaches this one.
+// Its snapshot was also already `pq`, so even a plain adopt-the-files refresh would have reported
+// `pq` with nothing having been rewritten. Neither arrangement is sensitive to the version this
+// creator picks, which is why it passed with the bug present.
+//
+// This asserts on the version read back off the files the loader actually produced -- both what
+// each loaded sstable reports and the `pq-` prefix local storage puts in the component names.
+// Passing a creator *in* and checking the version that came out would assert this test's own
+// argument; that is the trap the boot-path fix had to design around by extracting a named
+// function. Here `process_upload_dir()` picks the version itself, so driving it end to end is what
+// makes the choice observable.
+SEASTAR_TEST_CASE(test_storage_format_honoured_by_refresh_reshape) {
+    return do_with_cql_env_thread([] (cql_test_env& e) {
+        // STCS is pinned rather than left to the build's default because the four sstables staged
+        // below are chosen against its strict-mode reshape threshold, and because it merges them
+        // into a single output instead of ICS's runs, which keeps the count check exact.
+        e.execute_cql("CREATE TABLE ks.refresh_pq (pk int PRIMARY KEY, v int) "
+                      "WITH storage_format = 'parquet' "
+                      "AND compaction = {'class': 'SizeTieredCompactionStrategy'}").get();
+
+        auto& t = e.local_db().find_column_family("ks", "refresh_pq");
+        auto s = t.schema();
+
+        // Versions are collected as their *names*, joined, rather than as the raw enum:
+        // sstable_version_types has no operator<<, so BOOST_REQUIRE_EQUAL on it does not compile and
+        // BOOST_REQUIRE on a set comparison prints neither side. A failure here should say `me != pq`
+        // and not merely that a check failed.
+        auto loaded_sstables = [&e] {
+            std::set<sstables::sstable_version_types> versions;
+            size_t count = 0;
+            for (auto&& sst : *e.local_db().find_column_family("ks", "refresh_pq").get_sstables()) {
+                versions.insert(sst->get_version());
+                ++count;
+            }
+            std::string names;
+            for (auto v : versions) {
+                if (!names.empty()) {
+                    names += ",";
+                }
+                names += fmt::to_string(v);
+            }
+            return std::pair(names, count);
+        };
+
+        // Nothing has been written yet, so every sstable counted at the end is one the loader put
+        // there.
+        BOOST_REQUIRE_EQUAL(loaded_sstables().second, 0u);
+        BOOST_REQUIRE_EQUAL(loaded_sstables().first, "");
+
+        // Stage four *native* sstables in `upload/`, the way restoring a backup taken before the
+        // table was converted would. Four is the number that makes this test bite: STCS reshape in
+        // strict mode -- which is what process_upload_dir() asks for -- only returns a job once the
+        // input reaches max(min_compaction_threshold, 4). So this is the smallest staging that makes
+        // the loader *rewrite* rather than adopt the files unchanged, and a version can only be got
+        // wrong on a write.
+        constexpr size_t num_sstables = 4;
+        auto& sstm = t.get_sstables_manager();
+        auto& gen = t.get_sstable_generation_generator();
+        // Keys owned by this shard, so nothing needs resharding and the merge asserted below is the
+        // reshape's doing rather than a side effect of shard fan-out.
+        auto keys = tests::generate_partition_keys(num_sstables, s);
+        for (size_t i = 0; i < num_sstables; ++i) {
+            mutation m(s, keys[i]);
+            m.set_clustered_cell(clustering_key::make_empty(), to_bytes("v"),
+                                 data_value(int32_t(i)), api::new_timestamp());
+            auto sst = sstm.make_sstable(s, t.get_storage_options(), gen(),
+                                         sstables::sstable_state::upload,
+                                         sstables::sstable_version_types::me);
+            make_sstable_containing(sst, utils::chunked_vector<mutation>{std::move(m)}).get();
+        }
+
+        replica::distributed_loader::process_upload_dir(
+                e.db(), e.view_builder(), e.view_building_worker(), "ks", "refresh_pq",
+                false /* skip_cleanup */, false /* skip_reshape */).get();
+
+        auto [versions, loaded] = loaded_sstables();
+
+        // Guard against a vacuous pass. If reshape had not run, the four staged files would have
+        // been adopted exactly as they are, and the version check below would be measuring the
+        // staging loop above rather than anything process_upload_dir() decided. These two firing
+        // instead of the version check is the signal that this test's *setup* has gone stale --
+        // that the reshape threshold moved -- rather than that the product regressed.
+        BOOST_REQUIRE_GT(loaded, 0u);
+        BOOST_REQUIRE_LT(loaded, num_sstables);
+
+        // The contract. Without the fix this reads `me`.
+        BOOST_REQUIRE_EQUAL(versions, fmt::to_string(sstables::sstable_version_types::pq));
+
+        // The same claim read off the directory rather than the sstable objects, so that a version
+        // mislabelled in memory could not carry the test: local storage puts the version in the
+        // component name.
+        size_t data_components = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(tests::table_dir(t))) {
+            auto name = entry.path().filename().string();
+            if (!name.ends_with("-Data.db")) {
+                continue;
+            }
+            ++data_components;
+            BOOST_REQUIRE_EQUAL(name.substr(0, 3), "pq-");
+        }
+        BOOST_REQUIRE_EQUAL(data_components, loaded);
+
+        // And the rows have to survive the rewrite, not merely change format.
+        assert_that(e.execute_cql("SELECT pk, v FROM ks.refresh_pq").get())
+                .is_rows().with_size(num_sstables);
     });
 }
 

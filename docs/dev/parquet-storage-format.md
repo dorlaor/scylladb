@@ -1038,7 +1038,8 @@ evidence both are right.
   | Path | Before | Now |
   |---|---|---|
   | streaming / repair / bootstrap / refresh | native | honours `'parquet'` |
-  | reshard and reshape on load | native, via `get_safe_sstable_version_for_rewrites()` which only knows native versions | honours `'parquet'` |
+  | reshard and reshape on load (boot) | native, via `get_safe_sstable_version_for_rewrites()` which only knows native versions | honours `'parquet'` |
+  | reshard and reshape on load (`nodetool refresh`) | native, via `get_preferred_sstable_version()` — **missed by this audit**, see below | honours `'parquet'`, fixed 2026-08-21 |
   | split compaction | native, via `make_sstable(sst->state())` | honours `'parquet'` |
   | sstable-directory rewrite | already correct — uses `desc.version`, so it preserves the source | unchanged |
   | memtable flush | native | unchanged, **deliberately** — see above |
@@ -1047,6 +1048,14 @@ evidence both are right.
   wire the format, because it is the only place that *chooses* a format. The paths that merely
   *rewrite* data all defaulted to the node's preferred native version, and each was a silent
   downgrade of a table that had asked for Parquet.
+
+  And a second pattern, from what this audit *missed*: "reshard and reshape on load" was recorded as
+  one row and is two call sites. The audit grepped for creator assignments and found the boot one
+  (`table_populator`); the refresh one (`process_upload_dir()`) assigns its creator in a lambda
+  reading `sstm.get_preferred_sstable_version()` — a different accessor from the boot path's
+  `get_safe_sstable_version_for_rewrites()`, which is why a grep anchored on the latter did not
+  surface it. Counting *paths* when the thing that can drift is a *call site* is what let it hide,
+  twice: once in this audit and once again in the boot-path fix, which named the row closed.
 - ~~**`nodetool upgradesstables` does not force convergence.**~~ **Wrong — verified 2026-08-18:
   it does.** A native table altered to `storage_format = 'parquet'` and then upgraded, with no
   compaction triggered, came out as `pq`. The creator installed in `compact_sstables()` is shared
@@ -2055,6 +2064,7 @@ CI-wired binary:
 | `test_pq_dead_and_absent_are_distinguishable_on_disk` | `__dmask` entry counts read from the footer, so `dead` and `absent` are told apart in the file rather than through the reader; plus the fold/elision pairing, with both an elidable and a non-elidable row group in one file. |
 | `test_pq_reads_cross_a_window_seam_inside_a_row_group` | A row group wider than the 16 384-row scan window, so a read decodes one group in two windows — geometry no data-writing test had ever produced. |
 | `test_reshape_on_load_writes_parquet_for_hybrid_twcs` | The boot-time reshape/reshard version choice, for all six `storage_format` × strategy combinations and against two different native fallbacks. This is the defect below, and the test was confirmed to fail (`me != pq`) against the old gate. |
+| `test_storage_format_honoured_by_refresh_reshape` (`cql_ddl_test.cc`) | The `nodetool refresh` reshape/reshard version choice, end to end through `process_upload_dir()` — four native sstables staged in `upload/`, the version read back off the files that came out. The first test of a reshape-on-load creator that does *not* supply the creator itself. Confirmed to fail (`me != pq`) against the old creator. |
 
 | New binary | What it runs |
 |---|---|
@@ -2143,17 +2153,37 @@ here and are worth the paragraph:
   the one write path with no seam a test could reach, which is exactly why it was the one that
   drifted. (`distributed_loader_for_tests::reshard()` takes the creator as a parameter, so a test
   driving it asserts its own argument back.)
-- **`process_upload_dir()` has the same bug and is *not* fixed** (`distributed_loader.cc:193`).
-  Found while fixing the above. It is a *separate* reshape-on-load path — `nodetool refresh`
-  rather than boot — and it builds its own creator with
-  `sstm.get_preferred_sstable_version()`, consulting neither `_version_for_reshaping` nor
-  `writes_parquet_unconditionally()`. So refresh reshards and reshapes a `pq` table's uploaded
-  sstables into **native**, for `storage_format = 'parquet'` as well as hybrid+TWCS — a wider
-  hole than the boot path had. Not fixed here because it is a distinct defect with its own
-  blast radius (the §10.12 snapshot → truncate → refresh round trip passes, so whatever it
-  asserts is not format-sensitive), and it wants its own change plus a test that reads the
-  version back off the loaded files. This makes **five** non-compaction write paths, of which
-  four now agree.
+- ~~**`process_upload_dir()` has the same bug and is *not* fixed**~~ — **fixed 2026-08-21.**
+  It is a *separate* reshape-on-load path — `nodetool refresh` rather than boot — and it built its
+  own creator with `sstm.get_preferred_sstable_version()`, consulting neither
+  `_version_for_reshaping` nor `writes_parquet_unconditionally()`. So refresh reshaped and
+  resharded a `pq` table's uploaded sstables into **native**, for `storage_format = 'parquet'` as
+  well as hybrid+TWCS — a wider hole than the boot path had, which only mis-formatted hybrid+TWCS.
+  It now calls the same `version_for_rewrite_on_load()` helper, passing
+  `get_preferred_sstable_version()` as the native choice; the `_for_rewrites()` variant the boot
+  path uses is not wanted here, because refresh runs on a live node where cluster features are
+  known rather than inferred from the files on disk. All **five** non-compaction write paths now
+  agree.
+
+  **This one has an end-to-end test, and it needed a different seam from the boot path's.** The
+  boot fix could only be asserted through the extracted function, because its call site is
+  `table_populator`. `process_upload_dir()` is a public static that `cql_query_test.cc` already
+  drives under a `cql_test_env`, so the creator built *inside* it is reachable: stage sstables in
+  `upload/`, call it, and read the version back off what came out.
+  `test_storage_format_honoured_by_refresh_reshape` (`cql_ddl_test.cc`) does that and asserts it
+  twice over — the version each loaded sstable reports, and the `pq-` prefix local storage puts in
+  the on-disk component names, so a version mislabelled in memory could not carry it. Confirmed to
+  fail against the old creator with `[me != pq]`.
+
+  Two things about that test are load-bearing and easy to lose in a later edit. **Four staged
+  sstables, not one:** STCS reshape in strict mode returns no job below
+  `max(min_compaction_threshold, 4)`, and with fewer files `process_upload_dir()` *adopts* them
+  unchanged instead of rewriting — a version can only be got wrong on a write, so a
+  one-file version of this test passes no matter what the creator picks. **A guard that the merge
+  happened** (`loaded < 4`) sits in front of the version check for that reason: if the threshold
+  ever moves, that guard fires rather than the version assertion, which distinguishes "this test's
+  setup went stale" from "the product regressed". The strategy is pinned to STCS in the DDL rather
+  than left to the build's default for the same reason.
 - **TWCS never sets `parquet_ctx.bottom_tier`**, so C1 would read `false` for every TWCS
   compaction. Harmless only while the hybrid+TWCS short-circuit exists ahead of it.
 - **Counters in a mixed-format merge**, and non-frozen collections in one. Both round-trip
@@ -4558,6 +4588,18 @@ every sstable, so a reader that is wrong in a way ordinary queries do not reach 
 rewriting, so it is a whole-file integrity check of the Parquet reader. The snapshot round trip is the
 backup story end to end — snapshot, truncate to zero, stage the components into `upload/`, refresh,
 everything back.
+
+**What the refresh row does *not* cover, noted 2026-08-21.** It is a row-count check, and it is not
+sensitive to the sstable version refresh writes — which is why it passed while
+`process_upload_dir()` was rewriting `pq` tables as native (§9.6). Two reasons, either sufficient:
+it ran refresh in **load-and-stream** mode, which re-streams the snapshot's partitions through
+`table::make_streaming_sstable_for_write()` rather than adopting its files, so it exercises the
+streaming creator and never reaches the reshape/reshard one; and the snapshot it restored was
+already `pq`, so even a plain adopt-the-files refresh would have reported `pq` with nothing having
+been rewritten. The general lesson for this table: a round trip that asserts *rows* cannot catch a
+*format* regression, and a round trip whose input is already in the target format cannot catch one
+either, however much it looks like the scenario. The version-sensitive version of this check is now
+`test_storage_format_honoured_by_refresh_reshape`.
 
 **Object storage: 7/7** (`~/pq-lab/objstore_check.py`, minio). Recorded as blocked on Docker because
 the repo's GCS tests cannot pull their image on this machine. That was wrong twice over: **`minio` is
@@ -7006,7 +7048,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. Note this is a *bucketing* gap: mixed-set **correctness** — reads and compactions across both formats, with every tombstone shape — is now covered by unit tests (§9.6), which it was not when this row was written. |
-| Correctness coverage gaps | known | Enumerated in §9.6. The load-bearing one remaining: **no Python/pytest coverage of `storage_format` at all** (0 of 629 files under `test/*.py` mention it, and the two REST endpoints have none either). Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. **Opened 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc:193`) has the *same* defect on the `nodetool refresh` path and is not fixed — it builds its own creator from `get_preferred_sstable_version()`, so refresh rewrites even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. |
+| Correctness coverage gaps | known | Enumerated in §9.6. The load-bearing one remaining: **no Python/pytest coverage of `storage_format` at all** (0 of 629 files under `test/*.py` mention it, and the two REST endpoints have none either). Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. |
 | Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
 | **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |

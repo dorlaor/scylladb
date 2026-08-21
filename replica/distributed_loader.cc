@@ -189,12 +189,28 @@ distributed_loader::process_upload_dir(sharded<replica::database>& db, sharded<d
         };
         process_sstable_dir(directory, flags).get();
 
+        // get_preferred_sstable_version() picks among the *native* versions from config and cluster
+        // features; it has never heard of `pq`. Left to itself it would rewrite the sstables that
+        // reshard and reshape produce here as native, even for a table with an explicit
+        // `storage_format = 'parquet'` -- so `nodetool refresh` would undo, for the files it
+        // touches, the format the table's flushes, streams and compactions all agree on.
+        //
+        // Same predicate and same helper as the boot-time reshape-on-load path in
+        // table_populator::process_subdir(). That path was fixed first; this one is the other half
+        // of the same hole and is wider, because the boot path at least got `storage_format =
+        // 'parquet'` right and only mis-formatted hybrid + TWCS.
+        //
+        // get_preferred_sstable_version() rather than get_safe_sstable_version_for_rewrites() is
+        // right for the native choice here: refresh runs on a live node, so cluster features are
+        // known and there is no need to infer them from the files on disk.
         auto make_sstable = [&] (shard_id shard) {
             auto& sstm = global_table->get_sstables_manager();
             auto& gen = global_table->get_sstable_generation_generator();
             auto generation = gen();
+            auto version = sstables::parquet::version_for_rewrite_on_load(
+                    *global_table->schema(), sstm.get_preferred_sstable_version());
             return sstm.make_sstable(global_table->schema(), global_table->get_storage_options(),
-                                     generation, sstables::sstable_state::upload, sstm.get_preferred_sstable_version(),
+                                     generation, sstables::sstable_state::upload, version,
                                      sstables::sstable_format_types::big, db_clock::now(), &error_handler_gen_for_upload_dir);
         };
         // Pass owned_ranges_ptr to reshard to piggy-back cleanup on the resharding compaction.
