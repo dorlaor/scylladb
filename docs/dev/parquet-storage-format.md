@@ -2045,7 +2045,8 @@ no promoted index` (`writer_impl.cc:877`), because Parquet's own ColumnIndex pro
 intra-partition seeking. Adding `_pq_medium` and `_pq_large` cases would run the same
 battery three times for the same cost as running it once. Not done, on purpose.
 
-**Added 2026-08-21.** Three cases, all in `test/boost/sstable_parquet_test.cc`:
+**Added 2026-08-21.** Five cases in `test/boost/sstable_parquet_test.cc`, plus one new
+CI-wired binary:
 
 | Case | What it covers that nothing did |
 |---|---|
@@ -2053,6 +2054,11 @@ battery three times for the same cost as running it once. Not done, on purpose.
 | `test_hybrid_compaction_merges_native_and_parquet` | A compaction taking one native and one `pq` input, writing each output format in turn. |
 | `test_pq_dead_and_absent_are_distinguishable_on_disk` | `__dmask` entry counts read from the footer, so `dead` and `absent` are told apart in the file rather than through the reader; plus the fold/elision pairing, with both an elidable and a non-elidable row group in one file. |
 | `test_pq_reads_cross_a_window_seam_inside_a_row_group` | A row group wider than the 16 384-row scan window, so a read decodes one group in two windows — geometry no data-writing test had ever produced. |
+| `test_reshape_on_load_writes_parquet_for_hybrid_twcs` | The boot-time reshape/reshard version choice, for all six `storage_format` × strategy combinations and against two different native fallbacks. This is the defect below, and the test was confirmed to fail (`me != pq`) against the old gate. |
+
+| New binary | What it runs |
+|---|---|
+| `test/boost/parquet_tiering_test` | The per-criterion C1/C5/C6 policy tests, as a `pure_boost_tests` entry — a CI-enforced copy of what `sstables/parquet/test_tiering.cc` had only ever asserted under the hand-run script. Nine Boost cases covering the same eleven assertions. |
 
 The merge cases are the significant ones, and the reason is worth keeping. Every
 single-format round-trip test in this file is blind to a tombstone stored as an absent
@@ -2085,16 +2091,69 @@ here and are worth the paragraph:
 - **No Python-level coverage at all.** Zero of 629 files under `test/*.py` mention
   `storage_format` or `parquet`. The REST endpoints `column_family/storage_format/{name}`
   and `storage_service/estimate_parquet_ratios` have no `test/rest_api` coverage.
-- **`sstables/parquet/test_tiering.cc` is not in `configure.py`** — the only per-criterion
-  test of the C1/C5/C6 policy is built solely by the hand-run `run_tests.sh`, so CI never
-  executes it.
+- ~~**`sstables/parquet/test_tiering.cc` is not in `configure.py`**~~ — **closed 2026-08-21.**
+  The per-criterion C1/C5/C6 tests now also exist as `test/boost/parquet_tiering_test`, a
+  `pure_boost_tests` entry in `configure.py` and `KIND BOOST` in `test/boost/CMakeLists.txt`.
+  It needed no new sources: `tiering_policy.cc` is already in `scylla_core`, and
+  `tiering_policy.hh` has no Scylla dependencies, so there is no reactor to start.
+  `test_tiering.cc` itself is *not* what CI runs, and the reason is a choice rather than a
+  blocker. Two routes existed. **(a)** Enrol the file as-is in a `test/unit`-style suite:
+  `test/pylib/cpp/unit.py`'s `UnitTestFile.list_test_cases()` returns a single case and judges
+  it by process exit code, so a bespoke `int main()` returning 0/1 is exactly what it expects —
+  nothing there requires a Seastar `app_template`, the current `test/unit` members merely
+  happen to be one. **(b)** Write a `pure_boost_tests` entry. (b) was chosen: route (a) needs
+  the source at `test/<suite>/<target>.cc`, because `configure.py` derives `deps[t] = [t +
+  '.cc']` from the target name, so it means *moving* the file out of `sstables/parquet/` and
+  making `run_tests.sh` reach outside its own directory for it; and it collapses eleven
+  assertions into one pass/fail, where the Boost entry reports nine independently-runnable
+  cases with per-assertion failure locations. The two copies are therefore duplicated on
+  purpose: the standalone one keeps `run_tests.sh` self-contained (no Seastar, no Scylla
+  headers), the Boost one is what blocks a regression. Divergence between them is the cost,
+  and it is the reason `test_tiering.cc`'s stale "seven criteria" header comment went
+  unnoticed until now.
+- **`sstables/parquet/test_shred.cc` is still not in `configure.py`**, so the 6 480-case
+  folding-losslessness matrix is enforced only by `run_tests.sh`. Not done here because it
+  needs restructuring rather than wiring, but the restructuring is smaller than it looks and
+  the shape of it is settled. The subcommand dispatch is **not** the obstacle: a `test/unit`
+  suite runs one binary per `custom_args` entry and judges it by exit code, and
+  `test_config.yaml` already carries multiple arg lists for one target
+  (`lsa_sync_eviction_test` has three), so `roundtrip` / `filetrip` / `logical` / `recovery` /
+  `legacy` / `collections` map onto six entries with `main()` untouched. Linking is free too —
+  `schema_mapping.cc` and the four `format/*.cc` files are all in `scylla_core`. What actually
+  blocks it: (1) the source must sit at `test/<suite>/<target>.cc`, since `configure.py`
+  derives `deps[t] = [t + '.cc']` from the target name, so the file has to move and
+  `run_tests.sh` has to follow it; (2) its includes are relative to `sstables/parquet/`
+  (`#include "schema_mapping.hh"`, `"format/parquet_metadata.hh"`) rather than
+  repo-root-relative, so it does not compile under the in-tree convention; (3) `cost()`
+  returns 0 unconditionally — it is a CSV measurement, not an assertion — so it must be left
+  to the script rather than enrolled as a case that can never fail. A Boost port instead
+  would give per-case granularity but means lifting ~1 000 lines of generator code out of the
+  dispatch, which is the larger job of the two.
 - **Hybrid + TWCS on the streaming path** is untested: `cql_ddl_test.cc:363` covers hybrid
   under size-tiered only, where the answer is "not `pq`".
-- **`distributed_loader.cc:415` tests `storage_format() == parquet` rather than
-  `writes_parquet_unconditionally()`**, so reshape/reshard on load writes native sstables
-  into a hybrid+TWCS table whose flushes, streams and compactions all write `pq`. Nothing
-  asserts either behaviour. This is a real inconsistency with the single-home rule
-  `tiering_context.hh` states, not just a test gap.
+- ~~**`distributed_loader.cc:415` tests `storage_format() == parquet`**~~ — **fixed 2026-08-21.**
+  Boot-time reshape/reshard now asks the same predicate as flush, streaming and compaction, so a
+  hybrid+TWCS table no longer writes native there while writing `pq` everywhere else. The defence
+  for the old gate — that reshaping happens on load "where nothing is known about tiering yet" —
+  did not hold: `writes_parquet_unconditionally()` reads only `storage_format` and the compaction
+  strategy, both table properties known at load, and the two cases it covers are by definition the
+  ones that skip the tiering criteria. There was no tiering context to be missing. The decision is
+  now `sstables::parquet::version_for_rewrite_on_load(schema, native_choice)`, extracted **because**
+  the call site is `table_populator`, a class local to `distributed_loader.cc`: reshape-on-load was
+  the one write path with no seam a test could reach, which is exactly why it was the one that
+  drifted. (`distributed_loader_for_tests::reshard()` takes the creator as a parameter, so a test
+  driving it asserts its own argument back.)
+- **`process_upload_dir()` has the same bug and is *not* fixed** (`distributed_loader.cc:193`).
+  Found while fixing the above. It is a *separate* reshape-on-load path — `nodetool refresh`
+  rather than boot — and it builds its own creator with
+  `sstm.get_preferred_sstable_version()`, consulting neither `_version_for_reshaping` nor
+  `writes_parquet_unconditionally()`. So refresh reshards and reshapes a `pq` table's uploaded
+  sstables into **native**, for `storage_format = 'parquet'` as well as hybrid+TWCS — a wider
+  hole than the boot path had. Not fixed here because it is a distinct defect with its own
+  blast radius (the §10.12 snapshot → truncate → refresh round trip passes, so whatever it
+  asserts is not format-sensitive), and it wants its own change plus a test that reads the
+  version back off the loaded files. This makes **five** non-compaction write paths, of which
+  four now agree.
 - **TWCS never sets `parquet_ctx.bottom_tier`**, so C1 would read `false` for every TWCS
   compaction. Harmless only while the hybrid+TWCS short-circuit exists ahead of it.
 - **Counters in a mixed-format merge**, and non-frozen collections in one. Both round-trip
@@ -6947,7 +7006,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. Note this is a *bucketing* gap: mixed-set **correctness** — reads and compactions across both formats, with every tombstone shape — is now covered by unit tests (§9.6), which it was not when this row was written. |
-| Correctness coverage gaps | known | Enumerated in §9.6. The load-bearing ones: **no Python/pytest coverage of `storage_format` at all** (0 of 629 files under `test/*.py` mention it, and the two REST endpoints have none either); **`sstables/parquet/test_tiering.cc` is absent from `configure.py`**, so the only per-criterion test of C1/C5/C6 never runs in CI; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. Also a genuine inconsistency rather than a gap: `distributed_loader.cc:415` gates on `storage_format() == parquet` instead of `writes_parquet_unconditionally()`, so reshape-on-load writes native sstables into a hybrid+TWCS table that writes `pq` everywhere else, and nothing asserts either way. |
+| Correctness coverage gaps | known | Enumerated in §9.6. The load-bearing one remaining: **no Python/pytest coverage of `storage_format` at all** (0 of 629 files under `test/*.py` mention it, and the two REST endpoints have none either). Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. **Opened 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc:193`) has the *same* defect on the `nodetool refresh` path and is not fixed — it builds its own creator from `get_preferred_sstable_version()`, so refresh rewrites even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. |
 | Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
 | **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |
