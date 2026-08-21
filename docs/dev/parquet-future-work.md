@@ -96,9 +96,11 @@ row group) is what would make the first read O(1).
 
 **§10.27 measured it at 2.5 ms per sstable — 69 % of a 3 680 µs first read — and decided against
 building it**, because that cost is paid once per sstable per restart (about half a second for a
-200-sstable shard) and nothing in steady state moves: every published cold ratio is `min` over 400
-probes and so a footer-cache hit. The design in `parquet-side-index-design.md` is kept, with the
-conditions that would reopen it, rather than queued.
+200-sstable shard) and nothing in steady state moves: every published *steady-state* ratio is `min`
+over 400 probes and so a footer-cache hit. (Relabelled 2026-08-21, item 15: §10.24's `cached` column,
+§10.25 and §10.26 are those hits; §10.21 predates the cache and is the uncached cost, which makes it a
+fourth estimate of the 3 680 µs rather than an exception to the argument.) The design in
+`parquet-side-index-design.md` is kept, with the conditions that would reopen it, rather than queued.
 
 **Also not done:** the recovered `mapped_schema` is still rebuilt per reader. It is O(leaves), not
 O(row groups), so it does not scale with sstable size; caching it would mean keying by query schema,
@@ -256,7 +258,20 @@ Not defects — the numbers below are all real. They answer a different question
 label implies, which is easier to overlook than a wrong number and worse for a reader who trusts the
 label. Each item is a relabelling-and-scoping job, not a re-engineering one.
 
-### 15. Every "cold" figure in §10.21, §10.24, §10.25 and §10.26 is a warm reading
+### 15. ~~Every "cold" figure in §10.21, §10.24, §10.25 and §10.26 is a warm reading~~ — DONE 2026-08-21
+
+**Relabelled, and one of the four was not what this item said it was.** §10.24's `cached` column,
+§10.25 and §10.26 were `min`-of-400-after-a-restart with the footer cache in the binary, so they are
+cache hits; each now carries a table or paragraph saying which question it answers, and the word
+"cold" is gone from all three in favour of `steady`. **§10.21 is the exception**: it was measured
+*before the footer cache existed*, so all 400 of its probes paid the footer and its column is the
+uncached cost — it is renamed `uncached min`, not relabelled as a hit. It then turns out to be a
+fourth independent estimate of the very quantity §10.27 measured: same sstable shape, **3 958 µs
+against 3 680 µs, 7.0 % apart**. §10.27's heading ("every cold figure … is a footer-cache hit") is
+over-general and now says so inline. Both numbers are stated at every site, because a latency budget
+needs first contact *and* steady state: **3 680 µs and 1 149 µs at the shipping default, 3.2× apart.**
+
+The original item, for the record:
 
 Those figures are `min` over 400 probes after a single restart. The first probe pays whatever
 per-sstable one-time cost exists, so the *minimum* can only be a footer-cache hit — by construction it
@@ -278,7 +293,37 @@ do is go back and relabel the four sections whose tables still say "cold".
 latency budget will read "cold" as cold. Where a section's argument depends on the distinction, say
 which number the argument uses.
 
-### 16. `harness.py`'s "Parquet" figures are pyarrow re-encodings, not `pq` sstables
+### 16. ~~`harness.py`'s "Parquet" figures are pyarrow re-encodings, not `pq` sstables~~ — DONE 2026-08-21
+
+**Audited in full, and the significant case re-measured.** The inventory is §10.3j; each of the eight
+tables now carries its verdict inline — one of which the candidate list had missed. Headlines:
+
+* **§10.3's folding table is re-measured through the real write path** (`~/pq-lab/fold_levels.sh`,
+  the shape of §10.1f-prod). **L0/L1 on Backblaze is 6.63×, not 26.8×** — the model's L0 column was
+  4× too big because it writes a dense per-column `__ts_<col>` for every row, including the 73 % of
+  Backblaze cells that do not exist; its L0 figure is 97.7 % of `195 × 300 000 × 8 B`, i.e. the size
+  of an array the format never writes. The stated mechanism is also corrected: L0's cost is
+  per-column duplication × *distinct write times* × cell density, and on this corpus partition-key
+  cardinality dominates column count. The decision the table supports is unchanged and not close.
+* **L2 is unreachable in the `realistic` regime** — all three `uniform` requests came back
+  `folding_effective: L1`, byte-identical to `row`. The old L2 column described a file the format
+  cannot produce. Real L2 saving, where it applies: 1.4 % (§10.1m).
+* **The model's L1 column is good to ~2 % on narrow/dense schemas and 18 % optimistic on wide sparse
+  ones** — and it is right for the wrong reason even where it is right: 106 modelled leaves against
+  330 real ones on ClickBench, the difference being all-null channels worth 0.8 % of the file. A model
+  that agrees on bytes is not thereby validated on structure.
+* **One false positive:** §10.1f's export corpus is our own writer, not pyarrow. Superseded for
+  absolute sizes, but for an unrelated reason.
+* **One conclusion that rested on a mechanism we do not have:** §10.1g's `isdfloat` result. Our
+  writer's file grows **+19.6 %** on `int32` → `double`, not +0.1 %, because `numeric_dictionary` is
+  off by default. The conclusion survives (Parquet's saving 50.8 % → 52.8 %) but the effect is 2
+  points rather than 12.4.
+* **Un-measurable, permanently:** §10.1a's token-order penalty. Both arms must be models, because an
+  sstable is token-ordered and has no other order to be written in. The ratio is the trustworthy part.
+
+The original item, for the record:
+
+`harness.py`'s "Parquet" figures are pyarrow re-encodings, not `pq` sstables
 
 `harness.py` reads rows back over CQL and re-encodes them with `pyarrow.parquet.write_table`,
 synthesising the metadata leaves itself. Every probe line in a harness run shows `pq=0` — it never

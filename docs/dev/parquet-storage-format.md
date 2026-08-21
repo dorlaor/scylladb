@@ -2624,7 +2624,17 @@ One row per (dataset × timestamp regime), per §9.4. `TS regime` ∈ {collapsed
 
 All byte counts are SSTable `Data.db`; Parquet column is folding level L1 / zstd-3.
 
-| Dataset | TS regime | Rows | Cols | LZ4 | Zstd | LZ4+dicts | Zstd+dicts | Parquet L1 | vs. LZ4 | vs. Zstd+dicts |
+> **Provenance, audited 2026-08-21 (§10.3j).** This table is **mixed**, and the columns are not the
+> same kind of number. The four compressor columns are real SSTables written by a real node and
+> measured on disk. **`Parquet L1` is `harness.py`'s pyarrow model** — rows read back over CQL and
+> re-encoded by `pyarrow.parquet.write_table`, in **one row group** (the harness passes
+> `row_group_size = 1 000 000` for a 200 000–500 000-row dataset), with the metadata leaves
+> synthesised in Python. It is not a `pq` sstable. The three `realistic` rows have since been
+> re-measured through the real write path at the shipping `rows_per_row_group = 5 000`, and the model
+> is **optimistic by 0.8–5.5 %** on the Parquet column — see §10.3j for the side-by-side and §10.3
+> for the run. The `collapsed` rows have not been re-measured.
+
+| Dataset | TS regime | Rows | Cols | LZ4 | Zstd | LZ4+dicts | Zstd+dicts | Parquet L1 *(model)* | vs. LZ4 | vs. Zstd+dicts |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | D2 Backblaze | collapsed | 300 000 | 197 | 57 304 070 | 38 826 603 | 38 037 326 | 19 174 171 | 14 790 180 | 25.8 % | 77.1 % |
 | **D2 Backblaze** | **realistic** | 300 000 | 197 | 67 545 539 | 49 063 873 | 52 511 917 | 32 458 096 | 17 055 064 | 25.2 % | **52.5 %** |
@@ -2650,7 +2660,18 @@ for a hash-partitioned database.
 
 Parquet L1/zstd-3, identical rows and settings; only the row order differs.
 
-| Dataset (realistic) | Natural order | Token order | Penalty | Why |
+> **Provenance, audited 2026-08-21 (§10.3j): both columns are the pyarrow model, and this one cannot
+> be anything else.** The harness writes the same rows twice, once in source-file order and once in
+> the token order a `SELECT` returned them in. There is no real-write-path version of the natural-order
+> arm and there never can be: an sstable *is* token-ordered, so a `pq` file written by the server has
+> no other order to be in. The comparison is therefore a statement about the Parquet *format* under two
+> input orderings, not a measurement of two things Scylla can produce — and that is the only form this
+> question has. **The penalty is the load-bearing number and it is a ratio between two model files**,
+> which is the configuration in which a model is most trustworthy: both arms share every encoding
+> choice, so the choices cancel. Read the percentages, not the bytes. The token-order bytes here are
+> the same model figures as §10.1's Parquet column and inherit its 0.8–5.5 % optimism.
+
+| Dataset (realistic) | Natural order *(model)* | Token order *(model)* | Penalty | Why |
 |---|---:|---:|---:|---|
 | **D2 Backblaze** | 11 863 976 | 17 055 064 | **+43.8 %** | pk `serial_number` is high-cardinality; hashing shatters the one-row-per-drive-per-day locality |
 | D1 ClickBench | 16 183 075 | 16 177 362 | −0.0 % | pk `UserID`; natural order had little locality to lose |
@@ -2663,19 +2684,37 @@ table, which is what criterion C6 does.
 
 ### 10.1b Trap 2 — timestamp regime
 
-Parquet folding level L0 (the 2020 verbatim mapping) under the two regimes:
+Parquet folding level L0 (the 2020 verbatim mapping) under the two regimes.
 
-| Dataset | L0 collapsed | L0 realistic | Change | SSTable Zstd+dicts change |
-|---|---:|---:|---:|---:|
-| **D2 Backblaze** | 15 789 102 | 457 454 962 | **+2 797 %** | +69.3 % |
-| D1 ClickBench | 16 388 873 | 33 503 657 | +104.4 % | +2.1 % |
-| D5 NYC TLC | 8 763 261 | 8 763 448 | +0.0 % | +1.0 % |
+**Re-measured through the real write path 2026-08-21, and this table was not on the audited candidate
+list.** Both of its L0 columns come from the same `write_variant` path as §10.3's, so the audit of
+§10.3j applies here too — it was missed because its header says "L0" rather than "Parquet L1". The
+model figures are kept for comparison; the measured ones are what to quote.
 
-**Trap 2 confirmed, and it is worse than predicted.** A bulk load does not merely
-overstate the win — it makes the verbatim mapping look *fine* (18 % smaller than
-SSTables on D2). Measuring only that regime would have shipped the wrong schema mapping.
-The SSTable baseline moves too (+69 % on D2), so a bulk-load benchmark is fiction on
-both sides.
+| Dataset | L0 collapsed | L0 realistic | **Change** | *(model change)* | SSTable Zstd+dicts change |
+|---|---:|---:|---:|---:|---:|
+| **D2 Backblaze** | 32 972 667 | 138 027 815 | **+319 %** | *+2 797 %* | +69.3 % |
+| D1 ClickBench | 17 599 935 | 27 234 739 | **+55 %** | *+104.4 %* | +2.1 % |
+| D5 NYC TLC | 8 881 274 | 8 881 274 | **+0.0 %** | *+0.0 %* | +1.0 % |
+
+Method and guards as §10.3 (`fold_levels.sh`, `FOLD_REGIME=collapsed`); L1 measured twice per dataset
+and byte-identical both times. The collapsed native baselines cross-check §10.1's to **0.5 %**
+(Backblaze 19 277 711 against 19 174 171).
+
+**Trap 2 is confirmed and the direction is unchanged — but one of the conclusions drawn from it was an
+artefact of the model, and it is the memorable one.** The old table said a bulk load "makes the
+verbatim mapping look *fine* — 18 % smaller than SSTables on D2". On real `pq` files it does not:
+L0 collapsed is **32 972 667 B against a native sstable of 19 277 711**, i.e. **171 % of it**, so the
+verbatim mapping is 71 % *worse* than the row format even under the most flattering timestamp regime
+available. The model got "18 % smaller" the same way it got 26.8× — by writing a dense per-column
+timestamp array whose values are all identical under `collapsed`, which is the best case a dictionary
+encoder will ever see and compresses to nearly nothing (§10.3).
+
+So the trap is real and its lesson survives intact — a bulk-load benchmark overstates the win, by
+319 % of the L0 file on the widest table, and the SSTable baseline moves too (+69 % on D2), so such a
+benchmark is fiction on both sides. What changes is that measuring only the collapsed regime would
+**not** have made the 2020 mapping look acceptable. It would have made it look 1.7× too big instead of
+6.6× too big, and the wrong decision was never actually available.
 
 ### 10.1c Column-projection I/O
 
@@ -3198,6 +3237,15 @@ three vintages — three rows measured with pyarrow, three with our writer as it
 the encoding-hint and numeric-dictionary work, one current — which made the columns not
 comparable with each other. Where a row moved, both causes are named below.
 
+> **Provenance re-checked 2026-08-21 (§10.3j): clean, and the listed candidate was a false positive.**
+> The `harness.py` audit flagged this table because its column header says "Parquet L1/zstd-3", the
+> same header the model's columns carry. Reading the section settles it: both columns are our own
+> code — a live node for the SSTable column, `scylla sstable parquet-export` for the Parquet one — so
+> there is nothing to relabel. It remains superseded for **absolute** sizes for the unrelated reason
+> below (one row group, not what the storage writer emits), and §10.1f-prod is the table to quote.
+> Worth stating explicitly because "superseded" and "not a real measurement" are different defects and
+> this table has only the first.
+
 | Dataset | Rows | Leaves | Shape | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
 |---|---:|---:|---|---:|---:|---:|---:|
 | D12 NOAA ISD-Lite | 300 000 | 20 | hourly station telemetry | 3 707 948 | 1 737 372 | **46.9 %** | 53.1 % |
@@ -3323,18 +3371,34 @@ at rates from 0.6 % (`temp`) to 96 % (`precip_6h`). Two defensible mappings were
 measured, because binding `NULL` in a CQL `INSERT` writes a *deletion*, so the NULL variant
 carries roughly 1.1 M tombstones:
 
-| Variant | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio |
+> **Provenance, audited 2026-08-21 (§10.3j): the SSTable column is real, the Parquet column is the
+> pyarrow model.** 1 961 695 B is identified as a pyarrow file by the encoding table later in this
+> section, which reads `ts` out of *its* footer at 528 482 B under "pyarrow's defaults". Both variant
+> tables below share that column.
+
+| Variant | SSTable Zstd+dicts | Parquet L1/zstd-3 *(model)* | Ratio |
 |---|---:|---:|---:|
 | `isd` — `-9999` → NULL (tombstones) | 3 707 374 | 1 961 695 | 52.9 % |
 | `isdraw` — sentinel kept, all cells live | 3 770 433 | 1 973 753 | 52.4 % |
 
 Within half a point, so the headline does not rest on that modelling choice.
 
+**But the *tombstone* half of this comparison is exactly what the model cannot see, and §10.28 later
+measured it as the single largest defect in the mapping.** "Within half a point" is a claim that
+1.1 M cell tombstones cost `pq` nothing, and it was reached with an instrument that emits every
+`__ldt_<col>` as an all-null column. Measured on real `pq` files, retaining tombstones cost the
+per-column deletion channel 60.7 MB on Backblaze — 69 % of the file — until the deletion fold landed.
+The conclusion here is *probably* still right for D12, because 1.1 M tombstones over 10 columns is a
+far milder case than 42 M over 197 and because the fold has since made the channel four leaves wide
+regardless; but **this table is not evidence for it**, and the default `tombstone_gc` mode of `repair`
+means an unpinned run purges the tombstones before measuring anyway (§10.18). Re-measuring it wants
+`PQ_TOMBSTONE_GC=timeout` and the real write path.
+
 **Floats widen the gap rather than closing it.** The obvious objection to a numeric win is
 that it is an artifact of integer encodings, and that real IoT tables store floats. Measured
 (`harness.py isdfloat`, same observations as doubles in real units):
 
-| Variant | SSTable Zstd+dicts | Parquet L1/zstd-3 | Ratio | Saved |
+| Variant | SSTable Zstd+dicts | Parquet L1/zstd-3 *(model)* | Ratio | Saved |
 |---|---:|---:|---:|---:|
 | `isd` (int32) | 3 707 374 | 1 961 695 | 52.9 % | 47.1 % |
 | `isdfloat` (double) | 4 846 812 | 1 963 712 | **40.5 %** | **59.5 %** |
@@ -3346,6 +3410,21 @@ size is set by the number of *distinct* values — the index width — not by th
 the dictionary page, by 992 × 4 bytes. The SSTable stores each cell inline at its full width
 and relies on block compression, so it pays the full 4→8 byte increase. **Wider value types
 make the Parquet case stronger, not weaker.**
+
+> **Provenance, audited 2026-08-21 (§10.3j), and this is the one audit verdict where the *mechanism*
+> is at risk rather than only the bytes.** The Parquet column is `harness.py`, which passes
+> `use_dictionary=True` to pyarrow for **every** column. Our writer's shipping default is
+> `dictionary: text` — `numeric_dictionary = false` in `writer_options` — so it deliberately does
+> **not** dictionary-encode numeric columns, because doing so measured +10.5 % size for −3.9 % latency
+> (§8.2b). "Every measure is `RLE_DICTIONARY`" is therefore a property of pyarrow's defaults and not
+> of ours, and it is the whole of the argument: if the measures are delta- or plain-encoded instead,
+> a `double` column has twice the residual width of an `int32` one and the +0.1 % has no reason to hold.
+>
+> **Re-measured through the real write path 2026-08-21 (§10.3j) and it does not.** Our writer's file
+> grows **+19.6 %**, not +0.1 %. The *conclusion* survives — Parquet's saving still improves, 50.8 % →
+> 52.8 %, because the row format grows faster still at +24.7 % — but the effect is **2 points, not the
+> 12.4 below**, and the "every measure is `RLE_DICTIONARY`" mechanism is pyarrow's rather than ours.
+> Quote §10.3j, not this table.
 
 **How `DELTA_BINARY_PACKED` actually works, since this is the largest encoding effect in the
 corpus.** The encoder never stores a timestamp. It writes blocks of 128 values split into four
@@ -3558,7 +3637,18 @@ Archive and three hours of pageviews are each one traffic pattern.
 Swept by row count (L1/zstd-3, token order, realistic). Byte-sized sweep at bottom-tier
 scale is still to do.
 
-| Dataset | 125 k rows | 500 k rows | 2 M rows | 125 k vs 500 k |
+> **Provenance, audited 2026-08-21 (§10.3j): the pyarrow model, and superseded by a real sweep —
+> §10.1f-rg.** Two further problems follow from the provenance rather than from the arithmetic.
+> **The swept range is unreachable.** 125 000 to 2 000 000 rows per row group against a shipping
+> default of 5 000, and on a wide table `row_group_buffer_bytes` cuts the group long before any of
+> these values binds — it cuts Backblaze at ~6 400 rows (§8.2), so what is three configurations in the
+> model is one in the product. **The table also has fewer points than it appears to.** The 500 k and
+> 2 M columns are byte-identical on all three datasets, because the datasets are 200 000–500 000 rows
+> and at both settings the whole table is one row group. Two distinct points, not three.
+> **§10.1f-rg asks the same question through the real write path** at 5 000 / 20 000 / 50 000 /
+> 200 000 and is the one to quote.
+
+| Dataset *(model)* | 125 k rows | 500 k rows | 2 M rows | 125 k vs 500 k |
 |---|---:|---:|---:|---:|
 | D5 NYC TLC (20 cols) | 10 135 982 | 8 634 001 | 8 634 001 | +17.4 % |
 | D2 Backblaze (197 cols) | 17 688 614 | 17 055 064 | 17 055 064 | +3.7 % |
@@ -3568,27 +3658,197 @@ No universal answer: narrow tables want large row groups (dictionary and delta s
 amortise), while ClickBench is *better* with smaller ones. Confirms `rows_per_row_group` must
 stay user-tunable (§8.2) — a single cluster-wide value costs 3–17 % depending on schema.
 
-### 10.3 Sensitivity to metadata folding level
+**The qualitative conclusion survives the provenance; the quantities do not.** That
+`rows_per_row_group` has to stay tunable is confirmed independently and on real `pq` files by
+§10.1f-rg and §10.1f-prod — which find the effect to be a function of *leaf count*, and much larger:
+18.6 points between a 7-leaf and a 199-leaf table at one fixed setting. The direction here (narrow
+tables want large groups) also holds there. The **3–17 % range is model output over a range the writer
+cannot reach and should not be quoted.**
 
-Realistic timestamp regime, token order, zstd-3.
+### 10.3 Sensitivity to metadata folding level — re-measured through the real write path 2026-08-21
 
-| Dataset | Cols | L0 verbatim | L1 row-folded | L2 uniform | L0/L1 |
-|---|---:|---:|---:|---:|---:|
-| **D2 Backblaze** | 197 | 457 454 962 | 17 055 064 | 14 788 766 | **26.8×** |
-| D1 ClickBench | 105 | 33 503 657 | 16 177 362 | 16 008 547 | 2.1× |
-| D5 NYC TLC | 20 | 8 763 448 | 8 634 001 | 8 631 807 | 1.0× |
+**The conclusion holds and the headline number was 4× too big.** L0 costs **6.63×** L1 on the widest
+table in the corpus, not 26.8×. The previous version of this table was `harness.py`'s pyarrow model,
+and the gap between it and the writer is a specific, diagnosable modelling error, described below.
 
-**The single most important result of Phase 0.** The blow-up scales with column count:
-L0 stores the row's write time once *per column*, so a 195-data-column table carries 195
-near-identical high-entropy `int64` columns that zstd compresses well individually but
-cannot dedupe across column chunks. This is the true mechanism behind the 2020 study's
-151 % wide-sparse regression — it is an artefact of the mapping, not a property of
-Parquet or of sparse schemas.
+**Method — no model in the path** (`~/pq-lab/fold_levels.sh`, the shape of §10.1f-prod). Load over
+CQL with `harness.py --load-only`, which stops before the model is written; put the native side on
+Zstd with a trained dictionary (§3.2); then for each folding level `ALTER TABLE ... WITH
+storage_format = 'parquet' AND parquet = {'metadata_folding': …}`, major-compact so the creator
+converts (§6.2a), assert the version is `pq` and that exactly one sstable remains, and sum the
+`-Data.db` bytes on disk. `folding_effective` and the leaf count are read from **the file's own
+footer**, so the level is the one the writer used rather than the one requested. Realistic timestamp
+regime, token order, zstd-3, `rows_per_row_group` at the shipping 5 000, UNSET ingest.
+
+| Dataset | Cols | L0 verbatim | L1 row-folded | L2 uniform | **L0/L1** | leaves L0 → L1 | native, Zstd+dicts |
+|---|---:|---:|---:|---|---:|---|---:|
+| **D2 Backblaze** | 197 | 138 027 815 | **20 825 981** | *unreachable* | **6.63×** | 977 → 608 | 21 776 447 |
+| D1 ClickBench | 105 | 27 234 739 | **16 300 759** | *unreachable* | **1.67×** | 513 → 330 | 27 212 601 |
+| D5 NYC TLC | 20 | 8 881 274 | **8 803 452** | *unreachable* | **1.01×** | 88 → 75 | 15 742 395 |
+
+**Repeatability, because a size figure that does not repeat is uninterpretable.** L1 was measured
+twice per dataset, first and last, and both readings are **byte-identical on all three** — as is the
+native baseline across all four arms of each dataset. Load average ran 2.1–5.1 during the run and
+`min`-style defences are not needed for bytes on disk, but the run is logged with it anyway.
+
+**Four independent cross-checks say the pipeline is sound**, which matters because it is a new script:
+Backblaze L1 reproduces §10.1f-prod's 20 803 872 B to **0.11 %**; and the three native baselines
+reproduce §10.1f-prod / §10.1 to **0.3–0.4 %**. Backblaze's native 21 776 447 B also lands on
+§10.1f-prod's 21 709 715 rather than §10.1's 32 458 096, which is the expected answer and not a
+discrepancy: the difference between those two is the 42 M cell tombstones of the old bind-NULL
+loader, purged here by `tombstone_gc` mode `repair` at RF=1 (§10.18, §10.28).
+
+#### Why the model said 26.8× — it wrote metadata for cells that do not exist
+
+The model appends, per data column, a dense `__ts_<col>` `int64` for **every row**. A real L0 file
+writes that leaf only where the cell exists; an absent cell is a definition level. Backblaze is
+73 % absent — the same 42 448 175 missing values of §10.28, out of 195 × 300 000 — so the model
+materialised 58.5 M timestamps where the writer emits 16.1 M, a factor of 3.64 against the 3.31×
+actually observed on the L0 column. The arithmetic closes exactly:
+
+| Dataset | dense `datacols × rows × 8 B` | model L0 | share of it |
+|---|---:|---:|---:|
+| D2 Backblaze | 468 000 000 | 457 454 962 | **97.7 %** |
+| D1 ClickBench | 163 200 000 | 33 503 657 | 20.5 % |
+| D5 NYC TLC | 68 000 000 | 8 763 448 | 12.9 % |
+
+Backblaze's model L0 *is* its raw dense timestamp volume, to within 2.3 %. **So the old table's L0
+column was not a Parquet measurement at all on the sparse dataset — it was the size of an array the
+format never writes**, and the error is worst exactly where the headline was drawn.
+
+**The model got L0's structure exactly right and its density wrong, which is the opposite of its L1
+error and worth noticing.** Its L0 leaf count is `197 + 195 × 4 = 977`, byte for byte the 977 leaves
+the writer emits — so nothing about the *shape* of the verbatim mapping was mismodelled. At L1 the
+reverse holds: the model appends a single `__ts` and so emits 198 leaves for Backblaze and 106 for
+ClickBench, against the writer's 608 and 330 — a factor of three out — and yet its ClickBench byte
+total lands within 0.8 %. **Neither agreement validates the other.** A model can be right about a
+table's structure and wrong about its size, or wrong about structure and right about size, on the same
+two rows, and this one manages both.
+
+**And the stated mechanism needs correcting too.** "The blow-up scales with column count" is not what
+the table shows. The other three rows compress to 13–21 % of the same dense volume, and the reason is
+**partition-key cardinality**: the regime derives each row's timestamp from a hash of the partition
+key, so NYC TLC's 3 distinct `VendorID`s give 3 distinct timestamps that dictionary-encode to nothing
+however many columns repeat them, while Backblaze's high-cardinality `serial_number` gives 300 000
+distinct high-entropy values that do not compress in any column. **L0's cost is per-column
+duplication × distinct write times × cell density** — column count is one factor of three, and on
+this corpus it is not the dominant one.
+
+**What survives, and it is the part the design rests on.** L0 is 6.63× L1 on the wide sparse table,
+1.67× on the 105-column analytics table and a wash on the 20-column one. The direction, the ordering
+and the mechanism are unchanged, and the decision they support — do not ship the 2020 verbatim
+mapping — is not close. Note also that **L0 on ClickBench is 27 234 739 B against a native sstable of
+27 212 601**: the verbatim mapping buys nothing whatsoever over the row format there, which is a
+cleaner statement of the 2020 study's wide-schema regression than the old 2.1× was.
+
+**L2 is unreachable here, and the reason is stronger than the timestamp regime.** All three `uniform`
+requests came back `folding_effective: L1` with bytes byte-identical to the `row` arm. The obvious
+explanation is that the realistic regime exists to make timestamps vary, and L2 requires every cell to
+share one — so the two conditions cannot hold at once. That is true, and it is **not the binding
+constraint**, which was checked rather than assumed: the same three datasets re-run in the
+**`collapsed`** regime, where every row carries the identical timestamp `T0`, *also* return
+`folding_effective: L1` and are again byte-identical to `row` (Backblaze: 18 816 097 B at both).
+
+The reason is the row marker. `schema_mapping.cc` requires `!flags.any_marker` alongside
+`all_same_ts`, and a CQL `INSERT` writes a marker for every row. **So L2 is unreachable for
+INSERT-written data at any timestamp regime**, which matches §10.1m from the other side — it had to
+write `UPDATE ... USING TIMESTAMP` to get `folding_effective: L2` at all. **The old table's L2 column
+described a file this format cannot produce from this data**, and the same trap produced the 35-point
+L2 saving the doc once carried: the model got it by dropping a `__ts` column whose values *varied*,
+and varied timestamps are exactly what makes L2 illegal. For the real L2 saving, on UPDATE-written
+data where it genuinely applies, see §10.1m — **1.4 %**.
 
 **Correction to §3.4:** the "wide sparse ⇒ regression risk" row is wrong as written.
 With folding, the widest, sparsest table posted the *best* result (52.5 %), not the
 worst — it has the most redundant per-cell metadata to fold away and the most columns to
 prune on read.
+
+**One caveat on absolute bytes.** Every `pq` figure above was written by a binary containing
+`f0ed07985c`, which fixed a data-loss defect in the bit-packing accumulator that corrupted `bigint`
+and `timestamp` *key* columns. The published model figures could not have been affected — pyarrow does
+our encoding of nothing — but no `pq` artefact predating that commit was reused here, and none should
+be.
+
+### 10.3j Which published figures are the pyarrow model — the full inventory, 2026-08-21
+
+`harness.py` is a **model** of the mapping, not a measurement of our writer. It reads rows back over
+CQL and re-encodes them with `pyarrow.parquet.write_table`, synthesising the metadata leaves in Python
+(`write_variant`), and it never writes a `pq` sstable — 39 tombstone-probe lines across the retained
+run logs read `pq=0`, and the only non-zero `pq=` lines in `~/pq-lab/out/` come from the real-write-path
+scripts. It is a useful instrument with two limits that matter: it cannot see cell metadata a `SELECT`
+does not return, and it models the leaf *set* rather than the writer's encodings, pages, statistics or
+footer.
+
+This is the inventory the project rule requires — **every published figure must come from the `scylla`
+binary** — for every table whose Parquet column could be model output. Each site now carries the
+verdict inline as well. **One entry was not on the candidate list** — §10.1b's Trap 2 — because its
+header says "L0" rather than "Parquet L1", which is worth noting as a limit on how the list was built:
+it was assembled by grepping column headers, and a table can be model output under any header.
+
+| § | table | Parquet column | verdict |
+|---|---|---|---|
+| **10.3** | folding levels L0/L1/L2 | ~~model~~ → **real** | **RE-MEASURED.** Headline 26.8× → **6.63×**; L2 shown unreachable in this regime |
+| 10.1 | codec matrix | **model** (SSTable columns real) | mixed table, relabelled; three `realistic` rows now have real L1 figures below |
+| **10.1b** | Trap 2, L0 by regime | ~~model~~ → **real** | **NOT ON THE CANDIDATE LIST — found during this audit**, and re-measured. Trap 2 holds (+319 % on D2, against a modelled +2 797 %), but its "a bulk load makes the verbatim mapping look *fine*" was a model artefact: real L0 collapsed is 171 % of the row format, not 82 % |
+| 10.1a | token-order penalty | **model**, both arms | intrinsically un-measurable through the write path — an sstable has only one order. Ratio is sound, bytes inherit 10.1's optimism |
+| 10.1g | `isd`/`isdraw`, `isd`/`isdfloat` | **model** (SSTable columns real) | relabelled; the `isdfloat` **mechanism** was at risk and is re-measured below |
+| 10.2 | row-group sweep | **model** | relabelled; superseded by §10.1f-rg, and the swept range is unreachable |
+| 10.1f | export corpus | **real** (`parquet-export`) | **false positive.** Our own writer, not pyarrow. Superseded for absolute sizes for an unrelated reason |
+| 10.1f-prod | production corpus | **real** | clean, and the methodological template |
+
+#### How far off the model was, where a real figure now exists
+
+Same rows, same regime, model at one row group against the writer at the shipping 5 000:
+
+| Dataset | model L1 | **real L1** | model optimism |
+|---|---:|---:|---:|
+| D5 NYC TLC, 500 k | 8 634 001 | **8 803 452** | −1.9 % |
+| D1 ClickBench, 200 k | 16 177 362 | **16 300 759** | −0.8 % |
+| D2 Backblaze, 300 k | 17 055 064 | **20 825 981** | **−18.1 %** |
+
+**The model's L1 column is good to ~2 % on narrow and dense schemas and 18 % optimistic on the wide
+sparse one** — the same shape of error, and for the same reason, as the L0 column in §10.3. Note it is
+right for the *wrong reason* on the two good rows: the model emits 106 leaves for ClickBench where the
+writer emits 330, because the conservative leaf set materialises per-column `__ttl_`/`__ldt_` channels
+the model has no concept of. Those 224 extra leaves are all-null and RLE to ~0.8 % of the file, so the
+byte total survives an error of a factor of three in the leaf count. **A model that agrees on bytes is
+not thereby validated on structure**, and §10.28 is what that costs when the assumption is load-bearing.
+
+#### The one verdict that needed its own measurement: `isdfloat`
+
+§10.1g concludes that **wider value types make the Parquet case stronger**, on the strength of every
+measure being `RLE_DICTIONARY` so that stored size tracks the *distinct* count rather than the declared
+type. That is a property of pyarrow's `use_dictionary=True`, and our writer's shipping default is
+`dictionary: text` — `numeric_dictionary = false`, because numeric dictionaries measured +10.5 % size
+for −3.9 % latency (§8.2b). The mechanism therefore had no reason to hold for us. Re-measured through
+the real write path, L1, `rows_per_row_group` 5 000 (`fold_levels.sh`, `~/pq-lab/out/fold_isd.tsv`):
+
+| Variant | native, Zstd+dicts | **real `pq` L1** | ratio | saved |
+|---|---:|---:|---:|---:|
+| `isd` (int32) | 3 144 849 | 1 548 236 | **49.2 %** | 50.8 % |
+| `isdfloat` (double) | 3 922 992 | 1 851 686 | **47.2 %** | **52.8 %** |
+| change | **+24.7 %** | **+19.6 %** | −2.0 pts | +2.0 pts |
+
+**The conclusion survives; the mechanism and the magnitude do not.** Widening `int32` to `double`
+does make Parquet's advantage grow — 50.8 % saved becomes 52.8 % — so "wider value types make the
+Parquet case stronger, not weaker" is confirmed on real `pq` files, and the direction was never in
+doubt. But the *reason* given in §10.1g is pyarrow's and not ours. **Our writer's file grows 19.6 %,
+not 0.1 %**, because with `numeric_dictionary = false` a `double` measure is delta- or plain-encoded
+and carries twice the residual width of an `int32` one; there is no dictionary index whose size is set
+by the distinct count. Parquet still gains, but only because the row format grows *faster* (24.7 %),
+paying the full 4→8 byte widening on every cell inline. So the effect is **2 points, not the 12.4 the
+model reported** (52.9 % → 40.5 %) — a sixfold overstatement, and the one place in this audit where a
+model figure was carrying a mechanism that does not exist in our writer.
+
+L0 was collected on the same two tables and is consistent with §10.3: 1 726 375 and 2 029 562 B, i.e.
+**1.12× and 1.10× L1** on a 10-column table — the narrow end of the folding curve, where §10.3's NYC
+TLC row sits at 1.01×.
+
+**Absolute bytes here are not comparable with §10.1g's, and the reason is the ingest mode rather than
+the writer.** §10.1g was loaded bind-NULL, so up to 96 % of `precip_6h` was a cell tombstone; this run
+binds UNSET. That is visible in the native column — 3 144 849 B here against §10.1g's 3 707 374 — and
+it is the same ±15 % ingest-mode effect §10.18 documents, not a disagreement about compression. The
+claim under test is the *ratio between the two variants*, which the mode leaves alone.
 
 ### 10.3a Metadata folding — losslessness and the divergence cost curve
 
@@ -5162,7 +5422,7 @@ parsed.
 | 2026-08-16 | Backblaze Drive Stats (D2) is the designated adversarial dataset | Real production telemetry whose NULL fractions sit in the ~0.5 danger zone — the real-world form of the 2020 Scenario-3 regression, plus real cross-quarter schema drift |
 | 2026-08-16 | Ship the C6 estimator as a ratios-only field tool for customer environments | Public corpora validate the mechanism; only customer schemas validate the business case, and a ratios-only tool needs no data movement (§9.5) |
 | 2026-08-16 | **Phase 0 GO.** Exit criterion met on all three datasets (41–47 % saved vs. Zstd+dicts, realistic regime, token order) | §10.1. Result is better than §3.4 predicted, and the predicted wide-sparse regression did not materialise once folding was applied |
-| 2026-08-16 | Metadata folding is promoted from optimisation to hard prerequisite | 26.8× on a 197-column table (§10.3). Without it the project fails on exactly the widest tables, which hold the most data |
+| 2026-08-16 | Metadata folding is promoted from optimisation to hard prerequisite | **6.63×** on a 197-column table (§10.3, re-measured on real `pq` sstables 2026-08-21; the 26.8× this row used to cite was pyarrow model output). Without it the project fails on exactly the widest tables, which hold the most data — and on a 105-column table L0 buys nothing at all over the row format |
 | 2026-08-16 | Both timestamp regimes stay mandatory in every future measurement | Trap 2 turned out to invert a design conclusion, not merely shade a number (§10.1b) |
 | 2026-08-16 | Per-SSTable zstd dictionary duplication filed as a separate issue for the compression team | ~110 KB dictionary copied into every SSTable's `CompressionInfo.db`; with tablets producing many small SSTables it reached 45 % of table size. Independent of Parquet |
 | 2026-08-16 | Threat-to-validity #1 (folding assumes uniform row timestamps) **retired** | Losslessness proven over 540 cases including 100 % per-cell divergence; cost curve measured at 1.03×–2.68× (§10.3a). L1 never loses to L0 |
@@ -5512,13 +5772,32 @@ first reading inverts the tuning direction. A comment warning about it -- which 
 paragraph originally was -- only helps the reader who finds the comment; the name is what everyone
 else sees. The old name still parses, permanently, because it is persisted in schema.
 
-| arm | files | row groups | warm min | bypass min | cold min |
+| arm | files | row groups (total) | warm min | bypass min | **uncached min** |
 |---|---:|---:|---:|---:|---:|
 | native | 1 | — | 254 | 455 | 462 |
 | `rows_per_row_group` 20 000 | 4 | 402 | 256 | 2 494 | 2 500 |
-| `rows_per_row_group` 5 000 | 4 | 1 601 | 249 | 3 942 | 3 958 |
+| `rows_per_row_group` 5 000 | 4 | 1 601 | 249 | 3 942 | **3 958** |
 | `rows_per_row_group` 2 000 | 4 | 4 002 | 254 | 5 947 | 6 198 |
 | `rows_per_row_group` 1 000 | 4 | 8 001 | 256 | 10 155 | 10 905 |
+
+**Which question the last column answers, and it is not the one the other sections' "cold" columns
+answer (relabelled 2026-08-21).** This table was measured **before the footer cache existed** — the
+prediction two paragraphs below, "the ordering could invert once the cache lands", is written in the
+future tense on purpose. With no cache in the binary, all 400 probes fetched and walked the footer, so
+the `min` is the **uncached per-read cost**: what a *first contact* with an sstable costs. The column
+is therefore renamed from "cold min", which is what it was called, to what it is.
+
+That makes this table the one place where "cold" was accurate all along, and it cross-checks
+§10.27 by a method that manipulates nothing: the 5 000 arm here is four sstables of ~400 row groups —
+the same shape as §10.27's `pqps.pqdef` — and **3 958 µs against §10.27's genuine first read of
+3 680 µs, 7.0 % apart**, measured months apart on different data with different harnesses. §10.24's
+"squeezed" control reproduces this column to within 10 % arm for arm, which is the third agreement.
+
+Note the direction of the correction, because it is the opposite of the other three sites. §10.27's
+heading says *every* cold figure in §10.21, §10.24, §10.25 and §10.26 is a footer-cache hit. That is
+right for §10.24's `cached` column, for §10.25 and for §10.26 — and **wrong for this table**, whose
+numbers are the uncached ones §10.27 agrees with. Relabelling it as a cache hit would have been a new
+error dressed as a correction.
 
 Canary min across every block: 224–244 µs, a 9 % spread, so the machine was quiet enough for the
 numbers to mean something — which matters on a shared 32-core box whose load average moved between
@@ -5531,7 +5810,7 @@ out at `pq/native = 1.05×`: both arms were pinned to the floor, and the compari
 shown a difference whatever the engine did. **Any conclusion drawn from warm point-read ratios in
 this project should be discarded**, including the reassuring ones.
 
-**Cold, the effect is large and scales with the *number* of row groups.** Against native's 462 µs:
+**Uncached, the effect is large and scales with the *number* of row groups.** Against native's 462 µs:
 5.4× at 402 row groups, 8.6× at 1 601, 23.6× at 8 001.
 
 **The slope is 4.42 µs per row group *per file*, and §10.4j's 4.32 µs estimate was right.** An earlier
@@ -5568,7 +5847,9 @@ finding a setting that is good for both.
 **Superseded for the cached case by §10.24.** Everything above is the *uncached* cost, and it is
 still what the first read of an sstable pays. Once the footer cache is in play the slope inverts and
 smaller row groups become the faster point read; the trade described here applies to a cold start,
-not to a steady-state node.
+not to a steady-state node. **So this section sizes first contact and §10.24/§10.25/§10.26 size
+steady state, and a latency budget needs both** — they differ by 3.2× at the shipping default
+(§10.27).
 
 ### 10.23 Why the whole footer is read for one row group — and how to stop
 
@@ -5633,7 +5914,7 @@ sstable's footer — so the reclaimer takes every entry away as soon as a read p
 reproduces §10.21 to within 10 % arm for arm (+2.5 %, +9.2 %, 0.0 %, −4.1 %), which is what makes the
 improvement attributable to the cache rather than to anything else that moved in the tree today.
 
-| arm | row groups | §10.21 cold | squeezed (control) | cached | cached vs control |
+| arm | row groups | §10.21 uncached | squeezed (control) | cached | cached vs control |
 |---|---:|---:|---:|---:|---:|
 | native | — | 462 | 460 | 470 | — |
 | `rows_per_row_group` 20 000 | 402 | 2 500 | 2 563 | **1 684** | 1.5× |
@@ -5641,15 +5922,31 @@ improvement attributable to the cache rather than to anything else that moved in
 | `rows_per_row_group` 2 000 | 4 002 | 6 198 | 6 196 | **1 030** | 6.0× |
 | `rows_per_row_group` 1 000 | 8 001 | 10 905 | 10 458 | **832** | 12.6× |
 
-All figures µs, cold minimum. Canary min 225–261 µs (16 % spread) on the cached run and 225–253 µs
+**Which column answers which question (relabelled 2026-08-21).** All three numeric columns were
+called "cold" and only two of them are anything of the kind:
+
+| column | what it is | the question it answers |
+|---|---|---|
+| §10.21 uncached | no footer cache in the binary | **first contact** with an sstable |
+| squeezed (control) | cache present, reclaimer defeated | first contact, on today's binary |
+| **cached** | `min` over 400 probes after one restart | **steady state after warm-up** |
+
+The `cached` column cannot be a first read *by construction*: the first probe of the 400 pays the
+footer and publishes it, so the minimum of the set is necessarily a hit. It is the right estimator for
+steady state and the wrong one for first contact, and the two differ by 3.2× at the shipping default —
+1 149 µs against 3 680 (§10.27). A reader sizing a latency budget needs the pair, so **the columns are
+not interchangeable and the word "cold" is not used for either of them any more.**
+
+All figures µs, minimum of the probe set. Canary min 225–261 µs (16 % spread) on the cached run and 225–253 µs
 (12 %) on the control, against 224–244 µs in §10.21 — so all three are comparable and none of this
 is the machine, which matters on a box whose load average passed 30 earlier in the same hour. The
 cached run was measured twice, on two node restarts, agreeing to within 14 % (946/1 042/1 441/1 672
 against 832/1 030/1 361/1 684) — the widest gap being the 8 001-group arm, which is also the fastest
 and so the most exposed to the 250 µs floor underneath all of this.
 
-**Against the row format, cold: 1.8–3.6× rather than 5.4–23.6×.** The worst case improves most,
-which is the shape to expect from removing a term that scales.
+**Against the row format in steady state: 1.8–3.6× rather than 5.4–23.6×.** The worst case improves
+most, which is the shape to expect from removing a term that scales. First contact is a different
+number and does not improve at all — the squeezed column is what it costs.
 
 **The slope inverted, exactly as §10.21 predicted it might.** It was +4.42 µs per row group per
 file; with the footer cached it is **−0.449 µs per row group per file** (−0.112 per row group across
@@ -5668,7 +5965,7 @@ larger-row-groups-for-latency argument in §10.21 applies to the *uncached* firs
 **And the inversion turned out not to be about row groups at all — see §10.25.** Every arm in this
 table changed its *page* size along with its row group, because the writer emits
 `min(page_rows, rows in the group)` values per page and 8 192 cannot bind at 5 000. Re-measured with
-the row group held fixed, cold latency tracks the page at ~130 ns/row and the row-group count retains
+the row group held fixed, steady-state latency tracks the page at ~130 ns/row and the row-group count retains
 only a 10–20 %-per-4× residual: the −0.449 µs per row group above is mostly the page effect wearing
 the row group's label. The slope is real; its attribution was not.
 
@@ -5746,13 +6043,21 @@ harness now quiesces after the restart and drops a failed probe rather than the 
 Scans are therefore measured over a fixed 2 % token slice — identical across arms, so the comparison
 holds and only the absolute figure is a fiftieth of a table.
 
-#### Cold point reads and file size against the effective page
+#### Steady-state point reads and file size against the effective page
+
+**These are steady-state readings, not first reads (relabelled 2026-08-21).** The estimator is `min`
+over 400 probes after one restart, and with the footer cache in the binary the first of those probes
+publishes the footer — so the minimum is a cache *hit* and the column measures
+**steady-state-after-warmup**. That is the right question for this section, because the sweep is about
+page decode and the footer term is deliberately held constant at 401 row groups; but it is not first
+contact, which at the shipping default costs **3 680 µs against the 1 930 µs below** (§10.27, 3.2×).
+The columns were headed "cold µs". They are not.
 
 8 M rows, 2 sstables. Two independent replicates; the second adds the control arm and the scans.
 Canary 227–257 µs (13 % spread) and 228–266 µs (17 %), against 224–244 µs in §10.21, so all three
 runs are comparable.
 
-| arm | row groups | footer share | effective page | cold µs (run 1) | cold µs (run 2) | MB | scan ms |
+| arm | row groups | footer share | effective page | steady µs (run 1) | steady µs (run 2) | MB | scan ms |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | native | — | — | — | 470 | 454 | 223.18 | 326 |
 | **5 000 / 8 192 (shipping)** | 1 601 | 9.8 % | **5 000** | 1 930 | 1 366 | 22.32 | 921 |
@@ -5765,7 +6070,7 @@ runs are comparable.
 | 5 000 / 2 048 *(control)* | 1 601 | 6.9 % | 2 048 | — | 1 073 | 32.45 | 742 |
 
 **The hypothesis holds, and the slope is reproducible across measurements that share no code.** A
-least-squares fit of cold latency against *effective* page size gives **130.6 ns per row** (run 1)
+least-squares fit of steady-state latency against *effective* page size gives **130.6 ns per row** (run 1)
 and **129.4 ns** (run 2). §10.4g measured the page-decode slope directly at **114 ns/value** on a
 different schema, a different binary and an in-process harness; §10.24's `rows_per_row_group` slope
 re-expressed per *page* row implies **118 ns/row**; and the in-process grid below gives
@@ -5824,7 +6129,7 @@ same 10 %-ring probe puts `pq`/native at 1.06× at the shipping default and 1.09
 sweep, and the ordering follows *file size* rather than page size. So "both read shapes want smaller
 pages" is withdrawn for scans: a streaming scan reads the file, and a page is not a unit of work in
 it. Point reads still want smaller pages — which is what the recommendation actually rests on — and
-they got faster on every arm (shipping cold min 1 930 → 1 149 µs).
+they got faster on every arm (shipping steady-state min 1 930 → 1 149 µs).
 
 So the numbers in the `scan ms` column stand as measurements of the path CQL uses. What does *not*
 follow from them is a page recommendation: their slope is a property of the reader being on the wrong
@@ -5937,14 +6242,14 @@ into a net loss, and buys 173–293 µs against a ~1 ms floor.
 **The trade, in the units the decision is made in.** From the shipping pair, the two available moves
 cost:
 
-| move | size, real data | cold point read | scan memory |
+| move | size, real data | steady point read | scan memory |
 |---|---:|---:|---:|
 | lower `page_rows` to 4 096 | +6.3 % | ≈ −120 µs (from the 130 ns/row slope) | unchanged |
 | lower `page_rows` to 2 048 | **+17 to +20 %** | −293 µs (1 366 → 1 073), 3.0× → 2.4× native | unchanged |
 | lower `page_rows` to 1 024 | +37.8 % | nothing further — the floor | unchanged |
 | raise `rows_per_row_group` to 20 000 | **−4.3 to −5.0 %** | neutral within replicate spread | **+3.6×** |
 
-So the latency move is ~17 µs of cold point read per 1 % of file size, and the size move is ~3.2 MB
+So the latency move is ~17 µs of steady-state point read per 1 % of file size, and the size move is ~3.2 MB
 of reader memory per 1 % of file size. Neither is a bargain, which is what "the defaults are already
 on the frontier" looks like when it is measured instead of assumed. 4 096 is the one move that is
 close to fair — 6.3 % for about 120 µs — and it is left as a per-table option rather than a default
@@ -6267,7 +6572,15 @@ mode against the same `pqps` tables §10.25 measured, so this reads directly aga
 (400 probes × 3 rounds, `BYPASS CACHE`, production caching, canary spread 16 % against §10.25's
 13 %):
 
-| arm | §10.25 bypass / cold | after fix 1 | after both |
+**Steady-state figures, not first reads (relabelled 2026-08-21).** Every number in the next two tables
+is `min` over 400 probes after one restart with the footer cache in the binary, so it is a cache *hit*
+and answers **steady-state-after-warmup**. That is the right question here — the section is measuring
+what two read-path fixes did to the per-read cost — and the fixes are real. What they do not move is
+**first contact**, which is still 3 680 µs at this same shipping default, 3.2× the 1 149 below
+(§10.27): the footer is fetched and walked once per sstable per restart whatever the decode path does.
+Both numbers are needed to size a latency budget. The columns were headed "cold". They are not.
+
+| arm | §10.25 bypass / steady | after fix 1 | after both |
 |---|---:|---:|---:|
 | native | 460 / 470 | 456 / 466 | **454 / 455** |
 | **default 5 000 / 8 192** | 1 603 / 1 930 | 1 276 / 1 265 | **1 201 / 1 149** |
@@ -6278,24 +6591,26 @@ mode against the same `pqps` tables §10.25 measured, so this reads directly aga
 | 20 000 / 8 192 | 1 730 / 2 295 | 1 444 / 1 693 | **1 265 / 1 385** |
 | 20 000 / 20 000 | 3 978 / 3 853 | 3 688 / 3 390 | **2 661 / 2 691** |
 
-The shipping arm's cold point read goes **1 930 → 1 149 µs against native's 455**, i.e. 4.11× → 2.53×
-— which keeps it inside §10.24's "1.8–3.6× cold" band rather than moving it out, and by the mechanism
-predicted above: one operation for the group instead of 2 × 28, and then 23 of those 28 leaves not
-decoded at all. Fix 2 is the larger half of that on the arms that page (2 048: 1 375 → 770 cold).
+The shipping arm's steady-state point read goes **1 930 → 1 149 µs against native's 455**, i.e.
+4.11× → 2.53× — which keeps it inside §10.24's 1.8–3.6× steady-state band rather than moving it out,
+and by the mechanism predicted above: one operation for the group instead of 2 × 28, and then 23 of
+those 28 leaves not decoded at all. Fix 2 is the larger half of that on the arms that page (2 048:
+1 375 → 770). **The equivalent first-contact figure does not move with these fixes and is 3 680 µs**
+(§10.27) — 69 % of it footer fetch and walk, which neither fix touches.
 
 **Confirmed a second time, on a second keyspace, by the harness §10.24 itself used.**
 `pointread_v2.py` rebuilds its own tables rather than probing standing ones, so it is an independent
 sample of the same quantity — different data, different session, same estimator. 8 M rows, native
 plus the `rows_per_row_group = 5 000` arm, canary spread **1 %**:
 
-| arm | §10.24 warm / bypass / cold | now |
+| arm | §10.24 warm / bypass / steady | now |
 |---|---:|---:|
 | native | 257 / 464 / 481 | 256 / 462 / 458 |
 | `pq`, 5 000 rows per group | 262 / 1 436 / 1 441 | **254 / 1 052 / 1 169** |
 
-Native reproduces to 0.4–4.8 %, which is what makes the `pq` column comparable: **cold 1 441 → 1 169
-µs, 3.00× → 2.55× of native**, agreeing with the `pqps` figure of 1 149 above to 1.7 % across two
-keyspaces and two harnesses. So the improvement is not an artifact of the tables that were standing.
+Native reproduces to 0.4–4.8 %, which is what makes the `pq` column comparable: **steady state
+1 441 → 1 169 µs, 3.00× → 2.55× of native**, agreeing with the `pqps` figure of 1 149 above to 1.7 %
+across two keyspaces and two harnesses. So the improvement is not an artifact of the tables that were standing.
 
 **One conclusion of §10.25 moves, in the direction §10.26 predicted.** The 10 %-ring scan column,
 which §10.25 could not collect at all, now runs and no longer favours small pages: `pq`/native is
@@ -6328,11 +6643,21 @@ shipping-default cold point read from 1 930 µs to **1 149 µs against native's 
 defaults a point read now *streams* a whole row group rather than paging it. If the footer had become
 a small share of that 1 149 µs, the index would be unjustifiable.
 
-**It is not a share of it at all.** Every cold figure in §10.21, §10.24, §10.25 and §10.26 is `min`
-over 400 probes taken after one node restart — and the footer cache means the footer is fetched and
-walked on the *first* of those 400 and never again. The minimum of 400 can only be a cache **hit**.
-So the quantity the side index attacks was never inside any published number, and the two fixes
-neither helped nor hurt it. §10.24's own sentence — "the *first* read of an sstable after a restart
+**It is not a share of it at all.** The figures in §10.24's `cached` column, §10.25 and §10.26 are
+`min` over 400 probes taken after one node restart — and the footer cache means the footer is fetched
+and walked on the *first* of those 400 and never again. The minimum of 400 can only be a cache
+**hit**. So the quantity the side index attacks was never inside any of those numbers, and the two
+fixes neither helped nor hurt it.
+
+**One correction to that sweep, made while relabelling the four sections on 2026-08-21.** This
+section's heading claims *every* "cold" figure in the document is a cache hit, and §10.21 is the
+exception: it was measured **before the footer cache existed**, so all 400 of its probes paid the
+footer and its column is the uncached cost. It is not a counter-example to the argument, it is the
+fourth estimate of it — §10.21's 5 000 arm is four sstables of ~400 row groups, the same shape as
+`pqps.pqdef` below, and its 3 958 µs sits 7.0 % from the 3 680 µs measured here. §10.24's squeezed
+control is the third. The heading is left as written because it is how this finding is cited
+elsewhere, but the accurate form is **"every steady-state figure"**, and §10.21 is now labelled
+`uncached` rather than `cold`. §10.24's own sentence — "the *first* read of an sstable after a restart
 still fetches and walks the whole footer" — was exactly right, and the estimator that has been used
 ever since cannot see it.
 
@@ -7460,8 +7785,8 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Correctness coverage gaps | known | Enumerated in §9.6. **Closed 2026-08-21**: the Python/pytest gap, which was the load-bearing one — `test/cqlpy/test_parquet_storage_format.py` (33 cases) and `test/rest_api/test_parquet.py` (5) now cover the property through CQL DDL, the schema tables, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints, with every case confirmed to fail against a deliberately mutated build (§9.6a). Two findings from that exercise are worth carrying: distinguishing a dead cell from an absent one requires a **merge** even at CQL level, so the test flushes between the live write and the tombstone and asserts two Data components — without the flush it passes even with dead collapsed into absent; and one estimator assertion was **dropped as unfalsifiable** after it survived a build with the per-row normalisation re-broken. Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; **Closed 2026-08-21 (second pass)**: counters and collections merged across formats (`test_hybrid_merge_of_counters_across_formats`, `test_hybrid_merge_of_collections_across_formats` — both orders, all-`pq` and all-native controls, read path and compaction, asserted against a merge rule computed from the fixture as well as against the native reference), and hybrid+TWCS on the *streaming* path (`test_storage_format_honoured_by_streaming_writes`, extended, with the format read off the `pq-` component the creator's sstable produced). `mutation_test.cc` and `sstable_set_test.cc` were assessed for version-parameterisation and **declined** with reasons in §9.6 — the first writes no sstable at all and its one flushing case takes its version from the schema, the second's assertions are interval-map algebra over first/last key and self-referential size sums. **Also closed 2026-08-21 (third pass), and it was the largest known correctness gap**: `pq` failed `make_random_schema_specification` fixtures on roughly 1 seed in 4, with the partition sequence misaligned. Diagnosed to a **single product bug of the data-loss class** and fixed (§9.6b): the bit-packing accumulator in `DELTA_BINARY_PACKED` and in the RLE hybrid was a `uint64_t`, one value too narrow for the 0..7 bits of the previous value it carries, so any residual width above 57 lost bits — on the write side *and* the read side, asymmetrically. It reached only `bigint` and `timestamp` **key** columns, which are the ones `schema_mapping.cc` delta-encodes, and only via a partition key, whose value repeats within a partition and then jumps 64 bits at the boundary. None of the exotic types in the failing schemas mattered. The file on disk was wrong, not just the reader: pyarrow read 254 distinct values where 20 were written, which is also how the harness was ruled out. Now 16/16 on the seed set that failed 4, and 64/64 on a wider sweep; pinned by three deterministic tests, each confirmed to fail against the pre-fix codec. **Closed further 2026-08-21 (fourth pass)**: those sweeps were hand runs, so the *axis* that found the bug — random schemas against `pq` — was still not in the tree, and the next defect of the class would have hidden the same way. `test_pq_random_schema_fixed_seeds` now runs it as a deterministic case over a fixed, checked-in set of **64 seeds** (the three known-bad plus 1..61) in **6.6 s**, reusing `test_sstable_bytes_on_disk_correctness`'s body with the sstable version as its one new argument and `make_sstable_containing`'s own read-back as the only comparison. Confirmed to fail against the pre-fix codec, naming **10 of 64** seeds — with the finding that the encoder half alone catches 9 of them and seed 3262034951 needs the decoder half too, so no one of the four sites stands in for the others. The pyarrow interop arm is deliberately *not* pointed at these fixtures: 20 of the 26 types `tests::type_generator` draws from fall to `cql_type::blob` and reach the file as opaque BYTE_ARRAY, so pyarrow could only re-derive Scylla's serialisation in Python — the reimplemented-harness trap. What that leaves genuinely uncovered is a **symmetric** codec bug, invisible to any round trip by construction; §9.6c names the value-agnostic check that would catch it and why it was not built. One shared-test-infra defect was fixed on the way: a `make_sstable_containing` validation mismatch aborted the process on a leaked reader permit rather than failing the assertion, which is why the sweep could previously name only the first failing seed. A second instance out of the same exercise — a non-frozen UDT column throwing `std::bad_cast` out of `build_collection()`, i.e. **every** read of a `pq` sstable holding one — was fixed earlier the same day with a test. Two smaller items also closed: `bytes_on_disk()` for `pq` is now checked against the storage layer's own file sizes, and the counter-tombstone rule (a counter tombstone wins regardless of timestamp) is recorded. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. |
 | Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
-| **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |
-| **Harness "Parquet" figures are a model** | **measurement-method debt** | `harness.py` re-encodes rows read back over CQL with pyarrow and never writes a `pq` sstable (every probe line shows `pq=0`). It models the leaf set, not our writer — and it cannot see cell metadata a `SELECT` does not return, which is why the 60.7 MB per-column deletion channel was invisible to it (§10.28). **§10.1f-prod, the table to quote, is unaffected**: it uses the real `ALTER TABLE ... storage_format = 'parquet'` and sums actual `pq` sstables. What is not yet established is which other published tables are harness output cited as format measurements; the **folding-level L0/L1/L2 comparison behind §10.3's headline** is the significant candidate and wants re-measuring through the real write path, not relabelling. |
+| ~~"Cold" figures are warm readings~~ | **closed 2026-08-21** | Relabelled at all four sites. §10.24's `cached` column, §10.25 and §10.26 are `min` over 400 probes after one restart with the footer cache in the binary, so they are cache hits and answer **steady-state-after-warmup**; each now says so and the word "cold" is gone. **§10.21 was the exception** — measured before the cache existed, so its column is the *uncached* cost and is renamed accordingly, not relabelled as a hit; it then reads as a fourth estimate of §10.27's first-read figure, 3 958 µs against 3 680, 7.0 % apart. Both numbers are now stated wherever either is: **first contact 3 680 µs, steady state 1 149 µs, 3.2× apart** at shipping defaults. |
+| ~~Harness "Parquet" figures are a model~~ | **closed 2026-08-21** | Full inventory in **§10.3j**; every affected table now carries its verdict inline. `harness.py` re-encodes rows read back over CQL with pyarrow and never writes a `pq` sstable, and §10.1f-prod remains unaffected. **The significant case was re-measured through the real write path** (`fold_levels.sh`): §10.3's folding headline is **6.63×, not 26.8×**, because the model wrote a dense per-column timestamp for every row including Backblaze's 73 % absent cells — its L0 figure is 97.7 % of `195 × 300 000 × 8 B`, the size of an array the format never writes. **L2 turned out to be unreachable** in that regime (all three `uniform` requests returned `folding_effective: L1`, byte-identical to `row`), so the old L2 column described a file the format cannot produce. Also settled: one **false positive** (§10.1f's export corpus is our own writer), one table that is **permanently un-measurable** through the write path (§10.1a's token-order penalty — an sstable has only one order), one **conclusion resting on a mechanism we do not have** (§10.1g's `isdfloat`: our file grows +19.6 %, not +0.1 %, so the effect is 2 points rather than 12.4 — the conclusion survives, the reasoning does not), and one table the candidate list **missed** (§10.1b's Trap 2 L0 columns, same `write_variant` path). Model L1 is good to ~2 % on narrow/dense schemas, 18 % optimistic on wide sparse ones — and right for the wrong reason where it is right, modelling 106 leaves where the writer emits 330. |
 | Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). Not covered: key rotation (unexercised), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
