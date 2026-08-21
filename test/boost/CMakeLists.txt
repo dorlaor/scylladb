@@ -207,6 +207,8 @@ add_scylla_test(observable_test
   KIND BOOST)
 add_scylla_test(parquet_tiering_test
   KIND BOOST)
+add_scylla_test(parquet_writer_test
+  KIND SEASTAR)
 add_scylla_test(partitioner_test
   KIND SEASTAR)
 add_scylla_test(pretty_printers_test

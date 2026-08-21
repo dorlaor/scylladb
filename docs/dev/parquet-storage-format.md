@@ -2106,6 +2106,28 @@ here and are worth the paragraph:
   `pure_boost_tests` entry in `configure.py` and `KIND BOOST` in `test/boost/CMakeLists.txt`.
   It needed no new sources: `tiering_policy.cc` is already in `scylla_core`, and
   `tiering_policy.hh` has no Scylla dependencies, so there is no reactor to start.
+
+  **Both build systems are now verified, 2026-08-21.** The CMake entry had been pattern-matched
+  against `observable_test` and never configured, because nothing in this checkout builds via
+  CMake — `configure.py` is what produces `build/dev`. Configuring one confirms
+  `add_scylla_test(parquet_tiering_test KIND BOOST)` is right, and the check was taken all the way
+  through rather than stopped at configure, because configure only proves the target exists:
+  it compiles, links as `test/boost/parquet_tiering_test` (the `OUTPUT_NAME` `configure.py`
+  expects), and runs its 9 cases green. The same pass found `test/boost/parquet_writer_test` listed
+  in `configure.py` with **no CMakeLists entry at all**, now added as `KIND SEASTAR` — not `BOOST`,
+  because it uses `SEASTAR_TEST_CASE` and takes its `main()` from `test/lib/scylla_test_case.hh`,
+  matching `sstable_parquet_test` — and likewise linked and run green. Linking is the step that
+  earns the confidence: `KIND` decides which framework supplies `main`, so getting it wrong is a
+  duplicate- or missing-`main` link error that no amount of configuring or compiling would show.
+  Note also that `KIND BOOST` links `test-lib` and Seastar anyway, so it is *not* the CMake
+  analogue of `tests_not_using_seastar_test_framework`; it only selects the test framework.
+
+  Two things are needed to configure a CMake tree here at all, and neither is discoverable from the
+  error: `-DSeastar_LTTNG=OFF` (`lttng-ust-devel` is not installed, and
+  `SeastarDependencies.cmake` marks the dep `REQUIRED` under that option — `build/dev/seastar`'s
+  cache already has it `OFF`), and `-DCMAKE_CXX_COMPILER=clang++`, because CMake's Dev mode passes
+  `-fextend-variable-liveness=none`, which GCC rejects and which `configure.py` gets away with by
+  defaulting to clang.
   `test_tiering.cc` itself is *not* what CI runs, and the reason is a choice rather than a
   blocker. Two routes existed. **(a)** Enrol the file as-is in a `test/unit`-style suite:
   `test/pylib/cpp/unit.py`'s `UnitTestFile.list_test_cases()` returns a single case and judges
