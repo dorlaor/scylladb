@@ -513,6 +513,22 @@ future<format::read_crypto> pq_reader::read_crypto_for(format::cipher algo,
     const auto key_opts = parquet_parameters(_schema->parquet_options()).key_opts();
     format::read_crypto rc;
     try {
+        // Resolving a key is not this reader's own CPU work, and for several providers it is not
+        // even local: the replicated provider reads the key out of a system table, so a key
+        // lookup *is another read*, admitted by the very same reader_concurrency_semaphore that
+        // admitted this one. Say so, or the semaphore counts this permit as running on the CPU
+        // for the whole round trip and refuses to admit anything new once
+        // `reader_concurrency_semaphore_cpu_concurrency` permits are in that state -- including
+        // the key lookup this reader is blocked on. The cycle is only broken when the permit's
+        // own TTL expires (range_request_timeout_in_ms), so the symptom is that the first range
+        // scan of an encrypted table stalls for the whole range timeout and then fails, with the
+        // semaphore's "Identified bottleneck(s): CPU" diagnostics arriving only at the very end.
+        //
+        // Point reads escaped it by arithmetic rather than by design: one read is one need_cpu
+        // permit and the default cpu_concurrency is 2, which leaves exactly one slot for the
+        // nested lookup. A range scan runs two reads at a time and closes that slot, which is
+        // why the asymmetry looked like a property of the scan path.
+        reader_permit::awaits_guard awaiting{_permit};
         rc.key = co_await ksrc->key_for_read(key_opts, key_id);
     } catch (...) {
         std::throw_with_nested(std::runtime_error(seastar::format(

@@ -7224,6 +7224,93 @@ section.
 
 **Also absent**: plaintext-footer mode.
 
+#### 10.17a The key lookup deadlocked against the read that needed it — fixed 2026-08-22
+
+**Every encrypted `pq` table was unscannable.** A range scan that had to resolve a key not already
+in the provider's per-shard cache stalled for the whole of `range_request_timeout_in_ms` and then
+failed. Rotation was not required and neither was a second key: a freshly created single-key table
+did it too. Point reads were unaffected, and that asymmetry is what made the defect look like a
+property of the scan path. It is not.
+
+**The mechanism, in the node's own words.** With log level up and the client given longer than the
+range timeout, the semaphore prints its diagnostics — but only at the very end, which is why every
+earlier run saw *nothing* logged and concluded the node was silent:
+
+```
+Semaphore sl:default with 2/100 count and 34354/71145881 memory resources: timed out, ...
+Trigger permit: count=1, memory=17194, table=pqdl.t, operation=data-query, state=active/need_cpu
+Identified bottleneck(s): CPU
+permits count memory table/operation/state
+2       2     34K    pqdl.t/data-query/active/need_cpu
+2       0     0B     system_replicated_keys.encrypted_keys/data-query/waiting_for_admission
+reads_queued_because_need_cpu_permits: 2
+need_cpu_permits: 2
+awaits_permits: 0
+```
+
+Reading it: `database::query()` wraps every user read in `reader_permit::need_cpu_guard`, so a read
+in progress is counted as *using the CPU*. `reader_concurrency_semaphore::can_admit_read()` refuses
+to admit anything new once `(need_cpu_permits - awaits_permits) >= cpu_concurrency`
+(`reader_concurrency_semaphore.cc:1458`), and `reader_concurrency_semaphore_cpu_concurrency`
+defaults to **2**. `pq_reader::read_crypto_for()` suspended inside `key_for_read()` without ever
+declaring that it was *awaiting* rather than computing — and for `ReplicatedKeyProviderFactory`, and
+for KMIP and the cloud providers, what it awaits is another read: the replicated provider answers
+`key()` with a `SELECT` on `system_replicated_keys.encrypted_keys`, admitted by the same semaphore.
+Two scan reads blocked in the key lookup filled the CPU budget, so the lookups they were waiting for
+could never be admitted. A true deadlock, broken only when the outer permit's own TTL timer fires
+(`reader_concurrency_semaphore.cc:228`) and drops it to `preemptive_aborted`, releasing its need_cpu
+count.
+
+**Why point reads survived: arithmetic, not design.** One read is one need_cpu permit against a
+budget of 2, so a point read always left exactly one slot for its own key lookup. A range scan runs
+two reads at a time and closes it. Nothing about the point-read path was safer.
+
+**Two earlier framings were wrong and are worth recording.** "The first scan after a restart is
+cold" was refuted by isolation — warming *both* key regimes then scanning returns in 0.0 s while
+warming one hangs, and both are equally the first scan after a restart. And the observed
+self-healing was misread as "the table stays wedged until the node is restarted": measured, a retry
+after the timeout returns in **0.0 s**, because the timed-out attempt's now-orphaned key lookup is
+admitted the moment the outer permit is released and stores the key in the provider cache. That is
+also what made key-rotation phase 4 pass — it point-reads both regimes before scanning, so the
+passing test was encoding a workaround.
+
+**One environment artefact worth naming.** The lab node sets `range_request_timeout_in_ms: 300000`
+deliberately, which is what turned a 10 s failure at the shipped default into a five-minute
+apparent hang, and long enough that a wedged scan also blocked clean shutdown (systemd `SIGABRT`ed
+the node mid-run). The defect is the same either way; only its loudness changed.
+
+**The fix** is one guard, in `read_crypto_for()`: hold `reader_permit::awaits_guard` across the
+`key_for_read()` await, so the semaphore knows the permit is waiting on an external resource rather
+than running. That is the same idiom every other nested-query-under-a-permit site in the tree uses
+(`db/virtual_tables.cc`, `db/size_estimates_virtual_reader.cc`, `readers/multishard.cc`). Measured
+on the lab node: the first scan of a fresh single-key encrypted table goes from failing at
+**300.0 s** to **OK in 0.0 s**, and all three arms of `~/pq-lab/enc_scan_deadlock.py` pass where A
+and C previously hung.
+
+**Pinned by `test_pq_encrypted_read_does_not_deadlock_on_its_own_key_lookup`**
+(`test/boost/sstable_parquet_test.cc`). It writes a real encrypted `pq` sstable — asserted to carry
+the `PARE` magic — installs a key source that resolves the key by taking a permit from the same
+semaphore, and scans with a `need_cpu_guard` held exactly as `database::query()` holds it. The test
+env's semaphore has `cpu_concurrency` 1, so one reader suffices. The nested permit carries a 10 s
+timeout on purpose: without it a regression does not fail the test, it wedges it. With the timeout
+the deadlock becomes a bounded, named failure — `pq: ...-big-Data.db is encrypted, but its key could
+not be obtained from the key provider (id 'pq-test-key'); Caused by
+seastar::named_semaphore_timed_out` — preceded by the semaphore dump reporting
+`reads_queued_because_need_cpu_permits: 1` and `awaits_permits: 0`. Confirmed to fail that way
+against the pre-fix reader, and the 10 s bound is what distinguishes "never admitted" from "admitted
+late": an admitted resolution here takes microseconds.
+
+**What the fix does not remove.** The read path still issues a nested read while holding a permit,
+so the generic hazard remains at the *resource* limits rather than the CPU one: if all
+`max_count_concurrent_reads` (100) permits on a shard were simultaneously blocked in a first-time key
+lookup, the lookup could not be admitted for count reasons and the same cycle would reform until the
+TTL fired. That window is one provider round trip per (shard, key) — the provider caches the key
+afterwards — and it is the same exposure every other nested-read-under-permit site in the tree
+carries. Removing it properly means resolving the key off the user semaphore (the write path already
+gets that for free: a flush or compaction runs in a scheduling group that `classify_request()` maps
+to the *system* semaphore, so its key lookup never contends with its own permit). Named here rather
+than half-built.
+
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 
 Two references above point here, so it gets its own section: `single_partition_reads` and
@@ -7892,7 +7979,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
 | ~~"Cold" figures are warm readings~~ | **closed 2026-08-21** | Relabelled at all four sites. §10.24's `cached` column, §10.25 and §10.26 are `min` over 400 probes after one restart with the footer cache in the binary, so they are cache hits and answer **steady-state-after-warmup**; each now says so and the word "cold" is gone. **§10.21 was the exception** — measured before the cache existed, so its column is the *uncached* cost and is renamed accordingly, not relabelled as a hit; it then reads as a fourth estimate of §10.27's first-read figure, 3 958 µs against 3 680, 7.0 % apart. Both numbers are now stated wherever either is: **first contact 3 680 µs, steady state 1 149 µs, 3.2× apart** at shipping defaults. |
 | ~~Harness "Parquet" figures are a model~~ | **closed 2026-08-21** | Full inventory in **§10.3j**; every affected table now carries its verdict inline. `harness.py` re-encodes rows read back over CQL with pyarrow and never writes a `pq` sstable, and §10.1f-prod remains unaffected. **The significant case was re-measured through the real write path** (`fold_levels.sh`): §10.3's folding headline is **6.63×, not 26.8×**, because the model wrote a dense per-column timestamp for every row including Backblaze's 73 % absent cells — its L0 figure is 97.7 % of `195 × 300 000 × 8 B`, the size of an array the format never writes. **L2 turned out to be unreachable** in that regime (all three `uniform` requests returned `folding_effective: L1`, byte-identical to `row`), so the old L2 column described a file the format cannot produce. Also settled: one **false positive** (§10.1f's export corpus is our own writer), one table that is **permanently un-measurable** through the write path (§10.1a's token-order penalty — an sstable has only one order), one **conclusion resting on a mechanism we do not have** (§10.1g's `isdfloat`: our file grows +19.6 %, not +0.1 %, so the effect is 2 points rather than 12.4 — the conclusion survives, the reasoning does not), and one table the candidate list **missed** (§10.1b's Trap 2 L0 columns, same `write_variant` path). Model L1 is good to ~2 % on narrow/dense schemas, 18 % optimistic on wide sparse ones — and right for the wrong reason where it is right, modelling 106 leaves where the writer emits 330. |
-| Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). Not covered: key rotation (unexercised), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
+| Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). **One defect of the unusable class was found and fixed 2026-08-22 (§10.17a), and it had made every encrypted `pq` table unscannable**: the read path resolved its key while holding a reader permit the semaphore counted as CPU-bound, and for the replicated provider resolving a key *is another read* on the same semaphore — so at the default `cpu_concurrency` of 2 the two reads a range scan runs filled the budget and their own key lookups could never be admitted. It deadlocked until the permit's TTL expired, i.e. for the whole `range_request_timeout_in_ms`, with the semaphore's diagnostics arriving only at the end (hence "nothing is logged"). Point reads were unaffected purely by arithmetic — one permit against a budget of 2. Fixed with `reader_permit::awaits_guard` across the key await; pinned by `test_pq_encrypted_read_does_not_deadlock_on_its_own_key_lookup`, which fails in a bounded 10 s rather than hanging against the pre-fix reader. The residual, un-removed hazard is the same nested-read-under-permit exposure at the *count* limit, named in §10.17a. Not covered: key rotation (driven in the lab by `~/pq-lab/encryption_rotation.py`, which is how this defect was found, but no full pass was re-run after the fix and nothing in the tree covers it), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
 | Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
 | Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
 | Downgrade procedure | **done, both storage types** | Specified in §10.9, and the behaviour it rests on is observed on local disk *and* on object storage (§10.20): an older node aborts at startup on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
@@ -7921,6 +8008,18 @@ a running node rather than only in a unit test. What is left is genuinely narrow
   remains true is narrower than the old wording: the type system is now exercised against `pq`,
   but 20 of the 26 generated types reach the file as opaque BYTE_ARRAY, so what is covered is that
   they **round-trip**, not that an external reader can interpret them.
+- **One defect of the unusable class, now closed, and it was invisible to every test in the tree**:
+  every encrypted `pq` table was unscannable (§10.17a). The read path resolved its key while holding
+  a reader permit the semaphore counted as CPU-bound, and for the replicated provider resolving a
+  key is itself a read on that same semaphore — so a range scan deadlocked against its own key
+  lookup until the permit's TTL expired. Nothing in the tree caught it because nothing in the tree
+  read an encrypted `pq` sstable at all; the lab's rotation run found it, and then two successive
+  explanations of it ("cold cache", "restart-recency") were wrong before the semaphore's own
+  diagnostics settled it. Two things generalise. The asymmetry that made it look like a scan-path
+  bug — point reads always worked — was **arithmetic**, one permit against a `cpu_concurrency` of 2,
+  and reading it as a property of the scan path cost time. And "nothing is logged" was false: the
+  diagnostics exist, they just arrive at the *end* of the range timeout, after every previous run
+  had already given up and restarted the node.
 - **One accepted trade**: TWCS converts without a gain check, so a schema Parquet stores worse
   converts anyway. `storage_format = 'sstable'` is the only guard and it is manual.
 - **One half-measurement**: mixed-format bucketing at scale showed the right shape but over too

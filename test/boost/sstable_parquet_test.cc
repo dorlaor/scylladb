@@ -25,6 +25,7 @@
 
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
+#include <seastar/util/defer.hh>
 
 #include "test/lib/simple_schema.hh"
 #include "test/lib/sstable_test_env.hh"
@@ -44,6 +45,8 @@
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "sstables/sstables.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
+#include "sstables/parquet/format/encryption.hh"
+#include "sstables/parquet/encryption_keys.hh"
 #include "sstables/parquet/footer_cache.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
@@ -374,6 +377,171 @@ SEASTAR_THREAD_TEST_CASE(test_pq_full_scan_reader) {
             ++n;
         }
         BOOST_REQUIRE_EQUAL(n, expected.size());
+    }).get();
+}
+
+namespace {
+
+// A key source that resolves a key the way the real providers that issue ids do: by reading it.
+//
+// This is not a convenience of the stub, it is the property under test. The replicated provider
+// keeps its keys in system_replicated_keys and answers key() with a CQL SELECT, and the KMIP and
+// cloud providers answer it with a network round trip. Either way the pq read path suspends inside
+// key_for_read() while still holding the reader permit it was admitted with -- and in the
+// replicated provider's case what it suspends on is *another read admitted by the same
+// reader_concurrency_semaphore*. So the stub takes a permit from the same semaphore, which is the
+// smallest faithful model of that, and needs no encryption context, no system key and no keyspace.
+//
+// The nested permit is taken with a timeout on purpose. Without it a regression here does not fail
+// the test, it wedges it: the nested read waits for admission that can never come, the outer read
+// waits for the nested one, and nothing in the test would ever complete. A timeout turns the
+// deadlock into a bounded, named failure -- see the test below for what it looks like.
+class nested_read_key_source : public sstables::parquet::key_source {
+    reader_concurrency_semaphore& _sem;
+    schema_ptr _schema;
+    db::timeout_clock::duration _nested_timeout;
+    unsigned _resolutions = 0;
+
+    static sstables::parquet::format::encryption_key test_key() {
+        sstables::parquet::format::encryption_key k;
+        k.bytes.assign(16, uint8_t(0x5a));
+        return k;
+    }
+
+public:
+    nested_read_key_source(reader_concurrency_semaphore& sem, schema_ptr s,
+                           db::timeout_clock::duration nested_timeout)
+        : _sem(sem), _schema(std::move(s)), _nested_timeout(nested_timeout) {}
+
+    // How many times the read path asked for a key. Guards against a test that passes because
+    // something warmed a cache rather than because the deadlock is gone.
+    unsigned resolutions() const { return _resolutions; }
+
+    // The write path does not run under a user read permit -- a flush runs in the memtable
+    // scheduling group and a compaction in the compaction one, both of which route an internal
+    // read to a *different* semaphore -- so there is nothing to model here.
+    seastar::future<sstables::parquet::resolved_key> key_for_write(
+            const sstables::parquet::key_options&) override {
+        co_return sstables::parquet::resolved_key{test_key(), "pq-test-key"};
+    }
+
+    seastar::future<sstables::parquet::format::encryption_key> key_for_read(
+            const sstables::parquet::key_options&, const seastar::sstring&) override {
+        ++_resolutions;
+        auto permit = co_await _sem.obtain_permit(_schema, "data-query", 1024,
+                                                 db::timeout_clock::now() + _nested_timeout, {});
+        co_return test_key();
+    }
+
+    seastar::future<> validate(const sstables::parquet::key_options&) override {
+        return make_ready_future<>();
+    }
+};
+
+schema_ptr pq_encrypted_schema() {
+    return schema_builder(1, "ks", "pq_enc_tbl")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("v_int", int32_type)
+        .with_column("v_big", long_type)
+        .with_column("v_dbl", double_type)
+        .with_column("v_txt", utf8_type)
+        .set_parquet_options({{"encryption", "aes_gcm_v1"},
+                              {"cipher_algorithm", "AES/GCM/NoPadding"},
+                              {"secret_key_strength", "128"}})
+        .build();
+}
+
+} // namespace
+
+// Reading an encrypted pq sstable whose key is not already resolved must not deadlock against the
+// permit the read itself holds.
+//
+// The bug this pins down made *every* encrypted pq table unscannable. The read path resolved the
+// key from inside load_footer(), while holding a reader permit that database::query() has marked
+// need_cpu for the duration of the read; resolving the key is itself a read, and the semaphore
+// will not admit a new read once `reader_concurrency_semaphore_cpu_concurrency` permits are
+// need_cpu and not awaiting. So the key lookup queued behind the read that was waiting for it.
+// The node's own diagnostics, which only appear when the permit's TTL finally expires, said it
+// exactly:
+//
+//     Identified bottleneck(s): CPU
+//     permits count memory table/operation/state
+//     2       2     34K    pqdl.t/data-query/active/need_cpu
+//     2       0     0B     system_replicated_keys.encrypted_keys/data-query/waiting_for_admission
+//     reads_queued_because_need_cpu_permits: 2
+//     need_cpu_permits: 2
+//     awaits_permits: 0
+//
+// Two things about that shape are worth keeping in the test. First, awaits_permits: 0 is the
+// defect -- the reader was not using the CPU, it was waiting for a key, and it never said so.
+// Second, the count is what hid the bug: a point read is one need_cpu permit against a default
+// cpu_concurrency of 2, so it always had a slot left for its own key lookup and always worked. A
+// range scan runs two reads at a time and closed that slot. That asymmetry looked like a property
+// of the scan path and is not one -- it is arithmetic -- which is why this test scans, and why it
+// runs against the test env's semaphore whose cpu_concurrency is 1 and so needs only one reader.
+//
+// Without the fix this fails within `nested_timeout` rather than hanging, with the semaphore
+// naming itself in the message:
+//
+//     fatal error: in "test_pq_encrypted_read_does_not_deadlock_on_its_own_key_lookup":
+//     std::_Nested_exception<std::runtime_error>: pq: <...>-big-Data.db is encrypted, but its key
+//     could not be obtained from the key provider (id 'pq-test-key'); Caused by
+//     seastar::named_semaphore_timed_out: Semaphore timed out: sstables::test_env
+//
+// preceded by the semaphore's own dump, which reports reads_queued_because_need_cpu_permits: 1,
+// need_cpu_permits: 1 and awaits_permits: 0 -- the single-reader form of the production shape
+// above. `nested_timeout` is what distinguishes a
+// deadlock from a slow provider: it is orders of magnitude longer than the microseconds this
+// resolution needs when it is admitted at all, so a failure here means "never admitted", not
+// "admitted late".
+SEASTAR_THREAD_TEST_CASE(test_pq_encrypted_read_does_not_deadlock_on_its_own_key_lookup) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        using namespace std::chrono_literals;
+        auto s = pq_encrypted_schema();
+
+        nested_read_key_source ks(env.semaphore(), s, 10s);
+        auto* const prev_ks = sstables::parquet::key_source_ptr();
+        sstables::parquet::set_key_source(&ks);
+        auto restore = defer([prev_ks] () noexcept {
+            sstables::parquet::set_key_source(prev_ks);
+        });
+
+        auto muts = make_muts(s, 8, 20);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        // The file has to actually be encrypted, or the rest of this proves nothing: a plaintext
+        // footer is "PAR1" and never asks for a key at all.
+        const uint64_t len = sst->ondisk_data_size();
+        auto tail = sst->data_read(len - 8, 8, env.make_reader_permit()).get();
+        BOOST_REQUIRE_EQUAL(std::string_view(tail.get() + 4, 4),
+                            std::string_view(sstables::parquet::format::magic_encrypted, 4));
+
+        // Nothing has resolved the read key yet: writing used key_for_write, and the footer cache
+        // deliberately does not retain the key. This is the state a fresh node is in for every
+        // encrypted table it has not read yet.
+        const auto resolutions_before = ks.resolutions();
+        const auto queued_before =
+                env.semaphore().get_stats().reads_queued_because_need_cpu_permits;
+
+        auto permit = env.make_reader_permit();
+        // Exactly what database::query()'s read_func does around every user read, and the reason
+        // the deadlock exists at all.
+        reader_permit::need_cpu_guard ncpu{permit};
+
+        auto got = read_all(sst, s, permit);
+
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+        // The scan really did resolve the key, rather than finding it already resolved.
+        BOOST_REQUIRE_GT(ks.resolutions(), resolutions_before);
+        // And it was admitted straight away instead of queueing behind its own reader.
+        BOOST_REQUIRE_EQUAL(env.semaphore().get_stats().reads_queued_because_need_cpu_permits,
+                            queued_before);
     }).get();
 }
 
