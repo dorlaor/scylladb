@@ -7,15 +7,64 @@ cd "$(dirname "$0")"
 # conformance cases. Point PARQUET_TEST_DATA at a directory containing
 # nyc_taxi.parquet, hits_0.parquet and conf/*.parquet (see
 # docs/dev/parquet-storage-format.md section 9.3 for where they come from).
-DATA=${1:-${PARQUET_TEST_DATA:-./testdata}}
-if [ ! -d "$DATA" ]; then
-  echo "test data directory '$DATA' not found."
-  echo "Set PARQUET_TEST_DATA or pass the path as \$1."
-  echo "Suites 1, 6 and 7 need no fixtures; 2-5 do."
-  exit 2
-fi
+# The default is the lab location; CI overrides it with the env var.
+DATA=${1:-${PARQUET_TEST_DATA:-$HOME/pq-lab/data}}
 FAIL=0
 S=format
+
+# Fixture preflight.
+#
+# This used to be a bare `[ -d "$DATA" ] || exit 2`, which was a false-pass
+# generator in two distinct ways, and a "green baseline" was in fact once
+# reported off it:
+#   * it printed no PARQUET_SUITE terminator line, so the usual way of reading
+#     this log -- grep for PASS/FAILURES -- found neither, and "no failures"
+#     got read as "passed". The run had executed zero test cases.
+#   * `-d` is true for an *empty* directory, so pointing PARQUET_TEST_DATA at a
+#     real-but-unpopulated path skipped the guard entirely and fell through into
+#     the suites, where some fail confusingly and the nested ones (15, 16)
+#     silently print "(no nested fixture)" and pass.
+# So: check for the actual files, report every one that is missing rather than
+# just the first, and exit through the same failure terminator every other
+# failure in this script uses.
+MISSING=""
+require_file() { [ -f "$1" ] || MISSING="$MISSING$1"$'\n'; }
+require_glob() {
+  # shellcheck disable=SC2086
+  set -- $1
+  [ -f "$1" ] || MISSING="$MISSING$1 (no match)"$'\n'
+}
+require_file "$DATA/nyc_taxi.parquet"          # suites 2, 4
+require_file "$DATA/hits_0.parquet"            # suite 2
+require_glob "$DATA/conf/*.parquet"            # suite 2
+require_glob "$DATA/conf/v2page_*.parquet"     # suites 3, 12, 14
+if [ -n "$MISSING" ]; then
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "!! PARQUET SUITE ABORTED: required test fixtures are missing."
+  echo "!! NO TESTS WERE RUN. This is a FAILURE, not a skip."
+  echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+  echo "fixture directory: $DATA"
+  if [ ! -d "$DATA" ]; then
+    echo "  (that directory does not exist)"
+  fi
+  echo "missing:"
+  # Quoted / line-oriented: an unquoted $MISSING word-splits the "(no match)"
+  # annotations across separate output lines.
+  printf '%s' "$MISSING" | while IFS= read -r m; do echo "  $m"; done
+  echo
+  echo "Point PARQUET_TEST_DATA at a populated fixture directory, or pass the"
+  echo "path as \$1. See docs/dev/parquet-storage-format.md section 9.3 for how"
+  echo "these files are obtained."
+  echo
+  echo "==================================="
+  echo "PARQUET SUITE: FAILURES"
+  exit 1
+fi
+
+# Optional fixtures. Absent ones downgrade a suite to a skip, which is
+# legitimate -- but a skip must be *counted*, so that a run which quietly did
+# less than the full suite cannot be read as a clean full-suite pass.
+SKIPPED=0
 
 echo "### build ###"
 g++ -std=c++20 -O1 -Wall -Wextra -Wpedantic -fsanitize=address,undefined \
@@ -81,10 +130,14 @@ echo; echo "### 6. folding round-trip (losslessness) ###";     /tmp/pq_shred_t r
 echo; echo "### 7. divergence cost curve ###";                 /tmp/pq_shred_t cost || FAIL=1
 echo; echo "### 8. hybrid tiering policy (C1, C5, C6) ###";         /tmp/pq_tier_t || FAIL=1
 echo; echo "### 19. modular encryption: decrypt parquet-cpp's files ###"
-if [ -d "$HOME/pq-lab/data/enc_ref" ]; then
-  /tmp/pq_enc_t "$HOME/pq-lab/data/enc_ref" || FAIL=1
+# $DATA, not a hardcoded $HOME: otherwise pointing PARQUET_TEST_DATA at a CI
+# path still silently read the lab's home directory, and this suite claimed to
+# have tested fixtures that were not the ones under test.
+if [ -d "$DATA/enc_ref" ]; then
+  /tmp/pq_enc_t "$DATA/enc_ref" || FAIL=1
 else
-  echo "SKIP -- no reference files; generate with pq-lab/data/enc_ref/gen.py"
+  echo "SKIP -- no reference files; generate with \$PARQUET_TEST_DATA/enc_ref/gen.py"
+  SKIPPED=$((SKIPPED + 1))
 fi
 echo; echo "### 20. modular encryption: pyarrow reads what we write ###"
 ENCOUT=$(mktemp -d)
@@ -109,7 +162,8 @@ if [ -f "$DATA"/nested/nested.parquet ]; then
   /tmp/pq_nested_read_t "$DATA"/nested/nested.parquet "$DATA"/nested/nested.tags.txt \
       tags.list.element || FAIL=1
 else
-  echo "  (no nested fixture; generate with $S/gen_nested.py)"
+  echo "SKIP -- no nested fixture; generate with $S/gen_nested.py"
+  SKIPPED=$((SKIPPED + 2))   # suites 15 and 16
 fi
 
 echo; echo "### 17. write a nested list column, vs pyarrow ###"
@@ -128,5 +182,14 @@ echo; echo "### 12. cross-read: parquet-cpp files, values vs pyarrow ###"
 python3 $S/crossread.py /tmp/pq_xread_t $DATA/conf/v2page_*.parquet || FAIL=1
 
 echo; echo "==================================="
-[ $FAIL -eq 0 ] && echo "PARQUET SUITE: ALL PASS" || echo "PARQUET SUITE: FAILURES"
+echo "fixture directory: $DATA"
+if [ $FAIL -ne 0 ]; then
+  echo "PARQUET SUITE: FAILURES"
+elif [ $SKIPPED -ne 0 ]; then
+  # Deliberately not the "ALL PASS" string: a run that skipped suites must not
+  # match a grep for the clean-run marker.
+  echo "PARQUET SUITE: PASS WITH $SKIPPED SKIPPED SUITE(S) -- not a full run"
+else
+  echo "PARQUET SUITE: ALL PASS"
+fi
 exit $FAIL
