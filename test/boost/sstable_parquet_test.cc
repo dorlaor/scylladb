@@ -1684,6 +1684,155 @@ SEASTAR_THREAD_TEST_CASE(test_pq_dead_and_absent_are_distinguishable_on_disk) {
     }).get();
 }
 
+// A row group wider than the scan window, so a read has to cross the seam inside one group.
+//
+// next_window() picks streaming or paging per window from two comparisons: `lo == rg_first` and
+// `grp_hi == rg_end`. When both hold it streams the group without touching the page index, and a
+// streamed window is capped at scan_window_rows (16 384). So the *second* window of a row group
+// wider than that starts at 16 384 with `lo != rg_first`, which drops into the other branch: it
+// loads the OffsetIndex, computes the elidable leaves, and either pages the rest in 512-row windows
+// or streams it with a non-zero start offset. Both are code the first window never reaches.
+//
+// What is new here is specifically the *cap-driven* second window: a group that needs more than one
+// window because the 16 384 cap binds, rather than because a range bound falls inside it. To be
+// precise about the difference, since it is easy to overstate:
+// test_pq_bounded_range_streams_and_agrees_with_row_format does reach `lo != rg_first`, when a
+// bounded range starts partway into a group -- verified by mutation, see the commit message. What
+// it cannot reach is a group needing a second window at all, because at 8 000 rows in 5 000-row
+// groups no group is wider than the cap, so `lo + win` never binds and no read ever decodes one
+// group in two batches. Before this test, no data-writing case anywhere in the tree configured
+// rows_per_row_group above 16 384, so that geometry had never been written, let alone read.
+//
+// rows_per_row_group is set to 20 000, above the cap, and 25 000 rows are written. Cuts happen on
+// partition boundaries once the budget is reached, so the first group comes out at 20 090 rows --
+// the overshoot is expected -- with the seam at 16 384 inside it. The row-group width is asserted
+// on disk rather than assumed, so the test degrades loudly rather than silently if the writer's
+// budget or the cap ever changes. Dead cells and a range tombstone are spread across the seam as
+// well, because the window boundary is also where the folded deletion channel and the per-row
+// metadata have to line up across two separately decoded batches.
+SEASTAR_THREAD_TEST_CASE(test_pq_reads_cross_a_window_seam_inside_a_row_group) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = schema_builder(1, "ks", "pq_seam")
+            .with_column("pk", utf8_type, column_kind::partition_key)
+            .with_column("ck", int32_type, column_kind::clustering_key)
+            .with_column("a", int32_type)
+            .with_column("b", utf8_type)
+            .set_parquet_options({{"rows_per_row_group", "20000"}})
+            .build();
+        const auto& adef = *s->get_column_definition(to_bytes("a"));
+        const auto& bdef = *s->get_column_definition(to_bytes("b"));
+
+        // 250 x 100 = 25 000 rows: one 20 000-row group holding the seam, then a 5 000-row tail.
+        constexpr int parts = 250, rows = 100;
+        constexpr int64_t window = 16384;
+
+        utils::chunked_vector<mutation> muts;
+        for (int p = 0; p < parts; ++p) {
+            muts.emplace_back(s, partition_key::from_single_value(
+                    *s, utf8_type->decompose(sstring(format("sk{:05d}", p)))));
+        }
+        // Token order is the file's order, so the seam's position is only predictable once the
+        // partitions are sorted -- and the interesting reads below are picked by file position.
+        std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+            return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+        });
+
+        for (size_t p = 0; p < muts.size(); ++p) {
+            mutation& m = muts[p];
+            const api::timestamp_type ts = 900000 + p;
+            const auto ldt = gc_clock::time_point(gc_clock::duration(50000 + p));
+            for (int r = 0; r < rows; ++r) {
+                auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                m.partition().clustered_row(*s, ck).apply(row_marker(ts));
+                if (r % 5 == 0) {
+                    // Dead, so the folded channel is populated on both sides of the seam.
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_dead(ts, ldt));
+                } else if (r % 5 != 4) {
+                    m.set_clustered_cell(ck, adef, atomic_cell::make_live(
+                            *int32_type, ts, int32_type->decompose(int32_t(p) * 100 + r)));
+                }   // r % 5 == 4: absent
+                m.set_clustered_cell(ck, bdef, atomic_cell::make_live(
+                        *utf8_type, ts, utf8_type->decompose(sstring(format("s{}-{}", p, r)))));
+            }
+            // A range tombstone in every partition, so one crosses the seam wherever it falls.
+            m.partition().apply_delete(*s, range_tombstone(
+                    clustering_key_prefix::from_single_value(*s, int32_type->decompose(40)),
+                    bound_kind::incl_start,
+                    clustering_key_prefix::from_single_value(*s, int32_type->decompose(44)),
+                    bound_kind::excl_end,
+                    tombstone(ts + 1, ldt)));
+        }
+
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        // The premise: a row group actually wider than the window. Without this the test would
+        // silently degrade into another full-scan round trip if the writer's budget or the window
+        // constant ever changed.
+        const uint64_t len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+        std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+        auto md = sstables::parquet::format::parse_footer(img);
+        BOOST_REQUIRE_GT(md.row_groups.size(), 1u);
+        bool wide = false;
+        for (const auto& rg : md.row_groups) {
+            if (rg.num_rows > window) { wide = true; }
+        }
+        BOOST_REQUIRE(wide);
+
+        // A full scan, which crosses the seam at row 16 384 inside the first group.
+        {
+            auto want = fragments_of(ref, s, env.make_reader_permit());
+            auto got  = fragments_of(sst, s, env.make_reader_permit());
+            BOOST_REQUIRE_EQUAL(got.size(), want.size());
+            for (size_t i = 0; i < got.size(); ++i) {
+                BOOST_REQUIRE_EQUAL(got[i], want[i]);
+            }
+        }
+
+        // Ranges and single partitions picked by file position rather than by key, so each one
+        // lands where it is meant to relative to the seam. At 100 rows per partition, the
+        // partition at sorted index i starts at row 100*i, so the seam at 16 384 falls inside
+        // sorted partition 163.
+        const size_t seam_part = size_t(window) / rows;          // 163
+        auto dk = [&] (size_t i) { return muts[i].decorated_key(); };
+        auto range_of = [&] (size_t a, size_t b) {
+            return dht::partition_range::make({dk(a), true}, {dk(b), true});
+        };
+
+        struct probe { const char* what; dht::partition_range pr; };
+        std::vector<probe> probes;
+        // Straddling the seam: begins before it, ends after it.
+        probes.push_back({"range straddling the seam", range_of(seam_part - 3, seam_part + 3)});
+        // Entirely past the seam but still inside the wide group, so every window it produces has
+        // lo != rg_first.
+        probes.push_back({"range past the seam, same group", range_of(seam_part + 5,
+                                                                     seam_part + 20)});
+        // The single partition the seam runs through.
+        probes.push_back({"single partition on the seam",
+                          dht::partition_range::make_singular(dk(seam_part))});
+        // A single partition past the seam: a point read whose window starts mid-group.
+        probes.push_back({"single partition past the seam",
+                          dht::partition_range::make_singular(dk(seam_part + 7))});
+        // Spanning the row-group boundary at 20 000 as well as the seam.
+        probes.push_back({"range spanning the group boundary", range_of(seam_part, parts - 20)});
+
+        for (auto& pb : probes) {
+            BOOST_TEST_CONTEXT("probe: " << pb.what) {
+                auto want = fragments_in(ref, s, env.make_reader_permit(), pb.pr, s->full_slice());
+                auto got  = fragments_in(sst, s, env.make_reader_permit(), pb.pr, s->full_slice());
+                BOOST_REQUIRE_GT(want.size(), 0u);
+                BOOST_REQUIRE_EQUAL(got.size(), want.size());
+                for (size_t i = 0; i < got.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(got[i], want[i]);
+                }
+            }
+        }
+    }).get();
+}
+
 // `metadata_folding = 'uniform'` is silently not honoured once an sstable cuts a row group.
 //
 // This started as a hunt for a bug that turned out not to be reachable, and the real finding is
