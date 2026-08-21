@@ -2096,11 +2096,86 @@ here and are worth the paragraph:
    that is wrong while remaining self-consistent — and it is why proving an on-disk
    assertion can fail requires a *round-trip-neutral* mutation, not just any bug.
 
+### 9.6a Python/CQL-level coverage — added 2026-08-21
+
+Everything above builds sstables directly, so none of it exercises DDL parsing, schema-table
+persistence, `DESCRIBE`, or the flush path's format choice. Two new files close that:
+
+| File | Cases | What it covers |
+|---|---|---|
+| `test/cqlpy/test_parquet_storage_format.py` | 33 | The property through `CREATE`, `system_schema.scylla_tables`, `DESCRIBE` and `ALTER`; rejection of invalid values on both the create and alter paths; the flush path's format choice for all three values; and insert/update/delete for every object and tombstone shape — range/partition/row/cell deletes, static columns, frozen and non-frozen collections with whole-collection and per-element deletes, counters, TTL and expiry, no-clustering-key rows. |
+| `test/rest_api/test_parquet.py` | 5 | `column_family/storage_format/{name}` and `storage_service/estimate_parquet_ratios`. |
+
+**What makes them format tests rather than CQL tests.** Each DML case flushes, asserts the
+resulting sstables are `pq`, and only then reads back with `BYPASS CACHE`. Without that
+pairing every one of them would pass unchanged if the flush had written the native format —
+which is not hypothetical: it is exactly what the first mutation below demonstrates.
+`test_default_flush_writes_native` is the control for the file, and it is load-bearing: without
+it a build in which *everything* flushed as `pq` would pass all 33 cases.
+
+**Every case was confirmed able to fail.** Six mutations, each reverted afterwards:
+
+| Mutation | Effect |
+|---|---|
+| `replica/table.cc` — flush never selects `pq` | **15 failed.** Every DML and format case, e.g. `AssertionError: expected only Parquet SSTables for …, got versions {'mt'}`. This is the mutation that proves the DML cases are testing the Parquet path and not just CQL semantics. |
+| `cf_prop_defs.cc` validate + `schema.cc` DESCRIBE + `schema_tables.cc` cell, together | **32 failed, 1 passed** — the survivor being the native control. Distinct signatures per mutation: `assert None == 'parquet'` (persistence), `assert "storage_format = 'parquet'" in "CREATE TABLE …"` (DESCRIBE), and for the invalid-value cases a raw `Server error … message="unknown storage format 'nonesuch' (expected one of: sstable, parquet, hybrid)"`. |
+| `schema_mapping.cc` — collapse dead into absent (`if (!present) continue;`) | **4 failed on their *value* assertions**, not their format assertions: `test_absent_null_and_unset_are_distinct` (`binding NULL must write a cell tombstone that shadows the older value`), the cell delete in `test_parquet_insert_update_delete` (`assert (99 is None)`), the static-column delete (`{(1, 111, 10), …} == {(1, None, 10), …}`), and the frozen-collection delete (`assert SortedSet([1, 2, 3]) is None`). |
+| `replica/table.cc` — flush *always* selects `pq` | **3 failed**, all `expected no Parquet SSTables`: the native control plus the two mixed-format cases. |
+| `api/column_family.cc` — swap the `converged` classification | `assert 'mixed' == 'native'`. |
+| `api/column_family.cc` — misclassify `pq` sstables | `assert '2' == '0'` on an all-Parquet table's `native_sstables`. |
+| `api/storage_service.cc` — scale `ratio` | `assert 1.8915898295613298 == 0.945794914780665 ± 9.5e-04`. |
+
+Union: **every one of the 38 cases fails under at least one mutation**, except the two
+negative-path REST cases noted below.
+
+**Three things this found that were not the point of the exercise.**
+
+1. **A merge is required to distinguish dead from absent, even at CQL level.** The first draft of
+   `test_absent_null_and_unset_are_distinct` wrote the live value and the tombstone without a
+   flush between them. That test **passes under the dead-into-absent collapse**, because one
+   memtable merges the two writes before anything reaches a file: the file then holds a single
+   resolved cell and there is nothing left for the tombstone to shadow. Only with the live value
+   in one sstable and the tombstone in another does the collapse resurrect data. This is the
+   §9.6 merge argument reappearing one layer up — and the same reason the on-disk `__dmask`
+   assertion was needed there. The test now flushes in between and asserts ≥ 2 Data components,
+   so the merge cannot silently stop happening.
+2. **`validate()` is the only thing producing a clean error for a bad value.** With it removed,
+   the value reaches `sstring_to_storage_format_type()`, whose `std::invalid_argument` surfaces
+   as a bare `Server error` (code 0000) rather than a `ConfigurationException`. The second line
+   of defence exists but is not client-safe, so the tests pin the exception *type* as well as the
+   message.
+3. **One assertion was dropped for being unfalsifiable, rather than tuned.** Comparing a 10-row
+   sample's predicted `ratio` against the full sample's looks like the natural way to test the
+   endpoint's per-row normalisation. It is not: a Parquet image carries fixed footer and
+   per-column-chunk overhead that does not shrink with the row count, so at 10 rows the per-row
+   cost is legitimately several times the full-sample one. Both a `pytest.approx(rel=2.0)` form
+   (which admits everything down to zero, so it cannot see a collapsed ratio at all) and an
+   explicit two-sided `[full/3, full*3]` band **passed against a build with the normalisation
+   deliberately re-broken**. Left out and explained in the test file rather than widened into
+   something that cannot fail.
+
+Also worth recording, because it produced one flaky assertion before being understood: the
+estimator samples **one** sstable, and a flush writes one per shard, so `rows_sampled` is a
+per-shard share of the rows written and never the total. An `assert rows_sampled == 500` looked
+correct and failed as `assert 250 == 500` on a later run.
+
 **Still uncovered.** Named rather than implied:
 
-- **No Python-level coverage at all.** Zero of 629 files under `test/*.py` mention
-  `storage_format` or `parquet`. The REST endpoints `column_family/storage_format/{name}`
-  and `storage_service/estimate_parquet_ratios` have no `test/rest_api` coverage.
+- **Two negative-path REST cases were not separately mutated**:
+  `test_storage_format_breakdown_bad_name` and `test_estimate_parquet_ratios_missing_table`.
+  Both assert HTTP status codes for malformed or absent table names, which are produced by the
+  shared `map_reduce_cf_raw()` name-parsing path rather than by anything Parquet-specific;
+  mutating it would break every `/column_family` endpoint and the `test_column_family.py` cases
+  that already pin those messages. Their falsifiability rests on that shared coverage, not on a
+  mutation of their own.
+- **cqlpy is single-node and cannot restart a node**, so nothing here covers the property
+  surviving a restart, or multi-node convergence, at the Python level. `test/cluster/` is where
+  that would go (see `test/cluster/test_bti_index.py` for the format-on-disk idiom with a
+  `manager` fixture that can restart servers); §11.1's multi-node row records the manual
+  three-node verification that stands in for it today.
+- **`hybrid` under a non-TWCS strategy is asserted only for flushes**, which are deterministically
+  native. Which format a *compaction* then picks is a data-dependent policy decision, so it is
+  deliberately not asserted; the criteria themselves are covered by `parquet_tiering_test`.
 - ~~**`sstables/parquet/test_tiering.cc` is not in `configure.py`**~~ — **closed 2026-08-21.**
   The per-criterion C1/C5/C6 tests now also exist as `test/boost/parquet_tiering_test`, a
   `pure_boost_tests` entry in `configure.py` and `KIND BOOST` in `test/boost/CMakeLists.txt`.
@@ -7058,6 +7133,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | Size accounting | Mixed candidate sets bucket on `ondisk_data_size()`; all-native sets untouched (§10.3i). |
 | Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. |
 | Write-path correctness | `pq` is in `writable_sstable_versions`, so the standard mutation-source battery and every `writable_sstable_versions` loop across `sstable_mutation_test`, `sstable_datafile_test`, `sstable_3_x_test`, `sstable_compaction_test` and `sstable_resharding_test` already run against it, unguarded. The only `pq` exclusions are the 12 sites that load checked-in legacy fixtures. Reads and compactions over **format-mixed** sstable sets are now covered in both orders, and `dead` vs `absent` is asserted **in the file** via `__dmask` counts rather than only through the reader (§9.6). |
+| CQL-level correctness | The layer a user touches, covered at last (§9.6a): 38 pytest cases over CQL DDL, `system_schema.scylla_tables`, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints. Each DML case flushes, asserts the files are `pq`, then reads with `BYPASS CACHE`, so it cannot pass on a build that quietly wrote the native format. Every case confirmed to fail under a product mutation. |
 | Scale | GB-scale three-way measurement on real NOAA ISD-Lite under TWCS (§10.6). |
 
 ### Remaining
@@ -7070,7 +7146,7 @@ from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose
 | C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
 | Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
 | Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. Note this is a *bucketing* gap: mixed-set **correctness** — reads and compactions across both formats, with every tombstone shape — is now covered by unit tests (§9.6), which it was not when this row was written. |
-| Correctness coverage gaps | known | Enumerated in §9.6. The load-bearing one remaining: **no Python/pytest coverage of `storage_format` at all** (0 of 629 files under `test/*.py` mention it, and the two REST endpoints have none either). Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. |
+| Correctness coverage gaps | known | Enumerated in §9.6. **Closed 2026-08-21**: the Python/pytest gap, which was the load-bearing one — `test/cqlpy/test_parquet_storage_format.py` (33 cases) and `test/rest_api/test_parquet.py` (5) now cover the property through CQL DDL, the schema tables, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints, with every case confirmed to fail against a deliberately mutated build (§9.6a). Two findings from that exercise are worth carrying: distinguishing a dead cell from an absent one requires a **merge** even at CQL level, so the test flushes between the live write and the tombstone and asserts two Data components — without the flush it passes even with dead collapsed into absent; and one estimator assertion was **dropped as unfalsifiable** after it survived a build with the per-row normalisation re-broken. Also still open: **`sstables/parquet/test_shred.cc` is absent from `configure.py`**, so the 6 480-case folding-losslessness matrix is enforced only by the hand-run script — blocked on the file's location and its standalone-relative includes rather than on its subcommand `main()`, with the restructuring spelled out in §9.6; hybrid+TWCS on the *streaming* path untested; counters and non-frozen collections never merged across formats. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. |
 | Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
 | **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
 | **"Cold" figures are warm readings** | **measurement-method debt** | The cold latencies in §10.21, §10.24, §10.25 and §10.26 are `min` over 400 probes after one restart, so the minimum is necessarily a footer-cache hit. A genuine first read at shipping defaults is **3 680 µs**; the published "cold" figure is **1 149 µs**. Both are real and answer different questions — first contact versus steady-state-after-warmup — but a reader sizing a latency budget will read "cold" as cold. §10.27 established this and did not relabel the four sections. Job: relabel, and say at each which question the number answers. Not a defect. |
