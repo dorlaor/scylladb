@@ -8,10 +8,12 @@
 
 // Tests for the hybrid tiering policy.
 //
-// The policy is a conjunction of seven criteria, so the useful tests are: an
-// output that satisfies all of them is accepted, and relaxing exactly one
-// criterion at a time rejects it for the right reason. Anything less and a
-// criterion could silently stop being enforced.
+// The policy is a conjunction of three criteria -- C1 (position: bottom tier),
+// C5 (schema: eligible, and no wider than the column ceiling) and C6 (a measured
+// predicted gain) -- so the useful tests are: an output that satisfies all of
+// them is accepted, and relaxing exactly one criterion at a time rejects it for
+// the right reason. Anything less and a criterion could silently stop being
+// enforced.
 
 #include "sstables/parquet/tiering_policy.hh"
 
