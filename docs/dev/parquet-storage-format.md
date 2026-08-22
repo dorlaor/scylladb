@@ -453,6 +453,17 @@ there are no TTLs/tombstones, `__ts` degenerates to a single key-value metadata 
 and vanishes from the data entirely. The writer detects this and falls back to Level 1
 if the precondition breaks mid-group.
 
+> **The precondition is not only about timestamps, and calling it "the uniform-timestamp
+> precondition" (as this section, §5.5 and Phase 1 all once did) understates how narrow L2 is.**
+> The predicate at `sstables/parquet/schema_mapping.cc:336` also requires `!any_marker`,
+> `!any_no_ck` and `!any_rtc`. A CQL `INSERT` writes a row marker
+> (`cql3/statements/update_statement.cc:139`, guarded on `type.is_insert()`) where an `UPDATE`
+> does not — so **L2 is unreachable for INSERT-written data at any timestamp regime**, which is
+> the dominant case. It is independently unreachable once an sstable cuts a row group, because the
+> cutting path forges the flags under `leaf_set::conservative` (`schema_mapping.cc:184`), and for
+> static-only partitions (`!any_no_ck`). L2 is a narrow special case, not a broadly applicable
+> level; see §10.3, §10.1m and §10.15, and §11.1's correction.
+
 **Level 3 — logical / analytics.** Cell metadata dropped entirely; the file is exactly
 the user's CQL schema. **Lossy — export only, never a storage mode.** Implemented and
 reachable via `scylla sstable parquet-export --folding logical`. Enforced in three
@@ -7941,102 +7952,173 @@ upgrade — it does nothing about files that already exist.
   finishes. No data is at risk at any point during the procedure; the risk is entirely in starting the
   old binary before step 4 says it is safe.
 
-## 11.1 GA readiness — executed, and remaining
+## 11.1 GA readiness — verdict, blockers, and what is verified
 
-A single place to answer "is this shippable, and what is missing". The deck carries the same content
-from `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py`; this section is the prose form.
+Re-audited end to end on 2026-08-22 against the source and against the sections cited, after a week
+of incremental patching had left rows contradicting one another. Anything that could not be
+substantiated was removed or marked unverified rather than reworded into something vaguer.
+**Project rule: every published figure comes from the `scylla` binary. Anything still model output
+says so inline.** The deck's `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py` predates this audit
+and disagrees with it in several places; this section is authoritative.
 
-### Executed
+### Verdict
 
-| Area | State |
-|---|---|
-| Format integration | `pq` enrolled in the writable version set, TOC/index/filter components kept, `data_size()` semantics settled. Round-trips static rows, range tombstones, multi-cell collections, counters, and — since 2026-08-21 — non-frozen UDTs, which until then threw `std::bad_cast` out of the read path (§9.6). |
-| Format control | `storage_format` per-table property: validated, persisted, in `DESCRIBE`, acted on by compaction, with a `parquet = {...}` parameter map. Converting *back* is tested, not only forward. Per-column encodings are settable as CQL enums (§8.2b), rejected at DDL time when they cannot apply, and cancellable with `auto`. |
-| Hybrid tiering | Policy wired into `compaction_manager`. C1 bottom tier, C5 column ceiling, C6 measured gain over real data. Every decision logged with the deciding criterion. C6 fails closed. |
-| TWCS is all Parquet | Under TWCS, `'hybrid'` ≡ `'parquet'`; verified live against an ICS control (§6.3). |
-| Automatic convergence | Flushes write Parquet where the table writes Parquet unconditionally (§10.7). |
-| Multi-node | **Automated 2026-08-21** (§9.6d), having been a hand run until then: `test/cluster/test_parquet_storage_format.py`, 8 cases. 3 nodes, RF=3: independent per-replica convergence for `parquet` and `hybrid`+TWCS with native controls, `CL=ALL` and per-replica pinned reads, repair onto a replica that missed the writes, vnode bootstrap, tablet bootstrap and decommission. |
-| Restart | **Automated 2026-08-21** (§9.6d). Four staged `pq` sstables and a retained tombstone survive a real process restart; the files are still `pq`; `storage_format` survives schema reload in both `scylla_tables` and `DESCRIBE`; and a flush *after* the restart is still `pq`, which is what proves the reloaded schema still drives the write path. |
-| Bounded memory | Writer streams row groups: 98 % → 19 % buffered, byte-identical output. Scan memory asserted flat (1.01× for 8× rows). |
-| Size accounting | Mixed candidate sets bucket on `ondisk_data_size()`; all-native sets untouched (§10.3i). |
-| Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. |
-| Write-path correctness | `pq` is in `writable_sstable_versions`, so the standard mutation-source battery and every `writable_sstable_versions` loop across `sstable_mutation_test`, `sstable_datafile_test`, `sstable_3_x_test`, `sstable_compaction_test` and `sstable_resharding_test` already run against it, unguarded. The only `pq` exclusions are the 12 sites that load checked-in legacy fixtures. Reads and compactions over **format-mixed** sstable sets are now covered in both orders — including counters, whose merge is per-shard rather than last-write-wins, and multi-cell collections, whose tombstone can sit in one format with the elements it must not delete in the other — and `dead` vs `absent` is asserted **in the file** via `__dmask` counts rather than only through the reader (§9.6). Randomly generated schemas, which used to fail about 1 seed in 4, now pass: that was a single product bug — a bit-packing accumulator one value too narrow, corrupting `bigint`/`timestamp` **key** columns — fixed with three deterministic tests (§9.6b). And that coverage is now **permanent rather than a hand run**: `test_pq_random_schema_fixed_seeds` runs random schemas against `pq` over a fixed, checked-in set of **64 seeds** in 6.6 s, including the three recorded as failing pre-fix, confirmed to name 10 of the 64 against the pre-fix codec (§9.6c). |
-| CQL-level correctness | The layer a user touches, covered at last (§9.6a): 38 pytest cases over CQL DDL, `system_schema.scylla_tables`, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints. Each DML case flushes, asserts the files are `pq`, then reads with `BYPASS CACHE`, so it cannot pass on a build that quietly wrote the native format. Every case confirmed to fail under a product mutation. |
-| Scale | GB-scale three-way measurement on real NOAA ISD-Lite under TWCS (§10.6). |
+**Not GA-ready.** The format, its control surface, and its size and scan results are real and
+verified on a running node. What blocks GA is not a missing feature: it is a class of defect that
+produced **five** instances on 2026-08-21/22, every one of them in a path that had no end-to-end
+test — and this audit found a **sixth** (B1) while checking the claim that they were all closed.
 
-### Remaining
+Four blockers, below. Three of the four are in encryption at rest, and that is the shape of the
+decision to put in front of a reader: **shipping `pq` with encryption at rest disabled leaves only
+B1**, which is a day's work in the writer. Shipping it with encryption enabled means shipping B2 —
+the gap that has already produced one unusable-class defect — B3 and B4.
 
-| Area | Severity | What is missing |
+### Blockers
+
+| # | Blocker | Class | Substantiated by | What closes it |
+|---|---|---|---|---|
+| **B1** | **The `pq` writer writes no large-data metadata.** `sstables/parquet/writer_impl.cc:1210` passes `std::nullopt` for all three of `large_data_stats`, `ext_timestamp_stats` and `large_data_records`, where `sstables/mx/writer.cc:1891` populates all three. Consequence: `system.large_partitions`, `system.large_rows` and `system.large_cells` are **silently empty for every `pq` table** (`db/virtual_tables.cc:1538`/`1728`/`1892`, `db/large_data_handler.cc:143`). The operator loses the diagnostic that finds a pathological partition, with nothing logged to say the answer is absent rather than clean. | **defect** | **Found by this audit.** Five cases of `test/boost/sstable_3_x_test` fail against `pq` at HEAD — `test_large_data_records_round_trip`, `test_large_data_records_top_n_bounded`, `test_large_data_stats_large_{rows,cells,collections}` — all five looping `writable_sstable_versions`. Run at `--smp 1`: **97/102 passed, 5 failed, 10 assertions failed**. | Collect and write the three metadata blocks in the `pq` writer; take those five cases green. `ext_timestamp_stats` is the least urgent of the three — `compaction/compaction.cc:253` treats an empty map as the legacy path and falls back to `min_timestamp`, so tombstone purging is *conservative*, not wrong — but it is the same one line to fix. |
+| **B2** | **Nothing at the integration layers has ever read an encrypted `pq` sstable.** `test/cqlpy`, `test/cluster` and `test/rest_api` contain zero encryption references in their parquet tests and zero parquet references in their encryption tests. Whole-tree, exactly one file crosses the two: `test/boost/sstable_parquet_test.cc`. That single test installs a stub key source via `sstables::parquet::set_key_source`, so `ent/encryption/parquet_key_source.cc` and every real provider are out of the loop — it pins the semaphore interaction, not the provider integration. | **coverage gap that has already shipped an unusable-class defect** | §10.17a: this is *why* the deadlock shipped. Note also that `test/cqlpy` has no encryption-at-rest coverage at all, for any format (its only `encryption` hits are CQL-port TLS). | An encrypted-`pq` matrix in `test/cluster` over the real providers. **The harness already exists and the parquet tests simply do not use it**: `test/pylib/encryption_provider.py:25` enumerates all six providers and `test/cluster/conftest.py:398` already parametrizes a fixture over them. |
+| **B3** | **The encrypted read path still issues a nested read while holding a reader permit.** `reader_permit::awaits_guard` — the §10.17a fix — exempts the permit from the **CPU** limit only: `mark_awaits()` (`reader_concurrency_semaphore.cc:498`) touches no resources, and `awaits_permits` is consulted by `cpu_concurrency_limit_reached()` alone (`:1458`), while admission still requires `has_available_units(base_resources())`. An awaiting permit therefore still holds one **count** unit. At `max_count_concurrent_reads` = 100 (`replica/database.hh:1700`, per shard per service level) concurrent first-time key lookups, the same cycle reforms until the permit TTL fires. | **defect, residual** | §10.17a's own "what the fix does not remove". **Nothing in the tree tests it.** Two aggravating details: the fix *raises* reachability, because pre-fix `cpu_concurrency` = 2 capped blocked readers at 2 and the count limit was therefore unreachable; and there is no in-flight dedup, so N concurrent first-time reads issue N nested lookups (`ent/encryption/replicated_key_provider.cc:288` populates the cache only after resolution). | Resolve the key off the user semaphore. The write path already gets this for free — `classify_request()` maps a flush's or compaction's scheduling group to the *system* semaphore, so its key lookup never contends with its own permit. |
+| **B4** | **Key rotation is unverified after the deadlock fix, and the only configuration it was ever exercised in rests on a deprecated provider.** No rotation pass was re-run post-fix and nothing in the tree covers rotation at all. `ReplicatedKeyProviderFactory` is the only provider that both issues key ids and requires nothing outside the node — local-file works single-node but returns `std::nullopt` for the id, so it cannot express rotation — and it logs `"ReplicatedKeyProviderFactory is deprecated and will be removed in a future release"` (`ent/encryption/replicated_key_provider.cc:438`). | **unverified** | §10.17. Worse, `~/pq-lab/encryption_rotation.py`'s phase 4 was previously passing *because it point-read both key regimes before scanning*, i.e. the passing test was encoding the B3 workaround (§10.17a). Its pass history is therefore not evidence. | Re-run rotation end to end against the fixed reader, and decide which supported provider carries the single-node id-issuing path. |
+
+### Retracted or corrected by this audit
+
+- **Per-column encryption keys do not work through Scylla.** The previous row claimed "per-column
+  keys are written and pyarrow reads them, including the partial-access case", which is true *of the
+  format layer only*. The format layer is complete and externally interoperable — the
+  `RowGroup.ordinal` AAD fix (`sstables/parquet/format/parquet_writer.cc:736`), per-column write
+  (`:813`) and read (`format/parquet_reader.cc:244`) paths, and pyarrow partial-access interop
+  (`format/test_encrypt_interop.py`). The Scylla layer is uniform-mode only: `writer_impl.cc:1255-1268`
+  sets `footer_key` and nothing else; `column_keys` is assigned in exactly **one** place in the whole
+  tree and it is a format-level test (`format/test_encrypt_write.cc:154`); `reader.cc:532` is the
+  single `key_for_read` site and has no per-column dispatch. There is no vocabulary for it either —
+  the sub-option set is closed (`writer_impl.hh:118-165`) and `encoding.<column>` is the only
+  per-column prefix, so a per-column key request is rejected as an unknown option. **Through Scylla
+  there is one key per sstable, and independent per-column key rotation is unreachable** — there is
+  nothing to name, so nothing to rotate. Unimplemented, and a design question rather than a bug.
+- **§10.1b's Trap 2 conclusion died; the trap survived.** The old claim that a bulk load "makes the
+  verbatim mapping look *fine* — 18 % smaller than SSTables on D2" was a model artefact. Real L0
+  under `collapsed` is **171 %** of the row format, not 82 %. The trap itself is confirmed and
+  strengthened: measuring only the flattering regime would have made the 2020 mapping look 1.7× too
+  big rather than 6.6× too big, so the wrong decision was never actually available.
+- **`pq`'s membership in `writable_sstable_versions` is not evidence of passing, and the previous row
+  read it that way.** Until 2026-08-21 a null `clustered_index_cursor` in
+  `test/lib/index_reader_assertions.hh` **SIGSEGV'd the whole binary** on `pq`, so the **13 cases
+  declared after the crashing one in `sstable_mutation_test` never ran** — reading as "not executed"
+  rather than "failed". Two were range-tombstone cases:
+  `test_range_tombstones_are_correctly_seralized_for_non_compound_dense_schemas` (sic) and
+  `writer_handles_subsequent_range_tombstone_changes_without_tombstones`. Fixed, and **verified
+  42/42 at HEAD**. `sstable_3_x_test` is the same reasoning applied and *not* clean — see B1.
+- **L2 folding is narrower than §5.3 describes, and §5.3 is the misleading site.** The predicate
+  (`sstables/parquet/schema_mapping.cc:336`) requires `!any_marker`, and a CQL `INSERT` writes a row
+  marker (`cql3/statements/update_statement.cc:139`, guarded on `type.is_insert()`). So **L2 is
+  unreachable for INSERT-written data at any timestamp regime** — and, independently, unreachable
+  once an sstable cuts a row group (the cutting path forges the flags under
+  `leaf_set::conservative`, `schema_mapping.cc:184`) and for static-only partitions (`!any_no_ck`).
+  §5.3, §5.5 and Phase 1 all call this a *timestamp* precondition, which is the misleading half;
+  §10.3, §10.1m and §10.15 have it right. L2 is a narrow special case, not a broadly applicable level.
+- **"Cold" is gone from the point-read headline.** The pair is **first contact 3 680 µs, steady state
+  1 149 µs, 3.2× apart** (§10.27); §10.21's 3 958 µs is a *fourth* independent estimate of first
+  contact, 7.0 % from it, not a cache hit.
+- **§10.1g's `isdfloat` effect is 2 points, not 12.4** — a sixfold overstatement. Its premise, that
+  every measure is `RLE_DICTIONARY`, was pyarrow's `use_dictionary=True` default and not our writer's
+  (`numeric_dictionary = false`). Conclusion survives, mechanism does not (§10.3j).
+
+### Accepted limitations — documented, not defects
+
+| Limitation | Figure | Where |
 |---|---|---|
-| Point-read latency | known | **1.8–3.6× the row format cold**, at 8 M rows with the footer cache in place (§10.24), down from 5.4–23.6×; §10.26's read-path fixes then moved the shipping arm to **2.53×** (cold min 1 149 µs against native's 455, from 1 930) without a change aimed at point reads. Warm reads are at the client round-trip floor for every format. Note what "cold" means in that 1 149 µs: `min` over 400 probes after a restart, so it is a footer-cache *hit*. The **first** read of an sstable costs **3 680 µs**, 69 % of it the footer — measured three ways in §10.27, which then decided against §10.23's side index because that 2.5 ms is paid once per sstable per restart and steady state does not move. Parquet is still for scanned data. |
-| **Scan path** | **done** | **1.03× the row format through CQL** at 8 M rows and the shipping defaults, reading 21.3 MB of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796 (§10.26). It was 2.29×, 460 MB and ~497 000 extents until 2026-08-20, because the reader chose the point-read path for any *bounded* partition range and the coordinator splits every range scan at tablet boundaries; the window is now chosen per row group by which strategy fetches fewer bytes. Leaves the file's statistics prove empty are also skipped, which is 23 of 28 on the time-series schema. What remains unimplemented is *query* projection, and §10.26 argues it cannot be done at this layer without a fetched-vs-queried split above the sstable: `count(*)` still reads every value column. |
-| Production-scale re-measurement | **done for point reads and scans** | §10.21 re-measured point reads at 8 M rows with a canary and `BYPASS CACHE`, and retired every warm ratio in §10.4 as a measurement of the client round trip. §10.24 then measured the footer cache against a squeezed-cache control on the same data. §10.26 did the same for scans, and it moved a conclusion rather than scaling one. Write figures are still from 200–300 k-row sstables. |
-| C6 skipped under TWCS | accepted | A schema Parquet stores worse converts anyway; the 197-column sparse shape is 208 % of its SSTable. `storage_format = 'sstable'` is the only guard, and it is manual (§6.3). |
-| Corpus re-measurement | **done** | Re-ran all eight datasets under the deterministic dictionary (§10.16): where the input is identical nothing moved, and the two near-parity rows moved least. The two that moved did so because their input changed, not the dictionary. |
-| Mixed-format bucketing at scale | **partly measured** | Mixed sets confirmed to arise under ICS + `'hybrid'` at 4 M rows (12 `me` + 3 `pq` live, all rows readable), and Parquet took 0 % of rewrites (§10.19). But Parquet is 6.3 % of the bytes over a two-minute window, so that zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. Note this is a *bucketing* gap: mixed-set **correctness** — reads and compactions across both formats, with every tombstone shape — is now covered by unit tests (§9.6), which it was not when this row was written. |
-| Correctness coverage gaps | known | Enumerated in §9.6. **Closed 2026-08-21**: the Python/pytest gap, which was the load-bearing one — `test/cqlpy/test_parquet_storage_format.py` (33 cases) and `test/rest_api/test_parquet.py` (5) now cover the property through CQL DDL, the schema tables, `DESCRIBE`, `ALTER`, the flush path's format choice, every tombstone and object shape, and both REST endpoints, with every case confirmed to fail against a deliberately mutated build (§9.6a). Two findings from that exercise are worth carrying: distinguishing a dead cell from an absent one requires a **merge** even at CQL level, so the test flushes between the live write and the tombstone and asserts two Data components — without the flush it passes even with dead collapsed into absent; and one estimator assertion was **dropped as unfalsifiable** after it survived a build with the per-row normalisation re-broken. **Closed 2026-08-22**: ~~`sstables/parquet/test_shred.cc` is absent from `configure.py`~~ — the 6 480-case folding-losslessness matrix now runs in CI as `test/unit/parquet_shred_test`, six cases (one per subcommand), same case counts as the script, verified by an induced break that took the CI run to 3 failed / 3 passed and back. The file was **moved**, not copied, so `run_tests.sh` and CI share one copy. `cost` is excluded because it returns 0 unconditionally — the second unfalsifiable assertion this exercise has declined to wire rather than widen, after the estimator one above. One correction to the earlier diagnosis, which had it that the subcommand `main()` was fine: the `test/unit` harness prepends a hardcoded, non-overridable `DEFAULT_SCYLLA_ARGS` to argv, so `argv[1]` is `--overprovisioned` under CI and dispatch had to scan argv instead (§9.6); **Closed 2026-08-21 (second pass)**: counters and collections merged across formats (`test_hybrid_merge_of_counters_across_formats`, `test_hybrid_merge_of_collections_across_formats` — both orders, all-`pq` and all-native controls, read path and compaction, asserted against a merge rule computed from the fixture as well as against the native reference), and hybrid+TWCS on the *streaming* path (`test_storage_format_honoured_by_streaming_writes`, extended, with the format read off the `pq-` component the creator's sstable produced). `mutation_test.cc` and `sstable_set_test.cc` were assessed for version-parameterisation and **declined** with reasons in §9.6 — the first writes no sstable at all and its one flushing case takes its version from the schema, the second's assertions are interval-map algebra over first/last key and self-referential size sums. **Also closed 2026-08-21 (third pass), and it was the largest known correctness gap**: `pq` failed `make_random_schema_specification` fixtures on roughly 1 seed in 4, with the partition sequence misaligned. Diagnosed to a **single product bug of the data-loss class** and fixed (§9.6b): the bit-packing accumulator in `DELTA_BINARY_PACKED` and in the RLE hybrid was a `uint64_t`, one value too narrow for the 0..7 bits of the previous value it carries, so any residual width above 57 lost bits — on the write side *and* the read side, asymmetrically. It reached only `bigint` and `timestamp` **key** columns, which are the ones `schema_mapping.cc` delta-encodes, and only via a partition key, whose value repeats within a partition and then jumps 64 bits at the boundary. None of the exotic types in the failing schemas mattered. The file on disk was wrong, not just the reader: pyarrow read 254 distinct values where 20 were written, which is also how the harness was ruled out. Now 16/16 on the seed set that failed 4, and 64/64 on a wider sweep; pinned by three deterministic tests, each confirmed to fail against the pre-fix codec. **Closed further 2026-08-21 (fourth pass)**: those sweeps were hand runs, so the *axis* that found the bug — random schemas against `pq` — was still not in the tree, and the next defect of the class would have hidden the same way. `test_pq_random_schema_fixed_seeds` now runs it as a deterministic case over a fixed, checked-in set of **64 seeds** (the three known-bad plus 1..61) in **6.6 s**, reusing `test_sstable_bytes_on_disk_correctness`'s body with the sstable version as its one new argument and `make_sstable_containing`'s own read-back as the only comparison. Confirmed to fail against the pre-fix codec, naming **10 of 64** seeds — with the finding that the encoder half alone catches 9 of them and seed 3262034951 needs the decoder half too, so no one of the four sites stands in for the others. The pyarrow interop arm is deliberately *not* pointed at these fixtures: 20 of the 26 types `tests::type_generator` draws from fall to `cql_type::blob` and reach the file as opaque BYTE_ARRAY, so pyarrow could only re-derive Scylla's serialisation in Python — the reimplemented-harness trap. What that leaves genuinely uncovered is a **symmetric** codec bug, invisible to any round trip by construction; §9.6c names the value-agnostic check that would catch it and why it was not built. One shared-test-infra defect was fixed on the way: a `make_sstable_containing` validation mismatch aborted the process on a leaked reader permit rather than failing the assertion, which is why the sweep could previously name only the first failing seed. A second instance out of the same exercise — a non-frozen UDT column throwing `std::bad_cast` out of `build_collection()`, i.e. **every** read of a `pq` sstable holding one — was fixed earlier the same day with a test. Two smaller items also closed: `bytes_on_disk()` for `pq` is now checked against the storage layer's own file sizes, and the counter-tombstone rule (a counter tombstone wins regardless of timestamp) is recorded. **Closed 2026-08-21**: the C1/C5/C6 per-criterion tests now run in CI as `test/boost/parquet_tiering_test`, and the `distributed_loader.cc` reshape-on-load gate is fixed to use `writes_parquet_unconditionally()` with a test that was confirmed to fail against the old gate. Also **closed 2026-08-21**: `process_upload_dir()` (`distributed_loader.cc`), the `nodetool refresh` half of the same defect, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploaded sstables as native. It now calls `version_for_rewrite_on_load()` too, and unlike the boot half it has an end-to-end test that reads the version back off the files the loader produced (`test_storage_format_honoured_by_refresh_reshape`, confirmed to fail `[me != pq]` against the old creator). All five non-compaction write paths now agree. **Closed 2026-08-21 (fifth pass), and it was the last structural gap**: everything above was single-node, because `test/cqlpy` can neither restart a node nor run two. `test/cluster/test_parquet_storage_format.py` (8 cases, §9.6d) now covers restart survival and per-replica convergence, including the streaming path via repair. Three findings came out of it that the design doc had not recorded, all about where the decision is *not* made: `table::make_sstable(state)` is the single point of truth and `compaction_manager.cc`'s `write_parquet = false` branch falls back to it, so two of the three non-load write paths cannot be made to write the wrong format without also breaking flush; **off-strategy compaction converts streamed sstables before anything can observe them**, which is why the historical streaming drift was invisible in practice and why the repair test has to hold compaction still; and reshape-on-load does not run on a plain restart at all, so it stays covered only by test/boost. The honest limit: there is no *restart-specific* format mutation, because the property round-trips through the schema tables on every DDL rather than only at boot. |
-| Backblaze 4× anomaly | **resolved — not a bug, and not about Parquet** | §10.18: the difference is 42 448 175 cell tombstones, one per bound NULL, present or purged. A table created without a `tombstone_gc` property gets mode `repair` (`tombstone_gc.cc:325`), and under RF=1 that short-circuits `gc_before` to *now* (`tombstone_gc.cc:188`), making them purgeable immediately — `gc_grace_seconds` is never consulted. Measured: 4/4 purged at the default, 0/4 under `timeout`, 0/4 under `disabled`; and on four nodes, RF=1 purges while RF=3 retains. So the ~84 MB file is what a cluster stores and the ~20.8 MB one is an RF=1 artifact. The previous entry had the rule backwards. No published figure depends on it — re-measured both ingest ways on 2026-08-21 and the corpus pipeline's native bytes are byte-identical, because its default `repair` mode purges the tombstones before anything is read. But this entry's *other* claim, that the tombstone cost was "shared by both storage formats", was wrong: native paid ~10.7 MB for them and `pq` paid ~63.7 MB. That asymmetry was a missing fold, not a property of columnar storage, and is now fixed — see the row below. |
-| **Deletion channel not folded** | **fixed 2026-08-21** | §10.28: L1 folded every cell's *write* time into one `__ts` per row from the start, but a dead cell's deletion time went into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze's 197 columns, against 1.9 MB for the same rows' write times. Same information shape, ~32x the cost, and the whole reason `pq` paid ~63.7 MB for retained tombstones where the row format paid ~10.7 MB. Now four leaves independent of table width (`__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals`). Measured on real `pq` sstables with tombstones retained, identical pipeline both sides: **87 532 117 -> 28 246 463 B, 3.10x**, deletion channel 40.3x smaller, `data` channel byte-identical. Losslessness over 6 480 shred/reassemble cases with a new deletion-divergence dimension, both arms asserted populated; pre-fold files read unchanged with no migration; asserted on both write paths. Not applied to collections, whose per-element `__ldt` lives inside the MAP group (same exclusion as §10.26). |
-| ~~"Cold" figures are warm readings~~ | **closed 2026-08-21** | Relabelled at all four sites. §10.24's `cached` column, §10.25 and §10.26 are `min` over 400 probes after one restart with the footer cache in the binary, so they are cache hits and answer **steady-state-after-warmup**; each now says so and the word "cold" is gone. **§10.21 was the exception** — measured before the cache existed, so its column is the *uncached* cost and is renamed accordingly, not relabelled as a hit; it then reads as a fourth estimate of §10.27's first-read figure, 3 958 µs against 3 680, 7.0 % apart. Both numbers are now stated wherever either is: **first contact 3 680 µs, steady state 1 149 µs, 3.2× apart** at shipping defaults. |
-| ~~Harness "Parquet" figures are a model~~ | **closed 2026-08-21** | Full inventory in **§10.3j**; every affected table now carries its verdict inline. `harness.py` re-encodes rows read back over CQL with pyarrow and never writes a `pq` sstable, and §10.1f-prod remains unaffected. **The significant case was re-measured through the real write path** (`fold_levels.sh`): §10.3's folding headline is **6.63×, not 26.8×**, because the model wrote a dense per-column timestamp for every row including Backblaze's 73 % absent cells — its L0 figure is 97.7 % of `195 × 300 000 × 8 B`, the size of an array the format never writes. **L2 turned out to be unreachable** in that regime (all three `uniform` requests returned `folding_effective: L1`, byte-identical to `row`), so the old L2 column described a file the format cannot produce. Also settled: one **false positive** (§10.1f's export corpus is our own writer), one table that is **permanently un-measurable** through the write path (§10.1a's token-order penalty — an sstable has only one order), one **conclusion resting on a mechanism we do not have** (§10.1g's `isdfloat`: our file grows +19.6 %, not +0.1 %, so the effect is 2 points rather than 12.4 — the conclusion survives, the reasoning does not), and one table the candidate list **missed** (§10.1b's Trap 2 L0 columns, same `write_variant` path). Model L1 is good to ~2 % on narrow/dense schemas, 18 % optimistic on wide sparse ones — and right for the wrong reason where it is right, modelling 106 leaves where the writer emits 330. |
-| Encryption at rest | **done, including BYOK** | Built and verified end to end (§10.17): AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, and **keys from `ent/encryption`'s own providers** — local file, replicated, KMIP, AWS KMS, GCP, Azure — so BYOK works. Mutually exclusive with `scylla_encryption_options`, refused at DDL time, because that path would double-encrypt and hand out a file no external reader can open. pyarrow reads the encrypted `Data.db` with the provider's key. Per-column keys are written and pyarrow reads them, including the partial-access case (footer key alone opens one column and not the other). **One defect of the unusable class was found and fixed 2026-08-22 (§10.17a), and it had made every encrypted `pq` table unscannable**: the read path resolved its key while holding a reader permit the semaphore counted as CPU-bound, and for the replicated provider resolving a key *is another read* on the same semaphore — so at the default `cpu_concurrency` of 2 the two reads a range scan runs filled the budget and their own key lookups could never be admitted. It deadlocked until the permit's TTL expired, i.e. for the whole `range_request_timeout_in_ms`, with the semaphore's diagnostics arriving only at the end (hence "nothing is logged"). Point reads were unaffected purely by arithmetic — one permit against a budget of 2. Fixed with `reader_permit::awaits_guard` across the key await; pinned by `test_pq_encrypted_read_does_not_deadlock_on_its_own_key_lookup`, which fails in a bounded 10 s rather than hanging against the pre-fix reader. The residual, un-removed hazard is the same nested-read-under-permit exposure at the *count* limit, named in §10.17a. Not covered: key rotation (driven in the lab by `~/pq-lab/encryption_rotation.py`, which is how this defect was found, but no full pass was re-run after the fix and nothing in the tree covers it), a CQL surface for per-column keys, plaintext-footer mode, node-global `user_info_encryption`. |
-| Object storage | **done** | 7/7 on minio (§10.12): keyspace on S3 storage, `pq` table on it, objects in the bucket carrying `PAR1`, all rows readable. The downgrade sub-question is now closed too (§10.20): a binary that does not know `pq` refuses to start on a bucket written by one that does, naming the version. |
-| Maintenance tooling | **done** | 10/10 (§10.12): scrub in all four modes, cleanup, and the snapshot → truncate → refresh round trip. |
-| Downgrade procedure | **done, both storage types** | Specified in §10.9, and the behaviour it rests on is observed on local disk *and* on object storage (§10.20): an older node aborts at startup on an sstable version it does not know rather than skipping it. The procedure is manual and covers the backup retention window. |
+| Point-read latency | Steady state **2.53×** the row format (1 149 µs against native's 455). First contact **3 680 µs**, 69 % of it the footer, paid once per sstable per restart. Warm reads sit at the client round-trip floor for every format. | §10.26, §10.27 |
+| C6 is skipped under TWCS | A schema Parquet stores worse converts anyway; the 197-column sparse shape measures **208 %** of its SSTable. `storage_format = 'sstable'` is the only guard and it is manual. | §6.3, §10.4 |
+| Query projection unimplemented | The scan path chooses its window per row group by bytes fetched, but `count(*)` still reads every value column; §10.26 argues this cannot be fixed at the sstable layer without a fetched-vs-queried split above it. | §10.26 |
+| Mixed-format bucketing at scale | Right shape, too small a share of the bytes to be evidence: Parquet took 0 % of rewrites, but was only 6.3 % of the bytes over the window, so the zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. | §10.19 |
+| Write-side figures are small-scale | Read figures were re-measured at 8 M rows; **write figures are still from 200–300 k-row sstables**. Measurement debt, not a defect. | §10.21, §10.24, §10.26 |
+| R-13 write memory | Streaming brought buffering 98 % → 19 % with byte-identical output, and scan memory is flat (1.01× for 8× rows), but §5.5a records the target as still not met. | §5.5a |
 
+### Operational caveats for upgrade
 
-**The honest summary.** The functionality is built and, where the claim is behavioural, verified on
-a running node rather than only in a unit test. What is left is genuinely narrow:
+- **An sstable written before `f0ed07985c` with a `bigint` or `timestamp` key column holds corrupt
+  key data on disk.** The bit-packing accumulator was a `uint64_t` carrying 0..7 bits of the previous
+  value, so any residual width above 57 lost bits — on the write side as well as the read side. The
+  file is wrong, not merely the reader (pyarrow read 254 distinct values where 20 were written). Such
+  a file **must be rewritten from the source table, not migrated**: no reader can recover the lost
+  bits. Only `bigint`/`timestamp` *key* columns are affected, because those are what
+  `schema_mapping.cc` delta-encodes (§9.6b).
+- **Downgrade is manual and covers the backup retention window** (§10.9). An older node aborts at
+  startup on an sstable version it does not know rather than skipping it, observed on local disk and
+  on object storage (§10.20).
+- **`scylla_encryption_options` and Parquet encryption are mutually exclusive**, refused at DDL time,
+  because that path would double-encrypt and produce a file no external reader can open (§10.17).
 
-- **One conclusion that changed, and it was the headline one**: scans. §10.26 measured a whole-table
-  scan through CQL at **2.3× the row format**, not the 0.82× §10.4c reported and the deck quoted,
-  and localised it to the reader taking the point-read path for any bounded range while the
-  coordinator never hands it an unbounded one. That defect is fixed and re-measured: **1.03×**, with
-  21.3 MB read against native's 234 MB. So the corrected claim is **parity with an order of magnitude
-  less read I/O** — not the advantage 0.82× promised, which was never real, and not the 2.3× penalty
-  either. Point reads improved as a side effect (shipping arm, cold min 1 930 → 1 149 µs).
-- **One newly-found correctness gap, now closed, and it was the largest**: `pq` did not survive
-  randomly generated schemas — about 1 seed in 4 failed, with the partition sequence misaligned
-  rather than a single value wrong. It was invisible because every fixed-schema `pq` test
-  hand-writes its schema and every random-schema suite takes the version-less `make_sstable`
-  overload, which steps past `pq` by construction, so **nothing in the tree had ever pointed a
-  random schema at this format**. All of it was one product bug of the data-loss class: a
-  bit-packing accumulator one value too narrow, silently dropping everything past bit 63 and so
-  corrupting `bigint`/`timestamp` **key** columns on disk (§9.6b). Fixed, with three deterministic
-  tests on the mechanism, and the *axis* is now permanent too — 64 checked-in seeds run against
-  `pq` on every commit, confirmed to name 10 of them against the pre-fix codec (§9.6c). What
-  remains true is narrower than the old wording: the type system is now exercised against `pq`,
-  but 20 of the 26 generated types reach the file as opaque BYTE_ARRAY, so what is covered is that
-  they **round-trip**, not that an external reader can interpret them.
-- **One defect of the unusable class, now closed, and it was invisible to every test in the tree**:
-  every encrypted `pq` table was unscannable (§10.17a). The read path resolved its key while holding
-  a reader permit the semaphore counted as CPU-bound, and for the replicated provider resolving a
-  key is itself a read on that same semaphore — so a range scan deadlocked against its own key
-  lookup until the permit's TTL expired. Nothing in the tree caught it because nothing in the tree
-  read an encrypted `pq` sstable at all; the lab's rotation run found it, and then two successive
-  explanations of it ("cold cache", "restart-recency") were wrong before the semaphore's own
-  diagnostics settled it. Two things generalise. The asymmetry that made it look like a scan-path
-  bug — point reads always worked — was **arithmetic**, one permit against a `cpu_concurrency` of 2,
-  and reading it as a property of the scan path cost time. And "nothing is logged" was false: the
-  diagnostics exist, they just arrive at the *end* of the range timeout, after every previous run
-  had already given up and restarted the node.
-- **One accepted trade**: TWCS converts without a gain check, so a schema Parquet stores worse
-  converts anyway. `storage_format = 'sstable'` is the only guard and it is manual.
-- **One half-measurement**: mixed-format bucketing at scale showed the right shape but over too
-  small a share of the bytes to be evidence (§10.19).
-- **One former anomaly, now closed**: Backblaze's per-cell tombstone channel is present or purged
-  depending on tombstone GC, which under the lab's RF=1 makes every cell tombstone immediately
-  purgeable (§10.18). Legitimate behaviour, verified against a four-node cluster; the earlier
-  suspicion of a tombstone-retention bug rested on a misread default.
+### Verified — and what substantiates each
 
-Everything else on the old list is closed. Encryption at rest is built as Parquet Modular Encryption
-with its keys taken from Scylla's own encryption-at-rest providers, so BYOK works, and verified end to
-end including an external reader opening the encrypted file with the provider's key (§10.17) — the
-earlier "not applicable to this tree" answer conflated a standard format feature with Scylla's own
-EaR, and was wrong about both: the format feature was available, and `ent/encryption` was there all
-along. Downgrade safety now holds for **both**
-storage types, observed rather than reasoned (§10.20). The corpus survives the deterministic
-dictionary unchanged (§10.16). Object storage and maintenance tooling are done and verified.
+| Area | State | § |
+|---|---|---|
+| Format integration | `pq` in the writable version set; TOC/index/filter components kept; `data_size()` semantics settled. Round-trips static rows, range tombstones, multi-cell collections, counters, and non-frozen UDTs — the last of which threw `std::bad_cast` out of `build_collection()` on **every** read until 2026-08-21. | §9.6 |
+| Format control | `storage_format` per-table: validated, persisted, in `DESCRIBE`, acted on by compaction, with a `parquet = {...}` map. Converting *back* is tested. Per-column *encodings* (not keys) settable as CQL enums, rejected at DDL time when inapplicable, cancellable with `auto`. | §8.2b |
+| Hybrid tiering | Wired into `compaction_manager`; C1 bottom tier, C5 column ceiling, C6 measured over real data, every decision logged with its deciding criterion, C6 fails closed. Criteria run in CI as `test/boost/parquet_tiering_test`. | §6.3 |
+| All write paths agree | All five non-compaction write paths now ask the same question. Two were fixed 2026-08-21: the boot reshape-on-load gate (`distributed_loader.cc`, now `writes_parquet_unconditionally()`) and `process_upload_dir()`, the `nodetool refresh` half, which built its own creator from `get_preferred_sstable_version()` and so rewrote even an explicit `storage_format = 'parquet'` table's uploads as native (`version_for_rewrite_on_load()`, with `test_storage_format_honoured_by_refresh_reshape` confirmed to fail `[me != pq]` against the old creator). | §9.6, §9.6d |
+| Multi-node | `test/cluster/test_parquet_storage_format.py`: **8 pytest cases from 5 functions**. 3 nodes RF=3, per-replica convergence for `parquet` and `hybrid`+TWCS with native controls, `CL=ALL` and pinned per-replica reads, repair onto a replica that missed the writes, vnode bootstrap, tablet migration. | §9.6d |
+| Restart | Same file. Four staged `pq` sstables and a retained tombstone survive a real process restart; files still `pq`; `storage_format` survives schema reload in both `scylla_tables` and `DESCRIBE`; and a flush *after* the restart is still `pq`, which is what proves the reloaded schema still drives the write path. | §9.6d |
+| CQL and REST surface | **33 pytest cases from 23 functions** in `test/cqlpy/test_parquet_storage_format.py`, plus **5** in `test/rest_api/test_parquet.py`. Each DML case flushes, asserts the files are `pq`, then reads with `BYPASS CACHE`, so it cannot pass on a build that quietly wrote native. Every case confirmed to fail under a deliberate product mutation. | §9.6a |
+| Write-path correctness | `sstable_mutation_test` **42/42, verified at HEAD**. Format-**mixed** reads and compactions covered in both orders, including counters (per-shard merge, not last-write-wins) and multi-cell collections (tombstone in one format, the elements it must not delete in the other). `dead` vs `absent` asserted **in the file** via `__dmask` counts, not only through the reader. | §9.6 |
+| Random schemas | Was the largest known correctness gap: `pq` failed `make_random_schema_specification` on ~1 seed in 4, and **nothing in the tree had ever pointed a random schema at this format**. One product bug of the data-loss class (see the upgrade caveat above), fixed at four sites with three deterministic tests. The *axis* is now permanent: `test_pq_random_schema_fixed_seeds` runs **64 checked-in seeds** in 6.6 s, confirmed to name **10 of 64** against the pre-fix codec — and the encoder half alone catches 9, so no one site stands in for the others. | §9.6b, §9.6c |
+| Folding losslessness in CI | `test/unit/parquet_shred_test`, **6 480 cases** — re-verified by running it for this audit: `round-trip: 6480 cases, 0 failures`. Wired as **6 of the 7 subcommands**; `cost` is excluded because it returns 0 unconditionally, the second unfalsifiable assertion this exercise declined to wire rather than widen. The file was **moved** from `sstables/parquet/test_shred.cc`, so `run_tests.sh` and CI share one copy. | §9.6 |
+| Deletion channel folded | A dead cell's deletion time used to go into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze against 1.9 MB for the same rows' write times, ~32× the cost for the same information shape. Now four leaves independent of table width. Measured on real `pq` sstables: **87 532 117 → 28 246 463 B, 3.10×**, deletion channel 40.3× smaller, `data` channel byte-identical. Pre-fold files read unchanged, no migration. Not applied to collections, whose per-element `__ldt` lives inside the MAP group. | §10.28 |
+| Scan path | **1.03× the row format through CQL** at 8 M rows and shipping defaults: 21.3 MB read of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796. It was 2.29× and ~497 000 extents until 2026-08-20, because the reader took the point-read path for any *bounded* partition range while the coordinator splits every range scan at tablet boundaries. So the corrected claim is **parity with an order of magnitude less read I/O** — not the 0.82× advantage §10.4c reported and the deck quoted, which was never real, and not the 2.3× penalty either. | §10.26 |
+| Size | Corpus re-measured under the deterministic dictionary: where the input was identical nothing moved, and the two near-parity rows moved least. GB-scale three-way measurement on real NOAA ISD-Lite under TWCS. | §10.16, §10.6 |
+| Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. | §10.3i |
+| Encryption at rest, uniform mode | AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys from `ent/encryption`'s own providers (local file, replicated, KMIP, AWS KMS, GCP, Azure), so BYOK works; pyarrow opens the encrypted `Data.db` with the provider's key. **One key per sstable** — see the retraction above. Blocked by B2/B3/B4. Also not covered: plaintext-footer mode, node-global `user_info_encryption`. | §10.17 |
+| Object storage, tooling, downgrade | 7/7 on minio (keyspace on S3, `pq` table on it, objects carrying `PAR1`, all rows readable); 10/10 maintenance (scrub in all four modes, cleanup, snapshot → truncate → refresh); downgrade observed on both storage types. | §10.12, §10.20, §10.9 |
+| Backblaze 4× anomaly | Not a bug and not about Parquet: 42 448 175 cell tombstones, one per bound NULL. A table created without a `tombstone_gc` property gets mode `repair`, and under RF=1 that short-circuits `gc_before` to *now*, so `gc_grace_seconds` is never consulted. 4/4 purged at the default, 0/4 under `timeout` or `disabled`; RF=1 purges where RF=3 retains. No published figure depends on it. | §10.18 |
+
+### Still model output — do not quote as measurement
+
+- **§10.1's `collapsed` rows.** The `Parquet L1` column of §10.1 is `harness.py`'s pyarrow model
+  throughout — rows read back over CQL and re-encoded, in one row group, with the metadata leaves
+  synthesised in Python. The three `realistic` rows now have real figures beside them (model
+  optimistic by 0.8 % / 1.9 % / **18.1 %**, the last on the wide sparse schema). **The `collapsed`
+  rows have not been re-measured and remain model output.**
+- **§10.1a's token-order penalty, both arms** — intrinsically un-measurable through the write path,
+  because an sstable has only one order. The ratio is sound; the bytes inherit §10.1's optimism.
+- **§10.2's row-group sweep** — superseded by §10.1f-rg, and the swept range is unreachable.
+- One general lesson worth keeping: on ClickBench the model emits 106 leaves where the writer emits
+  330, and still agrees on bytes to 0.8 %, because the 224 extra all-null channels RLE to ~0.8 % of
+  the file. **A model that agrees on bytes is not thereby validated on structure** — and §10.28 is
+  what that costs when the structural assumption is load-bearing.
+
+### Where the remaining risk is
+
+Six defects in two days, and the pattern is exact rather than anecdotal: **every one was in a path
+that had no end-to-end assertion, and each was invisible to the tests that did exist.** The
+bit-packing accumulator hid because no random schema had ever been pointed at `pq`; the UDT
+`bad_cast` because no test read a non-frozen UDT from a `pq` file; both `storage_format`-ignoring
+write paths because no test read the version back off the files a loader produced; the encryption
+deadlock because nothing had ever read an encrypted `pq` sstable; and B1 because nothing asserted
+that a `pq` sstable carries the metadata the row format's does.
+
+So the honest predictor of remaining risk is not severity of what was found — it is the list of
+`pq` paths that still have no end-to-end assertion. Those are, in order of exposure:
+
+1. **Encrypted reads through a real key provider** (B2) — the largest, and the one that has already
+   paid out once.
+2. **Key rotation** (B4) — no coverage at all, and its one previously-passing lab run was encoding a
+   workaround for B3.
+3. **Anything that reads `pq` sstable metadata rather than `pq` data.** B1 is the first instance
+   found; the audit checked the three `write_scylla_metadata` arguments and found all three absent,
+   so this is a systematic gap in one call and worth sweeping rather than patching case by case.
+4. **Tombstone-purge effectiveness on `pq`** — `ext_timestamp_stats` being absent makes purging fall
+   back to `min_timestamp`. That is conservative and therefore safe, but no test asserts what it
+   costs, so a regression from "conservative" to "wrong" would not be caught here.
+5. **Reshape-on-load on a real restart** — §9.6d found it does not run on a plain restart at all, so
+   it stays covered only by `test/boost`.
+
+What is *not* on that list is worth stating too: the data path itself is now covered from several
+independent directions — the version-parameterised mutation-source battery, 64 random schemas, a
+6 480-case folding matrix, format-mixed merges in both orders, in-file `__dmask` assertions, and
+8 multi-node cases including repair and bootstrap. The risk has moved off the data path and onto
+its metadata, its encryption, and its operational surfaces.
 
 ## 12. References
 
