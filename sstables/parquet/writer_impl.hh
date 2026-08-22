@@ -27,6 +27,8 @@
 #include <set>
 #include <seastar/core/sstring.hh>
 #include "sstables/metadata_collector.hh"
+#include "sstables/types.hh"
+#include "mutation/collection_mutation.hh"
 #include "sstables/writer_impl.hh"
 #include "sstables/writer.hh"
 #include "sstables/parquet/encryption_keys.hh"
@@ -34,6 +36,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <vector>
 
 namespace sstables::parquet {
@@ -394,9 +397,116 @@ private:
     // only add_key().
     sstables::column_stats _c_stats;
 
+    // ------------------------------------------------ large-data reporting
+    //
+    // system.large_partitions / large_rows / large_cells. Without these an
+    // operator has no way to find a pathological partition in a `pq` table, and
+    // -- worse -- cannot tell "no large partitions" from "this format does not
+    // report them", because both read as an empty table.
+    //
+    // The measure is a *logical* size, not an on-disk one, and that is the one
+    // real semantic difference from mx. mx reports bytes written to the Data
+    // component for that row/cell/partition, which it can do because it encodes
+    // one row at a time into a byte stream. A Parquet row has no byte extent:
+    // its values are scattered across column chunks, interleaved with every
+    // other row's, then dictionary-encoded and compressed as a chunk. So what is
+    // reported here is the serialised size of the *content* -- the cell's
+    // in-memory serialised form (flags, timestamp, ttl/expiry or deletion time,
+    // value bytes), summed up the row and the partition. Encoding-independent,
+    // and arguably the more useful number for the diagnostic: a 10 MB blob is a
+    // 10 MB blob whether or not the codec squeezed it.
+    //
+    // Two further deliberate deviations, both consequences of the columnar
+    // layout rather than approximations:
+    //
+    //  - Static cells are charged to the *partition*, once, and not to any row.
+    //    The shredder replays static cells onto every storage row of the
+    //    partition (see fragment_shredder::replay_statics), so charging them per
+    //    row would multiply one static blob by the row count and report a
+    //    partition of small rows as a partition of large rows. They are still
+    //    reported as cells, once, exactly as mx does from its single static row.
+    //
+    //  - rows_in_partition counts *storage* rows: clustering rows, range
+    //    tombstone change markers, and the placeholder row a static-only
+    //    partition gets. There is no separate static row in a Parquet file, so
+    //    a partition that mx reports as N+1 rows (it writes an empty static row
+    //    whenever the schema declares static columns) is reported here as N.
+    //
+    // Everything below mirrors sstables/mx/writer.cc: the same five
+    // large_data_stats_entry aggregates and the same five bounded top-N heaps.
+    //
+    // The accounting lives in the fragment consumers, upstream of both write
+    // paths -- cut_row_group() and to_parquet_for_storage() -- so it cannot
+    // diverge between them: a row is counted when it is consumed, whatever the
+    // encoder later does with it.
+    std::optional<sstables::key> _partition_key;
+    // Logical bytes attributable to the partition being consumed: its key, its
+    // tombstone, its static cells (once), and the sum of its rows' sizes.
+    uint64_t _partition_logical_size = 0;
+
+    large_data_stats_entry _partition_size_entry;
+    large_data_stats_entry _rows_in_partition_entry;
+    large_data_stats_entry _row_size_entry;
+    large_data_stats_entry _cell_size_entry;
+    large_data_stats_entry _elements_in_collection_entry;
+
+    // Bounded min-heaps for top-N large data records, one per large_data_type.
+    // Size-type heaps (partition_size, row_size, cell_size) compare by `value`;
+    // element-count-type heaps (rows_in_partition, elements_in_collection)
+    // compare by `elements_count`.
+    struct large_data_record_cmp_by_value {
+        bool operator()(const large_data_record& a, const large_data_record& b) const {
+            return a.value > b.value; // min-heap: smallest value on top
+        }
+    };
+    struct large_data_record_cmp_by_elements {
+        bool operator()(const large_data_record& a, const large_data_record& b) const {
+            return a.elements_count > b.elements_count; // min-heap: smallest elements_count on top
+        }
+    };
+    using ld_size_heap = std::priority_queue<large_data_record, std::vector<large_data_record>, large_data_record_cmp_by_value>;
+    using ld_elements_heap = std::priority_queue<large_data_record, std::vector<large_data_record>, large_data_record_cmp_by_elements>;
+    ld_size_heap _ld_partition_size_records;
+    ld_elements_heap _ld_rows_in_partition_records;
+    ld_size_heap _ld_row_size_records;
+    ld_size_heap _ld_cell_size_records;
+    ld_elements_heap _ld_elements_in_collection_records;
+
+    // Insert a record into a bounded min-heap, keeping at most N entries.
+    // comp(rec, top) is true exactly when rec outranks the weakest kept entry.
+    template <typename Heap>
+    void insert_into_ld_heap(Heap& heap, large_data_record rec) {
+        auto max_records = _cfg.large_data_records_per_sstable;
+        if (max_records == 0) {
+            return;
+        }
+        if (heap.size() < max_records) {
+            heap.push(std::move(rec));
+        } else if (typename Heap::value_compare{}(rec, heap.top())) {
+            heap.pop();
+            heap.push(std::move(rec));
+        }
+    }
+
+    void maybe_record_large_partitions(uint64_t partition_size, uint64_t rows,
+            uint64_t range_tombstones, uint64_t dead_rows);
+    void maybe_record_large_rows(const clustering_key_prefix* clustering_key, uint64_t row_size);
+    void maybe_record_large_cells(const clustering_key_prefix* clustering_key,
+            const column_definition& cdef, uint64_t cell_size, uint64_t collection_elements);
+
+    // The three components of a logical size. Kept separate because the row and
+    // the partition need different subsets -- see the note above on statics.
+    static uint64_t cell_logical_size(const atomic_cell_view& cell);
+    static uint64_t collection_logical_size(collection_mutation_view cmv);
+    static uint64_t row_metadata_logical_size(const clustering_row& cr);
+
     void collect_atomic_cell(const atomic_cell_view& cell);
-    void collect_cell(const column_definition& cdef, const atomic_cell_or_collection& acoc);
-    void collect_cells(const ::row& cells, ::column_kind kind);
+    // Returns the cell's logical size, and reports it to the large-data handler
+    // under `clustering_key` (null for a static cell).
+    uint64_t collect_cell(const column_definition& cdef, const atomic_cell_or_collection& acoc,
+            const clustering_key_prefix* clustering_key);
+    uint64_t collect_cells(const ::row& cells, ::column_kind kind,
+            const clustering_key_prefix* clustering_key);
     void collect_marker(const row_marker& marker);
 
     // Streaming row groups. Both stay empty for an sstable that fits inside the

@@ -147,6 +147,66 @@ SEASTAR_THREAD_TEST_CASE(test_large_data) {
     }, cfg).get();
 }
 
+// The same end-to-end check as test_large_data, for a `storage_format =
+// 'parquet'` table.
+//
+// This exists because the unit-level assertion is much weaker than it looks. The
+// pq writer used to pass std::nullopt for all three large-data arguments of
+// write_scylla_metadata(), so system.large_partitions / large_rows / large_cells
+// were silently empty for every pq table -- and the failure mode was that the
+// table looked healthy, not that anything errored. Asserting that the metadata
+// component exists does not catch a regression in which the records are written
+// but the virtual tables cannot read them, so this asserts on rows coming back
+// from a query.
+//
+// The expected values are deliberately identical to the mx case even though the
+// sizes are measured differently (pq reports a logical size, mx an on-disk one --
+// see the note in sstables/parquet/writer_impl.hh). A 1 MB blob dominates both.
+SEASTAR_THREAD_TEST_CASE(test_large_data_parquet) {
+    auto cfg = make_shared<db::config>();
+    cfg->compaction_large_row_warning_threshold_mb(1);
+    cfg->compaction_large_cell_warning_threshold_mb(1);
+    cfg->compaction_large_partition_warning_threshold_mb(1);
+    do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("create table tbl (a int, b text, primary key (a)) "
+                      "with storage_format = 'parquet'").get();
+        sstring blob(1024*1024, 'x');
+        e.execute_cql("insert into tbl (a, b) values (42, 'foo');").get();
+        e.execute_cql("insert into tbl (a, b) values (44, '" + blob + "');").get();
+        flush(e);
+
+        // Only the large row, and it is the one keyed 44.
+        shared_ptr<cql_transport::messages::result_message> msg = e.execute_cql(
+                "select partition_key, row_size from system.large_rows "
+                "where table_name = 'tbl' allow filtering;").get();
+        auto res = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
+        auto rows = res->rs().result_set().rows();
+        BOOST_REQUIRE_EQUAL(rows.size(), 1);
+        auto row0 = rows[0];
+        BOOST_REQUIRE_EQUAL(row0.size(), 3);
+        BOOST_REQUIRE_EQUAL(to_bytes(*row0[0]), "44");
+        BOOST_REQUIRE_EQUAL(to_bytes(*row0[2]), "tbl");
+        auto row_size_bytes = *row0[1];
+        BOOST_REQUIRE_EQUAL(row_size_bytes.size(), 8);
+        long row_size = read_be<long>(reinterpret_cast<const char*>(&row_size_bytes[0]));
+        BOOST_REQUIRE(row_size > 1024*1024 && row_size < 1025*1024);
+
+        assert_that(e.execute_cql("select partition_key, column_name from system.large_cells where table_name = 'tbl' allow filtering;").get())
+            .is_rows()
+            .with_size(1)
+            .with_row({"44", "b", "tbl"});
+
+        assert_that(e.execute_cql("select partition_key, rows from system.large_partitions where table_name = 'tbl' allow filtering;").get())
+            .is_rows()
+            .with_size(1)
+            .with_row({ { utf8_type->decompose("44") },
+                        { long_type->decompose(1L) },
+                        { utf8_type->decompose("tbl") } });
+
+        return make_ready_future<>();
+    }, cfg).get();
+}
+
 SEASTAR_THREAD_TEST_CASE(test_large_row_count_warning) {
     auto cfg = make_shared<db::config>();
     cfg->compaction_rows_count_warning_threshold(10);

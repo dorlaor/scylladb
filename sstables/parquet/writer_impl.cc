@@ -27,6 +27,8 @@
 #include "mutation/collection_mutation.hh"
 #include "mutation/counters.hh"
 #include "types/collection.hh"
+#include "db/large_data_handler.hh"
+#include "utils/chunked_vector.hh"
 
 #include <cstdlib>
 #include <cstring>
@@ -975,7 +977,20 @@ pq_writer_impl::pq_writer_impl(sstables::sstable& sst, const ::schema& s,
     , _shredder(s)
     , _pcfg(std::move(pcfg))
     , _enc_stats(enc_stats)
-    , _sink(std::move(sink)) {
+    , _sink(std::move(sink))
+    // Thresholds are read once here, as mx does: they are what
+    // get_large_data_stat() reports next to the max, so a threshold changed
+    // mid-write would make the recorded aggregate self-inconsistent.
+    , _partition_size_entry(large_data_stats_entry{
+            .threshold = sst.get_large_data_handler().get_partition_threshold_bytes()})
+    , _rows_in_partition_entry(large_data_stats_entry{
+            .threshold = sst.get_large_data_handler().get_rows_count_threshold()})
+    , _row_size_entry(large_data_stats_entry{
+            .threshold = sst.get_large_data_handler().get_row_threshold_bytes()})
+    , _cell_size_entry(large_data_stats_entry{
+            .threshold = sst.get_large_data_handler().get_cell_threshold_bytes()})
+    , _elements_in_collection_entry(large_data_stats_entry{
+            .threshold = sst.get_large_data_handler().get_collection_elements_count_threshold()}) {
     if (_sink) {
         return;   // unit-test path: no sstable components at all
     }
@@ -1051,8 +1066,50 @@ void pq_writer_impl::collect_atomic_cell(const atomic_cell_view& cell) {
     }
 }
 
-void pq_writer_impl::collect_cell(const column_definition& cdef,
-                                  const atomic_cell_or_collection& acoc) {
+// The cell's own serialised form: flags, timestamp, then either expiry+ttl or a
+// local deletion time, then the value bytes. This is the encoding-independent
+// "how much content is this cell" number that stands in for mx's on-disk cell
+// extent -- see the note in writer_impl.hh on why a Parquet cell has no extent.
+uint64_t pq_writer_impl::cell_logical_size(const atomic_cell_view& cell) {
+    return cell.serialize().size_bytes();
+}
+
+// A collection is reported as a whole, like mx does: the collection-wide
+// tombstone plus every element's path and cell.
+uint64_t pq_writer_impl::collection_logical_size(collection_mutation_view cmv) {
+    uint64_t n = 0;
+    if (cmv.tomb()) {
+        n += sizeof(api::timestamp_type) + sizeof(int32_t);
+    }
+    for (auto&& kv : cmv) {
+        n += kv.first.size_bytes() + cell_logical_size(kv.second);
+    }
+    return n;
+}
+
+// Row-level metadata: the marker (which is what makes a row with no live cells
+// exist at all) and the two halves of the row tombstone. The partition
+// tombstone is charged to the partition, not to every row it is replayed onto.
+uint64_t pq_writer_impl::row_metadata_logical_size(const clustering_row& cr) {
+    uint64_t n = 0;
+    if (!cr.marker().is_missing()) {
+        n += sizeof(api::timestamp_type);
+        if (cr.marker().is_expiring()) {
+            n += 2 * sizeof(int32_t);   // ttl + expiry
+        }
+    }
+    if (cr.tomb().tomb()) {
+        n += sizeof(api::timestamp_type) + sizeof(int32_t);
+    }
+    if (cr.tomb().regular()) {
+        n += sizeof(api::timestamp_type) + sizeof(int32_t);
+    }
+    return n;
+}
+
+uint64_t pq_writer_impl::collect_cell(const column_definition& cdef,
+                                  const atomic_cell_or_collection& acoc,
+                                  const clustering_key_prefix* clustering_key) {
     if (!cdef.is_atomic()) {
         // A non-frozen collection counts as one column and one cell per element,
         // and carries its own collection-wide tombstone.
@@ -1063,17 +1120,134 @@ void pq_writer_impl::collect_cell(const column_definition& cdef,
             ++_c_stats.cells_count;
         }
         ++_c_stats.column_count;
-        return;
+        auto size = collection_logical_size(cmv);
+        maybe_record_large_cells(clustering_key, cdef, size, cmv.size());
+        return size;
     }
-    collect_atomic_cell(acoc.as_atomic_cell(cdef));
+    auto cell = acoc.as_atomic_cell(cdef);
+    collect_atomic_cell(cell);
     ++_c_stats.cells_count;
     ++_c_stats.column_count;
+    auto size = cell_logical_size(cell);
+    maybe_record_large_cells(clustering_key, cdef, size, 0);
+    return size;
 }
 
-void pq_writer_impl::collect_cells(const ::row& cells, ::column_kind kind) {
+uint64_t pq_writer_impl::collect_cells(const ::row& cells, ::column_kind kind,
+                                       const clustering_key_prefix* clustering_key) {
+    uint64_t total = 0;
     cells.for_each_cell([&] (column_id id, const atomic_cell_or_collection& acoc) {
-        collect_cell(_schema.column_at(kind, id), acoc);
+        total += collect_cell(_schema.column_at(kind, id), acoc, clustering_key);
     });
+    return total;
+}
+
+// The three recorders below mirror sstables/mx/writer.cc one for one: update the
+// aggregate's max, ask the handler (which counts above-threshold occurrences and
+// writes the system table row), and on a hit push a record into the bounded
+// top-N heap for this type.
+//
+// `_sink` is the unit-test route with no sstable behind it; there is no handler
+// to report to and nothing will ever read the metadata.
+
+void pq_writer_impl::maybe_record_large_partitions(uint64_t partition_size, uint64_t rows,
+        uint64_t range_tombstones, uint64_t dead_rows) {
+    if (_sink || !_partition_key) {
+        return;
+    }
+    auto& size_entry = _partition_size_entry;
+    auto& row_count_entry = _rows_in_partition_entry;
+    size_entry.max_value = std::max(size_entry.max_value, partition_size);
+    row_count_entry.max_value = std::max(row_count_entry.max_value, rows);
+    auto ret = _sst.get_large_data_handler().maybe_record_large_partitions(
+            _sst, *_partition_key, partition_size, rows, range_tombstones, dead_rows).get();
+    size_entry.above_threshold += unsigned(bool(ret.size));
+    row_count_entry.above_threshold += unsigned(bool(ret.elements));
+
+    if (!ret.size && !ret.elements) {
+        return;
+    }
+    const auto& pk_bytes = _partition_key->get_bytes();
+    auto make = [&] (large_data_type type) {
+        return large_data_record{
+            .type = type,
+            .partition_key = disk_string<uint32_t>{bytes(pk_bytes)},
+            .clustering_key = disk_string<uint32_t>{bytes()},
+            .column_name = disk_string<uint32_t>{bytes()},
+            .value = partition_size,
+            .elements_count = rows,
+            .range_tombstones = range_tombstones,
+            .dead_rows = dead_rows,
+        };
+    };
+    if (ret.size) {
+        insert_into_ld_heap(_ld_partition_size_records, make(large_data_type::partition_size));
+    }
+    if (ret.elements) {
+        insert_into_ld_heap(_ld_rows_in_partition_records, make(large_data_type::rows_in_partition));
+    }
+}
+
+void pq_writer_impl::maybe_record_large_rows(const clustering_key_prefix* clustering_key,
+        uint64_t row_size) {
+    if (_sink || !_partition_key) {
+        return;
+    }
+    auto& entry = _row_size_entry;
+    entry.max_value = std::max(entry.max_value, row_size);
+    if (!_sst.get_large_data_handler().maybe_record_large_rows(
+                _sst, *_partition_key, clustering_key, row_size).get()) {
+        return;
+    }
+    ++entry.above_threshold;
+    const auto& pk_bytes = _partition_key->get_bytes();
+    auto ck_bytes = clustering_key ? clustering_key->view().representation().linearize() : bytes();
+    insert_into_ld_heap(_ld_row_size_records, large_data_record{
+        .type = large_data_type::row_size,
+        .partition_key = disk_string<uint32_t>{bytes(pk_bytes)},
+        .clustering_key = disk_string<uint32_t>{std::move(ck_bytes)},
+        .column_name = disk_string<uint32_t>{bytes()},
+        .value = row_size,
+    });
+}
+
+void pq_writer_impl::maybe_record_large_cells(const clustering_key_prefix* clustering_key,
+        const column_definition& cdef, uint64_t cell_size, uint64_t collection_elements) {
+    if (_sink || !_partition_key) {
+        return;
+    }
+    auto& cell_size_entry = _cell_size_entry;
+    cell_size_entry.max_value = std::max(cell_size_entry.max_value, cell_size);
+    auto& collection_elements_entry = _elements_in_collection_entry;
+    collection_elements_entry.max_value =
+            std::max(collection_elements_entry.max_value, collection_elements);
+    auto ret = _sst.get_large_data_handler().maybe_record_large_cells(
+            _sst, *_partition_key, clustering_key, cdef, cell_size, collection_elements).get();
+    cell_size_entry.above_threshold += unsigned(bool(ret.size));
+    collection_elements_entry.above_threshold += unsigned(bool(ret.elements));
+
+    if (!ret.size && !ret.elements) {
+        return;
+    }
+    const auto& pk_bytes = _partition_key->get_bytes();
+    auto ck_bytes = clustering_key ? clustering_key->view().representation().linearize() : bytes();
+    auto make = [&] (large_data_type type) {
+        return large_data_record{
+            .type = type,
+            .partition_key = disk_string<uint32_t>{bytes(pk_bytes)},
+            .clustering_key = disk_string<uint32_t>{bytes(ck_bytes)},
+            .column_name = disk_string<uint32_t>{to_bytes(cdef.name_as_text())},
+            .value = cell_size,
+            .elements_count = collection_elements,
+        };
+    };
+    if (ret.size) {
+        insert_into_ld_heap(_ld_cell_size_records, make(large_data_type::cell_size));
+    }
+    if (ret.elements) {
+        insert_into_ld_heap(_ld_elements_in_collection_records,
+                            make(large_data_type::elements_in_collection));
+    }
 }
 
 void pq_writer_impl::collect_marker(const row_marker& marker) {
@@ -1176,6 +1350,15 @@ void pq_writer_impl::consume_new_partition(const dht::decorated_key& dk) {
     _shredder.new_partition(dk);
     _partition_first_row = _rows_flushed + _shredder.size();
 
+    // Kept for the whole partition: every large-data record carries the binary
+    // partition key, and it is the key the handler writes into the system table.
+    // Held here rather than reused from _last_key because _last_key is only
+    // populated when there is an Index component.
+    _partition_key = key::from_partition_key(_schema, dk.key());
+    // The key itself is content in a Parquet file: the shredder writes it into
+    // the key columns of every row of the partition. Charged once.
+    _partition_logical_size = _partition_key->get_bytes().size();
+
     if (_index_writer) {
         auto pk = key::from_partition_key(_schema, dk.key());
         // The filter and the min/max key statistics are fed per partition, as
@@ -1208,6 +1391,9 @@ void pq_writer_impl::consume(tombstone t) {
     if (t) {
         _shredder.set_partition_tombstone(t);
         _c_stats.update(t);
+        // Replayed onto every row of the partition, so charged to the partition
+        // once rather than to each row -- same reasoning as static cells.
+        _partition_logical_size += sizeof(api::timestamp_type) + sizeof(int32_t);
         // A partition tombstone spans the whole clustering range, so it widens the
         // min/max clustering key to both sentinels -- exactly what mx records.
         _collector.update_min_max_components(
@@ -1218,7 +1404,15 @@ void pq_writer_impl::consume(tombstone t) {
 }
 
 stop_iteration pq_writer_impl::consume(static_row&& sr) {
-    collect_cells(sr.cells(), ::column_kind::static_column);
+    // Static cells are reported as cells (with a null clustering key, as mx does
+    // from its static row) but charged to the partition, not to any row: the
+    // shredder replays them onto every storage row, and charging them per row
+    // would report a partition of small rows as a partition of large rows.
+    //
+    // There is deliberately no maybe_record_large_rows() call here. A Parquet
+    // file has no static row -- see the note in writer_impl.hh -- so reporting
+    // one would be inventing a row that is not in the file.
+    _partition_logical_size += collect_cells(sr.cells(), ::column_kind::static_column, nullptr);
     _shredder.add_static_row(sr);
     return stop_iteration::no;
 }
@@ -1228,11 +1422,15 @@ stop_iteration pq_writer_impl::consume(clustering_row&& cr) {
     collect_marker(cr.marker());
     _c_stats.update(cr.tomb().regular());
     _c_stats.update(cr.tomb().tomb());
-    collect_cells(cr.cells(), ::column_kind::regular_column);
+    uint64_t row_size = cr.key().representation().size()
+            + row_metadata_logical_size(cr)
+            + collect_cells(cr.cells(), ::column_kind::regular_column, &cr.key());
     ++_c_stats.rows_count;
     if (cr.tomb()) {
         ++_c_stats.dead_rows_count;
     }
+    maybe_record_large_rows(&cr.key(), row_size);
+    _partition_logical_size += row_size;
     _shredder.add_clustering_row(cr);
     return stop_iteration::no;
 }
@@ -1244,19 +1442,36 @@ stop_iteration pq_writer_impl::consume(range_tombstone_change&& rtc) {
     // because on its side the marker occupies a row slot in the data file.
     ++_c_stats.rows_count;
     ++_c_stats.range_tombstones_count;
+    // A marker occupies a storage row, so its bound and tombstone are part of the
+    // partition's volume. mx does not emit a row_size record for a marker either
+    // (see collect_range_tombstone_stats), so neither do we: "large row" means a
+    // row with data in it.
+    _partition_logical_size += (rtc.position().has_key()
+            ? rtc.position().key().representation().size() : 0)
+            + sizeof(int32_t) * 2   // bound weight + region
+            + (rtc.tombstone() ? sizeof(api::timestamp_type) + sizeof(int32_t) : 0);
     _shredder.add_range_tombstone_change(rtc);
     return stop_iteration::no;
 }
 
 stop_iteration pq_writer_impl::consume_end_of_partition() {
     _shredder.end_partition();
-    // Byte offsets are not available per partition here: the whole Parquet image is
-    // encoded once at end of stream, so a partition has no start offset or on-disk
-    // length while it is being consumed. Everything else in column_stats is exact;
-    // partition_size stays 0, which only affects the estimated-partition-size
-    // histogram, not any GC decision.
+    // Reported before column_stats is drained into the collector, because it is
+    // where the row and tombstone counts live.
+    //
+    // The size here is the partition's *logical* volume, not its on-disk length:
+    // byte offsets do not exist per partition, since the Parquet image is encoded
+    // once at end of stream. See the note in writer_impl.hh.
+    maybe_record_large_partitions(_partition_logical_size, _c_stats.rows_count,
+            _c_stats.range_tombstones_count, _c_stats.dead_rows_count);
+    // column_stats::partition_size still stays 0 for the same byte-offset reason.
+    // It only feeds the estimated-partition-size histogram, not any GC decision,
+    // and is deliberately left alone rather than fed the logical size: the
+    // histogram is consumed as on-disk bytes.
     _collector.update(std::move(_c_stats));
     _c_stats.reset();
+    _partition_key.reset();
+    _partition_logical_size = 0;
     // A partition boundary is the only place a cut is allowed, so this is where the
     // budget is checked.
     if (_shredder.buffered_bytes() >= _pcfg.row_group_buffer_bytes ||
@@ -1353,8 +1568,46 @@ void pq_writer_impl::write_components() {
     _sst.write_summary();
     _sst.write_filter();
     _sst.write_statistics();
+    // Large-data metadata. Passing nullopt here -- which this did until B1 was
+    // closed -- leaves system.large_partitions / large_rows / large_cells silently
+    // empty for every `pq` table, which is worse than a visible gap: the table
+    // looks healthy.
+    std::optional<scylla_metadata::large_data_stats> ld_stats(scylla_metadata::large_data_stats{
+        .map = {
+            { large_data_type::partition_size, std::move(_partition_size_entry) },
+            { large_data_type::rows_in_partition, std::move(_rows_in_partition_entry) },
+            { large_data_type::row_size, std::move(_row_size_entry) },
+            { large_data_type::cell_size, std::move(_cell_size_entry) },
+            { large_data_type::elements_in_collection, std::move(_elements_in_collection_entry) },
+        }
+    });
+    // Not merely reporting: compaction/compaction.cc reads min_live_timestamp to
+    // decide what a tombstone may purge, and falls back to the (more
+    // conservative, so safe but coarser) min_timestamp when it is absent.
+    std::optional<scylla_metadata::ext_timestamp_stats> ts_stats(scylla_metadata::ext_timestamp_stats{
+        .map = _collector.get_ext_timestamp_stats()
+    });
+    // Drain all per-type min-heaps into a single large_data_records array.
+    std::optional<scylla_metadata::large_data_records> ld_records;
+    {
+        utils::chunked_vector<large_data_record> records;
+        auto drain = [&records] (auto& heap) {
+            while (!heap.empty()) {
+                records.push_back(std::move(const_cast<large_data_record&>(heap.top())));
+                heap.pop();
+            }
+        };
+        drain(_ld_partition_size_records);
+        drain(_ld_rows_in_partition_records);
+        drain(_ld_row_size_records);
+        drain(_ld_cell_size_records);
+        drain(_ld_elements_in_collection_records);
+        if (!records.empty()) {
+            ld_records = scylla_metadata::large_data_records{.elements = std::move(records)};
+        }
+    }
     _sst.write_scylla_metadata(this_shard_id(), run_identifier{_cfg.run_identifier},
-                               std::nullopt, std::nullopt, std::nullopt);
+                               std::move(ld_stats), std::move(ts_stats), std::move(ld_records));
     if (!_cfg.leave_unsealed) {
         _sst.seal_sstable(_cfg.backup).get();
     }

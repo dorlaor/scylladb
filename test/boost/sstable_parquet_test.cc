@@ -4151,6 +4151,186 @@ SEASTAR_THREAD_TEST_CASE(test_pq_records_a_compression_ratio) {
     }).get();
 }
 
+namespace {
+// Records nothing (the system-table write is not what is under test) but keeps the
+// real threshold logic and the above-threshold counters of the base class.
+class ld_threshold_handler : public db::large_data_handler {
+public:
+    ld_threshold_handler(uint64_t partition_bytes, uint64_t row_bytes, uint64_t cell_bytes,
+                         uint64_t rows_count, uint64_t collection_elements)
+        : large_data_handler(partition_bytes, row_bytes, cell_bytes, rows_count,
+                             collection_elements) {
+        start();
+    }
+protected:
+    future<> record_large_cells(const sstables::sstable&, const sstables::key&,
+            const clustering_key_prefix*, const column_definition&, uint64_t, uint64_t) const override {
+        return make_ready_future<>();
+    }
+    future<> record_large_rows(const sstables::sstable&, const sstables::key&,
+            const clustering_key_prefix*, uint64_t) const override {
+        return make_ready_future<>();
+    }
+    future<> record_large_partitions(const sstables::sstable&, const sstables::key&,
+            uint64_t, uint64_t, uint64_t, uint64_t) const override {
+        return make_ready_future<>();
+    }
+    future<> delete_large_data_entries(const schema&, sstring, std::string_view) const override {
+        return make_ready_future<>();
+    }
+    future<> update_large_data_entries_sstable_name(const schema&, sstring, sstring,
+            std::string_view) const override {
+        return make_ready_future<>();
+    }
+};
+}
+
+// Large-data metadata (GA blocker B1). The pq writer used to pass std::nullopt for all three
+// large-data arguments of write_scylla_metadata(), so system.large_partitions / large_rows /
+// large_cells were silently empty for every pq table.
+//
+// Two things are pinned here that the tests in sstable_3_x_test.cc do not reach.
+//
+// First, both write paths. An sstable is written either by cut_row_group() once it outgrows the
+// row-group budget or by write_rows() in one shot when it fits; the choice is a function of data
+// size and invisible to the operator, and that divergence has produced separate bugs here before
+// (design doc 8.2b, 10.15). The accounting deliberately lives in the fragment consumers, upstream
+// of both encoders, so identical data must yield *byte-identical* records on the two paths -- which
+// is what this asserts, rather than merely asserting each path produces something.
+//
+// Second, ext_timestamp_stats. Nothing else in the suite reads it back for pq, and its absence
+// degrades safely (compaction/compaction.cc falls back to min_timestamp, so purging stays
+// conservative) -- which is exactly why a silent regression there would go unnoticed.
+SEASTAR_THREAD_TEST_CASE(test_pq_large_data_metadata_on_both_write_paths) {
+    // Row threshold low enough that the padded rows trip it, cell threshold likewise;
+    // partition threshold low enough that every partition is recorded.
+    ld_threshold_handler handler(1024, 512, 256,
+            std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+
+    sstables::test_env::do_with_async([&] (sstables::test_env& env) {
+        auto build = [] (const char* name, std::optional<int> rows_per_rg) {
+            auto sb = schema_builder(1, "ks", name)
+                .with_column("pk", utf8_type, column_kind::partition_key)
+                .with_column("ck", int32_type, column_kind::clustering_key)
+                .with_column("v_txt", utf8_type);
+            if (rows_per_rg) {
+                sb.set_parquet_options({{"rows_per_row_group", format("{}", *rows_per_rg)}});
+            }
+            return sb.build();
+        };
+        // Same shape and same data; only the row-group budget differs, and that is what selects
+        // the write path. 1 000 is the minimum the option accepts.
+        auto s_cut   = build("pq_ld_cut", 1000);
+        auto s_whole = build("pq_ld_whole", std::nullopt);
+
+        // 3 000 rows: three row groups under a 1 000-row budget, one under the 5 000 default.
+        constexpr int PARTS = 150, ROWS = 20;
+        // Fixed timestamps, so min_live_timestamp is a value this test can name.
+        constexpr api::timestamp_type TS_BASE = 1700000000000000;
+        const auto expected_min_live_ts = TS_BASE;
+
+        auto make_muts = [&] (const schema_ptr& s) {
+            const auto& vt = *s->get_column_definition(to_bytes("v_txt"));
+            utils::chunked_vector<mutation> muts;
+            muts.reserve(PARTS);
+            for (int p = 0; p < PARTS; ++p) {
+                auto pk = partition_key::from_single_value(
+                        *s, utf8_type->decompose(sstring(format("key{:06d}", p))));
+                mutation m(s, pk);
+                for (int r = 0; r < ROWS; ++r) {
+                    auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+                    // Row 0 of every partition carries a large value, the rest are small, so the
+                    // top-N heaps have something to rank and the row/cell thresholds are crossed
+                    // by a knowable subset.
+                    sstring val = r == 0 ? sstring(600 + p, 'x') : sstring(format("v{}", r));
+                    m.set_clustered_cell(ck, vt, atomic_cell::make_live(
+                            *utf8_type, TS_BASE + p * 100 + r, utf8_type->decompose(val)));
+                }
+                muts.push_back(std::move(m));
+            }
+            std::sort(muts.begin(), muts.end(), [] (const mutation& a, const mutation& b) {
+                return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
+            });
+            return muts;
+        };
+
+        auto sst_cut = make_sstable_containing(
+                env.make_sstable(s_cut, sstable_version_types::pq), make_muts(s_cut)).get();
+        auto sst_whole = make_sstable_containing(
+                env.make_sstable(s_whole, sstable_version_types::pq), make_muts(s_whole)).get();
+
+        // Confirm the two really did take different paths. Without this the comparison below
+        // could be two runs of the same encoder and would prove nothing.
+        auto row_groups = [&] (const shared_sstable& sst) {
+            const uint64_t len = sst->ondisk_data_size();
+            auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+            std::vector<uint8_t> img(buf.get(), buf.get() + buf.size());
+            return sstables::parquet::format::parse_footer(img).row_groups.size();
+        };
+        BOOST_REQUIRE_GT(row_groups(sst_cut), 1u);
+        BOOST_REQUIRE_EQUAL(row_groups(sst_whole), 1u);
+
+        for (const auto& [what, sst] : {std::pair<const char*, shared_sstable>{"cut", sst_cut},
+                                        std::pair<const char*, shared_sstable>{"whole", sst_whole}}) {
+            BOOST_TEST_CONTEXT(what) {
+                // Already opened by make_sstable_containing(), so the metadata below is loaded.
+                // large_data_records: what backs the three virtual tables.
+                auto& records_opt = sst->get_large_data_records();
+                BOOST_REQUIRE(records_opt.has_value());
+                std::map<sstables::large_data_type, unsigned> by_type;
+                for (const auto& rec : records_opt->elements) {
+                    ++by_type[rec.type];
+                    BOOST_REQUIRE_GT(rec.value, 0u);
+                    BOOST_REQUIRE(!rec.partition_key.value.empty());
+                }
+                BOOST_REQUIRE_GT(by_type[sstables::large_data_type::partition_size], 0u);
+                BOOST_REQUIRE_GT(by_type[sstables::large_data_type::row_size], 0u);
+                BOOST_REQUIRE_GT(by_type[sstables::large_data_type::cell_size], 0u);
+
+                // large_data_stats: the aggregate, and the legacy fallback the virtual tables
+                // use for an sstable without records.
+                for (auto t : {sstables::large_data_type::partition_size,
+                               sstables::large_data_type::row_size,
+                               sstables::large_data_type::cell_size}) {
+                    auto stat = sst->get_large_data_stat(t);
+                    BOOST_REQUIRE(stat.has_value());
+                    BOOST_REQUIRE_GT(stat->max_value, 0u);
+                    BOOST_REQUIRE_GT(stat->above_threshold, 0u);
+                }
+
+                // ext_timestamp_stats: read by compaction to bound what a tombstone may purge.
+                auto ts_stats = sst->get_ext_timestamp_stats();
+                auto it = ts_stats.find(sstables::ext_timestamp_stats_type::min_live_timestamp);
+                BOOST_REQUIRE(it != ts_stats.end());
+                BOOST_REQUIRE_EQUAL(it->second, expected_min_live_ts);
+            }
+        }
+
+        // The point of doing both: identical input must produce identical accounting, because the
+        // accounting happens before either encoder sees the rows.
+        auto canonical = [] (const shared_sstable& sst) {
+            std::vector<std::tuple<uint32_t, bytes, bytes, bytes, uint64_t, uint64_t>> v;
+            for (const auto& rec : sst->get_large_data_records()->elements) {
+                v.emplace_back(static_cast<uint32_t>(rec.type), rec.partition_key.value,
+                               rec.clustering_key.value, rec.column_name.value,
+                               rec.value, rec.elements_count);
+            }
+            std::sort(v.begin(), v.end());
+            return v;
+        };
+        BOOST_REQUIRE(canonical(sst_cut) == canonical(sst_whole));
+
+        for (auto t : {sstables::large_data_type::partition_size,
+                       sstables::large_data_type::row_size,
+                       sstables::large_data_type::cell_size}) {
+            BOOST_REQUIRE_EQUAL(sst_cut->get_large_data_stat(t)->max_value,
+                                sst_whole->get_large_data_stat(t)->max_value);
+            BOOST_REQUIRE_EQUAL(sst_cut->get_large_data_stat(t)->above_threshold,
+                                sst_whole->get_large_data_stat(t)->above_threshold);
+        }
+    }, { &handler }).get();
+}
+
 // A counter column's map values are two big-endian int64s, not an opaque blob, and the Parquet
 // schema cannot say so without a group inside the MAP value -- a third level of Dremel nesting,
 // which is a schema change and not yet done. Until then the footer declares the convention, so a
