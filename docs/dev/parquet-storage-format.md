@@ -481,6 +481,88 @@ annotations for the rest; `decimal`, `varint`, `inet`, `duration`, `date`, `time
 `INT64`/`FIXED_LEN_BYTE_ARRAY`. Frozen collections and UDTs are opaque `BYTE_ARRAY` in
 v1 (they already are, internally); non-frozen collections use Dremel `repeated` groups.
 
+### 5.3a The complete leaf inventory — added 2026-08-22
+
+§5.3 explains the folding levels but names only the leaves folding is *about*. Four groups it
+never mentions — row tombstones, partition tombstones, range-tombstone changes and the no-clustering-key
+flag — carry the rest of Scylla's storage model, and until this section they appeared nowhere in this
+document: `__rt_ts`, `__rtr_ts` and `__pt_ts` had **zero** occurrences. Written from
+`sstables/parquet/schema_mapping.cc` rather than from recollection, because the leaf set changed
+three times in the week to 2026-08-22 (the sparse `__tsx` channel, the folded deletion channel, the
+counter `clock` leaf).
+
+**Nothing here is unconditional except `__ts`.** Every group below is materialised only if some row
+in the file needs it, so a table that never deletes carries no deletion machinery at all. That is
+not a micro-optimisation: an always-present leaf costs page headers, statistics and a dictionary
+page per row group even when empty, and paying that per column is most of why L0 costs 6.63× L1 on
+a 197-column table (§10.3).
+
+| Group | Leaves | Type / repetition | Materialised when |
+|---|---|---|---|
+| Key | one per partition- and clustering-key component, in key order | per CQL type, `required` | always |
+| Values | one per scalar column; a 5-leaf `MAP` group per non-frozen collection | per CQL type, `optional` | always |
+| Write time | `__ts` | `int64` `required` | always at L1 |
+| Timestamp exceptions | `__tsx_mask`, `__tsx_vals` | `byte_array` `optional` | a row's cells disagree on write time (§10.3c) |
+| TTL | `__ttl_<col>` | `int32` `optional` | any cell has a TTL |
+| Live expiry | `__ldt_<col>` | `int32` `optional` | any live cell has an expiry |
+| Deletion channel | `__ldt`, `__dmask`, `__ldtx_mask`, `__ldtx_vals` | `int32` / `byte_array`, `optional` | any cell is dead (§10.28) |
+| Row marker | `__rm`, `__rm_ttl`, `__rm_ldt` | `int64` / `int32` `optional` | any row has a marker |
+| Row tombstone | `__rt_ts`, `__rt_ldt` (shadowable) and `__rtr_ts`, `__rtr_ldt` (regular) | `int64` / `int32` `optional` | any row is deleted |
+| Range tombstone | `__rtc_w`, `__rtc_reg`, `__rtc_len`, `__rtc_ts`, `__rtc_ldt` | `int32` except `__rtc_ts` `int64`, `optional` | the file carries a range-tombstone change |
+| Partition tombstone | `__pt_ts`, `__pt_ldt` | `int64` / `int32` `optional` | any partition is deleted |
+| No clustering key | `__no_ck` | `int32` `optional` | a row exists with no clustering key |
+
+**The row tombstone is two tombstones.** `__rt_*` is the shadowable half and `__rtr_*` the regular
+one. They are usually equal, so the second compresses to nearly nothing — but not always, and a
+reader that assumed one would lose the distinction an `UPDATE`-created marker depends on.
+
+**A range tombstone is stored as a row, and presence rather than value is what marks it.** A
+range-tombstone change is neither a value nor a row: it is a change of deletion state at a position
+in the clustering order. It occupies a Parquet row whose clustering-key leaves carry the *bound's
+prefix*, with `__rtc_len` saying how many components of that prefix are significant, `__rtc_w` the
+bound weight (−1 / 0 / +1) and `__rtc_reg` the region of the position in partition. **`__rtc_w`'s
+presence is the marker**, because the weight is legitimately `0` for an exact bound — so a scheme
+that inferred "is this a range tombstone" from a value rather than a definition level would misread
+an exact bound at a partition start. This is the same class of mistake as reading dead-vs-absent off
+a value leaf's definition level (§10.28), and keeping bounds in clustering order alongside the rows
+they affect is what lets a reader stream both in one pass instead of reconciling two sequences.
+
+**Why a deleted-empty partition still occupies a row.** `__pt_*` is set on the rows of the affected
+partition, so a partition tombstone with no surviving rows needs a row to carry it — it appears in
+the file as a row whose value leaves are all null. `__no_ck` exists for the same reason in reverse:
+"every clustering component is null" cannot otherwise be told from a row whose key genuinely is
+empty, which is the static-only and no-clustering-key case.
+
+#### Collections: the one place the two formats disagree structurally
+
+Not previously recorded here, and the difference is architectural rather than an encoding choice. A
+non-frozen collection is many cells sharing one column; the row format keeps them **inside the
+row**, Parquet **hoists them into columns of their own**.
+
+| | SSTable (`me`/`mx`) | Parquet (`pq`) |
+|---|---|---|
+| Element identity | a **cell path** written inline per cell — a varint length then the path bytes (`sstables/mx/writer.cc:1333`), repeated for every element of every row | a `key` leaf in a `MAP` group: all element keys of all rows share one chunk, dictionary-encoded |
+| Element value | a cell in the row's cell stream | a `value` leaf, `optional` |
+| Per-element metadata | each cell carries its own timestamp, TTL and deletion time, interleaved with the value | three leaves — `__ts` `required`, `__ttl`, `__ldt` — each its own column chunk |
+| Counters | an opaque packed blob per shard | `value` **and** `clock` as two `INT64` leaves, so the count and its logical clock are readable by any Parquet reader rather than only by something that knows Scylla's packing (§5.2). `clock` is *appended* after `__ldt`, not placed beside `value`, so the `vcol+N` offsets the shred and reassemble paths use keep their meaning |
+| Whole-collection delete | a complex-column deletion ahead of the elements | the collection's own tombstone, inside the group |
+| Frozen collection | one atomic cell | one scalar leaf — an opaque blob, indistinguishable from any other value |
+
+The trade: a 20-element map writes 5 column chunks instead of 20 interleaved cell paths per row, and
+element keys repeated across rows collapse into one dictionary. The cost is nesting — repetition and
+definition levels must now encode *which element of which row*, and the element count varies per
+row. **That variability is exactly why the deletion-channel fold does not extend to collections**
+(§10.28): `__dmask` indexes regular columns and a collection column never sets its bit, and there is
+no row-level leaf for a per-element `__ldt` to fold into.
+
+One consequence nobody predicted, recorded because it constrains an unrelated feature: because the
+`MAP` group's leaves are named `key`, `value`, `__ts`, `__ttl`, `__ldt`, **a collection owns no leaf
+bearing its own column name**, and a *scalar* column called `key` or `value` shares its leaf name
+with every collection in the table. Per-column encryption keys are resolved by leaf name
+(`path.back()`), so those columns are rejected as key targets **even when the table has no
+collection today** — an `ALTER … ADD` could introduce one later and silently widen an accepted key
+to cover it, which is a security change arriving through unrelated DDL.
+
 ### 5.4 Ordering and random access
 
 **Index design — decided 2026-08-16.** Scylla's index has two jobs, and Parquet answers
@@ -2732,6 +2814,98 @@ process boundary — a tombstone and a four-file `pq` merge re-read from footers
 previous process — and that has no cheap single-line falsifier.
 
 ---
+
+### 9.7 What the tests taught us — the false-green taxonomy, added 2026-08-22
+
+The individual findings are in §9.6–§9.6d, §10.17a and §10.28. This section exists because the
+*pattern* across them is more transferable than any one bug, and because it was only visible once
+they were listed together. It is written for whoever adds the next test here.
+
+**Seven defects were found on 2026-08-21/22. Every one lived in a path that had no end-to-end test.
+In three, the system's own self-healing hid the symptom.**
+
+| Defect | Class | Why it survived |
+|---|---|---|
+| Bit-packing accumulator dropped bits past 63, corrupting `bigint`/`timestamp` **key** columns | data loss | nothing had ever pointed randomly generated schemas at `pq` (§9.6b) |
+| Non-frozen UDT threw `std::bad_cast` on **every** read of a `pq` sstable holding one | total failure | a reference `dynamic_cast` to `collection_type_impl` on a type that is multi-cell but derives from `tuple_type_impl` |
+| Encrypted range scans deadlocked against their own key lookup | unusable feature | **nothing in the tree had ever read an encrypted `pq` sstable** (§10.17a) |
+| Boot-path reshape-on-load ignored `storage_format` | wrong format on disk | the decision lived in a class local to `distributed_loader.cc` with no test seam |
+| `nodetool refresh` ignored `storage_format`, for **explicit** `'parquet'` too | wrong format on disk | the doc's write-path table had one row for what is two call sites using two different accessors |
+| Writer emitted no large-data metadata, so `system.large_*` was silently empty | blind operator | its five failing tests were dismissed as "pre-existing failures" and never read (§11.1 B1) |
+| Promoted-index reader dereferenced a null index on `pq` | segfault masking 13 cases | a crash reads as "not run", never as "failed" |
+
+#### The self-healing that hid three of them
+
+Worth stating separately, because each defeats the obvious test:
+
+- **Off-strategy compaction** repairs a wrong-format streamed sstable before anything can observe
+  it, so a build whose streaming creator ignored `storage_format` entirely still *passes* a
+  bootstrap test. The multi-node repair case has to disable autocompaction on the receiving node,
+  or whether it sees repair's file or compaction's replacement is a race that **flakes green**
+  (§9.6d).
+- **The reader permit's TTL** breaks the encrypted-scan deadlock at `range_request_timeout_in_ms`,
+  turning a true deadlock into a "slow query" — and the lab's deliberately non-stock 300 000 ms
+  turned a broken feature into an apparent hang. Retries after the timeout return in 0.0 s,
+  because the queued lookup is then admitted and the key cached (§10.17a).
+- **`tombstone_gc` mode `repair` at RF=1** purges the tombstones a size measurement meant to
+  measure, short-circuiting `gc_before` to now so `gc_grace_seconds` is never consulted (§10.18).
+
+#### False greens, and how each was caught
+
+Every one of these was, at some point, a passing test:
+
+1. **Arguments in the wrong position.** `./build/dev/test/boost/<t> --smp 1` exits **200** with zero
+   cases run; seastar args need `-- --smp 1`. Boost also prints `*** No errors detected` when a
+   filter matches **nothing**, and an abbreviated `./test.py` selector collects 0 items (exit 5).
+   *Caught by grepping for the case count, never for the success string.*
+2. **A stub that is too obliging.** The deadlock regression test's stub key source returns one key
+   for every request — which made per-column keys look implemented. The per-column tests needed a
+   stub returning a *different* key per option set, plus two cases through a real provider.
+3. **A merge that never happened.** Dead-vs-absent is indistinguishable unless something merges: a
+   live write and its tombstone in one memtable collapse before reaching a file, so the test passes
+   even with `dead` folded into `absent`. Fixed by flushing between them *and* asserting ≥2 Data
+   components exist, so the merge cannot silently stop.
+4. **An operation that declines to run.** STCS strict reshape does no work below
+   `max(min_compaction_threshold, 4)` and simply *adopts* the files, and a format can only be got
+   wrong on a write — so a one- or two-sstable reshape test passes with the bug present. The test
+   stages four and guards on `loaded < 4`, so a moved threshold reports "setup went stale" rather
+   than "product regressed".
+5. **A sweep that exercises nothing.** A bit-width sweep stepping values by `2^(w-1)` yields uniform
+   deltas, `min_delta` absorbs the magnitude, and every iteration exercises a residual width of ~0.
+   That version reported "all ok" against the broken codec. What matters is `max_delta - min_delta`
+   *within one miniblock*.
+6. **An assertion that cannot fail.** Three were found. A relative-tolerance ratio comparison
+   (`pytest.approx(rel=2.0)` admits everything down to zero) and an explicit `[full/3, full*3]` band
+   both passed against a build with the per-row normalisation deliberately re-broken; the `cost`
+   subcommand returns 0 unconditionally. All three were **dropped rather than widened**.
+7. **A control that accepts the wrong outcome.** `not read_ok(...)` returns false for an exception,
+   an empty result *and* wrong data alike — so a silent empty result, the serious finding, would
+   have printed PASS. Replaced by a classifier that passes only on a loud failure.
+8. **A harness reporting the wrong exit code.** Chaining `cmd > log; echo EXIT=$?; tail log` reports
+   the *last* element's status; it produced a reported "exit code 0" against a log reading
+   `Configuring incomplete, errors occurred!`, twice. Same shape as `run_tests.sh`, which exited 2
+   on missing fixtures with no `PARQUET SUITE:` terminator, so grepping for PASS/FAILURES matched
+   neither and "no failures" read as green on a run that executed **zero of 21 suites**.
+9. **A build-system edit nobody compiled.** `add_scylla_test(... KIND ...)` selects which framework
+   supplies `main()`, so a wrong `KIND` is a *link* error that configuring and compiling both miss.
+   Pattern-matching `parquet_writer_test` from its sibling would have been wrong — the two use
+   different frameworks.
+
+#### The two rules that follow
+
+**A test is not evidence until it has been made to fail.** Every assertion added in this period was
+verified by mutating the product and reading the failure text. That is also how the three
+unfalsifiable assertions above were found. Where a mutation is impossible — the restart case, whose
+property round-trips through the schema tables on *every* DDL, not only at boot — the doc says so
+rather than implying falsifiability it does not have (§9.6d).
+
+**Round-trip agreement is weaker evidence than it looks, in two distinct ways.** `make_sstable_containing`
+already reads back and validates every sstable it builds, so a data-*losing* bug fails at
+construction and an on-disk assertion needs a **round-trip-neutral** mutation to be proven able to
+fail. And a symmetric codec bug round-trips *losslessly*: the bit-packing defect was only visible
+because the encoder and decoder were broken **asymmetrically**. The check that catches the symmetric
+case is an independent reader — which is why pyarrow reading 254 distinct values where 20 were
+written is what ruled out the harness and proved the file itself was non-conformant (§9.6b, §9.6c).
 
 ## 10. Configuration results
 
@@ -8093,8 +8267,17 @@ Re-audited end to end on 2026-08-22 against the source and against the sections 
 of incremental patching had left rows contradicting one another. Anything that could not be
 substantiated was removed or marked unverified rather than reworded into something vaguer.
 **Project rule: every published figure comes from the `scylla` binary. Anything still model output
-says so inline.** The deck's `GA_DONE` / `GA_GAPS` in `~/pq-lab/deck_data.py` predates this audit
-and disagrees with it in several places; this section is authoritative.
+says so inline.** This section is authoritative.
+
+*Reconciled with the deck 2026-08-22.* The audit found `~/pq-lab/deck_data.py` predating it and
+disagreeing in several places; the deck now carries this verdict and these three blockers as
+`blocking` rows, and had none before — it listed five known/accepted items and nothing that stops a
+release. Two of its claims were overtaken rather than merely stale and are corrected there: per-column
+encryption keys **are** exposed through CQL (§10.17b), and key rotation **has** been exercised, though
+it stays B4 here for the reason B4 gives. In the other direction the deck's format appendix supplied
+what this document was missing — see §5.3a for the leaf inventory, the row/partition/range-tombstone
+groups that appeared nowhere here, and the collections-versus-SSTable comparison, and §9.7 for the
+false-green taxonomy.
 
 ### Verdict
 
