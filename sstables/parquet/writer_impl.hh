@@ -364,6 +364,13 @@ public:
 private:
     fragment_shredder _shredder;
     pq_writer_config  _pcfg;
+    // The shard the new sstable will BELONG to, which during resharding is not the shard doing
+    // the work: compaction runs on one shard and calls the creator once per *target* shard. mx
+    // keeps this as `_shard` for exactly this reason (mx/writer.cc:542). Passing this_shard_id()
+    // to write_scylla_metadata() instead made every resharded `pq` output claim the coordinating
+    // shard, so two of them reported the same owner and the sstable's shard set was wrong on
+    // disk -- invisible on a flush, where the two values are equal.
+    shard_id          _shard;
     encoding_stats    _enc_stats;
     sink_type         _sink;
     uint64_t          _pos = 0;

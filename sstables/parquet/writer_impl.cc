@@ -976,6 +976,7 @@ pq_writer_impl::pq_writer_impl(sstables::sstable& sst, const ::schema& s,
     : sstables::sstable_writer::writer_impl(sst, s, cfg)
     , _shredder(s)
     , _pcfg(std::move(pcfg))
+    , _shard(shard)
     , _enc_stats(enc_stats)
     , _sink(std::move(sink))
     // Thresholds are read once here, as mx does: they are what
@@ -1606,7 +1607,7 @@ void pq_writer_impl::write_components() {
             ld_records = scylla_metadata::large_data_records{.elements = std::move(records)};
         }
     }
-    _sst.write_scylla_metadata(this_shard_id(), run_identifier{_cfg.run_identifier},
+    _sst.write_scylla_metadata(_shard, run_identifier{_cfg.run_identifier},
                                std::move(ld_stats), std::move(ts_stats), std::move(ld_records));
     if (!_cfg.leave_unsealed) {
         _sst.seal_sstable(_cfg.backup).get();
