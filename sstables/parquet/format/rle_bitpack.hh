@@ -50,7 +50,15 @@ namespace sstables::parquet::format {
 // DELTA_BINARY_PACKED is applied to (schema_mapping.cc), whenever a miniblock's delta range needed
 // more than 57 bits -- which is the normal case for a partition key, where deltas are zero inside a
 // partition and an arbitrary 64-bit jump between partitions. See §9.6 of the design doc.
+// `unsigned __int128` is a GCC/Clang extension, so -Wpedantic objects to naming it. Silenced at
+// the definition rather than by dropping the flag: run_tests.sh compiles these sources standalone
+// with -Wall -Wextra -Wpedantic and no -Werror, so the warning was not fatal -- it was just ten
+// lines of noise per build in a suite whose value depends on someone reading its output. A pragma
+// rather than __extension__ because that script uses g++ while the main build uses clang++.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
 using bitpack_acc = unsigned __int128;
+#pragma GCC diagnostic pop
 
 class rle_error : public std::runtime_error {
 public:
