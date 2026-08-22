@@ -2821,8 +2821,10 @@ The individual findings are in §9.6–§9.6d, §10.17a and §10.28. This sectio
 *pattern* across them is more transferable than any one bug, and because it was only visible once
 they were listed together. It is written for whoever adds the next test here.
 
-**Seven defects were found on 2026-08-21/22. Every one lived in a path that had no end-to-end test.
-In three, the system's own self-healing hid the symptom.**
+**Nine defects were found on 2026-08-21/22. Every one lived in a path that had no end-to-end test.
+In three, the system's own self-healing hid the symptom; in two more — both found by running the
+build and the suite the way CI runs them — nothing had ever built or run the thing that would have
+caught it.**
 
 | Defect | Class | Why it survived |
 |---|---|---|
@@ -2833,6 +2835,8 @@ In three, the system's own self-healing hid the symptom.**
 | `nodetool refresh` ignored `storage_format`, for **explicit** `'parquet'` too | wrong format on disk | the doc's write-path table had one row for what is two call sites using two different accessors |
 | Writer emitted no large-data metadata, so `system.large_*` was silently empty | blind operator | its five failing tests were dismissed as "pre-existing failures" and never read (§11.1 B1) |
 | Promoted-index reader dereferenced a null index on `pq` | segfault masking 13 cases | a crash reads as "not run", never as "failed" |
+| **A stale `static_assert` guard on `writable_sstable_versions` meant `test/boost/schema_changes_test.cc` did not compile** | build failure — upstream CI would reject the branch | every session ran `ninja <target>` for the suites it touched, never `ninja test`, so a target that would not compile was never built, never run, and never reported. Wired in both `configure.py` and `test/boost/CMakeLists.txt` |
+| **Resharded `pq` sstables recorded the coordinating shard, not the target shard** | wrong metadata on disk | `pq_writer_impl`'s constructor takes a `shard_id` and never stored it; `write_scylla_metadata()` used `this_shard_id()`. `mx` keeps it as `_shard` for exactly this reason (`mx/writer.cc:542`). A flush makes the two values equal, and every test written for this format flushes — `sstable_resharding_over_s3_test` was failing with `Mutations differ` and passes with the shard threaded through |
 
 #### The self-healing that hid three of them
 
@@ -2886,7 +2890,15 @@ Every one of these was, at some point, a passing test:
    `Configuring incomplete, errors occurred!`, twice. Same shape as `run_tests.sh`, which exited 2
    on missing fixtures with no `PARQUET SUITE:` terminator, so grepping for PASS/FAILURES matched
    neither and "no failures" read as green on a run that executed **zero of 21 suites**.
-9. **A build-system edit nobody compiled.** `add_scylla_test(... KIND ...)` selects which framework
+9. **A build graph that lies about staleness.** `build.ninja` was itself out of date
+   (`CONFIGURE --mode=dev` pending), so even `ninja -n` reported targets as current when they were
+   not — and `test.py` does not build, it runs whatever is on disk. A binary **five days old** was
+   executed and its result reported as a run of the current tree.
+10. **An argument that removes the thing under test.** `sstable_resharding_test` run by hand with
+   `--smp 1` **passes**, because with one shard there is nothing to reshard. `test.py` runs it with
+   `-c2`, where it fails immediately. A green obtained by narrowing the configuration until the
+   behaviour disappears is worse than a red, because it looks like evidence.
+11. **A build-system edit nobody compiled.** `add_scylla_test(... KIND ...)` selects which framework
    supplies `main()`, so a wrong `KIND` is a *link* error that configuring and compiling both miss.
    Pattern-matching `parquet_writer_test` from its sibling would have been wrong — the two use
    different frameworks.
