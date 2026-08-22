@@ -45,6 +45,7 @@
 #include "readers/mutation_fragment_v1_stream.hh"
 #include "sstables/sstables.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
+#include "sstables/parquet/format/parquet_reader.hh"
 #include "sstables/parquet/format/encryption.hh"
 #include "sstables/parquet/encryption_keys.hh"
 #include "sstables/parquet/footer_cache.hh"
@@ -438,6 +439,60 @@ public:
     }
 };
 
+// A key source that gives a *different* key to every distinct provider option set, which is the
+// property per-column keys rest on: `encryption_key.<col>` names another option set, and if the
+// source ignored the options and returned one key the whole feature would look like it worked while
+// encrypting everything under the same key.
+//
+// It stands in for the provider only in this one respect. The real-provider integration is covered
+// in encryption_at_rest_test (test_parquet_per_column_keys_through_local_file_provider), which goes
+// through ent/encryption/parquet_key_source.cc and the local-file provider; this one exists to
+// assert the *file structure*, which needs keys a test can recompute.
+class per_options_key_source : public sstables::parquet::key_source {
+    std::vector<sstables::parquet::key_options> _write_opts;
+    std::vector<sstables::parquet::key_options> _read_opts;
+
+public:
+    // Deterministic in the options, so a test can derive the same key and parse the footer itself.
+    static sstables::parquet::format::encryption_key key_of(
+            const sstables::parquet::key_options& kopts) {
+        size_t h = 0x9e3779b9;
+        for (const auto& [k, v] : kopts) {
+            for (char c : k) { h = h * 1099511628211u + uint8_t(c); }
+            h = h * 1099511628211u + '=';
+            for (char c : v) { h = h * 1099511628211u + uint8_t(c); }
+            h = h * 1099511628211u + ',';
+        }
+        sstables::parquet::format::encryption_key k;
+        k.bytes.resize(16);
+        for (size_t i = 0; i < 16; ++i) { k.bytes[i] = uint8_t(h >> (8 * (i % 8))) ^ uint8_t(i); }
+        return k;
+    }
+
+    const std::vector<sstables::parquet::key_options>& write_opts() const { return _write_opts; }
+    const std::vector<sstables::parquet::key_options>& read_opts() const { return _read_opts; }
+
+    seastar::future<sstables::parquet::resolved_key> key_for_write(
+            const sstables::parquet::key_options& kopts) override {
+        _write_opts.push_back(kopts);
+        // An id derived from the options, so the reader's per-column id round trip is exercised
+        // rather than defaulted to empty as the local-file provider would leave it.
+        auto it = kopts.find("secret_key_file");
+        co_return sstables::parquet::resolved_key{
+                key_of(kopts), it == kopts.end() ? seastar::sstring("base") : it->second};
+    }
+
+    seastar::future<sstables::parquet::format::encryption_key> key_for_read(
+            const sstables::parquet::key_options& kopts, const seastar::sstring&) override {
+        _read_opts.push_back(kopts);
+        co_return key_of(kopts);
+    }
+
+    seastar::future<> validate(const sstables::parquet::key_options&) override {
+        return make_ready_future<>();
+    }
+};
+
 schema_ptr pq_encrypted_schema() {
     return schema_builder(1, "ks", "pq_enc_tbl")
         .with_column("pk", utf8_type, column_kind::partition_key)
@@ -449,6 +504,27 @@ schema_ptr pq_encrypted_schema() {
         .set_parquet_options({{"encryption", "aes_gcm_v1"},
                               {"cipher_algorithm", "AES/GCM/NoPadding"},
                               {"secret_key_strength", "128"}})
+        .build();
+}
+
+// The same table, with two of its columns keyed separately -- `v_txt` and `v_big` under one key,
+// `v_dbl` under another. Three distinct option sets in all, which is what makes the deduplication
+// and the multi-key read paths both visible.
+schema_ptr pq_percolumn_encrypted_schema() {
+    return schema_builder(1, "ks", "pq_enc_pc_tbl")
+        .with_column("pk", utf8_type, column_kind::partition_key)
+        .with_column("ck", int32_type, column_kind::clustering_key)
+        .with_column("v_int", int32_type)
+        .with_column("v_big", long_type)
+        .with_column("v_dbl", double_type)
+        .with_column("v_txt", utf8_type)
+        .set_parquet_options({{"encryption", "aes_gcm_v1"},
+                              {"cipher_algorithm", "AES/GCM/NoPadding"},
+                              {"secret_key_strength", "128"},
+                              {"secret_key_file", "/keys/table.key"},
+                              {"encryption_key.v_txt", "secret_key_file=/keys/pii.key"},
+                              {"encryption_key.v_big", "secret_key_file=/keys/pii.key"},
+                              {"encryption_key.v_dbl", "secret_key_file=/keys/dbl.key"}})
         .build();
 }
 
@@ -542,6 +618,178 @@ SEASTAR_THREAD_TEST_CASE(test_pq_encrypted_read_does_not_deadlock_on_its_own_key
         // And it was admitted straight away instead of queueing behind its own reader.
         BOOST_REQUIRE_EQUAL(env.semaphore().get_stats().reads_queued_because_need_cpu_permits,
                             queued_before);
+    }).get();
+}
+
+// Per-column encryption keys through the Scylla layers: the `parquet` property names a separate key
+// for some columns, the writer resolves each through the key source, the file records them as
+// column keys, and the reader resolves all of them and reads the table back.
+//
+// Three things are asserted that no format-level test can, because they are about the Scylla layers
+// rather than the codec:
+//
+//  1. The *file* really is per-column encrypted. A reader holding only the footer key sees the
+//     keyed columns' chunks with `meta` absent and their metadata sitting in
+//     encrypted_column_metadata, and every other column inline as usual. This is the partial-access
+//     property, and asserting it here is what makes the test fail if `wopt.encryption.column_keys`
+//     is never populated -- which is exactly the state the tree was in.
+//  2. Keys are deduplicated by option set. Two columns naming the same key must cost one provider
+//     round trip on write and one on read, not two. This matters beyond tidiness: every read-side
+//     lookup happens under the reader permit (§11.1 B3).
+//  3. The round trip is byte-exact through the real read path, with three keys in play.
+SEASTAR_THREAD_TEST_CASE(test_pq_per_column_encryption_keys_round_trip) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        namespace pf = sstables::parquet::format;
+        auto s = pq_percolumn_encrypted_schema();
+
+        per_options_key_source ks;
+        auto* const prev_ks = sstables::parquet::key_source_ptr();
+        sstables::parquet::set_key_source(&ks);
+        auto restore = defer([prev_ks] () noexcept {
+            sstables::parquet::set_key_source(prev_ks);
+        });
+
+        auto muts = make_muts(s, 6, 12);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        // Three distinct option sets: the table's, the PII one shared by v_txt and v_big, and
+        // v_dbl's. Four columns are keyed-or-footer'd but only three keys exist, so anything that
+        // resolved per column rather than per option set would report four.
+        BOOST_REQUIRE_EQUAL(ks.write_opts().size(), 3u);
+
+        // The option sets the writer asked for must differ in the one option the property
+        // overrode and agree on everything else -- that is what "overlaid on the table's options"
+        // means, and a column landing on the default provider would show up here.
+        for (const auto& o : ks.write_opts()) {
+            BOOST_REQUIRE_EQUAL(o.at("cipher_algorithm"), "AES/GCM/NoPadding");
+            BOOST_REQUIRE_EQUAL(o.at("secret_key_strength"), "128");
+        }
+
+        // ---- (1) the file's own structure, read with the footer key alone.
+        const auto footer_key = per_options_key_source::key_of(
+                sstables::parquet::parquet_parameters(s->parquet_options()).key_opts());
+        const uint64_t len = sst->ondisk_data_size();
+        auto image = sst->data_read(0, len, env.make_reader_permit()).get();
+        auto img = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(image.get()), image.size());
+
+        const std::set<std::string> keyed{"v_txt", "v_big", "v_dbl"};
+        {
+            auto ef = pf::parse_encrypted_footer(img, footer_key);
+            BOOST_REQUIRE(!ef.md.row_groups.empty());
+            size_t n_keyed = 0, n_footer = 0;
+            for (const auto& ch : ef.md.row_groups[0].columns) {
+                BOOST_REQUIRE(ch.crypto_metadata);
+                if (ch.crypto_metadata->with_footer_key) {
+                    // Encrypted under the footer key, so its metadata is inline as always.
+                    BOOST_REQUIRE(ch.meta);
+                    ++n_footer;
+                    continue;
+                }
+                // Its own key: the footer names the column and nothing else about it.
+                BOOST_REQUIRE(!ch.meta);
+                BOOST_REQUIRE(ch.encrypted_column_metadata);
+                BOOST_REQUIRE(!ch.crypto_metadata->path_in_schema.empty());
+                const auto leaf = ch.crypto_metadata->path_in_schema.back();
+                BOOST_REQUIRE_MESSAGE(keyed.contains(leaf),
+                                      seastar::format("unexpected column key on leaf '{}'", leaf));
+                ++n_keyed;
+            }
+            BOOST_REQUIRE_EQUAL(n_keyed, keyed.size());
+            BOOST_REQUIRE_GT(n_footer, 0u);
+        }
+
+        // Handed the column keys as well, the same footer yields the metadata the previous parse
+        // could not see. Without this the check above would also pass on a file whose keyed
+        // columns were simply corrupt.
+        {
+            std::map<std::string, pf::encryption_key> cks;
+            for (const auto& [col, kopts] :
+                     sstables::parquet::parquet_parameters(s->parquet_options())
+                             .column_key_opts()) {
+                cks[std::string(col)] = per_options_key_source::key_of(kopts);
+            }
+            BOOST_REQUIRE_EQUAL(cks.size(), keyed.size());
+            auto ef = pf::parse_encrypted_footer(img, footer_key, {}, cks);
+            for (const auto& ch : ef.md.row_groups[0].columns) {
+                BOOST_REQUIRE(ch.meta);
+            }
+        }
+
+        // ---- (3) the round trip through the real read path, and (2) on the read side.
+        const auto reads_before = ks.read_opts().size();
+        auto got = read_all(sst, s, env.make_reader_permit());
+        BOOST_REQUIRE_EQUAL(got.size(), expected.size());
+        for (size_t i = 0; i < got.size(); ++i) {
+            assert_that(got[i]).is_equal_to(expected[i]);
+        }
+        // One footer key plus two distinct column keys. Not "at least": a per-column lookup rather
+        // than a per-option-set one would make this four, and that difference is the whole of the
+        // B3 amplification this feature adds, so it is asserted exactly.
+        BOOST_REQUIRE_EQUAL(ks.read_opts().size() - reads_before, 3u);
+    }).get();
+}
+
+// A column key the schema cannot locate must fail the read, loudly.
+//
+// This is the failure mode the feature must never have. format::parse_encrypted_footer tolerates a
+// chunk whose key it lacks by leaving `meta` empty -- correct for a general reader that legitimately
+// holds only some keys -- but inside Scylla an empty `meta` is a column with no pages, which
+// reassembles as an all-null column. "No access" rendering as "no data" is silent data loss, so the
+// read path refuses instead.
+//
+// The unavailability is arranged the way it will actually happen: an ALTER drops
+// `encryption_key.<col>` from the property while files written under it still exist. The provider
+// options live in the schema, not in the file (see read_crypto_for), so this is the one edit that
+// takes a key away.
+SEASTAR_THREAD_TEST_CASE(test_pq_missing_column_key_fails_loudly) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_percolumn_encrypted_schema();
+
+        per_options_key_source ks;
+        auto* const prev_ks = sstables::parquet::key_source_ptr();
+        sstables::parquet::set_key_source(&ks);
+        auto restore = defer([prev_ks] () noexcept {
+            sstables::parquet::set_key_source(prev_ks);
+        });
+
+        auto muts = make_muts(s, 4, 8);
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        // The same table with v_txt's key no longer named. Everything else is identical, so the
+        // sstable is still this schema's own file -- which is the point: the data is there, the
+        // key is not.
+        auto altered = schema_builder(s)
+                .set_parquet_options({{"encryption", "aes_gcm_v1"},
+                                      {"cipher_algorithm", "AES/GCM/NoPadding"},
+                                      {"secret_key_strength", "128"},
+                                      {"secret_key_file", "/keys/table.key"},
+                                      {"encryption_key.v_big", "secret_key_file=/keys/pii.key"},
+                                      {"encryption_key.v_dbl", "secret_key_file=/keys/dbl.key"}})
+                .build();
+
+        bool threw = false;
+        try {
+            auto got = read_all(sst, altered, env.make_reader_permit());
+            // If this is ever reached the failure is not "an exception was missing", it is that
+            // the read returned rows for a column it cannot decrypt. Say which.
+            BOOST_FAIL(seastar::format(
+                    "read of a file with an unavailable column key returned {} partitions instead "
+                    "of failing", got.size()));
+        } catch (const std::exception& e) {
+            threw = true;
+            const std::string what = e.what();
+            // The message has to name the column and say where to put the option back; a bare
+            // decode error would leave an operator with no way to act.
+            BOOST_REQUIRE_MESSAGE(what.find("v_txt") != std::string::npos,
+                                  "message does not name the column: " + what);
+            BOOST_REQUIRE_MESSAGE(what.find("encryption_key.v_txt") != std::string::npos,
+                                  "message does not name the missing sub-option: " + what);
+        }
+        BOOST_REQUIRE(threw);
     }).get();
 }
 

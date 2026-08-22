@@ -547,6 +547,101 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
         // Even when they agree: the operator still has to be told the map is ambiguous.
         rejects({{pp::ROW_GROUP_ROWS_LEGACY, "7500"}, {pp::ROWS_PER_ROW_GROUP, "7500"}});
     }
+
+    // ---- per-column encryption keys
+    //
+    // The vocabulary half of the feature: `encryption_key.<column>` carries key *provider options*
+    // overlaid on the table's own, because a key is identified by an option map (ent/encryption's
+    // get_provider takes one) and which option names a key differs per provider.
+    {
+        pp p{{{pp::ENCRYPTION, "aes_gcm_v1"},
+              {"key_provider", "LocalFileSystemKeyProviderFactory"},
+              {"secret_key_file", "/keys/tbl.key"},
+              {"secret_key_strength", "256"},
+              {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "secret_key_file=/keys/pii.key"},
+              {sstring(pp::ENCRYPTION_KEY_PREFIX) + "dob", "secret_key_file=/keys/pii.key"}}};
+
+        const auto& cko = p.column_key_opts();
+        BOOST_REQUIRE_EQUAL(cko.size(), 2u);
+
+        // The override is *overlaid*, so the column inherits the provider, the algorithm and the
+        // key length and replaces only what it named. If it did not inherit, the column would
+        // silently land on the default provider with the default AES/CBC algorithm, which the
+        // format cannot honour at all.
+        const auto& ssn = cko.at("ssn");
+        BOOST_REQUIRE_EQUAL(ssn.at("secret_key_file"), "/keys/pii.key");
+        BOOST_REQUIRE_EQUAL(ssn.at("key_provider"), "LocalFileSystemKeyProviderFactory");
+        BOOST_REQUIRE_EQUAL(ssn.at("secret_key_strength"), "256");
+        BOOST_REQUIRE_EQUAL(ssn.at("cipher_algorithm"), "AES/GCM/NoPadding");
+        // And the table's own options are untouched by the column's.
+        BOOST_REQUIRE_EQUAL(p.key_opts().at("secret_key_file"), "/keys/tbl.key");
+
+        // Two columns naming the same key must produce *equal* option sets, because that equality
+        // is what both the writer and the reader deduplicate on -- one provider round trip for
+        // "encrypt the PII columns under the PII key" rather than one per column.
+        BOOST_REQUIRE(cko.at("ssn") == cko.at("dob"));
+
+        // Round-trips as the operator's own text, not as the overlay: DESCRIBE must not read as if
+        // each column had been configured from scratch.
+        auto m = p.to_map();
+        BOOST_REQUIRE_EQUAL(m.at(sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn"),
+                            "secret_key_file=/keys/pii.key");
+        pp again{m};
+        BOOST_REQUIRE(again.column_key_opts() == cko);
+
+        // Several options at once, with the whitespace an operator will write.
+        pp multi{{{pp::ENCRYPTION, "aes_gcm_v1"},
+                  {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn",
+                   "key_provider=KmipKeyProviderFactory, kmip_host=h1, key_namespace=pii"}}};
+        const auto& mk = multi.column_key_opts().at("ssn");
+        BOOST_REQUIRE_EQUAL(mk.at("key_provider"), "KmipKeyProviderFactory");
+        BOOST_REQUIRE_EQUAL(mk.at("kmip_host"), "h1");
+        BOOST_REQUIRE_EQUAL(mk.at("key_namespace"), "pii");
+        // A value containing '=' survives: only the first '=' splits. Base64 key material ids and
+        // padded provider handles both look like this.
+        pp eq{{{pp::ENCRYPTION, "aes_gcm_v1"},
+               {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "master_key=abc=="}}};
+        BOOST_REQUIRE_EQUAL(eq.column_key_opts().at("ssn").at("master_key"), "abc==");
+    }
+
+    // A per-column key with no `encryption` is worse than inert: it reads as "this column has its
+    // own key" when nothing is encrypted at all.
+    rejects({{sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "secret_key_file=/k/p.key"}});
+    // A typo'd provider option would be ignored by the provider and fall back to the *table's*
+    // key, leaving the column looking separately encrypted when it is not.
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "secret_key_fil=/k/p.key"}});
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "/k/p.key"}});      // no '<opt>='
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "secret_key_file="}});  // empty value
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", ""}});
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX), "secret_key_file=/k/p.key"}});  // no column
+    // An override may not name an algorithm the format cannot honour, exactly as the table's own
+    // options may not: the check is shared, so a per-column set cannot slip past it.
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn",
+              "cipher_algorithm=AES/CBC/PKCS5Padding"}});
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "ssn", "secret_key_strength=64"}});
+
+    // Columns whose Parquet leaf name is not theirs alone cannot be keyed. `value` and `key` are
+    // the names of leaves inside *every* non-frozen collection, so a key looked up by leaf name
+    // would cover those too -- including a collection added by a later ALTER, which is why this is
+    // rejected without consulting the current schema.
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "value", "secret_key_file=/k/p.key"}});
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "key", "secret_key_file=/k/p.key"}});
+    rejects({{pp::ENCRYPTION, "aes_gcm_v1"},
+             {sstring(pp::ENCRYPTION_KEY_PREFIX) + "__ts", "secret_key_file=/k/p.key"}});
+    // And the rule has exactly one definition, which the DDL layer calls for the type-dependent
+    // case it alone can see.
+    BOOST_REQUIRE(!pp::keyable_column_error("ssn", false));
+    BOOST_REQUIRE(pp::keyable_column_error("ssn", true));
+    BOOST_REQUIRE(pp::keyable_column_error("value", false));
 }
 
 SEASTAR_THREAD_TEST_CASE(test_parquet_schema_eligibility) {

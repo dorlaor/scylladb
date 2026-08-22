@@ -7145,10 +7145,11 @@ absent field**, once anything derives a *computation* from its presence. The fix
 groups therefore has no ordinal to write -- such a file cannot be encrypted at all, and now says so
 instead of silently reusing an AAD.
 
-**Per-column keys are still not exposed through CQL**, but for a different reason than before.
-Interop is no longer the blocker; what is missing is the property syntax for "which columns get
-which keys" and the decision about how a reader is told the per-column key ids. That is a design
-question, not a bug.
+**Per-column keys were not exposed through CQL as of 10.17** — interop was no longer the blocker;
+what was missing was the property syntax for "which columns get which keys" and the decision about
+how a reader is told the per-column key ids. Both were design questions rather than bugs, and both
+are now answered: `encryption_key.<column>` carries provider options overlaid on the table's, and the
+ids travel in `ColumnCryptoMetaData.key_metadata`, one per column. See §10.17b.
 
 **The `ent/encryption` alignment — built, and the conflict is what shaped it.**
 
@@ -7321,6 +7322,122 @@ carries. Removing it properly means resolving the key off the user semaphore (th
 gets that for free: a flush or compaction runs in a scheduling group that `classify_request()` maps
 to the *system* semaphore, so its key lookup never contends with its own permit). Named here rather
 than half-built.
+
+#### 10.17b Per-column encryption keys, through Scylla — built 2026-08-22
+
+§10.17 shipped one key per sstable. The format layer had supported per-column keys since it was
+written, and the §11.1 audit correctly retracted the claim that this reached Scylla: the writer set
+only `footer_key`, the reader had one `key_for_read` site, and the closed `parquet = {...}` sub-option
+set made a per-column key *unexpressible in DDL*. All three are now wired.
+
+**The DDL surface.** `encryption_key.<column>`, whose value is a comma-separated list of key-provider
+options overlaid on the table's own:
+
+```
+CREATE TABLE t (id int PRIMARY KEY, v text, ssn text, dob text)
+WITH storage_format = 'parquet'
+AND parquet = {
+    'encryption':        'aes_gcm_v1',
+    'key_provider':      'LocalFileSystemKeyProviderFactory',
+    'secret_key_file':   '/etc/scylla/keys/t.key',
+    'encryption_key.ssn': 'secret_key_file=/etc/scylla/keys/pii.key',
+    'encryption_key.dob': 'secret_key_file=/etc/scylla/keys/pii.key'
+};
+```
+
+It takes *options* rather than a bare key name because that is what a key is in `ent/encryption`:
+`get_provider()` resolves a provider from an option map, and which option names a key differs by
+provider — `secret_key_file` for local-file, `master_key` for the cloud ones,
+`template_name`/`key_namespace` for KMIP. There is no provider-neutral single name to hard-code. The
+overlay is what makes the normal one-pair form work: the column inherits the provider, the algorithm
+and the key length and replaces only the locator, so a column cannot silently land on the default
+provider with `AES/CBC/PKCS5Padding`, which the format cannot honour at all. No key material enters
+the schema, exactly as with `scylla_encryption_options`; only the options that locate it. Keys are
+**always** resolved by the provider — never derived from the footer key, never held in the schema.
+
+Round-trips like `storage_format` does: the stored map is what `DESCRIBE` echoes verbatim
+(`schema.cc`) and `to_map()` emits the operator's own text rather than the overlay result, so
+`DESCRIBE` does not read as if each column had been configured from scratch.
+
+**Deduplication by option set, not by column.** Two columns naming one key cost one provider round
+trip on write, one at DDL validation, and one per read. This is not tidiness: every read-side lookup
+happens under a reader permit (B3, below), so the count is the exposure.
+
+**Only a column that owns a uniquely-named Parquet leaf can be keyed** — a restriction discovered
+while building this, and a real property of the format rather than caution. `ColumnCryptoMetaData`
+names a column by path, but a key is looked up by the *last* element of that path
+(`format::read_crypto::key_for`, `parquet_file_writer::column_key_for`), and the mapping does not give
+every CQL column a uniquely-named leaf. A non-frozen collection becomes five leaves called `key`,
+`value`, `__ts`, `__ttl`, `__ldt` under a group named after the column (`schema_mapping.cc`), so:
+
+- a non-frozen collection owns no leaf bearing its own name — there is nothing to key; and
+- a *scalar* column called `key` or `value` shares its leaf name with every collection in the table,
+  so keying it would silently key those leaves too.
+
+The second is rejected **whether or not the table currently has a collection**, because
+`ALTER TABLE ... ADD` can introduce one later: an accepted key on a column named `value` would then
+quietly widen to cover a new collection's values — a security change arriving through an unrelated
+DDL. Names beginning `__` are rejected for the same reason. Frozen collections and every other scalar
+are fine. A bad column name is a `configuration_exception` at DDL time, never an ignored option: an
+inert `encoding.<column>` is a performance setting doing nothing, but an inert
+`encryption_key.<column>` is an operator believing a column has its own key when it does not, which
+is a false security claim.
+
+**The read path.** Driven off the *file*, not off the schema. The file states which columns it
+encrypted under their own key and under which provider id; the schema says only where to find those
+keys. That asymmetry is what makes ALTER safe in the direction that matters — dropping
+`encryption_key.<col>` does not make existing files unreadable, because they still declare the column
+key and the reader still goes looking for it. Per-column ids come from
+`ColumnCryptoMetaData.key_metadata`, so one column's key rotates without touching another's, and the
+provider's local-file fallback stays gated on `!id` (`replicated_key_provider.cc`) because ids are
+passed through unchanged.
+
+Sequencing note: on a footer *miss* the footer key must be resolved before the footer can be
+decrypted, and which columns have their own key is only legible once that footer is parsed — so the
+two resolutions happen at different points, and `resolve_column_keys()` is separate for that reason.
+One row group is materialised into a throwaway copy to harvest the ids (4.3 µs, §10.4j); the ids are
+cached on the footer-cache entry, the keys deliberately are not.
+
+**A column key the schema cannot locate fails the read, loudly.** `format::parse_encrypted_footer`
+tolerates leaving `meta` empty for a column whose key it lacks — correct for a general-purpose reader
+that legitimately holds only some keys — but inside Scylla an empty `meta` is a column with no pages,
+which reassembles as an all-null column. "No access" must never render as "no data". Two guards, both
+mutation-tested: `resolve_column_keys()` refuses when the schema has no `encryption_key.<col>`, naming
+the column and the sub-option to restore, and `decrypt_column_metadata()` refuses a chunk whose key is
+absent. Worth recording what the mutation run showed: with *both* guards removed the codec still
+refuses, with `parquet/decode: column chunk without metadata`. So a silent empty column was never
+actually reachable — but the codec's message names no column and no remedy, which is the whole value
+of the two guards above it.
+
+**Where the loud failure is loud.** In the node log. What reaches a CQL client is the coordinator's
+generic `received 0 responses and 1 failures from 1 CL=ONE`, because this is a replica-side read
+failure like any other. An operator reading only the CQL error learns that the read failed and
+nothing about why.
+
+**A DDL-time side effect worth knowing.** `validate_encryption()` now resolves every per-column option
+set as well as the table's, so with the local-file provider the per-column key *file is created at
+CREATE/ALTER time*, not at first flush. Same behaviour the table key already had, one layer wider.
+
+**Coverage.** `test/boost/parquet_writer_test` (`test_parquet_parameters`) covers parsing, the
+overlay, round-trip and every rejection. `test/boost/sstable_parquet_test`
+(`test_pq_per_column_encryption_keys_round_trip`, `test_pq_missing_column_key_fails_loudly`) covers
+the file structure and the loud failure against a stub whose keys a test can recompute — including the
+partial-access property, that a footer-key-only reader sees the keyed columns exist and nothing else.
+`test/boost/encryption_at_rest_test`
+(`test_parquet_per_column_keys_through_local_file_provider`, `test_parquet_per_column_key_ddl_validation`)
+is the one that goes through `ent/encryption/parquet_key_source.cc` and a real provider, which closes
+part of B2 for this feature specifically — the first parquet-encryption test in the tree that is not
+stubbed.
+
+**Interaction with B3 — this makes it worse, and the feature should not ship ahead of it.** See B3 in
+§11.1 for the amended statement. In short: a file with *K* distinct column keys holds its reader
+permit for `K+1` sequential provider round trips instead of one. The threshold is unchanged (still
+`max_count_concurrent_reads` concurrent readers) and no new concurrency is introduced — the lookups are
+sequential on purpose, since issuing them concurrently would put *K* nested lookups in flight from a
+single reader and make the count limit reachable from far fewer readers — but the *window* during
+which each reader sits in the state that reforms the cycle is multiplied. Deduplicating by option set
+bounds *K* by distinct keys rather than keyed columns, which is the mitigation available without
+touching B3 itself. It is not a fix.
 
 ### 10.14 Read-shape telemetry — built 2026-08-19, for a criterion that was then dropped
 
@@ -7978,25 +8095,23 @@ the gap that has already produced one unusable-class defect — B3 and B4.
 | # | Blocker | Class | Substantiated by | What closes it |
 |---|---|---|---|---|
 | **B1** | **The `pq` writer writes no large-data metadata.** `sstables/parquet/writer_impl.cc:1210` passes `std::nullopt` for all three of `large_data_stats`, `ext_timestamp_stats` and `large_data_records`, where `sstables/mx/writer.cc:1891` populates all three. Consequence: `system.large_partitions`, `system.large_rows` and `system.large_cells` are **silently empty for every `pq` table** (`db/virtual_tables.cc:1538`/`1728`/`1892`, `db/large_data_handler.cc:143`). The operator loses the diagnostic that finds a pathological partition, with nothing logged to say the answer is absent rather than clean. | **defect** | **Found by this audit.** Five cases of `test/boost/sstable_3_x_test` fail against `pq` at HEAD — `test_large_data_records_round_trip`, `test_large_data_records_top_n_bounded`, `test_large_data_stats_large_{rows,cells,collections}` — all five looping `writable_sstable_versions`. Run at `--smp 1`: **97/102 passed, 5 failed, 10 assertions failed**. | Collect and write the three metadata blocks in the `pq` writer; take those five cases green. `ext_timestamp_stats` is the least urgent of the three — `compaction/compaction.cc:253` treats an empty map as the legacy path and falls back to `min_timestamp`, so tombstone purging is *conservative*, not wrong — but it is the same one line to fix. |
-| **B2** | **Nothing at the integration layers has ever read an encrypted `pq` sstable.** `test/cqlpy`, `test/cluster` and `test/rest_api` contain zero encryption references in their parquet tests and zero parquet references in their encryption tests. Whole-tree, exactly one file crosses the two: `test/boost/sstable_parquet_test.cc`. That single test installs a stub key source via `sstables::parquet::set_key_source`, so `ent/encryption/parquet_key_source.cc` and every real provider are out of the loop — it pins the semaphore interaction, not the provider integration. | **coverage gap that has already shipped an unusable-class defect** | §10.17a: this is *why* the deadlock shipped. Note also that `test/cqlpy` has no encryption-at-rest coverage at all, for any format (its only `encryption` hits are CQL-port TLS). | An encrypted-`pq` matrix in `test/cluster` over the real providers. **The harness already exists and the parquet tests simply do not use it**: `test/pylib/encryption_provider.py:25` enumerates all six providers and `test/cluster/conftest.py:398` already parametrizes a fixture over them. |
-| **B3** | **The encrypted read path still issues a nested read while holding a reader permit.** `reader_permit::awaits_guard` — the §10.17a fix — exempts the permit from the **CPU** limit only: `mark_awaits()` (`reader_concurrency_semaphore.cc:498`) touches no resources, and `awaits_permits` is consulted by `cpu_concurrency_limit_reached()` alone (`:1458`), while admission still requires `has_available_units(base_resources())`. An awaiting permit therefore still holds one **count** unit. At `max_count_concurrent_reads` = 100 (`replica/database.hh:1700`, per shard per service level) concurrent first-time key lookups, the same cycle reforms until the permit TTL fires. | **defect, residual** | §10.17a's own "what the fix does not remove". **Nothing in the tree tests it.** Two aggravating details: the fix *raises* reachability, because pre-fix `cpu_concurrency` = 2 capped blocked readers at 2 and the count limit was therefore unreachable; and there is no in-flight dedup, so N concurrent first-time reads issue N nested lookups (`ent/encryption/replicated_key_provider.cc:288` populates the cache only after resolution). | Resolve the key off the user semaphore. The write path already gets this for free — `classify_request()` maps a flush's or compaction's scheduling group to the *system* semaphore, so its key lookup never contends with its own permit. |
+| **B2** | **Nothing at the integration layers has ever read an encrypted `pq` sstable.** `test/cqlpy`, `test/cluster` and `test/rest_api` contain zero encryption references in their parquet tests and zero parquet references in their encryption tests. Whole-tree, exactly one file crosses the two: `test/boost/sstable_parquet_test.cc`. That single test installs a stub key source via `sstables::parquet::set_key_source`, so `ent/encryption/parquet_key_source.cc` and every real provider are out of the loop — it pins the semaphore interaction, not the provider integration. **Narrowed 2026-08-22, not closed:** `test/boost/encryption_at_rest_test`'s two per-column cases (§10.17b) are the first parquet-encryption tests in the tree to run through `parquet_key_source.cc` and a real provider (local-file), covering write, read-back and DDL validation of a `pq` table via CQL on a real node. That is one provider and one binary; `test/cqlpy`, `test/cluster` and `test/rest_api` still contain nothing, and the other five providers are still uncovered for `pq`. | **coverage gap that has already shipped an unusable-class defect** | §10.17a: this is *why* the deadlock shipped. Note also that `test/cqlpy` has no encryption-at-rest coverage at all, for any format (its only `encryption` hits are CQL-port TLS). | An encrypted-`pq` matrix in `test/cluster` over the real providers. **The harness already exists and the parquet tests simply do not use it**: `test/pylib/encryption_provider.py:25` enumerates all six providers and `test/cluster/conftest.py:398` already parametrizes a fixture over them. |
+| **B3** | **The encrypted read path still issues a nested read while holding a reader permit.** `reader_permit::awaits_guard` — the §10.17a fix — exempts the permit from the **CPU** limit only: `mark_awaits()` (`reader_concurrency_semaphore.cc:498`) touches no resources, and `awaits_permits` is consulted by `cpu_concurrency_limit_reached()` alone (`:1458`), while admission still requires `has_available_units(base_resources())`. An awaiting permit therefore still holds one **count** unit. At `max_count_concurrent_reads` = 100 (`replica/database.hh:1700`, per shard per service level) concurrent first-time key lookups, the same cycle reforms until the permit TTL fires. | **defect, residual** | §10.17a's own "what the fix does not remove". **Nothing in the tree tests it.** Two aggravating details: the fix *raises* reachability, because pre-fix `cpu_concurrency` = 2 capped blocked readers at 2 and the count limit was therefore unreachable; and there is no in-flight dedup, so N concurrent first-time reads issue N nested lookups (`ent/encryption/replicated_key_provider.cc:288` populates the cache only after resolution). **Amended 2026-08-22: per-column keys (§10.17b) widen this.** A file with *K* distinct column keys holds its permit for `K+1` sequential provider round trips rather than one, multiplying the window each reader spends in the state that reforms the cycle. The threshold is unchanged and no new concurrency is added — the lookups are sequential precisely so that one reader cannot put *K* nested lookups in flight — and dedup by option set bounds *K* by distinct keys rather than keyed columns. That bounds it; it does not fix it. **A table using per-column keys should not ship before B3 is closed.** | Resolve the key off the user semaphore. The write path already gets this for free — `classify_request()` maps a flush's or compaction's scheduling group to the *system* semaphore, so its key lookup never contends with its own permit. |
 | **B4** | **Key rotation is unverified after the deadlock fix, and the only configuration it was ever exercised in rests on a deprecated provider.** No rotation pass was re-run post-fix and nothing in the tree covers rotation at all. `ReplicatedKeyProviderFactory` is the only provider that both issues key ids and requires nothing outside the node — local-file works single-node but returns `std::nullopt` for the id, so it cannot express rotation — and it logs `"ReplicatedKeyProviderFactory is deprecated and will be removed in a future release"` (`ent/encryption/replicated_key_provider.cc:438`). | **unverified** | §10.17. Worse, `~/pq-lab/encryption_rotation.py`'s phase 4 was previously passing *because it point-read both key regimes before scanning*, i.e. the passing test was encoding the B3 workaround (§10.17a). Its pass history is therefore not evidence. | Re-run rotation end to end against the fixed reader, and decide which supported provider carries the single-node id-issuing path. |
 
 ### Retracted or corrected by this audit
 
-- **Per-column encryption keys do not work through Scylla.** The previous row claimed "per-column
-  keys are written and pyarrow reads them, including the partial-access case", which is true *of the
-  format layer only*. The format layer is complete and externally interoperable — the
-  `RowGroup.ordinal` AAD fix (`sstables/parquet/format/parquet_writer.cc:736`), per-column write
-  (`:813`) and read (`format/parquet_reader.cc:244`) paths, and pyarrow partial-access interop
-  (`format/test_encrypt_interop.py`). The Scylla layer is uniform-mode only: `writer_impl.cc:1255-1268`
-  sets `footer_key` and nothing else; `column_keys` is assigned in exactly **one** place in the whole
-  tree and it is a format-level test (`format/test_encrypt_write.cc:154`); `reader.cc:532` is the
-  single `key_for_read` site and has no per-column dispatch. There is no vocabulary for it either —
-  the sub-option set is closed (`writer_impl.hh:118-165`) and `encoding.<column>` is the only
-  per-column prefix, so a per-column key request is rejected as an unknown option. **Through Scylla
-  there is one key per sstable, and independent per-column key rotation is unreachable** — there is
-  nothing to name, so nothing to rotate. Unimplemented, and a design question rather than a bug.
+- **Per-column encryption keys did not work through Scylla — now they do. Superseded 2026-08-22; see
+  §10.17b below.** The retraction was correct when written: the format layer was complete and
+  externally interoperable (the `RowGroup.ordinal` AAD fix, the per-column write and read paths, and
+  pyarrow partial-access interop in `format/test_encrypt_interop.py`), while the Scylla layer was
+  uniform-mode only — `writer_impl.cc` set `footer_key` and nothing else, `column_keys` was assigned
+  in exactly one place in the tree and it was a format-level test, `reader.cc` had a single
+  `key_for_read` site, and the closed sub-option set left a per-column key *unexpressible in DDL*.
+  All three layers are now wired and tested (§10.17b). What the retraction got wrong about its own
+  subject matter is worth keeping: an earlier brief claimed the `column_keys` *field* did not exist
+  in `pq_writer_config`, which was false — `pq_writer_config` embeds `format::writer_options`, so the
+  map was always reachable and simply never written to. The gap was plumbing, not structure.
 - **§10.1b's Trap 2 conclusion died; the trap survived.** The old claim that a bulk load "makes the
   verbatim mapping look *fine* — 18 % smaller than SSTables on D2" was a model artefact. Real L0
   under `collapsed` is **171 %** of the row format, not 82 %. The trap itself is confirmed and
@@ -8069,7 +8184,7 @@ the gap that has already produced one unusable-class defect — B3 and B4.
 | Scan path | **1.03× the row format through CQL** at 8 M rows and shipping defaults: 21.3 MB read of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796. It was 2.29× and ~497 000 extents until 2026-08-20, because the reader took the point-read path for any *bounded* partition range while the coordinator splits every range scan at tablet boundaries. So the corrected claim is **parity with an order of magnitude less read I/O** — not the 0.82× advantage §10.4c reported and the deck quoted, which was never real, and not the 2.3× penalty either. | §10.26 |
 | Size | Corpus re-measured under the deterministic dictionary: where the input was identical nothing moved, and the two near-parity rows moved least. GB-scale three-way measurement on real NOAA ISD-Lite under TWCS. | §10.16, §10.6 |
 | Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. | §10.3i |
-| Encryption at rest, uniform mode | AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys from `ent/encryption`'s own providers (local file, replicated, KMIP, AWS KMS, GCP, Azure), so BYOK works; pyarrow opens the encrypted `Data.db` with the provider's key. **One key per sstable** — see the retraction above. Blocked by B2/B3/B4. Also not covered: plaintext-footer mode, node-global `user_info_encryption`. | §10.17 |
+| Encryption at rest, uniform mode | AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys from `ent/encryption`'s own providers (local file, replicated, KMIP, AWS KMS, GCP, Azure), so BYOK works; pyarrow opens the encrypted `Data.db` with the provider's key. **Per-column keys work through Scylla as of 2026-08-22** (`encryption_key.<column>`, §10.17b), which supersedes the "one key per sstable" retraction below; only columns owning a uniquely-named leaf can be keyed, so non-frozen collections cannot. Blocked by B2/B3/B4, and per-column keys make B3's window `K+1`× wider — see the amended B3. Also not covered: plaintext-footer mode, node-global `user_info_encryption`. | §10.17, §10.17b |
 | Object storage, tooling, downgrade | 7/7 on minio (keyspace on S3, `pq` table on it, objects carrying `PAR1`, all rows readable); 10/10 maintenance (scrub in all four modes, cleanup, snapshot → truncate → refresh); downgrade observed on both storage types. | §10.12, §10.20, §10.9 |
 | Backblaze 4× anomaly | Not a bug and not about Parquet: 42 448 175 cell tombstones, one per bound NULL. A table created without a `tombstone_gc` property gets mode `repair`, and under RF=1 that short-circuits `gc_before` to *now*, so `gc_grace_seconds` is never consulted. 4/4 purged at the default, 0/4 under `timeout` or `disabled`; RF=1 purges where RF=3 retains. No published figure depends on it. | §10.18 |
 
@@ -8102,7 +8217,9 @@ So the honest predictor of remaining risk is not severity of what was found — 
 `pq` paths that still have no end-to-end assertion. Those are, in order of exposure:
 
 1. **Encrypted reads through a real key provider** (B2) — the largest, and the one that has already
-   paid out once.
+   paid out once. Narrowed on 2026-08-22 by §10.17b's two `encryption_at_rest_test` cases, which are
+   the first to run a `pq` encrypted write *and* read through `parquet_key_source.cc` and a real
+   provider. One provider of six, one binary, and still nothing in `test/cqlpy` or `test/cluster`.
 2. **Key rotation** (B4) — no coverage at all, and its one previously-passing lab run was encoding a
    workaround for B3.
 3. **Anything that reads `pq` sstable metadata rather than `pq` data.** B1 is the first instance

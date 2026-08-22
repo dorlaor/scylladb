@@ -489,6 +489,26 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
                         cdef.type->name()));
             }
         }
+        // A per-column encryption key names a column too, and here the stakes are higher than for
+        // an encoding: an `encryption_key.<column>` that named nothing would leave the operator
+        // believing a column has its own key when it is in fact encrypted under the table's, which
+        // is a security claim that is simply false. So a bad name is an error, never inert.
+        for (const auto& [col, kopts] : pp.column_key_opts()) {
+            const cql3::column_identifier id{col, true};
+            if (!builder.has_column(id)) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "The 'parquet' option sets an encryption key for column '{}', which this "
+                        "table does not have", col));
+            }
+            const auto& cdef = builder.find_column(id);
+            // The name-based restrictions are already checked in parquet_parameters (they hold
+            // wherever the property is parsed); this is the one that needs the column's type.
+            if (auto why = sstables::parquet::parquet_parameters::keyable_column_error(
+                        col, cdef.type->is_multi_cell())) {
+                throw exceptions::configuration_exception(seastar::format(
+                        "The 'parquet' option asks for a per-column encryption key, but {}", *why));
+            }
+        }
         // The remaining encryption checks -- an algorithm the format cannot honour, provider
         // options with encryption off -- are in parquet_parameters itself, above, because they
         // must hold everywhere the property is parsed and not only where a DDL statement created

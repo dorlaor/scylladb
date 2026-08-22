@@ -195,6 +195,16 @@ public:
     std::string           aad_file_unique;
     std::string           aad_prefix;
     seastar::sstring      key_id;
+    // For a file with per-column keys: the leaf name of each column the file says has its own key,
+    // and the provider id that column's key_metadata carried. Harvested once, from row group 0,
+    // because the writer sets the column keys for the whole file -- so every group repeats the same
+    // ids, and a file that somehow did not would fail authentication rather than misread.
+    //
+    // Ids, not keys: the same reason `key_id` above is here and the footer key is not. An id is not
+    // a capability, so caching it hands out nothing; a key would outlive the read that fetched it
+    // and stop being the provider's to revoke. A reader on a cache hit still asks the provider for
+    // every one of these, which is what §11.1 B3 is about -- see read_crypto_for().
+    std::map<std::string, seastar::sstring> column_key_ids;
 
     size_t memory_size() const noexcept override { return _retained; }
 
@@ -224,6 +234,9 @@ public:
             n += heap_size(*md.created_by);
         }
         n += heap_size(aad_file_unique) + heap_size(aad_prefix);
+        for (const auto& [leaf, id] : column_key_ids) {
+            n += heap_size(leaf) + heap_size(id) + sizeof(decltype(column_key_ids)::value_type);
+        }
         _retained = n;
     }
 
@@ -369,7 +382,17 @@ class pq_reader : public mutation_reader::impl {
     future<format::read_crypto> read_crypto_for(format::cipher algo,
                                                 std::string_view aad_file_unique,
                                                 std::string_view aad_prefix,
-                                                const seastar::sstring& key_id);
+                                                const seastar::sstring& key_id,
+                                                const std::map<std::string, seastar::sstring>&
+                                                        column_key_ids);
+    // The per-column half of the above, separate because the two happen at different points on a
+    // footer *miss*: the footer key is needed to decrypt the footer at all, and which columns have
+    // their own key -- and under which id -- is only legible once that footer is parsed.
+    future<> resolve_column_keys(format::read_crypto&,
+                                const std::map<std::string, seastar::sstring>& column_key_ids);
+    // Decrypt the per-column-key chunks of the currently materialised row group. Synchronous:
+    // read_crypto_for() has already fetched every key this can need.
+    void decrypt_column_metadata(size_t rg);
     void prepare_row_group_metadata() {
         _rgmd = format::file_metadata{};
         // walk_leaves() needs the schema tree, not the row groups, so this is the whole of what
@@ -405,6 +428,9 @@ class pq_reader : public mutation_reader::impl {
         rtimer _t{rphase::rg_materialise};
         _rgmd.row_groups.assign(1, _cf->md.row_groups.at(rg));
         format::materialise_row_group(_rgmd, 0, footer_bytes());
+        // Any chunk with its own key arrives here with `meta` empty and its bytes in
+        // encrypted_column_metadata; nothing downstream tolerates that, by design.
+        decrypt_column_metadata(rg);
         _rgmd_rg = rg;
     }
     // The column metadata of the currently materialised row group. need_columns(rg) first.
@@ -489,10 +515,12 @@ public:
     future<> close() noexcept override { return make_ready_future<>(); }
 };
 
-future<format::read_crypto> pq_reader::read_crypto_for(format::cipher algo,
-                                                       std::string_view aad_file_unique,
-                                                       std::string_view aad_prefix,
-                                                       const seastar::sstring& key_id) {
+future<format::read_crypto> pq_reader::read_crypto_for(
+        format::cipher algo,
+        std::string_view aad_file_unique,
+        std::string_view aad_prefix,
+        const seastar::sstring& key_id,
+        const std::map<std::string, seastar::sstring>& column_key_ids) {
     // The key id carries what the key provider issued for this file, or nothing at all if the
     // provider issues no ids. Trusting the file to name its own key is safe: it is an id, not a
     // capability, and a wrong one simply fails to authenticate.
@@ -510,7 +538,8 @@ future<format::read_crypto> pq_reader::read_crypto_for(format::cipher algo,
                 "pq: {} is encrypted, but this node has no encryption key provider registered",
                 _sst->get_filename()));
     }
-    const auto key_opts = parquet_parameters(_schema->parquet_options()).key_opts();
+    const parquet_parameters pp{_schema->parquet_options()};
+    const auto key_opts = pp.key_opts();
     format::read_crypto rc;
     try {
         // Resolving a key is not this reader's own CPU work, and for several providers it is not
@@ -543,7 +572,117 @@ future<format::read_crypto> pq_reader::read_crypto_for(format::cipher algo,
     rc.algo = algo;
     rc.aad_file_unique = std::string(aad_file_unique);
     rc.aad_prefix = std::string(aad_prefix);
+
+    if (!column_key_ids.empty()) {
+        co_await resolve_column_keys(rc, column_key_ids);
+    }
     co_return rc;
+}
+
+future<> pq_reader::resolve_column_keys(
+        format::read_crypto& rc, const std::map<std::string, seastar::sstring>& column_key_ids) {
+    auto* ksrc = key_source_ptr();
+    if (!ksrc) {
+        throw std::runtime_error(seastar::format(
+                "pq: {} is encrypted, but this node has no encryption key provider registered",
+                _sst->get_filename()));
+    }
+    const parquet_parameters pp{_schema->parquet_options()};
+    // Driven off the *file*, not off the schema. The file states which columns it encrypted under
+    // their own key; the schema only says where to find those keys. That asymmetry is deliberate
+    // and it is what makes ALTER safe in the one direction that matters: dropping
+    // `encryption_key.<col>` from the property does not make existing files unreadable, because
+    // they still declare the column key and we still go looking for it. The reverse -- adding one
+    // -- affects new files only, since old ones declare the footer key for that column.
+    //
+    // A column the file says has its own key and the schema cannot locate is a hard error. That is
+    // the whole point: the alternative is `read_crypto::key_for()` falling back to the footer key,
+    // which authenticates against nothing and would surface as a decode failure pages later, or --
+    // worse and the failure mode this feature must never have -- an empty column that reads as
+    // "no data" rather than "no access".
+    const auto& col_opts = pp.column_key_opts();
+    // Deduplicated by option set, exactly as on the write side: several columns under one key must
+    // cost one lookup. See the B3 note below for why the count matters and not just the latency.
+    std::map<key_options, format::encryption_key> resolved;
+    for (const auto& [leaf, col_key_id] : column_key_ids) {
+        auto oi = col_opts.find(seastar::sstring(leaf));
+        if (oi == col_opts.end()) {
+            throw std::runtime_error(seastar::format(
+                    "pq: {} encrypts column '{}' under its own key, but the table's 'parquet' "
+                    "option has no 'encryption_key.{}' saying where to find it. Restore that "
+                    "sub-option (the key provider options are read from the schema, not from the "
+                    "file) -- refusing to read rather than return the column as empty",
+                    _sst->get_filename(), leaf, leaf));
+        }
+        if (auto ri = resolved.find(oi->second); ri != resolved.end()) {
+            rc.column_keys[leaf] = ri->second;
+            continue;
+        }
+        format::encryption_key ck;
+        try {
+            // Same reasoning, and the same guard, as the footer key above: this suspends on a
+            // provider round trip -- for the replicated provider, on another read admitted by the
+            // very semaphore that admitted this one -- so the permit must say it is awaiting and
+            // not burning CPU.
+            //
+            // §11.1 B3 is not fixed by that guard and this makes its window longer. An awaiting
+            // permit still holds one *count* unit, so a file with K distinct column keys keeps its
+            // permit for K+1 sequential provider round trips instead of one, multiplying the time
+            // each concurrent reader spends in the state that reforms the cycle. The lookups are
+            // sequential on purpose: issuing them concurrently would put K nested lookups in flight
+            // from a single reader and make the count limit reachable from far fewer readers.
+            reader_permit::awaits_guard awaiting{_permit};
+            ck = co_await ksrc->key_for_read(oi->second, col_key_id);
+        } catch (...) {
+            std::throw_with_nested(std::runtime_error(seastar::format(
+                    "pq: {} encrypts column '{}' under its own key, which could not be obtained "
+                    "from the key provider (id '{}')",
+                    _sst->get_filename(), leaf, col_key_id)));
+        }
+        if (!ck.valid()) {
+            throw std::runtime_error(seastar::format(
+                    "pq: {}: the key provider returned a {}-byte key for column '{}'; AES needs "
+                    "16, 24 or 32", _sst->get_filename(), ck.bytes.size(), leaf));
+        }
+        resolved.emplace(oi->second, ck);
+        rc.column_keys[leaf] = std::move(ck);
+    }
+}
+
+// Fill in the ColumnMetaData of any chunk whose metadata was encrypted under a column key. Pure
+// CPU: every key this needs was resolved in read_crypto_for() before any row group was touched.
+//
+// A chunk we cannot decrypt is an error and not a skip. format::parse_encrypted_footer tolerates
+// leaving `meta` empty -- correct for a general-purpose reader that may legitimately hold only some
+// keys -- but for Scylla reading its own sstable it is not a partial-access case, it is a missing
+// key, and an empty `meta` would flow on as a column with no pages, i.e. as an all-null column.
+// "No access" must never render as "no data".
+void pq_reader::decrypt_column_metadata(size_t rg) {
+    if (!_crypto) { return; }
+    auto& chunks = _rgmd.row_groups[0].columns;
+    for (size_t c = 0; c < chunks.size(); ++c) {
+        auto& ch = chunks[c];
+        if (ch.meta || !ch.encrypted_column_metadata || !ch.crypto_metadata) { continue; }
+        const auto& path = ch.crypto_metadata->path_in_schema;
+        const std::string leaf = path.empty() ? std::string() : path.back();
+        auto it = _crypto->column_keys.find(leaf);
+        if (it == _crypto->column_keys.end()) {
+            throw std::runtime_error(seastar::format(
+                    "pq: {}: row group {} column '{}' is encrypted under its own key, which this "
+                    "reader does not hold", _sst->get_filename(), rg,
+                    leaf.empty() ? "<unnamed>" : leaf));
+        }
+        // The AAD binds the module to its row group and column ordinal, which is why the writer
+        // must emit RowGroup.ordinal: a reader that substitutes -1 for an absent one derives a
+        // different AAD and every per-column decrypt fails.
+        auto aad = format::build_aad(_crypto->aad_prefix, _crypto->aad_file_unique,
+                                    format::module_type::column_metadata, int(rg), int(c));
+        auto blob = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(ch.encrypted_column_metadata->data()),
+                ch.encrypted_column_metadata->size());
+        auto plain = format::decrypt_module(blob, it->second, aad, nullptr, _crypto->algo, false);
+        ch.meta = format::parse_column_metadata_blob(plain);
+    }
 }
 
 // Get the parsed footer into _cf, from the sstable's cache if it is there and by reading,
@@ -566,7 +705,7 @@ future<> pq_reader::load_footer() {
         if (_cf->encrypted) {
             // The envelope was cached; the key was not, on purpose. Fetch it again.
             _crypto = co_await read_crypto_for(_cf->algo, _cf->aad_file_unique, _cf->aad_prefix,
-                                               _cf->key_id);
+                                               _cf->key_id, _cf->column_key_ids);
         }
         prepare_row_group_metadata();
         co_return;
@@ -635,8 +774,10 @@ future<> pq_reader::load_footer() {
         if (entry->aad_prefix.empty()) {
             entry->aad_prefix = fmt::format("{}.{}", _schema->ks_name(), _schema->cf_name());
         }
+        // Column keys cannot be resolved yet: which columns have their own, and under which id,
+        // is stated inside the footer this key is about to decrypt. Harvested and resolved below.
         auto rc = co_await read_crypto_for(entry->algo, entry->aad_file_unique, entry->aad_prefix,
-                                           entry->key_id);
+                                           entry->key_id, {});
         auto aad = format::build_aad(rc.aad_prefix, rc.aad_file_unique,
                                      format::module_type::footer);
         entry->footer = format::decrypt_module(region.subspan(consumed), rc.key, aad, nullptr,
@@ -657,6 +798,35 @@ future<> pq_reader::load_footer() {
                                                 format::metadata_mode::lazy);
         t_parse += std::chrono::steady_clock::now() - t0;
     }
+    // Which columns the file encrypted under their own key, and the provider id each one recorded.
+    //
+    // One row group is materialised into a throwaway copy to read it: the ids are the same in every
+    // group, because the writer fixes the file's column keys once, and one materialisation is 4.3 us
+    // (design doc 10.4j) against the provider round trips it is about to inform. Cached on the
+    // entry so a later reader pays neither this nor the parse -- only the lookups themselves, which
+    // are deliberately never cached.
+    if (encrypted && !entry->md.row_groups.empty()) {
+        format::file_metadata probe;
+        probe.schema = entry->md.schema;
+        probe.row_groups.assign(1, entry->md.row_groups.front());
+        format::materialise_row_group(probe, 0, entry->footer);
+        for (const auto& ch : probe.row_groups[0].columns) {
+            if (!ch.crypto_metadata || ch.crypto_metadata->with_footer_key) { continue; }
+            const auto& path = ch.crypto_metadata->path_in_schema;
+            if (path.empty()) {
+                throw std::runtime_error(seastar::format(
+                        "pq: {}: a column chunk declares its own encryption key but names no "
+                        "column, so the key cannot be looked up", _sst->get_filename()));
+            }
+            entry->column_key_ids[path.back()] = ch.crypto_metadata->key_metadata
+                    ? key_id_from_metadata(seastar::sstring(*ch.crypto_metadata->key_metadata))
+                    : seastar::sstring();
+        }
+        if (!entry->column_key_ids.empty()) {
+            co_await resolve_column_keys(*_crypto, entry->column_key_ids);
+        }
+    }
+
     entry->rg_start.reserve(entry->md.row_groups.size());
     for (const auto& g : entry->md.row_groups) {
         entry->rg_start.push_back(entry->total_rows);

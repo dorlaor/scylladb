@@ -403,6 +403,19 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                         "supported: provider, parquet_kms", v));
             }
             _cfg.encryption_key_metadata = *f;
+        } else if (k.size() > std::strlen(ENCRYPTION_KEY_PREFIX)
+                   && k.compare(0, std::strlen(ENCRYPTION_KEY_PREFIX), ENCRYPTION_KEY_PREFIX) == 0) {
+            // Stored raw and resolved in validate_key_options(), which is the first point that has
+            // the whole map: the overlay needs the table's own key options, and CQL map order is
+            // not the operator's, so 'encryption_key.ssn' may well be parsed before
+            // 'secret_key_file'.
+            const sstring col = k.substr(std::strlen(ENCRYPTION_KEY_PREFIX));
+            if (col.empty()) {
+                throw exceptions::configuration_exception(
+                        "The 'encryption_key.' sub-option needs a column name, e.g. "
+                        "'encryption_key.my_col'");
+            }
+            _column_key_raw[col] = v;
         } else if (k.size() > std::strlen(ENCODING_PREFIX)
                    && k.compare(0, std::strlen(ENCODING_PREFIX), ENCODING_PREFIX) == 0) {
             const sstring col = k.substr(std::strlen(ENCODING_PREFIX));
@@ -429,7 +442,8 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
                     seastar::format("Unknown sub-option '{}' for the 'parquet' option; supported: "
                                     "rows_per_row_group, row_group_buffer_bytes, page_rows, compression, "
                                     "compression_level, metadata_folding, dictionary, encryption, "
-                                    "encryption_key_metadata, 'encoding.<column>', and the key "
+                                    "encryption_key_metadata, 'encoding.<column>', "
+                                    "'encryption_key.<column>', and the key "
                                     "provider options ({})",
                                     k, fmt::join(key_option_names(), ", ")));
         }
@@ -463,6 +477,99 @@ const std::set<sstring>& parquet_parameters::key_option_names() {
     return names;
 }
 
+std::optional<sstring> parquet_parameters::keyable_column_error(const sstring& column,
+                                                                bool multi_cell) {
+    // See the long note on the declaration for why each of these is a hard restriction of the
+    // format layer's leaf-name key lookup rather than caution.
+    if (multi_cell) {
+        return seastar::format(
+                "column '{}' is a non-frozen collection, which Parquet cannot give its own "
+                "encryption key: the column becomes a group of leaves named 'key', 'value', "
+                "'__ts', '__ttl' and '__ldt', so there is no leaf bearing the column's name for a "
+                "key to attach to. Freeze the column, or encrypt the whole table by setting "
+                "'encryption' without 'encryption_key.{}'", column, column);
+    }
+    // The names the mapping uses for collection and metadata leaves. A scalar column with one of
+    // these names shares its leaf name with those leaves, and a key looked up by leaf name would
+    // cover both.
+    static const std::set<sstring> reserved{"key", "value", "clock"};
+    if (reserved.contains(column)) {
+        return seastar::format(
+                "column '{}' cannot have its own encryption key: '{}' is also the name Parquet "
+                "gives a leaf inside every non-frozen collection, and a key is looked up by leaf "
+                "name -- so the key would silently cover those leaves too, including in a "
+                "collection added by a later ALTER TABLE. Rename the column, or encrypt the whole "
+                "table by setting 'encryption' without 'encryption_key.{}'", column, column,
+                column);
+    }
+    if (column.size() >= 2 && column[0] == '_' && column[1] == '_') {
+        return seastar::format(
+                "column '{}' cannot have its own encryption key: names beginning '__' are what "
+                "Parquet's mapping calls its synthetic timestamp, TTL and deletion leaves, so a "
+                "key looked up by leaf name could not be told apart from one of those",
+                column);
+    }
+    return std::nullopt;
+}
+
+// Split 'a=b,c=d' into provider options. Comma between pairs and the *first* '=' within a pair:
+// a provider option value may contain '=' (base64 padding) and ':' (a KMS ARN) but not ',', which
+// no provider's key locator uses.
+static std::map<sstring, sstring> parse_key_option_overrides(const sstring& column,
+                                                             const sstring& spec) {
+    std::map<sstring, sstring> out;
+    size_t i = 0;
+    while (i <= spec.size()) {
+        const auto comma = spec.find(',', i);
+        const auto end = comma == sstring::npos ? spec.size() : comma;
+        std::string_view pair(spec.data() + i, end - i);
+        // Trim, so 'a=b, c=d' works like every other comma list an operator has ever written.
+        while (!pair.empty() && std::isspace(static_cast<unsigned char>(pair.front()))) {
+            pair.remove_prefix(1);
+        }
+        while (!pair.empty() && std::isspace(static_cast<unsigned char>(pair.back()))) {
+            pair.remove_suffix(1);
+        }
+        if (pair.empty()) {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option's 'encryption_key.{}' has an empty entry; it takes key "
+                    "provider options, e.g. 'secret_key_file=/etc/scylla/keys/pii.key'", column));
+        }
+        const auto eq = pair.find('=');
+        if (eq == std::string_view::npos || eq == 0) {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option's 'encryption_key.{}' entry '{}' is not "
+                    "'<option>=<value>'; it takes key provider options, e.g. "
+                    "'secret_key_file=/etc/scylla/keys/pii.key'", column, pair));
+        }
+        const sstring name(pair.substr(0, eq));
+        const sstring value(pair.substr(eq + 1));
+        if (!parquet_parameters::key_option_names().contains(name)) {
+            // The same reasoning as the closed sub-option list: a provider ignores options it does
+            // not know, so a typo'd 'secret_key_fil' here would fall back to the *table's* key and
+            // leave the column looking separately encrypted when it is not.
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option's 'encryption_key.{}' names '{}', which is not a key "
+                    "provider option; supported: {}", column, name,
+                    fmt::join(parquet_parameters::key_option_names(), ", ")));
+        }
+        if (value.empty()) {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option's 'encryption_key.{}' sets '{}' to the empty string",
+                    column, name));
+        }
+        out[name] = value;
+        if (comma == sstring::npos) { break; }
+        i = comma + 1;
+    }
+    if (out.empty()) {
+        throw exceptions::configuration_exception(seastar::format(
+                "The 'parquet' option's 'encryption_key.{}' is empty; it takes key provider "
+                "options, e.g. 'secret_key_file=/etc/scylla/keys/pii.key'", column));
+    }
+    return out;
+}
+
 void parquet_parameters::validate_key_options() {
     if (!_cfg.encryption_enabled) {
         // Provider options without `encryption` do nothing, and an inert security setting is
@@ -474,9 +581,43 @@ void parquet_parameters::validate_key_options() {
                     "the key options only apply when encryption is on",
                     _cfg.key_opts.begin()->first));
         }
+        // Worse than inert in this case: `encryption_key.<column>` reads as "this column is
+        // encrypted under its own key", which without `encryption` is the opposite of the truth.
+        if (!_column_key_raw.empty()) {
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option sets 'encryption_key.{}' but no 'encryption'; a "
+                    "per-column key only applies when encryption is on, and nothing is encrypted "
+                    "here", _column_key_raw.begin()->first));
+        }
         return;
     }
 
+    validate_one_key_option_set(_cfg.key_opts, "the 'parquet' option");
+
+    // Each per-column set starts from the table's own options -- already defaulted and validated
+    // above -- and applies the operator's overrides on top. So an override naming only the one
+    // option that locates a key inherits the provider, the algorithm and the key length, which is
+    // what makes the one-pair form the normal one.
+    for (const auto& [col, spec] : _column_key_raw) {
+        if (auto why = keyable_column_error(col, /*multi_cell=*/false)) {
+            // The collection case cannot be seen from here -- parquet_parameters is constructed
+            // wherever the schema is read and has no columns -- so it is checked in
+            // cf_prop_defs::apply_to_builder. The name-based cases are checkable here, and are
+            // checked here so they also hold for a schema arriving from another node.
+            throw exceptions::configuration_exception(seastar::format(
+                    "The 'parquet' option asks for a per-column encryption key, but {}", *why));
+        }
+        key_options ko = _cfg.key_opts;
+        for (const auto& [name, value] : parse_key_option_overrides(col, spec)) {
+            ko[name] = value;
+        }
+        validate_one_key_option_set(
+                ko, seastar::format("the 'parquet' option's 'encryption_key.{}'", col));
+        _cfg.column_key_opts[col] = std::move(ko);
+    }
+}
+
+void parquet_parameters::validate_one_key_option_set(key_options& opts, std::string_view what) {
     // Parquet Modular Encryption permits AES-GCM and AES-GCM-CTR and nothing else, and even
     // AES_GCM_CTR_V1 uses GCM for every metadata module -- so the key is always an AES-GCM key.
     // ent/encryption's default is `AES/CBC/PKCS5Padding`, which cannot be honoured at all.
@@ -495,8 +636,8 @@ void parquet_parameters::validate_key_options() {
     // format permits, so there is no other value for it to become.
     static constexpr const char* CIPHER = "cipher_algorithm";
     static constexpr const char* required_cipher = "AES/GCM/NoPadding";
-    if (auto it = _cfg.key_opts.find(CIPHER); it == _cfg.key_opts.end()) {
-        _cfg.key_opts[CIPHER] = required_cipher;
+    if (auto it = opts.find(CIPHER); it == opts.end()) {
+        opts[CIPHER] = required_cipher;
     } else {
         // JCE spelling: transformation/mode/padding, case-insensitive, mode and padding optional
         // (and an absent mode means CBC to both OpenSSL and ent/encryption -- so it is refused
@@ -511,22 +652,22 @@ void parquet_parameters::validate_key_options() {
                                : spec.substr(first + 1, spec.find('/', first + 1) - first - 1);
         if (alg != "aes" || mode != "gcm") {
             throw exceptions::configuration_exception(seastar::format(
-                    "The 'parquet' option asks for cipher_algorithm '{}', which Parquet Modular "
+                    "{} asks for cipher_algorithm '{}', which Parquet Modular "
                     "Encryption cannot honour: the format permits only AES-GCM (and AES-GCM-CTR, "
                     "whose metadata is still GCM). Use '{}', or encrypt the whole component with "
                     "scylla_encryption_options instead -- at the cost of a file no external "
-                    "reader can open", it->second, required_cipher));
+                    "reader can open", what, it->second, required_cipher));
         }
     }
 
     // 128/192/256 -> 16/24/32 bytes, which is what format::encryption_key accepts. Anything else
     // would be a table that takes its DDL and then fails every flush.
     static constexpr const char* STRENGTH = "secret_key_strength";
-    if (auto it = _cfg.key_opts.find(STRENGTH); it != _cfg.key_opts.end()) {
+    if (auto it = opts.find(STRENGTH); it != opts.end()) {
         if (it->second != "128" && it->second != "192" && it->second != "256") {
             throw exceptions::configuration_exception(seastar::format(
-                    "The 'parquet' option asks for secret_key_strength '{}'; AES keys are 128, "
-                    "192 or 256 bits", it->second));
+                    "{} asks for secret_key_strength '{}'; AES keys are 128, "
+                    "192 or 256 bits", what, it->second));
         }
     }
 }
@@ -594,6 +735,11 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
             // Qualified: the member to_string(column_encoding) would otherwise hide it.
             m[ENCRYPTION_KEY_METADATA] =
                     sstables::parquet::to_string(_cfg.encryption_key_metadata);
+        }
+        // The operator's text, not the overlay result -- see the note on _column_key_raw. These
+        // are locators, like the table's own key options, so there is nothing here to leak either.
+        for (const auto& [col, spec] : _column_key_raw) {
+            m[sstring(ENCRYPTION_KEY_PREFIX) + col] = spec;
         }
     }
     return m;
@@ -1266,6 +1412,42 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
         // understands as "no id".
         pcfg.wopt.encryption.key_metadata = std::string(
                 make_key_metadata(rk.id, pcfg.encryption_key_metadata));
+
+        // Per-column keys. Resolved through the same provider interface as the footer key, so
+        // BYOK works identically and no key is ever derived from another or held in the schema.
+        //
+        // Deduplicated by option set, which is what makes the common shape cheap: "encrypt the PII
+        // columns under the PII key" names one key for several columns, and that must be one
+        // provider round trip, not one per column. It also matters on the read side, where each
+        // distinct set costs a nested key lookup under a reader permit (§11.1 B3).
+        std::map<key_options, resolved_key> by_opts;
+        for (const auto& [col, kopts] : pcfg.column_key_opts) {
+            auto it = by_opts.find(kopts);
+            if (it == by_opts.end()) {
+                resolved_key crk;
+                try {
+                    crk = ks->key_for_write(kopts).get();
+                } catch (...) {
+                    std::throw_with_nested(std::runtime_error(seastar::format(
+                            "{}.{}: could not obtain the parquet encryption key for column '{}' "
+                            "from the key provider", s.ks_name(), s.cf_name(), col)));
+                }
+                if (!crk.key.valid()) {
+                    throw std::runtime_error(seastar::format(
+                            "{}.{}: the key provider returned a {}-byte key for column '{}'; AES "
+                            "needs 16, 24 or 32",
+                            s.ks_name(), s.cf_name(), crk.key.bytes.size(), col));
+                }
+                it = by_opts.emplace(kopts, std::move(crk)).first;
+            }
+            // The column's own key_metadata, so the reader can ask the provider for *that* key by
+            // id -- which is what lets one column's key rotate without touching another's.
+            pcfg.wopt.encryption.column_keys[std::string(col)] =
+                    format::writer_options::encryption_options::column_key{
+                            it->second.key,
+                            std::string(make_key_metadata(it->second.id,
+                                                          pcfg.encryption_key_metadata))};
+        }
     }
     return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
                                             std::move(pcfg), enc_stats, shard, nullptr);
@@ -1294,6 +1476,22 @@ future<> validate_encryption(const ::schema& s) {
         std::throw_with_nested(exceptions::configuration_exception(seastar::format(
                 "{}.{}: the 'parquet' option asks for encryption, but no key could be obtained "
                 "from the key provider", s.ks_name(), s.cf_name())));
+    }
+    // Every per-column key too, and for the same reason: a per-column key that cannot be resolved
+    // is a table that accepts its DDL and then fails every flush, whose first symptom is a
+    // compaction error hours later. Deduplicated by option set so that keying twenty columns under
+    // one PII key is one provider round trip at DDL time, not twenty.
+    std::set<key_options> seen;
+    for (const auto& [col, kopts] : pp.column_key_opts()) {
+        if (!seen.insert(kopts).second) { continue; }
+        try {
+            co_await ks->validate(kopts);
+        } catch (...) {
+            std::throw_with_nested(exceptions::configuration_exception(seastar::format(
+                    "{}.{}: the 'parquet' option asks for a separate encryption key for column "
+                    "'{}', but no key could be obtained from the key provider",
+                    s.ks_name(), s.cf_name(), col)));
+        }
     }
 }
 

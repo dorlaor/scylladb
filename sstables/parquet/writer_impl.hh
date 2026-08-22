@@ -54,6 +54,19 @@ struct pq_writer_config {
     // ent/encryption's option vocabulary, forwarded verbatim to key_source. Empty unless
     // encryption is on.
     key_options      key_opts{};
+    // Per-column keys, by CQL column name: the provider options that locate *that column's* key,
+    // already overlaid onto `key_opts` so each entry is a complete option set a provider can be
+    // asked with. A column listed here is encrypted under its own key instead of the footer key,
+    // and its ColumnMetaData moves out of the footer -- so a reader holding only the footer key
+    // learns that the column exists and nothing else about it.
+    //
+    // Complete option sets rather than deltas because that is what `key_source` takes: a key is
+    // identified by an option map, and ent/encryption's `get_provider()` resolves a provider from
+    // one. Storing the overlay result here means the writer and the reader never have to agree on
+    // how a delta is applied -- they both just hand a map to the provider.
+    //
+    // Still no key material, exactly as with `key_opts`: only the options that locate it.
+    std::map<sstring, key_options> column_key_opts{};
     // A row group is cut when either limit trips.
     //
     // `row_group_buffer_bytes` is **buffered shredder memory**, not encoded output, and
@@ -163,6 +176,26 @@ public:
     // (parquet-java's key-material JSON, needed only by pyarrow's and Spark's KMS-mediated
     // readers). See encryption_keys.hh for why this is the operator's choice.
     static constexpr const char* ENCRYPTION_KEY_METADATA = "encryption_key_metadata";
+    // Per-column encryption key: `parquet = {'encryption_key.<column>': '<opt>=<v>[,<opt>=<v>]'}`.
+    //
+    // The value is a comma-separated list of key-provider options -- the same vocabulary as
+    // key_option_names() -- overlaid on the table's own key options. Usually one pair, because a
+    // per-column key normally differs from the table key in exactly the one option that *names* a
+    // key, and which option that is depends on the provider: `secret_key_file` for the local-file
+    // provider, `master_key` for the cloud ones, `template_name`/`key_namespace` for KMIP. There is
+    // no provider-neutral single name to hard-code, which is why this takes options rather than a
+    // bare key identifier.
+    //
+    //   parquet = {'encryption': 'aes_gcm_v1',
+    //              'secret_key_file': '/etc/scylla/keys/t.key',
+    //              'encryption_key.ssn': 'secret_key_file=/etc/scylla/keys/pii.key'}
+    //
+    // A prefix rather than a nested map for the same reason as ENCODING_PREFIX: a CQL table
+    // property is map<text,text> and there is no nesting to be had.
+    //
+    // Only a column that owns a uniquely-named Parquet leaf can be keyed -- see
+    // keyable_column_error(), which is the whole of the restriction and the reason it exists.
+    static constexpr const char* ENCRYPTION_KEY_PREFIX  = "encryption_key.";
     // The sub-options forwarded verbatim to the key provider. A closed list on purpose: an
     // unrecognised sub-option is an error (see the `else` in the parser), and providers ignore
     // options they do not know, so an open-ended pass-through would turn a typo'd
@@ -205,15 +238,49 @@ public:
     // rest of the config.
     const key_options& key_opts() const { return _cfg.key_opts; }
     bool encryption_enabled() const { return _cfg.encryption_enabled; }
+    // Per-column key options, by CQL column name, each already overlaid on key_opts(). The read
+    // path indexes this by the leaf name a file says has its own key.
+    const std::map<sstring, key_options>& column_key_opts() const { return _cfg.column_key_opts; }
+
+    // Why `column` cannot carry its own encryption key, or nullopt if it can. Checked at DDL time,
+    // where the operator is present, and exposed here so there is exactly one definition of the
+    // rule.
+    //
+    // The restriction is a real property of the format layer, not caution: Parquet's
+    // ColumnCryptoMetaData names a column by its path, but a key is looked up by the *last*
+    // element of that path (`format::read_crypto::key_for`, `parquet_file_writer::column_key_for`),
+    // and Scylla's mapping does not give every CQL column a uniquely-named leaf. A non-frozen
+    // collection becomes five leaves called `key`, `value`, `__ts`, `__ttl`, `__ldt` under a group
+    // named after the column (schema_mapping.cc), so:
+    //
+    //   * a collection column owns no leaf bearing its own name -- there is nothing to key; and
+    //   * a *scalar* column that happens to be called `key` or `value` shares its leaf name with
+    //     every collection in the table, so keying it would silently key those leaves too.
+    //
+    // The second case is rejected whether or not the table currently has a collection, because
+    // ALTER TABLE ... ADD can introduce one later: an accepted key on a column named `value` would
+    // then quietly widen to cover a new collection's values, which is a security change arriving
+    // through an unrelated DDL.
+    static std::optional<sstring> keyable_column_error(const sstring& column, bool multi_cell);
 
 private:
     // Runs once the whole map is parsed: the interesting checks are about combinations (an
     // algorithm the format cannot honour, provider options with encryption off) rather than
     // single values, and CQL map order is not the operator's.
     void validate_key_options();
+    // Shared by the table's own key options and by every per-column set: an algorithm the format
+    // cannot honour and a key length AES does not have are errors wherever they appear, and a
+    // per-column set that skipped the check would be a table that took its DDL and then failed
+    // every flush of that one column. `what` names the option in the error message.
+    static void validate_one_key_option_set(key_options&, std::string_view what);
 
     pq_writer_config _cfg;
     std::map<sstring, column_encoding> _column_encodings;
+    // The per-column key overrides exactly as the operator wrote them, so to_map() round-trips the
+    // text rather than a re-serialisation of the overlay result. Emitting the overlay would put
+    // the table's own options back into every column's entry, which parses to the same thing but
+    // reads, in DESCRIBE, as if each column had been configured from scratch.
+    std::map<sstring, sstring> _column_key_raw;
 };
 
 // Builds the layer-2 column description for a Scylla schema. Exposed because
