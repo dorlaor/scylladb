@@ -1249,7 +1249,14 @@ fragmented_ostringstream& schema::schema_properties(const schema_describe_helper
     os << "\n    AND memtable_flush_period_in_ms = " << fmt::to_string(memtable_flush_period());
     os << "\n    AND min_index_interval = " << fmt::to_string(min_index_interval());
     os << "\n    AND speculative_retry = '" << speculative_retry().to_sstring() << "'";
-    if (has_storage_format() && storage_format() != storage_format_type::sstable) {
+    // Emitted unconditionally, including at the 'sstable' default. Every other property in this
+    // function prints at its default too -- bloom_filter_fp_chance = 0.01, default_time_to_live = 0,
+    // crc_check_chance = 1 -- so suppressing only this one made storage_format the single property
+    // whose absence was ambiguous: a table described without it could be an explicit 'sstable', or
+    // a server that does not know the property at all. Since which storage format a table uses is
+    // the whole subject of this feature, that is the last property that should be guessed at.
+    // has_storage_format() still gates it, so a table predating the feature prints nothing.
+    if (has_storage_format()) {
         os << "\n    AND storage_format = '" << storage_format_type_to_sstring(storage_format()) << "'";
     }
     if (storage_engine() != storage_engine_type::normal) {

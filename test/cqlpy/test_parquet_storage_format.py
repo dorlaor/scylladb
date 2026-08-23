@@ -151,37 +151,40 @@ def test_storage_format_create_round_trips(cql, test_keyspace, fmt):
         assert scylla_tables_storage_format(cql, table) == fmt
 
 
-# DESCRIBE shows the property for the two non-default formats, and omits it for
-# 'sstable'. The omission is deliberate (schema.cc emits the line only when the
-# format differs from the default), so it is asserted rather than assumed: a
-# DESCRIBE that leaked `storage_format = 'sstable'` into every table's output
-# would be a regression, and one that dropped 'parquet' would silently produce
-# a CREATE statement that does not recreate the table.
-def test_storage_format_describe_shows_non_default_only(cql, test_keyspace):
-    for fmt in ["parquet", "hybrid"]:
+# DESCRIBE shows the property whenever it was explicitly set -- INCLUDING at the
+# 'sstable' default. Changed 2026-08-23: it used to be suppressed at the default,
+# which made storage_format the only property in the CREATE statement whose
+# absence was ambiguous. Every other property prints at its default
+# (bloom_filter_fp_chance = 0.01, default_time_to_live = 0, crc_check_chance = 1),
+# so a missing storage_format could mean "explicitly sstable" or "server does not
+# know this property" -- and for a feature whose entire subject is which storage
+# format a table uses, that is the last thing that should have to be guessed.
+def test_storage_format_describe_shows_every_explicit_value(cql, test_keyspace):
+    for fmt in ["parquet", "hybrid", "sstable"]:
         with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int",
                             f" WITH storage_format = '{fmt}'") as table:
             assert f"storage_format = '{fmt}'" in describe(cql, table)
 
-    with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int",
-                        " WITH storage_format = 'sstable'") as table:
-        assert "storage_format" not in describe(cql, table)
-
 
 # A table that never mentioned the property is distinguishable from one that
-# explicitly asked for the default: the former stores no cell (NULL), the
-# latter stores 'sstable'. DESCRIBE hides both. This asymmetry is easy to
-# break in either direction, and it is what makes "did the user choose this?"
-# answerable at all.
+# explicitly asked for the default: the former stores no cell (NULL), the latter
+# stores 'sstable'. As of 2026-08-23 DESCRIBE reflects that distinction too --
+# has_storage_format() is storage_format.has_value(), so the never-set case still
+# prints nothing while an explicit 'sstable' prints the line. Previously DESCRIBE
+# hid both and the distinction was only visible in system_schema.scylla_tables.
 def test_storage_format_persisted_vs_absent(cql, test_keyspace):
     with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int") as table:
         assert scylla_tables_storage_format(cql, table) is None
+        # And the never-set case must stay absent from DESCRIBE, or the two states
+        # become indistinguishable again in the opposite direction.
         assert "storage_format" not in describe(cql, table)
 
     with new_test_table(cql, test_keyspace, "pk int PRIMARY KEY, v int",
                         " WITH storage_format = 'sstable'") as table:
         assert scylla_tables_storage_format(cql, table) == 'sstable'
-        assert "storage_format" not in describe(cql, table)
+        # Explicitly-chosen default now prints, which is the whole point of the
+        # 2026-08-23 change: "I asked for sstable" is visible, not inferred.
+        assert "storage_format = 'sstable'" in describe(cql, table)
 
 
 # An unrecognised value must be rejected at DDL time with a message naming the
@@ -228,10 +231,13 @@ def test_storage_format_survives_alter(cql, test_keyspace):
         assert "storage_format = 'hybrid'" in describe(cql, table)
 
         # Back to the default. The cell is now explicitly 'sstable' rather than
-        # NULL -- the ALTER is recorded -- but DESCRIBE stops showing it.
+        # NULL -- the ALTER is recorded -- and since 2026-08-23 DESCRIBE says so.
+        # An ALTER back to the default used to become invisible, so a table that
+        # had been parquet and was reverted looked identical to one that was never
+        # anything else.
         cql.execute(f"ALTER TABLE {table} WITH storage_format = 'sstable'")
         assert scylla_tables_storage_format(cql, table) == 'sstable'
-        assert "storage_format" not in describe(cql, table)
+        assert "storage_format = 'sstable'" in describe(cql, table)
 
 
 # DESCRIBE has to be reproducible: the statement it prints must recreate a
