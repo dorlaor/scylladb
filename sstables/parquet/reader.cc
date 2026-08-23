@@ -885,22 +885,53 @@ future<> pq_reader::init() {
         std::exception_ptr ex;
         try {
             bool present = true;
+            std::optional<int64_t> singular_end;
             if (_pr->is_singular()) {
                 // A singular range needs the exact-key lookup, not advance_to():
                 // advance_to() positions for a *range* and leaves both bounds at
                 // the start for a point, which reads back as an empty window.
                 // This is the same call mx makes for a single-partition read.
-                rtimer _t{rphase::index_lookup};
-                present = co_await ir->advance_lower_and_check_if_present(
-                        dht::ring_position_view(_pr->start()->value()));
+                {
+                    rtimer _t{rphase::index_lookup};
+                    present = co_await ir->advance_lower_and_check_if_present(
+                            dht::ring_position_view(_pr->start()->value()));
+                }
+                // ...but that call leaves the *upper* bound unset, and an unset upper bound is
+                // not a missing optimisation here -- it is a window that runs to the end of the
+                // file. `data_file_positions().end` is engaged only when an upper bound exists,
+                // so a point read used to come back with [first row of the partition, total
+                // rows), and next_window() would then decode and reassemble min(window, rest of
+                // the row group) rows in order to return the handful the partition holds. At the
+                // shipping defaults that is a whole row group: ~2 500 rows on average to answer
+                // a five-row question, and it was 90 % of the read (design doc 10.28).
+                //
+                // Stepping the lower bound on by one partition costs an increment of an index
+                // page cursor -- the page is already in memory, read_partition_data() having
+                // just been awaited inside the call above -- and gives the ordinal the partition
+                // ends at. `_row_lo` is captured *before* the step, because the step moves the
+                // bound this reads the start from.
+                if (present && !ir->eof()) {
+                    _row_lo = std::min<int64_t>(int64_t(ir->data_file_positions().start), acc);
+                    rtimer _t{rphase::index_lookup};
+                    co_await ir->advance_to_next_partition();
+                    // At the last partition of the file this is data_file_end(), which is a byte
+                    // count rather than a row ordinal -- so it is clamped to `acc` like every
+                    // other position here, and lands on "to the end of the file", which for the
+                    // last partition is the right answer anyway.
+                    singular_end = std::min<int64_t>(int64_t(ir->data_file_positions().start), acc);
+                }
             } else {
                 rtimer _t{rphase::index_lookup};
                 co_await ir->advance_to(*_pr);
             }
-            auto pos = present ? ir->data_file_positions() : sstables::data_file_positions_range{0, 0};
             if (!present) { _sst->get_filter_tracker().add_false_positive(); }
-            _row_lo = std::min<int64_t>(int64_t(pos.start), acc);
-            _row_hi = pos.end ? std::min<int64_t>(int64_t(*pos.end), acc) : acc;
+            if (singular_end) {
+                _row_hi = *singular_end;
+            } else {
+                auto pos = present ? ir->data_file_positions() : sstables::data_file_positions_range{0, 0};
+                _row_lo = std::min<int64_t>(int64_t(pos.start), acc);
+                _row_hi = pos.end ? std::min<int64_t>(int64_t(*pos.end), acc) : acc;
+            }
             if (_row_hi < _row_lo) { _row_hi = _row_lo; }
         } catch (...) { ex = std::current_exception(); }
         co_await ir->close();
@@ -1500,6 +1531,7 @@ mutation_reader make_full_scan_reader(
 void reader_profile_reset() {
     rprof::ns.fill(0);
     rprof::hits.fill(0);
+    format::decode_profile_reset();
 }
 
 std::string reader_profile_report() {
@@ -1526,6 +1558,10 @@ std::string reader_profile_report() {
                            names[i], ms, rprof::hits[i], per, share);
     }
     out += fmt::format("  {:<18} {:>9.1f}\n", "instrumented", double(total) / 1e6);
+    // Appended rather than merged: these are *inside* rg_decode and decode_cpu, so folding them
+    // into the table above would double-count them and dilute every share in it -- which is
+    // exactly the defect 10.27 records against the old page_decode phase.
+    out += format::decode_profile_report();
     return out;
 }
 
