@@ -57,6 +57,28 @@ encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const en
                                                 column_keys = {},
                                         limits = {});
 
+// Where the time inside a page decode goes. A *breakdown* of the reader's rg_decode and
+// decode_cpu phases, not a peer of them: these are nested inside those, so they are reported
+// separately and must never be added into the reader's own share column.
+//
+// It exists because once pq_reader's window was clipped to the rows a point read actually wants,
+// every remaining phase of the read except this one was under 10 % -- and "the page decode" is
+// four quite different costs wearing one label. Which of them dominates decides whether the lever
+// is the codec, the page size or the decode loop, and guessing wrong there has cost a wrong
+// answer before (design doc 10.27, 10.28). Same switch as the reader's own profile,
+// PQ_READER_PROFILE=1, and likewise always compiled.
+enum class dphase : size_t {
+    decompress,     // the codec, on a whole page: zstd cannot decompress part of a frame
+    levels,         // repetition and definition level streams, RLE-decoded for the whole page
+    values,         // the wanted slice of the page's values, plus any skip the encoding forces
+    expand_nulls,   // re-expanding a sparse column to one entry per slot
+    trim,           // clipping a column to the requested row range
+    plan,           // per-call setup: walking the schema tree for leaf level bounds
+    _count
+};
+std::string decode_profile_report();
+void decode_profile_reset();
+
 // Decode one row group into one column_data per leaf, in schema order.
 std::vector<column_data> read_row_group(std::span<const uint8_t> image,
                                         const file_metadata&,

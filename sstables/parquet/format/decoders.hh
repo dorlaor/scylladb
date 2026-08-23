@@ -36,23 +36,45 @@ public:
     explicit decode_error(const std::string& w) : std::runtime_error("parquet/decode: " + w) {}
 };
 
+// Every decoder below takes an optional leading `skip`: produce `count` values starting at the
+// `skip`-th one in the stream, rather than at the first. A point read reads one page per leaf and
+// wants a few of the values in it, so the values before its window are pure waste -- and for the
+// dictionary and BYTE_ARRAY paths that waste is an allocation per value, not just a load. Where
+// the encoding allows it (PLAIN, BYTE_STREAM_SPLIT, RLE_DICTIONARY) the skip is arithmetic or a
+// run walk; where it cannot (the DELTA family, whose values are defined relative to their
+// predecessor) the decoder still decodes from the start and simply does not hand back the head,
+// which is what it did before this parameter existed.
+//
+// `skip == 0` is the whole of the scan path and is bit-for-bit the old behaviour.
+
 // ---------------------------------------------------------------- PLAIN
 template <typename T>
-inline std::vector<T> decode_plain(std::span<const uint8_t> in, size_t count) {
-    if (in.size() < count * sizeof(T)) {
+inline std::vector<T> decode_plain(std::span<const uint8_t> in, size_t count, size_t skip = 0) {
+    if (in.size() / sizeof(T) < skip || (in.size() - skip * sizeof(T)) / sizeof(T) < count) {
         throw decode_error("PLAIN buffer too small for " + std::to_string(count) + " values");
     }
     std::vector<T> out(count);
     // memcpy with a null source or destination is UB even for a zero length, and
     // an all-null column legitimately produces a zero-value page.
-    if (count) { std::memcpy(out.data(), in.data(), count * sizeof(T)); }
+    if (count) { std::memcpy(out.data(), in.data() + skip * sizeof(T), count * sizeof(T)); }
     return out;
 }
 
-inline std::vector<std::string> decode_plain_byte_array(std::span<const uint8_t> in, size_t count) {
+// The length prefixes still have to be walked to find the `skip`-th value, but no string is built
+// for the ones passed over.
+inline std::vector<std::string> decode_plain_byte_array(std::span<const uint8_t> in, size_t count,
+                                                       size_t skip = 0) {
     std::vector<std::string> out;
     out.reserve(count);
     size_t p = 0;
+    for (size_t i = 0; i < skip; ++i) {
+        if (p + 4 > in.size()) { throw decode_error("truncated BYTE_ARRAY length"); }
+        uint32_t n;
+        std::memcpy(&n, in.data() + p, 4);
+        p += 4;
+        if (p + n > in.size()) { throw decode_error("truncated BYTE_ARRAY value"); }
+        p += n;
+    }
     for (size_t i = 0; i < count; ++i) {
         if (p + 4 > in.size()) { throw decode_error("truncated BYTE_ARRAY length"); }
         uint32_t n;
@@ -66,14 +88,22 @@ inline std::vector<std::string> decode_plain_byte_array(std::span<const uint8_t>
 }
 
 // ---------------------------------------------------------------- BYTE_STREAM_SPLIT
+// `total` is the number of values in the whole stream, which is what the stride is made of: the
+// b-th byte of value i lives at `b * total + i`. It is therefore *not* derivable from the slice
+// being asked for, which is why it is a separate parameter rather than `skip + count`.
 template <typename T>
-inline std::vector<T> decode_byte_stream_split(std::span<const uint8_t> in, size_t count) {
+inline std::vector<T> decode_byte_stream_split(std::span<const uint8_t> in, size_t total,
+                                              size_t skip = 0, size_t count = size_t(-1)) {
     constexpr size_t K = sizeof(T);
-    if (in.size() < count * K) { throw decode_error("BYTE_STREAM_SPLIT buffer too small"); }
+    if (count == size_t(-1)) { count = total - std::min(total, skip); }
+    if (in.size() < total * K) { throw decode_error("BYTE_STREAM_SPLIT buffer too small"); }
+    if (skip > total || count > total - skip) {
+        throw decode_error("BYTE_STREAM_SPLIT range outside the stream");
+    }
     std::vector<T> out(count);
     for (size_t i = 0; i < count; ++i) {
         uint8_t buf[K];
-        for (size_t b = 0; b < K; ++b) { buf[b] = in[b * count + i]; }
+        for (size_t b = 0; b < K; ++b) { buf[b] = in[b * total + skip + i]; }
         std::memcpy(&out[i], buf, K);
     }
     return out;
@@ -106,10 +136,11 @@ inline std::vector<std::string_view> index_plain_byte_array(std::span<const uint
 // RLE_DICTIONARY over a view table: only referenced entries become strings.
 inline std::vector<std::string> decode_rle_dictionary_views(std::span<const uint8_t> page,
                                                             std::span<const std::string_view> dict,
-                                                            size_t count) {
+                                                            size_t count, size_t skip = 0) {
     if (page.empty()) { throw decode_error("empty dictionary index page"); }
     const uint8_t bw = page[0];
     rle_decoder dec(page.subspan(1), bw);
+    if (skip && dec.skip(skip) != skip) { throw decode_error("short dictionary index stream"); }
     auto idx = dec.decode_all(count);
     if (idx.size() != count) { throw decode_error("short dictionary index stream"); }
     std::vector<std::string> out;
@@ -127,10 +158,11 @@ inline std::vector<std::string> decode_rle_dictionary_views(std::span<const uint
 template <typename T>
 inline std::vector<T> decode_rle_dictionary(std::span<const uint8_t> page,
                                             const std::vector<T>& dict,
-                                            size_t count) {
+                                            size_t count, size_t skip = 0) {
     if (page.empty()) { throw decode_error("empty dictionary index page"); }
     const uint8_t bw = page[0];
     rle_decoder dec(page.subspan(1), bw);
+    if (skip && dec.skip(skip) != skip) { throw decode_error("short dictionary index stream"); }
     auto idx = dec.decode_all(count);
     if (idx.size() != count) { throw decode_error("short dictionary index stream"); }
     std::vector<T> out;
@@ -147,7 +179,16 @@ inline std::vector<T> decode_rle_dictionary(std::span<const uint8_t> page,
 // needs it: its three streams are concatenated with no length prefixes, so the only way to find where
 // the suffix data begins is to know where the preceding stream ended.
 inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> in, size_t count,
-                                                      size_t* consumed = nullptr) {
+                                                      size_t* consumed = nullptr, size_t skip = 0) {
+    // Each value is defined against its predecessor, so there is nothing to seek with: the head
+    // has to be decoded and is then dropped. `count` below is the number *wanted*, so the loops
+    // run to skip + count.
+    //
+    // Stopping short of the stream is safe here and only here: this decoder's own values are
+    // correct from the first one, and a caller that also needs `consumed` -- the two DELTA
+    // byte-array encodings, whose streams are concatenated without lengths -- must pass the
+    // stream's full count so the block is walked to its end.
+    count += skip;
     size_t p = 0;
     auto uvarint = [&] () -> uint64_t {
         uint64_t v = 0; int shift = 0;
@@ -232,22 +273,36 @@ inline std::vector<int64_t> decode_delta_binary_packed(std::span<const uint8_t> 
         }
     }
     if (consumed) { *consumed = p; }
+    if (skip) { out.erase(out.begin(), out.begin() + long(std::min(skip, out.size()))); }
     return out;
 }
 
 // ---------------------------------------------------------------- DELTA_LENGTH_BYTE_ARRAY
 // A DELTA_BINARY_PACKED block of lengths, then the values' bytes back to back.
+// `total` is the number of values in the stream, and it is the count the length block must be
+// decoded with regardless of how few values are wanted: decode_delta_binary_packed() stops as
+// soon as it has produced `count` values, so a short count leaves `used` pointing into the middle
+// of the length block and the value bytes are then read from the wrong offset. That was not a
+// hypothetical -- asking for a slice of a DELTA_BYTE_ARRAY page made the suffix stream parse start
+// at a stray varint and fail with "bad delta header" (test_pq_corpus_shaped_schema).
+//
+// So the head is always decoded here; only the strings are skipped.
 inline std::vector<std::string> decode_delta_length_byte_array(std::span<const uint8_t> in,
-                                                              size_t count) {
+                                                              size_t total, size_t skip = 0,
+                                                              size_t take = size_t(-1)) {
+    if (take == size_t(-1)) { take = total - std::min(total, skip); }
     size_t used = 0;
-    auto lens = decode_delta_binary_packed(in, count, &used);
+    auto lens = decode_delta_binary_packed(in, total, &used);
     std::vector<std::string> out;
-    out.reserve(lens.size());
+    out.reserve(take);
     size_t p = used;
-    for (int64_t L : lens) {
+    for (size_t i = 0; i < lens.size(); ++i) {
+        const int64_t L = lens[i];
         if (L < 0) { throw decode_error("negative length in delta_length_byte_array"); }
         if (p + size_t(L) > in.size()) { throw decode_error("truncated delta_length_byte_array"); }
-        out.emplace_back(reinterpret_cast<const char*>(in.data() + p), size_t(L));
+        if (i >= skip && out.size() < take) {
+            out.emplace_back(reinterpret_cast<const char*>(in.data() + p), size_t(L));
+        }
         p += size_t(L);
     }
     return out;
@@ -258,10 +313,16 @@ inline std::vector<std::string> decode_delta_length_byte_array(std::span<const u
 // `prefix` bytes of the value before it, followed by its own suffix -- so decoding is strictly
 // sequential and a corrupt prefix length is not recoverable, which is why it is range-checked
 // against the previous value rather than trusted.
-inline std::vector<std::string> decode_delta_byte_array(std::span<const uint8_t> in, size_t count) {
+inline std::vector<std::string> decode_delta_byte_array(std::span<const uint8_t> in, size_t total,
+                                                       size_t skip = 0, size_t take = size_t(-1)) {
+    // Strictly sequential -- value i is a prefix of value i-1 plus its own suffix -- and, like
+    // DELTA_LENGTH_BYTE_ARRAY above, its two streams are concatenated with no length prefix, so
+    // the prefix block has to be decoded in full for `used` to locate the suffix block. Both
+    // reasons say the same thing: `total`, never a short count. Only the strings are skipped.
+    if (take == size_t(-1)) { take = total - std::min(total, skip); }
     size_t used = 0;
-    auto prefixes = decode_delta_binary_packed(in, count, &used);
-    auto suffixes = decode_delta_length_byte_array(in.subspan(used), count);
+    auto prefixes = decode_delta_binary_packed(in, total, &used);
+    auto suffixes = decode_delta_length_byte_array(in.subspan(used), total);
     if (suffixes.size() != prefixes.size()) {
         throw decode_error("delta_byte_array: prefix and suffix counts differ");
     }
@@ -277,8 +338,8 @@ inline std::vector<std::string> decode_delta_byte_array(std::span<const uint8_t>
         v.reserve(size_t(k) + suffixes[i].size());
         v.assign(prev, 0, size_t(k));
         v.append(suffixes[i]);
-        out.push_back(v);
-        prev = std::move(v);
+        prev = v;
+        if (i >= skip && out.size() < take) { out.push_back(std::move(v)); }
     }
     return out;
 }

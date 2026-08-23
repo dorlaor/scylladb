@@ -10,7 +10,13 @@
 #include "page_header.hh"
 #include "decoders.hh"
 
+#include <optional>
+
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include <cstring>
 #include <snappy.h>
@@ -20,7 +26,70 @@ namespace sstables::parquet::format {
 
 namespace {
 
+struct dprof {
+    static inline bool enabled = [] {
+        const char* e = std::getenv("PQ_READER_PROFILE");
+        return e && *e && *e != '0';
+    }();
+    static inline std::array<uint64_t, size_t(dphase::_count)> ns{};
+    static inline std::array<uint64_t, size_t(dphase::_count)> hits{};
+};
+
+// Scoped, and every phase disjoint from the others -- same discipline as pq_reader's rtimer,
+// for the same reason: a share column over overlapping phases means nothing.
+class dtimer {
+    dphase _p;
+    std::chrono::steady_clock::time_point _t0;
+public:
+    explicit dtimer(dphase p) : _p(p) {
+        if (dprof::enabled) { _t0 = std::chrono::steady_clock::now(); }
+    }
+    ~dtimer() {
+        if (!dprof::enabled) { return; }
+        const auto dt = std::chrono::steady_clock::now() - _t0;
+        dprof::ns[size_t(_p)] += uint64_t(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count());
+        ++dprof::hits[size_t(_p)];
+    }
+};
+
+} // namespace
+
+void decode_profile_reset() {
+    dprof::ns.fill(0);
+    dprof::hits.fill(0);
+}
+
+std::string decode_profile_report() {
+    if (!dprof::enabled) { return {}; }
+    static constexpr const char* names[] = {
+        "decompress", "levels", "values", "expand_nulls", "trim", "plan",
+    };
+    static_assert(std::size(names) == size_t(dphase::_count));
+    uint64_t total = 0;
+    for (auto v : dprof::ns) { total += v; }
+    if (!total) { return {}; }
+    // snprintf rather than fmt: run_tests.sh compiles this file standalone, without libfmt on the
+    // link line, and the point of that suite is that it runs anywhere.
+    std::string out = "  page decode (inside rg_decode + decode_cpu, not additive with them)\n";
+    char line[160];
+    for (size_t i = 0; i < size_t(dphase::_count); ++i) {
+        const double ms = double(dprof::ns[i]) / 1e6;
+        const double per = dprof::hits[i] ? double(dprof::ns[i]) / 1e3 / double(dprof::hits[i]) : 0.0;
+        const double share = 100.0 * double(dprof::ns[i]) / double(total);
+        std::snprintf(line, sizeof(line), "  %-18s %9.1f %8llu %11.2f %8.1f %%\n",
+                      names[i], ms, (unsigned long long)dprof::hits[i], per, share);
+        out += line;
+    }
+    std::snprintf(line, sizeof(line), "  %-18s %9.1f\n", "page decode total", double(total) / 1e6);
+    out += line;
+    return out;
+}
+
+namespace {
+
 std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t expected) {
+    dtimer _dt{dphase::decompress};
     switch (c) {
     case codec::uncompressed:
         return {in.begin(), in.end()};
@@ -50,29 +119,35 @@ std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t exp
     }
 }
 
-// Append `n` decoded values of the chunk's physical type to `cd`.
+// Append values [skip, skip + take) of a page holding `total` values to `cd`.
+//
+// `total` is the page's whole present-value count and is not redundant: BYTE_STREAM_SPLIT strides
+// by it, and the DELTA encodings need to know how far to decode before the wanted run begins. The
+// scan path passes skip = 0, take = total, which is exactly what this did before it could be
+// asked for a slice.
 void append_values(column_data& cd, phys_type pt, encoding enc,
-                   std::span<const uint8_t> body, size_t n,
+                   std::span<const uint8_t> body, size_t total, size_t skip, size_t take,
                    std::span<const std::string_view> dict_ba,
                    const std::vector<int32_t>& dict_i32,
                    const std::vector<int64_t>& dict_i64,
                    const std::vector<double>& dict_f64) {
+    dtimer _dt{dphase::values};
     switch (pt) {
     case phys_type::int32: {
         auto v = (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary)
-               ? decode_rle_dictionary<int32_t>(body, dict_i32, n)
-               : decode_plain<int32_t>(body, n);
+               ? decode_rle_dictionary<int32_t>(body, dict_i32, take, skip)
+               : decode_plain<int32_t>(body, take, skip);
         cd.i32.insert(cd.i32.end(), v.begin(), v.end());
         break;
     }
     case phys_type::int64: {
         std::vector<int64_t> v;
         if (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary) {
-            v = decode_rle_dictionary<int64_t>(body, dict_i64, n);
+            v = decode_rle_dictionary<int64_t>(body, dict_i64, take, skip);
         } else if (enc == encoding::delta_binary_packed) {
-            v = decode_delta_binary_packed(body, n);
+            v = decode_delta_binary_packed(body, take, nullptr, skip);
         } else {
-            v = decode_plain<int64_t>(body, n);
+            v = decode_plain<int64_t>(body, take, skip);
         }
         cd.i64.insert(cd.i64.end(), v.begin(), v.end());
         break;
@@ -80,11 +155,11 @@ void append_values(column_data& cd, phys_type pt, encoding enc,
     case phys_type::dbl: {
         std::vector<double> v;
         if (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary) {
-            v = decode_rle_dictionary<double>(body, dict_f64, n);
+            v = decode_rle_dictionary<double>(body, dict_f64, take, skip);
         } else if (enc == encoding::byte_stream_split) {
-            v = decode_byte_stream_split<double>(body, n);
+            v = decode_byte_stream_split<double>(body, total, skip, take);
         } else {
-            v = decode_plain<double>(body, n);
+            v = decode_plain<double>(body, take, skip);
         }
         cd.f64.insert(cd.f64.end(), v.begin(), v.end());
         break;
@@ -92,14 +167,14 @@ void append_values(column_data& cd, phys_type pt, encoding enc,
     case phys_type::byte_array: {
         std::vector<std::string> v;
         if (enc == encoding::rle_dictionary || enc == encoding::plain_dictionary) {
-            auto views = decode_rle_dictionary_views(body, dict_ba, n);
+            auto views = decode_rle_dictionary_views(body, dict_ba, take, skip);
             v.assign(views.begin(), views.end());
         } else if (enc == encoding::delta_byte_array) {
-            v = decode_delta_byte_array(body, n);
+            v = decode_delta_byte_array(body, total, skip, take);
         } else if (enc == encoding::delta_length_byte_array) {
-            v = decode_delta_length_byte_array(body, n);
+            v = decode_delta_length_byte_array(body, total, skip, take);
         } else {
-            v = decode_plain_byte_array(body, n);
+            v = decode_plain_byte_array(body, take, skip);
         }
         cd.str.insert(cd.str.end(), v.begin(), v.end());
         break;
@@ -117,6 +192,7 @@ void append_values(column_data& cd, phys_type pt, encoding enc,
 // spans several slots, so the row boundaries have to be found in rep_levels and
 // the value vectors sliced by how many values those slots actually carried.
 void trim(column_data& cd, size_t drop, size_t keep, bool repeated) {
+    dtimer _dt{dphase::trim};
     auto cut = [&] (auto& v, size_t from, size_t count) {
         if (from >= v.size()) { v.clear(); return; }
         v.erase(v.begin(), v.begin() + long(from));
@@ -165,6 +241,7 @@ void trim(column_data& cd, size_t drop, size_t keep, bool repeated) {
 
 void expand_nulls(column_data& cd, phys_type pt, size_t first, size_t count,
                   std::span<const uint64_t> levels) {
+    dtimer _dt{dphase::expand_nulls};
     const size_t present = size_t(std::count(levels.begin(), levels.end(), uint64_t(1)));
     if (present == count) { return; }   // dense: nothing to do
     auto expand = [&] (auto& vec, auto zero) {
@@ -206,7 +283,9 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 
     // Levels come from the schema *tree*: a leaf's own repetition type does not
     // determine them once it sits inside a repeated group.
-    auto leaves = walk_leaves(md);
+    std::optional<std::vector<leaf_info>> planned;
+    { dtimer _dt{dphase::plan}; planned = walk_leaves(md); }
+    auto leaves = std::move(*planned);
     if (leaves.size() != rg.columns.size()) {
         throw decode_error("row group chunk count does not match the schema");
     }
@@ -387,24 +466,50 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                     off = body_at + ph.compressed_page_size;
                     continue;
                 }
-                if (first_row_decoded[c] < 0) { first_row_decoded[c] = row_at; }
+                // Which slots of this page the caller actually asked for. For a flat leaf a slot
+                // is a row, so the page's wanted sub-range is known before any value is touched
+                // and the decoders can be told to start there. This is what keeps a point read
+                // from paying for the whole page: at the shipping defaults a page *is* the row
+                // group, so decoding all of it to keep five rows was 29 % of the read and every
+                // value of it was then thrown away by trim() (design doc 10.28).
+                //
+                // Under repetition a slot is not a row -- a row spans an unknown number of slots,
+                // and finding the boundaries means walking the repetition levels -- so a repeated
+                // leaf keeps decoding the page whole and is sliced afterwards by trim(), exactly
+                // as before. The saving is not available there, and correctness is not negotiable.
+                const size_t slot_lo = repeated ? 0
+                        : size_t(std::max<int64_t>(0, row_lo - row_at));
+                const size_t slot_hi = repeated ? n
+                        : size_t(std::min<int64_t>(int64_t(n), row_hi - row_at));
+                if (first_row_decoded[c] < 0) {
+                    first_row_decoded[c] = row_at + int64_t(slot_lo);
+                }
                 row_at += page_rows;
                 const size_t rl = size_t(h.repetition_levels_byte_length);
                 const size_t dl = size_t(h.definition_levels_byte_length);
                 if (rl + dl > body.size()) { throw decode_error("level lengths exceed page body"); }
 
                 if (repeated) {
+                    dtimer _dt{dphase::levels};
                     rle_decoder rd(body.subspan(0, rl), bit_width_for(max_rep));
                     auto reps = rd.decode_all(n);
                     if (reps.size() != n) { throw decode_error("short repetition level stream"); }
                     out[c].rep_levels.insert(out[c].rep_levels.end(), reps.begin(), reps.end());
                 }
+                // Levels are decoded for the whole page even when only part of it is wanted: the
+                // definition levels before the window are what say how many *values* precede it,
+                // and there is no cheaper way to learn that. They are an RLE stream over a
+                // one-or-two-bit alphabet, so this is the cheap half of the page by a wide
+                // margin -- 1.4 us against 21 us for the values it locates.
                 std::vector<uint64_t> levels;
                 if (optional) {
+                    dtimer _dt{dphase::levels};
                     rle_decoder ld(body.subspan(rl, dl), bit_width_for(max_def));
                     levels = ld.decode_all(n);
                     if (levels.size() != n) { throw decode_error("short definition level stream"); }
-                    out[c].def_levels.insert(out[c].def_levels.end(), levels.begin(), levels.end());
+                    out[c].def_levels.insert(out[c].def_levels.end(),
+                                             levels.begin() + long(slot_lo),
+                                             levels.begin() + long(slot_hi));
                 }
 
                 // V2 keeps levels outside the compressed region. The page's own
@@ -418,14 +523,26 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 
                 const size_t present = optional
                         ? size_t(std::count(levels.begin(), levels.end(), uint64_t(max_def))) : n;
+                // Values are stored present-only, so the value offset of a slot is the number of
+                // present slots before it -- not the slot index.
+                const size_t vskip = optional
+                        ? size_t(std::count(levels.begin(), levels.begin() + long(slot_lo),
+                                            uint64_t(max_def)))
+                        : slot_lo;
+                const size_t vtake = optional
+                        ? size_t(std::count(levels.begin() + long(slot_lo),
+                                            levels.begin() + long(slot_hi), uint64_t(max_def)))
+                        : slot_hi - slot_lo;
                 const size_t before = out[c].num_values();
-                append_values(out[c], cm.type, h.value_encoding, raw, present,
+                append_values(out[c], cm.type, h.value_encoding, raw, present, vskip, vtake,
                               dict_ba, dict_i32, dict_i64, dict_f64);
                 // Densifying to one value per *slot* only makes sense when a slot
                 // is a row. Under repetition the caller has to walk the levels, so
                 // the values stay as the file has them: present only.
                 if (optional && !repeated) {
-                    expand_nulls(out[c], cm.type, before, n, levels);
+                    expand_nulls(out[c], cm.type, before, slot_hi - slot_lo,
+                                 std::span<const uint64_t>(levels).subspan(slot_lo,
+                                                                           slot_hi - slot_lo));
                 }
                 produced += int64_t(n);
             } else {

@@ -173,6 +173,57 @@ public:
         return n;
     }
 
+    // Advance past `max` values without materialising them. Returns how many were stepped over;
+    // a short return means the input is exhausted, exactly as decode() reports it.
+    //
+    // Exists because a point read decodes one page per leaf and wants a handful of the values in
+    // it. Decoding the ones before the window and throwing them away was the single largest term
+    // in the read once the window itself was fixed (design doc 10.28): for a dictionary-encoded
+    // column that is a dictionary lookup and -- for BYTE_ARRAY -- a std::string per value, all of
+    // it discarded. A whole bit-packed group is eight values in `_bit_width` bytes, so skipping
+    // one is a pointer add rather than an unpack; that is what makes this cheaper than decoding
+    // into a scratch buffer rather than merely tidier.
+    size_t skip(size_t max) {
+        if (_bit_width == 0) {
+            // decode() would have produced `max` zeroes from nothing, and consumed no input.
+            return max;
+        }
+        size_t n = 0;
+        while (n < max) {
+            if (_rle_count) {
+                const size_t take = size_t(std::min<uint64_t>(_rle_count, max - n));
+                _rle_count -= take;
+                n += take;
+            } else if (_packed_count) {
+                if (_group_pos < _group_len) {
+                    // A group already in hand, possibly part-consumed: step within it.
+                    const size_t avail = size_t(_group_len - _group_pos);
+                    const size_t take = std::min({avail, max - n, size_t(_packed_count)});
+                    _group_pos = uint8_t(_group_pos + take);
+                    _packed_count -= take;
+                    n += take;
+                    continue;
+                }
+                // Nothing in hand, so whole groups can be stepped over by moving the read
+                // pointer -- eight values for `_bit_width` bytes, with no unpacking at all.
+                const size_t whole = size_t(std::min<uint64_t>(_packed_count / 8, (max - n) / 8));
+                if (whole) {
+                    const size_t need = size_t(_bit_width) * whole;
+                    if (size_t(_end - _p) < need) { throw rle_error("truncated bit-packed group"); }
+                    _p += need;
+                    _packed_count -= whole * 8;
+                    n += whole * 8;
+                    continue;
+                }
+                unpack8();      // fewer than eight left to step: go through the group path
+            } else {
+                if (_p >= _end) { break; }
+                next_run();
+            }
+        }
+        return n;
+    }
+
     std::vector<uint64_t> decode_all(size_t count) {
         std::vector<uint64_t> v(count);
         size_t got = decode(v.data(), count);
