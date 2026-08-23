@@ -482,6 +482,22 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
         BOOST_REQUIRE(!none.config().wopt.use_dictionary);
         BOOST_REQUIRE_EQUAL(none.to_map().at(pp::DICTIONARY), "none");
 
+        // Every codec the option accepts, and the on-the-wire enum each maps to. "lz4" is
+        // LZ4_RAW (codec 7), the bare block every current Parquet implementation reads, not the
+        // deprecated Hadoop-framed codec 5 -- so the mapping is asserted rather than assumed.
+        // It used to be in the `rejects` list below; see design doc 10.29 for why it is writable
+        // now and why zstd is still the default.
+        pp c_lz4{{{pp::COMPRESSION, "lz4"}}};
+        BOOST_REQUIRE(c_lz4.config().wopt.compression == pq::format::codec::lz4_raw);
+        BOOST_REQUIRE_EQUAL(c_lz4.to_map().at(pp::COMPRESSION), "lz4");
+        pp c_none{{{pp::COMPRESSION, "none"}}};
+        BOOST_REQUIRE(c_none.config().wopt.compression == pq::format::codec::uncompressed);
+        BOOST_REQUIRE_EQUAL(c_none.to_map().at(pp::COMPRESSION), "none");
+        pp c_zstd{{{pp::COMPRESSION, "zstd"}}};
+        BOOST_REQUIRE(c_zstd.config().wopt.compression == pq::format::codec::zstd);
+        // zstd is the default, so to_map() omits it -- which is the contract, not an oversight.
+        BOOST_REQUIRE(!c_zstd.to_map().contains(pp::COMPRESSION));
+
         // Round-trips through the map form, which is how it is persisted.
         auto m = p.to_map();
         BOOST_REQUIRE_EQUAL(m[pp::ROWS_PER_ROW_GROUP], "7500");
@@ -505,7 +521,7 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_parameters) {
     rejects({{pp::ROW_GROUP_BUFFER_BYTES, "16"}});          // under the 1 MiB floor
     rejects({{pp::ROW_GROUP_BUFFER_BYTES, "8GiB"}});        // over the 1 GiB ceiling
     rejects({{pp::COMPRESSION, "gzip"}});                   // plausible, unsupported
-    rejects({{pp::COMPRESSION, "lz4"}});
+    rejects({{pp::COMPRESSION, "snappy"}});                 // readable, but never written
     rejects({{pp::COMPRESSION_LEVEL, "99"}});
     // L3 discards write times and TTLs: it is export-only and must not be reachable
     // as a storage setting.
