@@ -40,6 +40,7 @@
 
 #include <chrono>
 #include <random>
+#include <string_view>
 
 using namespace sstables;
 using namespace std::chrono;
@@ -87,6 +88,25 @@ schema_ptr perf_schema() {
     // default never binds -- so every point read decodes a whole row group's page.
     if (const char* e = std::getenv("PQ_PERF_PAGE_ROWS")) {
         opts["page_rows"] = sstring(e);
+    }
+    // Anything else, spelled the way CQL spells it: PQ_PERF_PQ_OPTS="compression=lz4,dictionary=none".
+    // The two knobs above predate this and stay, being the two that get swept most; this exists so
+    // that measuring a *new* sub-option does not need a new env var and a rebuild of the harness.
+    // Notably `compression`: the parquet arm is zstd while the row format's default is
+    // LZ4WithDictsCompressor, so any CPU comparison between them that does not vary the codec is
+    // measuring the codec as much as the format (design doc 10.28).
+    if (const char* e = std::getenv("PQ_PERF_PQ_OPTS")) {
+        std::string_view all(e);
+        while (!all.empty()) {
+            const auto comma = all.find(',');
+            auto kv = all.substr(0, comma);
+            const auto eq = kv.find('=');
+            if (eq != std::string_view::npos) {
+                opts[sstring(kv.substr(0, eq))] = sstring(kv.substr(eq + 1));
+            }
+            if (comma == std::string_view::npos) { break; }
+            all = all.substr(comma + 1);
+        }
     }
     if (!opts.empty()) {
         b.set_parquet_options(std::move(opts));
