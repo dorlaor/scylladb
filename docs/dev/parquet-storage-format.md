@@ -1528,8 +1528,9 @@ Guard rails, with reasons rather than round numbers:
 | `rows_per_row_group` floor | 1 000 | Below this the fixed ~225 B per leaf per row group dominates: at 100 rows on a 20-leaf table that is 45 B/row against a 5.2 B/row total, so the file grows ~9x (§10.4c) |
 | `rows_per_row_group` ceiling | 100 000 000 | Sanity |
 | `row_group_buffer_bytes` | 1 MiB - 1 GiB | A guard rail, not a dial: *buffered shredder memory* rather than output, sized to stop a shard OOMing on a pathological partition (R-13). At the 5 000-row default it never binds; see §5.5a |
-| `page_rows` | 128 - 1 000 000 | The ceiling has to exceed the row-group ceiling for `page_rows` to be expressible as "one page per group"; the floor is where the curve has gone flat — below ~2 048 rows a smaller page buys no latency at all and only costs size (§10.25) |
-| `compression_level` | 1 - 22 | zstd's range |
+| `page_rows` | 128 - 1 000 000 | The ceiling has to exceed the row-group ceiling for `page_rows` to be expressible as "one page per group". The floor is where the curve goes flat — §10.25 put that at ~2 048 rows; re-measured against the fixed reader (§10.29) it is ~256, below which latency *rises* because per-page overhead exceeds the decode it saves. 128 is kept so the boundary itself stays reachable |
+| `compression` | `none`, `lz4`, `zstd` | What the writer can actually emit. `lz4` is LZ4_RAW (codec 7), the bare block every current Parquet implementation reads, not the deprecated Hadoop-framed codec 5. zstd is the default and stays it: lz4 is the cheaper codec but costs +76 % on disk on the perf schema, and page geometry beats it on both axes at once (§10.29) |
+| `compression_level` | 1 - 22 | zstd's range; ignored by the other two codecs |
 
 `row_group_buffer_bytes` accepts a `KiB`/`MiB`/`GiB` suffix as well as a plain count.
 
@@ -1539,7 +1540,7 @@ the natural reading of the names gets all three wrong:
 | knob | what it actually trades | measured |
 |---|---|---|
 | `rows_per_row_group` | size against **scan memory**, at ~1.1 kB of reader memory per row of group | 5 000 → 20 000 is −4.3/−5.0 % of the file for **3.6×** the memory (5.6 → 19.9 MB) |
-| `page_rows` | size against **latency**, at **zero** memory cost | ~130 ns of cold point read per row of page, five independent estimates 114–131; 4× smaller costs +18/+20 % of the file on real data |
+| `page_rows` | size against **latency**, at **zero** memory cost | ~130 ns of cold point read per row of page, five independent estimates 114–131; 4× smaller costs +18/+20 % of the file on real data. Re-measured against the fixed reader in §10.29: the slope is steeper in relative terms (page decode is now 76 % of the read rather than a fifth of it) and the size cost scales with **leaf count**, +7.5 % on seven columns at 2 048 against +24.3 % on sixty-five |
 | `row_group_buffer_bytes` | nothing, deliberately — it is a guard rail against OOM | binds on sparse wide shapes (cuts Backblaze at ~6 400 rows) and never at the default on narrow ones |
 
 **`page_rows` is a ceiling, not a page size, and that is why 8 192 exceeds the 5 000-row group.** The
@@ -7836,6 +7837,163 @@ load, not to the format; §10.18 is right about that. But the *asymmetry* was th
 a missing fold rather than an inherent cost of columnar storage. With the fold, retaining 42 448 175
 tombstones costs `pq` roughly what it costs the row format instead of six times as much.
 
+### 10.29 The point read was 90 % waste — measured and fixed 2026-08-23, 2.8× with no format change
+
+A 3-node cluster measurement (i4i.xlarge, RF=3, 10^9 rows per arm, identical keys, random point
+reads with `BYPASS CACHE` at QUORUM) put `pq` at **1 350 req/s saturation against native's 24 532**,
+and — the part that says where to look — **77.9 % CPU at 1 300 req/s against native's 17.3 %**, on
+**35 566 bytes read per request in 4.44 IOs against native's ~24 700 in ~8.0**. So `pq` reads more
+bytes in fewer operations and is not I/O-bound at all; it is CPU-bound, and the I/O efficiency the
+format was built for is already there.
+
+`PQ_READER_PROFILE=1` on `sstable_parquet_perf_test` agrees and localises it. Over 1 000 random
+point reads at shipping defaults, **`reassemble` + `rg_decode` were 90 %** and all I/O was 1.7 %.
+
+Two independent defects, both of them "decode a great deal in order to return five rows", and
+neither of them a property of Parquet.
+
+**Defect 1: the window ran to the end of the file.** `pq_reader::init()` used
+`advance_lower_and_check_if_present()` for a singular range, which is the right call — it is what
+mx makes — but it positions only the *lower* bound, and `data_file_positions().end` is engaged only
+when an upper bound exists. So a point read's ordinal window was **[first row of the partition,
+total rows in the file)**, and `next_window()` then took `min(window, rest of the row group)`: at
+shipping defaults, where `page_rows >= rows_per_row_group` makes a page the whole column chunk,
+that is most of a row group. ~2 500 rows decoded and reassembled per read to return 5.
+
+It was invisible because the answer was still right. `emit_row()` stops as soon as a partition
+sorts past the range end, so the over-decode was work done and discarded rather than rows leaking
+out — the same shape as §10.26's defect, and found the same way, by asking a profile which phase
+scaled with something other than the answer.
+
+Fix: step the lower bound on by one partition and read the ordinal off it. Nearly free —
+`read_partition_data()` has just been awaited inside the presence check, so the index page is in
+memory. **1 036 µs → 663 µs, `reassemble` 484 µs → 9 µs.**
+
+**Defect 2: a page was decoded whole to keep part of it.** With the window fixed, the next cost was
+the rest of the page. `decode_columns()` decoded every value of any page intersecting the wanted
+rows and then cut it down with `trim()` — 5 000 values per leaf to keep 5, which for a
+dictionary-encoded `BYTE_ARRAY` column meant building a `std::string` per discarded value.
+
+For a flat leaf a slot is a row, so the wanted sub-range of a page is known before a value is
+touched. The decoders took a leading `skip`; definition levels are still decoded for the whole page
+(they are what says how many *values* precede the window, and at 0.8 µs against 21 µs they are the
+cheap half). What each encoding can do with a skip differs and the difference is not cosmetic:
+
+| encoding | skip mechanism |
+|---|---|
+| PLAIN, BYTE_STREAM_SPLIT | pointer arithmetic |
+| RLE_DICTIONARY | `rle_decoder::skip()`: whole bit-packed groups step by advancing the read pointer, eight values per `bit_width` bytes, no unpacking |
+| DELTA_BINARY_PACKED | none — each value is defined against its predecessor; head decoded and dropped |
+| DELTA_BYTE_ARRAY, DELTA_LENGTH_BYTE_ARRAY | none, **and they must be decoded with the stream's full count** |
+
+That last row is a defect this change created and `test_pq_corpus_shaped_schema` caught:
+`decode_delta_binary_packed()` stops as soon as it has produced `count` values, and both delta
+byte-array encodings use its `consumed` to find where their next stream begins, their streams being
+concatenated with no length prefix. A short count left `consumed` pointing into the middle of the
+length block and the suffix stream then parsed a stray varint as a block header — "bad delta
+header". `total` is therefore a parameter separate from the range asked for.
+
+Repeated leaves are untouched: a row spans an unknown number of slots there, so the boundaries are
+not known until the repetition levels have been walked. They decode whole and are cut by `trim()`.
+
+**663 µs → 367 µs.** `values` fell 21 µs → 1.1 µs per call, `trim` 4.6 µs → 0.04 µs.
+
+**Together: 1 036 µs → 367 µs, 2.82×, no format change, no size change, byte-identical files.**
+
+| phase | before | after |
+|---|---:|---:|
+| `reassemble` | 484 µs (47.6 %) | 8.3 µs (2.3 %) |
+| `rg_decode` + `decode_cpu` | 481 + 46 µs | 279 µs (76 %) |
+| — of which the codec | | **260 µs (70 % of the read)** |
+| `page_fetch` | 3.4 µs | 33 µs (9.2 %) |
+| `offset_index` | 23 µs (2.3 %) | 27 µs (7.4 %) |
+| everything else | | ~28 µs |
+| **total** | **1 036 µs** | **367 µs** |
+
+The path also flips: with a five-row window the OffsetIndex says paging is cheaper than the row
+group, so 1 002 of 1 008 reads now take the paged path where 101 did.
+
+#### What is left is geometry, and it is the codec
+
+After both fixes **70 % of a point read is `ZSTD_decompress`**, and it is decompressing pages the
+size of a row group. Nine pages, ~29 µs each: on the order of **390 kB decompressed to return
+250 bytes of row**. That is not a decode-loop problem and no amount of work on the decode loop
+touches it. Three levers exist and all three were measured.
+
+**Page geometry.** `page_rows` is a table property; the writer uses `min(page_values, row group
+size)`, so at 8 192 against row groups cut at 5 000 it does not bind. Sweeping it, same 2 000 × 5
+harness, 1 000 random point reads, size as a fraction of the row format's file for the same rows:
+
+| `page_rows` | 7-column point µs | size | Δ size | 65-column point µs | size | Δ size |
+|---|---:|---:|---:|---:|---:|---:|
+| default (does not bind) | 372 | 0.321× | — | 1 289 | 0.321× | — |
+| 4 096 | 299 | 0.333× | +3.7 % | 1 026 | 0.360× | +12.2 % |
+| 2 048 | 206 | 0.345× | +7.5 % | 761 | 0.399× | +24.3 % |
+| 1 024 | **163** | 0.366× | **+14.0 %** | 627 | 0.463× | +44.2 % |
+| 512 | 137 | 0.414× | +29.0 % | 575 | 0.590× | +83.8 % |
+| 256 | 131 | 0.523× | +62.9 % | 568 | 0.832× | +159 % |
+| 128 | 140 | 0.719× | +124 % | 603 | 1.223× | +281 % |
+
+Write and scan throughput are flat across the whole sweep, in both schemas; the entire cost is
+size. Latency bottoms out around 256 rows and then *rises*, because per-page overhead starts
+costing more than the decode it saves.
+
+This confirms the mechanism the pre-fix numbers already pointed at — before either fix the same
+sweep read 1 036 / 936 / 671 / 295 µs at default / 4 096 / 512 / 128 — and it also settles which of
+the two knobs §10.25 was really measuring: `page_rows`, again.
+
+**It is not being made the default, and the reason is in the table.** The size cost is a function
+of leaf count: +7.5 % at 2 048 on seven columns, +24.3 % on sixty-five. `page_values` was set to
+2 048 once before on one schema's evidence and reverted the same day when the corpus measured
+**+16.7 %**, 2.5× the prediction. This measurement is two schemas, not a corpus, so it is the same
+kind of evidence that was wrong last time. What *has* changed is the premise of that reversal — it
+rested on the point read staying "20-33× the row format either way", and at `page_rows = 1024` the
+seven-column case is 5.6×. The trade is now worth spending disk on where it is worth spending disk;
+settling the default needs the corpus (Backblaze at 197 columns, ClickBench at 105) measured at
+1 024 and 2 048.
+
+**Codec.** `compression = 'lz4'` now exists (LZ4_RAW, codec 7), because until it did, every CPU
+comparison between `pq` and the row format was partly a comparison of zstd against
+`LZ4WithDictsCompressor` and nobody could say how much. The answer:
+
+| codec | page geometry | point µs | size |
+|---|---|---:|---:|
+| zstd | default | 370 | 0.321× |
+| **lz4** | default | **245** | 0.564× |
+| none | default | 141 | 1.645× |
+| zstd | 512 | 137 | 0.414× |
+| lz4 | 512 | 114 | 0.696× |
+
+So the codec is a real term — a third of the read at default geometry — and it is **not** the
+lever, because page geometry beats it on both axes at once: zstd at `page_rows = 512` is both faster
+(137 µs) and much smaller (0.414×) than lz4 at the default geometry (245 µs, 0.564×). Of the
+cluster's 4.5× CPU gap, the codec is worth roughly a third of the read at shipping geometry and
+about a quarter once the geometry is fixed. zstd stays the default; lz4 is the honest setting for a
+codec-controlled comparison and a defensible one for a hot tier where disk is cheap.
+
+**Partial decompression** was considered and rejected on arithmetic. zstd cannot decompress part of
+a frame, but a *prefix* is available, and for PLAIN fixed-width leaves the prefix length is exactly
+`(skip + take) * sizeof(T)`. On this schema those leaves are ~160 kB of the ~390 kB decompressed per
+read, and a uniformly-placed window saves half of that — ~21 % of the codec cost, ~1.17× overall —
+for a streaming rewrite of the decode loop. The encodings where it would pay most (the byte-array
+dictionaries) are the ones that cannot bound a prefix without decoding the index stream first.
+
+#### Remaining floor
+
+At `page_rows = 512` the read is 137 µs and the codec is down to 28 % of it. What is left is
+**`offset_index` 33 µs (24 %)** — one extra read and parse per point read, of a blob that is a pure
+function of an immutable file — and **`page_fetch` 31 µs (23 %)**. The OffsetIndex is the obvious
+next target and is deliberately *not* fixed here: caching it means either mutating the footer-cache
+entry after publication, which §10.24's design exists to prevent, or a second evictable cache with
+its own policy, which §10.22 argues against. It needs a decision, not a patch.
+
+One asymmetry found and left alone, because settling it needs a node rather than a laptop: the
+paged/streamed choice in `paged_fetch_is_not_cheaper()` compares *bytes*, and eliding an all-null
+leaf makes paging look cheaper without shrinking the row group's extent. At default geometry that
+buys 9 read operations plus a 27 µs OffsetIndex read in exchange for not fetching six chunks the
+reader would not have decompressed either way. On a node where I/O is 1.7 % of the read that is
+probably the wrong way round, but "probably" is not a measurement.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
@@ -8423,7 +8581,7 @@ metadata component exists would not have caught records written but unreadable b
 
 | Limitation | Figure | Where |
 |---|---|---|
-| Point-read latency | Steady state **2.53×** the row format (1 149 µs against native's 455). First contact **3 680 µs**, 69 % of it the footer, paid once per sstable per restart. Warm reads sit at the client round-trip floor for every format. | §10.26, §10.27 |
+| Point-read latency | Steady state was **2.53×** the row format (1 149 µs against native's 455) before 2026-08-23; two reader fixes took the microbenchmark **1 036 µs → 367 µs (2.82×)** with no format change, so the cluster figure is stale and needs re-measuring. What remains is geometry, not code: **70 % of the fixed read is zstd decompressing pages the size of a row group**, and `page_rows = 1024` measures another 2.3× for +14 % (7 columns) to +44 % (65 columns) on disk — a trade the corpus has to settle, not one schema. First contact **3 680 µs**, 69 % of it the footer, paid once per sstable per restart. Warm reads sit at the client round-trip floor for every format. | §10.29, §10.26, §10.27 |
 | C6 is skipped under TWCS | A schema Parquet stores worse converts anyway; the 197-column sparse shape measures **208 %** of its SSTable. `storage_format = 'sstable'` is the only guard and it is manual. | §6.3, §10.4 |
 | Query projection unimplemented | The scan path chooses its window per row group by bytes fetched, but `count(*)` still reads every value column; §10.26 argues this cannot be fixed at the sstable layer without a fetched-vs-queried split above it. | §10.26 |
 | Mixed-format bucketing at scale | Right shape, too small a share of the bytes to be evidence: Parquet took 0 % of rewrites, but was only 6.3 % of the bytes over the window, so the zero is consistent with correct bucketing *and* with no opportunity. Settling it needs a differential against the fix disabled. | §10.19 |

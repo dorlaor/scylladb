@@ -43,6 +43,13 @@ struct page_location {
 };
 
 struct writer_options {
+    // zstd, and it stays zstd. LZ4_RAW is supported and reachable as `compression = 'lz4'`; it is
+    // *measurably* the cheaper codec -- 260 us of a 370 us point read becomes 135 us -- and it is
+    // still not the right default, because page geometry beats it on both axes at once: zstd at
+    // page_rows=512 is both faster (137 us) and far smaller (0.414x of the row format) than lz4 at
+    // the shipping geometry (245 us, 0.564x). lz4 exists because the row format's default is
+    // LZ4WithDictsCompressor, so a codec-controlled comparison was impossible without it, and
+    // because it is a defensible choice for a hot tier where disk is cheap (design doc 10.29).
     codec   compression = codec::zstd;
     int     zstd_level = 3;
     // Values per data page. The writer uses min(page_values, row group size), so at 8 192
@@ -61,8 +68,28 @@ struct writer_options {
     // uncompetitive. Disk is what Parquet is for; 4 096 is no better a compromise, buying 1.14x
     // for +7.5 %.
     //
-    // If point-read latency becomes a priority, the footer cache (10.4l) is the lever: at
-    // production scale footer parse dominates everything measured here and costs no size at all.
+    // **That reasoning was re-opened on 2026-08-23 and its premise no longer holds.** Two reader
+    // fixes (10.29) took a point read from 1 036 us to 367 us with no format change, which leaves
+    // 70 % of it in ZSTD_decompress on pages the size of a row group -- so page size is now the
+    // whole of what is left, not a sixth of the format's value spent on a lost cause. Re-swept
+    // against the fixed reader, seven columns and sixty-five, with write and scan throughput flat
+    // across the whole range:
+    //
+    //     page_rows   7-col us / size    65-col us / size
+    //     default        372 / 0.321x      1 289 / 0.321x
+    //     2 048          206 / 0.345x        761 / 0.399x
+    //     1 024          163 / 0.366x        627 / 0.463x
+    //       512          137 / 0.414x        575 / 0.590x
+    //
+    // At 1 024 the seven-column point read is 5.6x the row format rather than 20-33x. The trade is
+    // now worth making somewhere; it is still not clear it is worth making *by default*, because
+    // the size cost is a function of leaf count -- +7.5 % on seven columns at 2 048, +24.3 % on
+    // sixty-five -- and two schemas is the same kind of evidence that was wrong last time. What
+    // settles it is the corpus (Backblaze at 197 columns, ClickBench at 105) at 1 024 and 2 048.
+    //
+    // Note also that latency bottoms out near 256 rows and rises below it: per-page overhead
+    // starts costing more than the decode it saves. There is no point going smaller than that
+    // whatever the size budget allows.
     size_t  page_values = 8192;
     bool    use_dictionary = true;
     // Dictionary-encode *numeric* columns too, not just byte_array ones.
