@@ -19,6 +19,7 @@
 #include <cstdlib>
 
 #include <cstring>
+#include <lz4.h>
 #include <snappy.h>
 #include <zstd.h>
 
@@ -98,6 +99,19 @@ std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t exp
         const size_t n = ZSTD_decompress(out.data(), out.size(), in.data(), in.size());
         if (ZSTD_isError(n)) { throw decode_error(std::string("zstd: ") + ZSTD_getErrorName(n)); }
         out.resize(n);
+        return out;
+    }
+    case codec::lz4_raw: {
+        // A bare LZ4 block: the uncompressed length lives in the page header, not in the block, so
+        // `expected` is the only thing that says how big the output is. LZ4_decompress_safe is
+        // bounded by that and rejects anything that would overrun it, which is the property this
+        // path needs -- page bodies come from files the node did not necessarily write.
+        std::vector<uint8_t> out(expected);
+        const int n = LZ4_decompress_safe(reinterpret_cast<const char*>(in.data()),
+                                          reinterpret_cast<char*>(out.data()),
+                                          int(in.size()), int(expected));
+        if (n < 0) { throw decode_error("lz4: corrupt or truncated block"); }
+        out.resize(size_t(n));
         return out;
     }
     case codec::snappy: {

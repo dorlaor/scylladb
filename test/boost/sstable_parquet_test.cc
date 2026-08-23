@@ -4121,6 +4121,106 @@ SEASTAR_THREAD_TEST_CASE(test_c6_parquet_gain_is_measured_over_real_data) {
     }).get();
 }
 
+// Every codec the `compression` sub-option accepts, round-tripped, plus the two things that make
+// a codec more than a speed/size dial: the footer has to *declare* it per column chunk (that is
+// what lets another implementation open the file) and the setting has to survive DESCRIBE.
+//
+// lz4 exists because the comparison that matters is against the row format, and the row format's
+// default is LZ4WithDictsCompressor while pq's is zstd -- so a CPU comparison between them that
+// does not vary the codec is measuring the codec as much as the format. Quantifying that was the
+// point (design doc 10.28): on the perf harness zstd is 70 % of a point read at the shipping page
+// geometry and lz4 recovers a third of the read, but it costs +76 % on disk here, and once the
+// page geometry is fixed the codec is 28 % of the read and the swap stops paying. So lz4 is an
+// option, and zstd stays the default -- but an option nobody can read back is not an option.
+//
+// On the wire it is LZ4_RAW (codec 7), the bare block every current Parquet implementation writes,
+// not the deprecated Hadoop-framed codec 5.
+SEASTAR_THREAD_TEST_CASE(test_pq_compression_codecs_round_trip) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        struct expect { const char* opt; sstables::parquet::format::codec want; };
+        const expect cases[] = {
+            {"zstd", sstables::parquet::format::codec::zstd},
+            {"lz4",  sstables::parquet::format::codec::lz4_raw},
+            {"none", sstables::parquet::format::codec::uncompressed},
+        };
+        // The reference arm carries no `parquet` option at all, so it also pins that the default
+        // is still zstd rather than whatever the loop happens to leave behind.
+        auto ref_schema = pq_schema();
+        auto ref = read_all(make_sstable_containing(
+                        env.make_sstable(ref_schema, sstable_version_types::pq),
+                        make_muts(ref_schema, 8, 60)).get(),
+                   ref_schema, env.make_reader_permit());
+
+        for (const auto& c : cases) {
+            BOOST_TEST_CONTEXT("compression=" << c.opt) {
+                auto sb = schema_builder(1, "ks", "pq_tbl");
+                sb.with_column("pk", utf8_type, column_kind::partition_key)
+                  .with_column("ck", int32_type, column_kind::clustering_key)
+                  .with_column("v_int", int32_type)
+                  .with_column("v_big", long_type)
+                  .with_column("v_dbl", double_type)
+                  .with_column("v_txt", utf8_type);
+                sb.set_parquet_options({{"compression", sstring(c.opt)}});
+                auto s = sb.build();
+                auto sst = make_sstable_containing(
+                        env.make_sstable(s, sstable_version_types::pq),
+                        make_muts(s, 8, 60)).get();
+
+                // Same rows back, whichever codec carried them.
+                auto got = read_all(sst, s, env.make_reader_permit());
+                BOOST_REQUIRE_EQUAL(got.size(), ref.size());
+                for (size_t i = 0; i < got.size(); ++i) {
+                    assert_that(got[i]).is_equal_to(ref[i]);
+                }
+
+                // And a point read, which is a different code path in the reader: it decodes one
+                // page per leaf rather than a whole row group, and a codec that only worked on
+                // the scan path would pass everything above.
+                {
+                    auto pr = dht::partition_range::make_singular(ref[3].decorated_key());
+                    auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+                    auto close = deferred_close(rd);
+                    auto m = read_mutation_from_mutation_reader(rd).get();
+                    BOOST_REQUIRE(m);
+                    assert_that(*m).is_equal_to(ref[3]);
+                }
+
+                // The footer must name the codec, per chunk, or no other reader can open this.
+                const uint64_t len = sst->ondisk_data_size();
+                auto buf = sst->data_read(0, len, env.make_reader_permit()).get();
+                auto img = std::span<const uint8_t>(
+                        reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
+                auto md = sstables::parquet::format::parse_footer(img);
+                BOOST_REQUIRE(!md.row_groups.empty());
+                size_t chunks = 0;
+                for (const auto& rg : md.row_groups) {
+                    for (const auto& ch : rg.columns) {
+                        BOOST_REQUIRE(ch.meta);
+                        BOOST_REQUIRE(ch.meta->compression == c.want);
+                        ++chunks;
+                    }
+                }
+                BOOST_REQUIRE_GT(chunks, 0u);
+
+                // DESCRIBE: the option has to come back out under the name it went in as.
+                // `none` is the interesting one in reverse -- it is not the default, so it must
+                // be emitted -- and `zstd` is, so a writer that emitted nothing for it would be
+                // right for the wrong reason. Assert the value either way.
+                sstables::parquet::parquet_parameters params(s->parquet_options());
+                auto back = params.to_map();
+                auto it = back.find("compression");
+                if (c.want == sstables::parquet::format::codec::zstd) {
+                    // The default: absent is correct, present must say zstd.
+                    if (it != back.end()) { BOOST_REQUIRE_EQUAL(it->second, sstring("zstd")); }
+                } else {
+                    BOOST_REQUIRE(it != back.end());
+                    BOOST_REQUIRE_EQUAL(it->second, sstring(c.opt));
+                }
+            }
+        }
+    }).get();
+}
+
 // A Parquet sstable has no CompressionInfo component -- it compresses inside the file -- so
 // sstable::get_compression_ratio() reported NO_COMPRESSION_RATIO (-1.0) for every Parquet table,
 // i.e. nodetool and the REST API showed no ratio for a table that has a perfectly good one. The

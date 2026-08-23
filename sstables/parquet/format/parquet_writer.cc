@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <lz4.h>
 #include <zstd.h>
 
 namespace sstables::parquet::format {
@@ -22,7 +23,29 @@ namespace {
 
 std::vector<uint8_t> compress(const std::vector<uint8_t>& in, codec c, int level) {
     if (c == codec::uncompressed || in.empty()) { return in; }
-    if (c != codec::zstd) { throw std::runtime_error("writer: only zstd/uncompressed for now"); }
+    if (c == codec::lz4_raw) {
+        // LZ4_RAW, not LZ4: codec 7, a bare LZ4 block with no framing and no length prefix, which
+        // is what every current Parquet implementation writes. Codec 5 ("LZ4") is the deprecated
+        // Hadoop-framed variant and is deliberately not produced here.
+        //
+        // The uncompressed size is not stored in the block -- the reader takes it from the page
+        // header, which Parquet requires to be exact -- so nothing is prefixed.
+        const int bound = LZ4_compressBound(int(in.size()));
+        if (bound <= 0) { throw std::runtime_error("lz4: page too large to compress"); }
+        // Named, because `std::vector<uint8_t> out(size_t(bound))` is a function declaration and
+        // the brace form would build a one-element vector holding `bound`.
+        const size_t cap = size_t(bound);
+        std::vector<uint8_t> out(cap);
+        const int n = LZ4_compress_default(reinterpret_cast<const char*>(in.data()),
+                                           reinterpret_cast<char*>(out.data()),
+                                           int(in.size()), bound);
+        if (n <= 0) { throw std::runtime_error("lz4: compression failed"); }
+        out.resize(size_t(n));
+        return out;
+    }
+    if (c != codec::zstd) {
+        throw std::runtime_error(std::string("writer: unsupported codec ") + to_string(c));
+    }
     size_t bound = ZSTD_compressBound(in.size());
     std::vector<uint8_t> out(bound);
     size_t n = ZSTD_compress(out.data(), bound, in.data(), in.size(), level);

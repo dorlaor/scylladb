@@ -334,12 +334,18 @@ parquet_parameters::parquet_parameters(const std::map<sstring, sstring>& opts) {
             // Only what the writer can actually emit. See the note on the class.
             if (v == "zstd") {
                 _cfg.wopt.compression = format::codec::zstd;
+            } else if (v == "lz4") {
+                // LZ4_RAW on the wire (codec 7), which is what every current Parquet
+                // implementation means by LZ4. Spelled "lz4" here because that is what the rest
+                // of Scylla calls this codec, and an operator comparing a pq table against the
+                // row format's LZ4WithDictsCompressor should not have to know the difference.
+                _cfg.wopt.compression = format::codec::lz4_raw;
             } else if (v == "none") {
                 _cfg.wopt.compression = format::codec::uncompressed;
             } else {
                 throw exceptions::configuration_exception(
                         seastar::format("Unsupported 'compression' value '{}' in the 'parquet' "
-                               "option; supported: none, zstd", v));
+                               "option; supported: none, lz4, zstd", v));
             }
         } else if (k == COMPRESSION_LEVEL) {
             _cfg.wopt.zstd_level = int(parse_count(k, v, 1, 22));
@@ -696,7 +702,8 @@ std::map<sstring, sstring> parquet_parameters::to_map() const {
         m[PAGE_ROWS] = seastar::format("{}", _cfg.wopt.page_values);
     }
     if (_cfg.wopt.compression != def.wopt.compression) {
-        m[COMPRESSION] = _cfg.wopt.compression == format::codec::zstd ? "zstd" : "none";
+        m[COMPRESSION] = _cfg.wopt.compression == format::codec::zstd ? "zstd"
+                       : _cfg.wopt.compression == format::codec::lz4_raw ? "lz4" : "none";
     }
     if (_cfg.wopt.zstd_level != def.wopt.zstd_level) {
         m[COMPRESSION_LEVEL] = seastar::format("{}", _cfg.wopt.zstd_level);
