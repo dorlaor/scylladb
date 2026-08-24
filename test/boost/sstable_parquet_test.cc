@@ -4975,3 +4975,66 @@ SEASTAR_THREAD_TEST_CASE(test_pq_bigint_key_partition_sequence_round_trips) {
         }
     }).get();
 }
+
+// The read monitor is how compaction learns how far through an sstable it has got:
+// compaction_read_monitor::compacted() reads the reader_position_tracker that on_read_started()
+// hands it, and the backlog tracker uses that to discount work already done.
+//
+// pq_reader got both halves wrong. It never called on_read_started() at all, so the compaction
+// monitor's tracker stayed null and compacted() returned 0 for every pq sstable for the whole of
+// every compaction -- the backlog was overestimated throughout. And it called on_read_completed()
+// at the end of init(), i.e. when the read was just *beginning*, which with a null tracker was a
+// silent no-op. Both are invisible to a correctness test: the rows come back either way.
+//
+// This asserts the ordering, not just the counts, because the counts alone passed before the fix.
+SEASTAR_THREAD_TEST_CASE(test_pq_full_scan_reader_reports_progress_to_the_read_monitor) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto sst = make_sstable_containing(env.make_sstable(s, sstable_version_types::pq),
+                                          make_muts(s, 40, 16)).get();
+
+        struct counting_monitor final : public sstables::read_monitor {
+            unsigned started = 0;
+            unsigned completed = 0;
+            const sstables::reader_position_tracker* tracker = nullptr;
+            uint64_t total_at_start = 0;
+            uint64_t position_at_completion = 0;
+            void on_read_started(const sstables::reader_position_tracker& t) override {
+                ++started;
+                tracker = &t;
+                total_at_start = t.total_read_size;
+            }
+            void on_read_completed() override {
+                ++completed;
+                if (tracker) {
+                    position_at_completion = tracker->position;
+                }
+            }
+        };
+        counting_monitor mon;
+
+        // make_full_scan_reader is the path compaction takes.
+        auto rd = sst->make_full_scan_reader(s, env.make_reader_permit(), nullptr, mon);
+        auto close_rd = deferred_close(rd);
+        unsigned frags = 0;
+        while (auto mf = rd().get()) {
+            ++frags;
+        }
+        BOOST_REQUIRE_GT(frags, 0u);
+
+        // The stream is drained but the reader is still open. Progress must have been reported and
+        // the read must NOT yet be marked complete -- completion used to be announced from init(),
+        // before a single fragment had been emitted.
+        BOOST_REQUIRE_EQUAL(mon.started, 1u);
+        BOOST_REQUIRE_EQUAL(mon.completed, 0u);
+        BOOST_REQUIRE(mon.tracker != nullptr);
+        BOOST_REQUIRE_GT(mon.tracker->position, 0u);
+        // The monitor is told how big the thing being read is, which is what turns a byte count
+        // into a fraction for the backlog estimate.
+        BOOST_REQUIRE_EQUAL(mon.total_at_start, sst->ondisk_data_size());
+
+        close_rd.close_now();
+        BOOST_REQUIRE_EQUAL(mon.completed, 1u);
+        BOOST_REQUIRE_GT(mon.position_at_completion, 0u);
+    }).get();
+}

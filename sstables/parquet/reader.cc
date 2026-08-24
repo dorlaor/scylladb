@@ -323,6 +323,15 @@ class pq_reader : public mutation_reader::impl {
     query::partition_slice _slice;
     sstables::read_monitor& _mon;
     const bool _use_index;
+    // What the read monitor watches. mx keeps this inside its read context, which advances it as
+    // the data file is consumed sequentially; this reader has no such context and its reads are not
+    // sequential, so `position` accumulates bytes actually fetched. For the one consumer that
+    // matters -- compaction_read_monitor::compacted(), which feeds the backlog tracker -- "bytes of
+    // this sstable consumed so far" is the intended quantity, and on a compaction (which reads every
+    // column) the two definitions converge.
+    sstables::reader_position_tracker _tracker;
+    bool _read_started = false;
+    bool _read_completed = false;
 
     bool _init = false;
     // The sstable's parsed footer, shared and immutable. Held by shared_ptr rather than looked up
@@ -375,6 +384,8 @@ class pq_reader : public mutation_reader::impl {
     bool _skipping = false;
 
     future<> init();
+    // Every data-file fetch goes through this so the read monitor's position keeps advancing.
+    future<temporary_buffer<char>> tracked_read(uint64_t off, size_t len);
     future<> load_footer();             // cache hit, or fetch-decrypt-parse-publish
     // Ask the key provider for this file's key and build the per-read crypto context around the
     // envelope the footer declared. Separate from the footer load because the envelope is cached
@@ -512,8 +523,35 @@ public:
                                   "handled by the forwardable adapter");
     }
 
-    future<> close() noexcept override { return make_ready_future<>(); }
+    future<> close() noexcept override {
+        // on_read_completed() used to be called at the end of init(), i.e. when the read was just
+        // beginning. With the compaction monitor that was a no-op -- on_read_started() was never
+        // called, so its _tracker was null -- and the visible effect was that
+        // compaction_read_monitor::compacted() returned 0 for every pq sstable, so the backlog
+        // tracker could not discount work already done and overestimated a pq table's backlog for
+        // the whole of every compaction.
+        if (_read_started && !_read_completed) {
+            _read_completed = true;
+            _mon.on_read_completed();
+        }
+        return make_ready_future<>();
+    }
 };
+
+// Every data-file fetch goes through here so the monitor's position cannot silently stop
+// advancing when a new read site is added. on_read_started() is deferred to the first fetch rather
+// than done in the constructor: the monitor expects a tracker that is about to move, and a reader
+// that is constructed and closed without reading anything should not register at all.
+future<temporary_buffer<char>> pq_reader::tracked_read(uint64_t off, size_t len) {
+    if (!_read_started) {
+        _read_started = true;
+        _tracker.total_read_size = _sst->ondisk_data_size();
+        _mon.on_read_started(_tracker);
+    }
+    auto buf = co_await _sst->data_read(off, len, _permit);
+    _tracker.position += buf.size();
+    co_return std::move(buf);
+}
 
 future<format::read_crypto> pq_reader::read_crypto_for(
         format::cipher algo,
@@ -723,7 +761,7 @@ future<> pq_reader::load_footer() {
     {
         rtimer _t{rphase::footer_io};
         const auto t0 = std::chrono::steady_clock::now();
-        tail = co_await _sst->data_read(len - 8, 8, _permit);
+        tail = co_await tracked_read(len - 8, 8);
         t_fetch += std::chrono::steady_clock::now() - t0;
     }
     uint32_t flen;
@@ -737,7 +775,7 @@ future<> pq_reader::load_footer() {
     {
         rtimer _t{rphase::footer_io};
         const auto t0 = std::chrono::steady_clock::now();
-        raw = co_await _sst->data_read(len - 8 - flen, flen, _permit);
+        raw = co_await tracked_read(len - 8 - flen, flen);
         t_fetch += std::chrono::steady_clock::now() - t0;
     }
     entry->encrypted = encrypted;
@@ -938,7 +976,6 @@ future<> pq_reader::init() {
         if (ex) { std::rethrow_exception(ex); }
     }
     _cursor = _row_lo;
-    _mon.on_read_completed();
 }
 
 // The materialised row group's byte span: [first page of any chunk, end of the last). One call
@@ -966,7 +1003,7 @@ future<> pq_reader::load_row_group(size_t rg) {
     if (lo >= hi) { throw std::runtime_error("pq: empty row group extent"); }
     {
         rtimer _t{rphase::rg_fetch};
-        _rg_buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
+        _rg_buf = co_await tracked_read(uint64_t(lo), size_t(hi - lo));
     }
     _rg_base = lo;
     _cur_rg = rg;
@@ -1161,7 +1198,7 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
     }
     if (lo >= hi) { co_return; }        // file has no page index; caller falls back
     rtimer _t{rphase::offset_index};
-    auto buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
+    auto buf = co_await tracked_read(uint64_t(lo), size_t(hi - lo));
     auto img = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
     for (size_t c = 0; c < _oi.size(); ++c) {
         const auto& cc = columns()[c];
@@ -1244,7 +1281,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         std::vector<future<temporary_buffer<char>>> fs;
         fs.reserve(want.size());
         for (const auto& e : want) {
-            fs.push_back(_sst->data_read(e.off, e.len, _permit));
+            fs.push_back(tracked_read(e.off, e.len));
         }
         held = co_await when_all_succeed(fs.begin(), fs.end());
     }
