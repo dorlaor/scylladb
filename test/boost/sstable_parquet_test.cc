@@ -5064,10 +5064,26 @@ SEASTAR_THREAD_TEST_CASE(test_pq_compaction_aborted_while_reading_does_not_fault
         // and the compaction finished before the abort was requested -- BOOST_REQUIRE(threw) caught
         // that rather than letting a vacuous run report success, which is the whole reason the
         // assertion is there.
+        //
+        // Scale and abort delay are overridable so the committed default stays CI-fast while the
+        // same test can be driven hard by hand. The AWS fault was on a compaction 3-4 orders of
+        // magnitude bigger than this, and "the race needs a deeper in-flight pipeline" is the
+        // leading hypothesis for why it does not reproduce here, so being able to turn the dial
+        // without editing the test is the point.
+        auto env_int = [] (const char* k, int dflt) {
+            const char* v = std::getenv(k);
+            return v ? std::max(1, std::atoi(v)) : dflt;
+        };
+        const int n_ssts  = env_int("PQ_ABORT_SSTS", 10);
+        const int n_parts = env_int("PQ_ABORT_PARTS", 3000);
+        const int n_rows  = env_int("PQ_ABORT_ROWS", 40);
+        const int delay_ms = env_int("PQ_ABORT_DELAY_MS", 30);
         std::vector<shared_sstable> in;
-        for (int i = 0; i < 10; ++i) {
-            in.push_back(make_sstable_containing(sst_gen(), make_muts(s, 3000, 40)).get());
+        for (int i = 0; i < n_ssts; ++i) {
+            in.push_back(make_sstable_containing(sst_gen(), make_muts(s, n_parts, n_rows)).get());
         }
+        testlog.info("built {} pq sstables of {} x {} rows; abort at {} ms",
+                     n_ssts, n_parts, n_rows, delay_ms);
         auto& table_s = cf.as_compaction_group_view();
 
         compaction::compaction_descriptor desc(in);
@@ -5088,7 +5104,7 @@ SEASTAR_THREAD_TEST_CASE(test_pq_compaction_aborted_while_reading_does_not_fault
                 const auto t0 = std::chrono::steady_clock::now();
                 auto fut = ::compaction::compact_sstables(std::move(desc), cdata, table_s, pm);
                 auto waiter = seastar::async([&] {
-                    seastar::sleep(std::chrono::milliseconds(30)).get();
+                    seastar::sleep(std::chrono::milliseconds(delay_ms)).get();
                     keys_at_abort = cdata.total_keys_written;
                     // cdata.stop(), NOT abort.request_abort(). is_stop_requested() tests the
                     // stop_requested STRING, and stop() is what sets it as well as tripping the
