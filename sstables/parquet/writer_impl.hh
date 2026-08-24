@@ -361,6 +361,23 @@ class pq_writer_impl : public sstables::sstable_writer::writer_impl {
 public:
     using sink_type = std::function<void(std::vector<uint8_t>)>;
 
+    // Close whatever file writers are still open.
+    //
+    // Needed because the success path is not the only path. consume_end_of_stream() closes
+    // _data_writer and _index_writer explicitly, but a cancelled compaction never calls it: the
+    // compaction_writer optional is destroyed instead, and with it this object. Leaving the
+    // writers to their own destructors is a use-after-free, not merely untidy --
+    // checksummed_file_writer keeps `checksum _c` as a DERIVED member while the base file_writer
+    // owns the output_stream whose sink holds a reference to it (sstables/writer.hh:160-172).
+    // Derived members are destroyed before the base destructor runs, and ~file_writer()
+    // best-effort auto-closes an unclosed stream, so the flush appends a CRC to a checksum
+    // struct that is already gone. That is the #18 segfault: si_addr 0x8 in
+    // chunked_vector::emplace_back, reached from ~pq_writer_impl.
+    //
+    // Closing here instead runs while *_data_writer is fully alive, and close() sets the base's
+    // _closed flag so ~file_writer() then does nothing.
+    ~pq_writer_impl();
+
 private:
     fragment_shredder _shredder;
     pq_writer_config  _pcfg;

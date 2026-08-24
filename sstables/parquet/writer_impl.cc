@@ -35,6 +35,11 @@
 
 namespace sstables::parquet {
 
+// Nothing in this file logged before; the teardown path below needs to be able to
+// report a failed close without throwing out of a destructor.
+static seastar::logger pqwlog("pq_writer");
+
+
 namespace {
 
 // Scylla serialises fixed-width scalars big-endian, so the physical mapping can
@@ -1487,6 +1492,26 @@ stop_iteration pq_writer_impl::consume_end_of_partition() {
         cut_row_group();
     }
     return stop_iteration::no;
+}
+
+pq_writer_impl::~pq_writer_impl() {
+    // Only reached with writers still held when the stream did not end normally -- a cancelled or
+    // failed compaction. Must not throw: this is a destructor, and the abort that got us here may
+    // well have poisoned the sink, so a failing flush is expected rather than exceptional.
+    auto shut = [] (auto& w, const char* what) noexcept {
+        if (!w) {
+            return;
+        }
+        try {
+            w->close();
+        } catch (...) {
+            pqwlog.warn("closing {} during teardown failed: {}. Ignored.",
+                      what, std::current_exception());
+        }
+        w.reset();
+    };
+    shut(_data_writer, "the data component");
+    shut(_index_writer, "the index component");
 }
 
 void pq_writer_impl::consume_end_of_stream() {
