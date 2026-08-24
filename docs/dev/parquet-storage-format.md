@@ -7994,6 +7994,69 @@ buys 9 read operations plus a 27 µs OffsetIndex read in exchange for not fetchi
 reader would not have decompressed either way. On a node where I/O is 1.7 % of the read that is
 probably the wrong way round, but "probably" is not a measurement.
 
+### 10.30 Scan, write and the size baseline, measured at a billion rows — 2026-08-23/24, and §10.26's scan parity does not survive
+
+Three claims were re-measured on the AWS cluster (3× i4i.xlarge, RF=3, 1 000 000 000 rows per arm,
+build `fe3c018bd7cf`). Two survived. One did not, and it is the one this format is usually sold on.
+
+**The scan is not at time parity.** §10.26 records 1.03× the row format through CQL at 8 M rows.
+Scanning 2 % of the token ring — 19.9 M rows — at consistency ONE with `BYPASS CACHE`:
+
+| scan | native | parquet | disk | time |
+|---|---|---|---|---|
+| all 5 columns | 232.5 B/row, 60.6 s | **57.7 B/row**, 173.9 s | **4.02× less** | **2.87× slower** |
+| one column | 234.4 B/row, 42.6 s | 58.6 B/row, 157.3 s | 3.98× less | 3.70× slower |
+
+Disk operations: 329 859 against 147 590, so 2.23× fewer as well as 4× smaller. Both arms ran
+through the same Python client, so a client bottleneck would have made them *equal*; the divergence
+is server-side, and for pq it is decode CPU — consistent with §10.29's finding that 94.6 % of page
+decode is zstd inflating whole pages. **The scan advantage is an I/O advantage, not a time
+advantage.** That is worth having where storage is I/O-bound or billed per byte, and it is a loss
+where CPU is the scarce resource. §10.26's figure is not withdrawn; it stands for its own scale, and
+the two disagree because 8 M rows in one file is not 1 B rows across 2 335 sstables.
+
+Also confirmed at scale, having previously only been asserted: **query projection is not pushed
+down.** Selecting one column instead of five moves what pq reads by 1.6 %, and in the wrong
+direction. A columnar format that cannot skip unread columns is giving up its second largest
+advantage.
+
+**Writes are at parity, and this one holds.** Separate tables, never the 1 B-row arms — adding rows
+to one side would have invalidated both the size and the scan results. At a fixed 60 000 writes/s
+across four interleaved passes the cluster spends 24.12 % of itself on native and 24.08 % on pq.
+Unthrottled: 177 458/s against 175 110/s, so pq gives up 1.3 % of throughput for 1.7 % more CPU and
+6 % on the tail. The fixed rate is the primary comparison because the loader is 4 vCPU and the
+original bulk load ran it at load average 4.1 — pegged — and a saturated loader reports parity
+whatever is true. Two figures not to over-read: p95 and p99 agree to four significant figures across
+all four passes, which is the coordinator histogram's bucket width; and at the ceiling the loader
+reached 3.01 of 4, so 1.3 % is a floor on the difference rather than a measurement of it.
+
+**The size baseline is fair.** Every size figure in this document, 87.3 % included, is measured
+against a native arm running `LZ4WithDictsCompressor` — Scylla's default — while this project's
+stated baseline is a *trained zstd dictionary*, which is a stronger comparator. So the saving could
+have been an artefact of the codec. Re-measured on identical data with three arms and the dictionary
+genuinely trained (`POST /storage_service/retrain_dict`, then a major compaction so it is written
+into the files rather than merely declared):
+
+| arm | bytes/row | ratio to zstd+dicts |
+|---|---|---|
+| `LZ4WithDictsCompressor` | 3.998 | 1.019 |
+| `ZstdWithDictsCompressor` | 3.922 | 1.000 |
+| parquet | **0.316** | **0.081** |
+
+Zstd dictionaries recover **1.9 %** over LZ4 dictionaries, which moves the pq ratio by **0.2
+percentage points**. The saving is not an artefact of the baseline. The local set is far more
+compressible than the AWS corpus — 3.9 B/row native against 24.9 — so the absolute ratio here is not
+comparable to the cluster's; the transferable quantity is the 1.9 % gap between the two dictionary
+codecs, because that is what decides whether the choice of comparator matters at all.
+
+**Two measurement faults found on the way**, both of which had produced plausible numbers. The
+IO-queue read counters carry a `class` label spanning compaction, commitlog, memtable, streaming and
+the service levels; summing all of them credited a scan with whatever else the cluster was doing,
+and produced a one-column pq scan that appeared to read 4× *more* than the same scan of all five —
+which is not something storage can do, and is what exposed it. And a rate window of 30 s over a
+20 s scrape interval under-reported throughput by 2×.
+
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
@@ -8619,7 +8682,7 @@ metadata component exists would not have caught records written but unreadable b
 | Random schemas | Was the largest known correctness gap: `pq` failed `make_random_schema_specification` on ~1 seed in 4, and **nothing in the tree had ever pointed a random schema at this format**. One product bug of the data-loss class (see the upgrade caveat above), fixed at four sites with three deterministic tests. The *axis* is now permanent: `test_pq_random_schema_fixed_seeds` runs **64 checked-in seeds** in 6.6 s, confirmed to name **10 of 64** against the pre-fix codec — and the encoder half alone catches 9, so no one site stands in for the others. | §9.6b, §9.6c |
 | Folding losslessness in CI | `test/unit/parquet_shred_test`, **6 480 cases** — re-verified by running it for this audit: `round-trip: 6480 cases, 0 failures`. Wired as **6 of the 7 subcommands**; `cost` is excluded because it returns 0 unconditionally, the second unfalsifiable assertion this exercise declined to wire rather than widen. The file was **moved** from `sstables/parquet/test_shred.cc`, so `run_tests.sh` and CI share one copy. | §9.6 |
 | Deletion channel folded | A dead cell's deletion time used to go into its own column's `__ldt_<col>` leaf — 195 leaves and 60.7 MB on Backblaze against 1.9 MB for the same rows' write times, ~32× the cost for the same information shape. Now four leaves independent of table width. Measured on real `pq` sstables: **87 532 117 → 28 246 463 B, 3.10×**, deletion channel 40.3× smaller, `data` channel byte-identical. Pre-fold files read unchanged, no migration. Not applied to collections, whose per-element `__ldt` lives inside the MAP group. | §10.28 |
-| Scan path | **1.03× the row format through CQL** at 8 M rows and shipping defaults: 21.3 MB read of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796. It was 2.29× and ~497 000 extents until 2026-08-20, because the reader took the point-read path for any *bounded* partition range while the coordinator splits every range scan at tablet boundaries. So the corrected claim is **parity with an order of magnitude less read I/O** — not the 0.82× advantage §10.4c reported and the deck quoted, which was never real, and not the 2.3× penalty either. | §10.26 |
+| Scan path | **1.03× the row format through CQL** at 8 M rows and shipping defaults: 21.3 MB read of a 23.4 MB file against native's 234 MB, in 1 601 read extents against 1 796. It was 2.29× and ~497 000 extents until 2026-08-20, because the reader took the point-read path for any *bounded* partition range while the coordinator splits every range scan at tablet boundaries. So the corrected claim is **parity with an order of magnitude less read I/O** — not the 0.82× advantage §10.4c reported and the deck quoted, which was never real, and not the 2.3× penalty either. **Re-measured at 1 B rows on real hardware (§10.30) the I/O half holds and the time half does not: 4.02× fewer bytes and 2.23× fewer disk operations, but 2.87× SLOWER in wall time.** So the GA-facing claim is *parity on nothing, an I/O advantage, and a time penalty that grows with scale* — good where storage is I/O-bound or billed per byte, bad where CPU is scarce. Query projection is confirmed not pushed down: one column instead of five moves pq's bytes/row by 1.6 %, the wrong way. | §10.26, §10.30 |
 | Size | Corpus re-measured under the deterministic dictionary: where the input was identical nothing moved, and the two near-parity rows moved least. GB-scale three-way measurement on real NOAA ISD-Lite under TWCS. | §10.16, §10.6 |
 | Interoperability | 16 shapes read by pyarrow and DuckDB — which is what caught the MAP annotation bug. | §10.3i |
 | Encryption at rest, uniform mode | AES_GCM_V1/AES_GCM_CTR_V1, encrypted footer, keys from `ent/encryption`'s own providers (local file, replicated, KMIP, AWS KMS, GCP, Azure), so BYOK works; pyarrow opens the encrypted `Data.db` with the provider's key. **Per-column keys work through Scylla as of 2026-08-22** (`encryption_key.<column>`, §10.17b), which supersedes the "one key per sstable" retraction below; only columns owning a uniquely-named leaf can be keyed, so non-frozen collections cannot. Blocked by B2/B3/B4, and per-column keys make B3's window `K+1`× wider — see the amended B3. Also not covered: plaintext-footer mode, node-global `user_info_encryption`. | §10.17, §10.17b |
