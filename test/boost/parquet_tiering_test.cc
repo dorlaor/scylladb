@@ -41,7 +41,10 @@ tiering_inputs good() {
     in.bottom_tier = true;
     in.schema_eligible = true;
     in.column_count = 105;             // ClickBench's width: admitted, and saves 40 %
-    in.predicted_gain = 0.42;
+    // Comfortably over the 0.40 default and comfortably under the 0.80 that
+    // test_tiering_honours_custom_thresholds sets, so neither test sits on a boundary
+    // it did not mean to test. Not a measured figure -- a fixture.
+    in.predicted_gain = 0.60;
     return in;
 }
 
@@ -99,11 +102,20 @@ BOOST_AUTO_TEST_CASE(test_tiering_c6_rejects_gain_below_the_floor) {
     require_reject(in, "predicted gain");
 }
 
+BOOST_AUTO_TEST_CASE(test_tiering_c6_refuses_a_gain_the_old_gate_allowed) {
+    // 0.30 was accepted while min_gain_ratio was 0.15 and must be refused at 0.40. This is the
+    // only case that would notice the default being reverted -- the boundary test below moves with
+    // the default, so it cannot catch that on its own.
+    auto in = good();
+    in.predicted_gain = 0.30;
+    require_reject(in, "predicted gain");
+}
+
 BOOST_AUTO_TEST_CASE(test_tiering_c6_accepts_exactly_at_the_threshold) {
     // The boundary itself, so that a `>` / `>=` slip is caught rather than being absorbed by
     // a comfortable margin on either side.
     auto in = good();
-    in.predicted_gain = 0.15;
+    in.predicted_gain = 0.40;
     BOOST_REQUIRE(evaluate_tiering(in).parquet());
 }
 

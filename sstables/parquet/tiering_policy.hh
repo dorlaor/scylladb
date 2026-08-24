@@ -79,7 +79,21 @@ struct tiering_thresholds {
     // Stands in for C7, which cannot be evaluated at all (6.2a). Cruder: it declines a wide
     // table that is only ever scanned, which is where Parquet is fastest.
     size_t   max_columns   = 128;
-    double   min_gain_ratio     = 0.15;           // C6: >= 15 % saved
+    // C6: >= 40 % saved against what the table costs on disk today.
+    //
+    // Raised from 0.15 on 2026-08-24. 15 % was set when the question was "can this format ever
+    // pay", and it admitted tables where the answer is technically yes and practically no: the
+    // format's cost side is a 1.4-1.5x point read and a scan that reads 4x less but takes 2.9x
+    // longer (10.30), which is not worth paying for a sixth of the disk. The corpus says the
+    // shapes divide cleanly rather than continuously -- timeseries at 0.127 of native, isd at
+    // 0.45, ClickBench at 0.60, Backblaze at 0.91 and *bigger* than native once pages are small
+    // (10.32) -- so a gate at 0.40 keeps the shapes the format is for and drops the ones where it
+    // is a rounding error. Tables that fail are not broken, they simply stay on the row format.
+    //
+    // The baseline is the source sstable's ON-DISK bytes (gain_estimator.cc), so it is measured
+    // against whatever that table actually pays today, dictionaries included -- not against an
+    // uncompressed size, and not against a hypothetical codec it does not use.
+    double   min_gain_ratio     = 0.40;
 };
 
 // What the caller must be able to say about a candidate output. Anything the

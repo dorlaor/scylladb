@@ -1234,7 +1234,26 @@ representable, and every other type falls back to an opaque blob column. The gat
 as the place a future encoding gap belongs — see §11 item 11.
 
 **C6 — Predicted gain.** A sampling estimator predicts ≥ `parquet_min_gain_ratio`
-(default **15 %**) saving versus the table's current compressor. **Do not guess —
+(default **40 %**, raised from 15 % on 2026-08-24) saving versus the table's current compressor.
+The baseline is the source sstable's **on-disk** bytes, so it is measured against what that table
+actually pays today — dictionaries included if it uses them — and not against an uncompressed size
+or a codec it does not run.
+
+*Why 40 and not 15.* 15 % was set when the question was "can this format ever pay". It admitted
+tables where the answer is technically yes and practically no, because the cost side is now priced:
+a point read is 1.4–1.5× native and a scan reads 4× less while taking 2.9× longer (§10.30). A sixth
+of the disk does not buy that. The corpus also says the shapes divide rather than shade into each
+other — timeseries at 0.127 of native, isd at 0.45, ClickBench at 0.60, Backblaze at 0.91 and
+*larger* than native once pages are small (§10.32) — so a gate at 0.40 keeps the shapes the format
+is for and drops the ones where it is a rounding error. **A table that fails C6 is not a problem;
+it stays on the row format, which is the point of choosing per table.**
+
+One consequence worth stating, because it inverts an earlier conclusion: once the gate is at 40 %,
+the tables that pass have so much headroom that `page_rows` stops being a size decision for them.
+A timeseries table at 0.127 can absorb a 372 % size increase before reaching 0.60, and the worst
+`page_rows` cost measured anywhere in the corpus is +48 %. So on the shapes the format is for, small
+pages are close to free in gate terms, and the size/latency conflict of §10.32 binds only the
+marginal tables the gate has already excluded. **Do not guess —
 measure.** Implemented in `sstables/parquet/gain_estimator.cc`; see §6.2a for how it samples
 and §10.1f for why no formula would do — the corpus spans 0.47× to 0.85× with the same
 folding and the same codec.

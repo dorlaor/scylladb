@@ -33,7 +33,10 @@ tiering_inputs good() {
     in.bottom_tier = true;
     in.schema_eligible = true;
     in.column_count = 105;             // ClickBench's width: admitted, and saves 40 %
-    in.predicted_gain = 0.42;
+    // Comfortably over the 0.40 default and comfortably under the 0.80 that
+    // test_tiering_honours_custom_thresholds sets, so neither test sits on a boundary
+    // it did not mean to test. Not a measured figure -- a fixture.
+    in.predicted_gain = 0.60;
     return in;
 }
 
@@ -87,7 +90,9 @@ int main() {
       expect_reject(in, "C6 unmeasured", "no measured gain"); }
     { auto in = good(); in.predicted_gain = 0.05;
       expect_reject(in, "C6 gain too small", "predicted gain"); }
-    { auto in = good(); in.predicted_gain = 0.15;
+    { auto in = good(); in.predicted_gain = 0.30;
+      expect_reject(in, "C6 gain that passed the old 15 % gate", "predicted gain"); }
+    { auto in = good(); in.predicted_gain = 0.40;
       expect(evaluate_tiering(in).parquet(), "C6 exactly at threshold accepted"); }
 
     // Custom thresholds must actually be honoured, not just the defaults.
