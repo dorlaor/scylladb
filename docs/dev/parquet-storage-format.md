@@ -8057,6 +8057,50 @@ which is not something storage can do, and is what exposed it. And a rate window
 20 s scrape interval under-reported throughput by 2×.
 
 
+### 10.31 The read monitor was never wired up — found by inspection 2026-08-24, and it is not the crash
+
+Chasing the compaction-cancel segfault (§11.1 B-list) by reading the teardown path turned up a
+different defect, which is worth separating from the crash rather than filed under it.
+
+`pq_reader` never called `read_monitor::on_read_started()`, and called `on_read_completed()` at the
+end of `init()` — when the read was *beginning*. The consequence is not on reads at all. It is
+`compaction_read_monitor`, which keeps the `reader_position_tracker` it is handed at
+`on_read_started()` and reports it from `compacted()`; `compaction_backlog_tracker` uses that to
+discount the part of an sstable already consumed. With no tracker, `compacted()` returned **0 for
+every `pq` sstable for the whole of every compaction**, so each was counted as entirely unstarted
+from beginning to end and a `pq` table's backlog was overestimated throughout.
+`register_compacting_sstable()` was never reached either, so a `pq` sstable under compaction was
+never in `_ongoing_compactions`.
+
+Fixed: all five data-file fetch sites route through a `tracked_read()` helper, so the tracker cannot
+stop advancing when a sixth is added later; `on_read_started()` fires on the first fetch with
+`total_read_size` set; `on_read_completed()` moves to `close()`, guarded to fire once and only if a
+read began.
+
+**Two candidate explanations for the segfault were checked and discarded**, which is the more useful
+half of this entry. The register/revert asymmetry cannot fault: `revert_charges()` is two map erases
+and erasing an absent key is safe, so `remove_sstable()` on a never-registered sstable is harmless.
+And `pq_reader::close()` returning a ready future does violate the documented contract — *"close
+should cancel any outstanding background operations, if possible, and wait on them to complete"*
+(`readers/mutation_reader.hh`) — but no caller was found that closes while a `fill_buffer()` is
+outstanding, and this reader starts no detached fibers: every I/O is awaited inline. So it is
+recorded as a contract concern, not asserted as the cause.
+
+**The crash remains unreproduced.** 12 local attempts, all *valid* — a compaction confirmed mid-read
+at 25–50 % progress with the `"due to truncate"` line emitted each time, on a 4-shard
+tablets-enabled node matching the AWS keyspace — for both `parquet` and `sstable`. Neither crashed,
+so the native arm does not settle attribution either; it rules out "any truncate-during-compaction
+crashes on this build" and nothing more. The limiting factor is scale: local compactions were
+**92–156 keys** against a billion-row table on AWS. And "already fixed" is unlikely, because the only
+reader change since the crash build is confined to the `_pr->is_singular()` branch, which a
+compaction's range reader never enters.
+
+The test asserts the *ordering*, not the counts: `on_read_completed()` was called exactly once
+before the fix too, just at the wrong moment and against a null tracker, so a count-only assertion
+passed against the bug. Verified by reverting `reader.cc` and rebuilding — `mon.started == 1u has
+failed [0 != 1]`.
+
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
