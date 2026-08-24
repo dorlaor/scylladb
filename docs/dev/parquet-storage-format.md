@@ -8120,6 +8120,60 @@ passed against the bug. Verified by reverting `reader.cc` and rebuilding — `mo
 failed [0 != 1]`.
 
 
+### 10.32 What `page_rows` actually costs — corpus size 2026-08-24, in-process latency the same day
+
+Two sweeps, because one instrument could not answer both halves, and the first attempt at the
+latency half was measured on a machine too noisy to see the effect at all.
+
+**Size, on the corpus** (`~/pq-lab/out/page_sweep_20260824.tsv`, `rows_per_row_group` held at
+20 000 so only the page moves):
+
+| dataset | leaves | rows/group | `page=2048` | `page=1024` |
+|---|---|---|---|---|
+| isd | 20 | ~23 000 | 55.5 % (+23 %) | 66.5 % (**+48 %**) |
+| ClickBench | 105 | ~3 300 | 65.8 % (+10 %) | 75.4 % (+26 %) |
+| Backblaze | 199 | ~6 400 | **109.6 %** (+20 %) | **128.6 %** (+41 %) |
+
+On Backblaze small pages make Parquet **larger than the row format it replaces**. The cost is not
+driven by leaf count — an earlier framing of "+14 % narrow, +44 % at 65 columns" does not survive
+this — it tracks the **ratio of `page_rows` to the actual rows per group**: isd 22.5× → +48 %,
+Backblaze 6.2× → +41 %, ClickBench 3.3× → +26 %. Leaf count matters only through its effect on group
+size, and on the wide shapes the group is bound by the 64 MiB shredder budget rather than by
+`rows_per_row_group` at all (ClickBench's three largest-page arms are byte-identical for exactly that
+reason).
+
+**Latency, in process** (`~/pq-lab/out/perf_pagesweep.tsv`, 300 000 rows, 15 row groups):
+
+| rows/group | `page_rows` | point read | ratio to native | decompress µs/call |
+|---|---|---|---|---|
+| 20 000 | 512 | **150 µs** | 0.385 | 3.70 |
+| 20 000 | 1 024 | 160 µs | 0.341 | 6.35 |
+| 20 000 | 2 048 | 200 µs | 0.317 | 11.29 |
+| 20 000 | 8 192 | 460 µs | 0.301 | 37.94 |
+| 20 000 | 20 000 | 1 007 µs | 0.293 | 95.57 |
+| 5 000 *(shipping)* | 8 192 | 335 µs | 0.309 | 25.92 |
+
+Point-read cost scales **6.7× across the range**, and decompress per call scales close to linearly
+with page size (26×) — which is the mechanism §10.29 predicted: a zstd frame cannot be partially
+decoded, so a point read pays for its whole page. Against the shipping default, `page_rows = 2048`
+at a 20 000-row group is **1.67× faster for 2.6 % more disk** *on this data*.
+
+**A correction on the record.** §10.31's CQL-level attempt at this reported no measurable latency
+effect, and that conclusion was wrong rather than merely weak: that run had a **220 % canary spread**
+— other tenants on the build box — against a 4.4 % spread between the arms being compared, so it
+could not have resolved a 6.7× effect either way. The in-process harness has no network, no
+coordinator and no canary in the path, which is why it can.
+
+**Why the default still does not move.** The two sweeps disagree on the *magnitude* of the size cost
+by an order of magnitude: shrinking the page from 20 000 to 2 048 costs +8 % here and **+80 %** on
+the timeseries table measured through CQL. The in-process harness is the trustworthy one for latency
+and the corpus one for size, and the size half is the half that decides a default. `page_rows` was
+set to 2 048 once on one schema's evidence and reverted the same day when the corpus measured
++16.7 %; it does not move again on a harness whose size column disagrees with the corpus by 10×.
+What has changed is that the *latency* half is no longer speculative, so the trade is now a real
+trade rather than an argument.
+
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

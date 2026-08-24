@@ -5038,3 +5038,91 @@ SEASTAR_THREAD_TEST_CASE(test_pq_full_scan_reader_reports_progress_to_the_read_m
         BOOST_REQUIRE_GT(mon.position_at_completion, 0u);
     }).get();
 }
+
+// Task #18: cancelling an in-flight pq compaction. On the AWS cluster this segfaulted the shard
+// eleven times over nine crash-restart cycles -- si_addr 0x10, near-null, inside
+// compacting_reader::fill_buffer, always immediately after the compaction_manager logged that it
+// was stopping ongoing compactions "due to truncate".
+//
+// Twelve real truncate-during-compaction attempts on a 4-shard node did not reproduce it, for both
+// parquet AND native, and the limiting factor was scale: those compactions were 92-156 keys, while
+// the AWS ones ran over a billion-row table. So rather than race a TRUNCATE and hope, this drives
+// the abort path directly -- enough input sstables that the compacting reader has a real merge to
+// do, and the abort requested once it is demonstrably reading.
+//
+// What it asserts is deliberately modest: the compaction must fail rather than complete, and the
+// process must still be able to read and write pq sstables afterwards. It does NOT assert a
+// particular exception type -- the point is the absence of a fault, not the shape of the error.
+SEASTAR_THREAD_TEST_CASE(test_pq_compaction_aborted_while_reading_does_not_fault) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto cf = env.make_table_for_tests(s);
+        auto stop_cf = deferred_stop(cf);
+        auto sst_gen = env.make_sst_factory(s, sstable_version_types::pq);
+
+        // Big enough that a timed abort lands inside the merge. The first version used 6 x 400 x 25
+        // and the compaction finished before the abort was requested -- BOOST_REQUIRE(threw) caught
+        // that rather than letting a vacuous run report success, which is the whole reason the
+        // assertion is there.
+        std::vector<shared_sstable> in;
+        for (int i = 0; i < 10; ++i) {
+            in.push_back(make_sstable_containing(sst_gen(), make_muts(s, 3000, 40)).get());
+        }
+        auto& table_s = cf.as_compaction_group_view();
+
+        compaction::compaction_descriptor desc(in);
+        desc.creator = [&sst_gen] (shard_id) { return sst_gen(); };
+        desc.replacer = sstables::replacer_fn_no_op();
+
+        bool threw = false;
+        uint64_t keys_at_abort = 0;
+        std::chrono::steady_clock::duration compaction_took{};
+        // The job body runs inside seastar::async on purpose. The first version was a coroutine
+        // that called future::get(), which is only legal in a seastar::thread -- so the intended
+        // interleaving never happened and the abort was requested after the compaction had already
+        // returned, which read as "it completed" rather than as a broken test.
+        run_compaction_task(env, desc.run_identifier, table_s,
+                            [&] (compaction::compaction_data& cdata) {
+            return seastar::async([&] {
+                compaction::compaction_progress_monitor pm;
+                const auto t0 = std::chrono::steady_clock::now();
+                auto fut = ::compaction::compact_sstables(std::move(desc), cdata, table_s, pm);
+                auto waiter = seastar::async([&] {
+                    seastar::sleep(std::chrono::milliseconds(30)).get();
+                    keys_at_abort = cdata.total_keys_written;
+                    // cdata.stop(), NOT abort.request_abort(). is_stop_requested() tests the
+                    // stop_requested STRING, and stop() is what sets it as well as tripping the
+                    // abort source -- requesting the abort alone left the string empty, so the
+                    // compaction ignored it and ran to completion (1504 ms against an abort at
+                    // 30 ms). This is the call the compaction_manager makes on truncate, which is
+                    // the path that faulted on AWS.
+                    cdata.stop("due to truncate (test)");
+                });
+                try {
+                    std::move(fut).get();
+                } catch (...) {
+                    threw = true;
+                }
+                compaction_took = std::chrono::steady_clock::now() - t0;
+                std::move(waiter).get();
+            });
+        }).get();
+
+        testlog.info("pq compaction ran {} ms before the abort took effect, {} keys written at abort",
+                     std::chrono::duration_cast<std::chrono::milliseconds>(compaction_took).count(),
+                     keys_at_abort);
+
+        // Stopped, not quietly completed. Without this the run could "pass" having never cancelled
+        // anything -- which is how the first twelve attempts at this bug looked.
+        BOOST_REQUIRE(threw);
+        testlog.info("aborted a pq compaction with {} keys written so far", keys_at_abort);
+
+        // The shard survived and the read/write paths still work. On AWS this is exactly what did
+        // not hold: the node crash-looped and resumed the same compaction on restart.
+        auto after = make_sstable_containing(sst_gen(), make_muts(s, 10, 10)).get();
+        BOOST_REQUIRE_GT(after->data_size(), 0u);
+        auto rd_frags = fragments_in(after, s, env.make_reader_permit(),
+                                     query::full_partition_range, s->full_slice());
+        BOOST_REQUIRE_GT(rd_frags.size(), 0u);
+    }).get();
+}
