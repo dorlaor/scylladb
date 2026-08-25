@@ -5074,6 +5074,42 @@ table::query(schema_ptr query_schema,
         co_return make_lw_shared<query::result>();
     }
 
+    // A client query builds its result from the slice's columns and discards the rest, so a
+    // storage engine that can cheaply skip the others may. Derived here, and only here, for two
+    // reasons that both had to hold:
+    //
+    //   * it must not cross the wire. enum_set::from_mask() throws on an unknown bit, so a new
+    //     coordinator setting this in the read command would break the read on an older replica
+    //     mid-upgrade. Setting it replica-side means old and new nodes interoperate untouched, in
+    //     either direction.
+    //   * bypass_cache alone is not permission. A reader whose output populates the row cache must
+    //     produce whole rows, so the cache is the reason the flag is needed -- but
+    //     table::stream_view_replica_updates() also sets bypass_cache, and a materialized-view
+    //     update computed from a partially-read base row produces wrong view rows. That path goes
+    //     through as_mutation_source_excluding_staging(), never through table::query(), which is
+    //     what makes *this* function the safe place to conclude it.
+    //
+    // The copy is per query and shallow enough not to matter next to the read it is about to do.
+    // DISABLED, and the reason is a bug this derivation had, not a doubt about the plumbing.
+    //
+    // Enabling it here made `SELECT ck, a ... BYPASS CACHE` return 5 rows where the row format
+    // returns 6, caught by test_parquet_bypass_cache_projection_matches_row_format. The missing row
+    // is one written by `UPDATE ... SET b = ...`: it has no row marker, so in CQL it exists exactly
+    // because `b` is live. The row format sends every cell, so the query layer sees b live, decides
+    // the row exists, and returns it with a = null. Project b away and pq sends no cells at all, so
+    // the layer concludes there is no row.
+    //
+    // So a projecting reader has to convey "this row has a live cell somewhere" -- something the row
+    // format conveys implicitly by sending everything, and which pq's shared channels do not
+    // currently say (`__ts` covers live *and* dead cells, and CQL row existence needs live).
+    // Skipping the read is easy; preserving that one bit of information is the actual problem.
+    //
+    // The reader capability stays -- it is exercised by the explicit may_project_columns option in
+    // the sstable tests and by the perf benchmark -- so the measurements in design doc 10.47 stand
+    // as what this is worth once the liveness question is solved. Nothing sets the option in
+    // production until then.
+    const query::read_command& cmd_ref = cmd;
+
     const auto table_async_gate_holder = _async_gate.hold();
     utils::latency_counter lc;
     _stats.reads.set_latency(lc);
@@ -5094,12 +5130,12 @@ table::query(schema_ptr query_schema,
         _stats.reads.mark(lc);
     });
 
-    const auto short_read_allowed = query::short_read(cmd.slice.options.contains<query::partition_slice::option::allow_short_read>());
+    const auto short_read_allowed = query::short_read(cmd_ref.slice.options.contains<query::partition_slice::option::allow_short_read>());
     auto accounter = co_await (opts.request == query::result_request::only_digest
              ? memory_limiter.new_digest_read(permit.max_result_size(), short_read_allowed)
              : memory_limiter.new_data_read(permit.max_result_size(), short_read_allowed));
 
-    query_state qs(query_schema, cmd, opts, partition_ranges, std::move(accounter));
+    query_state qs(query_schema, cmd_ref, opts, partition_ranges, std::move(accounter));
 
     std::optional<querier> querier_opt;
     if (saved_querier) {

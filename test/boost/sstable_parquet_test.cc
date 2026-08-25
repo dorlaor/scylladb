@@ -5196,7 +5196,19 @@ SEASTAR_THREAD_TEST_CASE(test_pq_batch_reader_projection_reads_less_and_changes_
     }).get();
 }
 
-// Is reader-level projection semantically safe? Asked before plumbing it anywhere.
+// Is reader-level projection semantically safe? Asked before plumbing it anywhere -- and answered
+// wrongly by this test, which is why the comment now leads with that.
+//
+// It reads through the batch reader and reassemble(), which returns one row per key. So it can only
+// ever conclude that the row *set* survives projection, which it does at that layer. The layer a
+// client goes through is the mutation path, where a clustering row with no marker and no cells is
+// not a row -- and there, projecting away the only live cell of a marker-less row does lose it.
+// test_parquet_bypass_cache_projection_matches_row_format (cql_query_large_test.cc) is the test that
+// found this, at CQL level: 5 rows against the row format's 6.
+//
+// Kept, because what it asserts is true and worth pinning: reassemble() over a projected batch does
+// not drop keys. Renamed in spirit rather than in name: read it as "projection preserves the key
+// set", not "projection is safe".
 //
 // The tempting change is to have pq_reader honour the query slice's column list and skip the rest.
 // reader.cc's own comment refuses that, because the row format "reads every regular column from

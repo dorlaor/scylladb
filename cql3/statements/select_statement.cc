@@ -218,13 +218,10 @@ select_statement::select_statement(schema_ptr schema,
 {
     _opts = _selection->get_query_options();
     _opts.set_if<query::partition_slice::option::bypass_cache>(_parameters->bypass_cache());
-    // A client SELECT builds its result from `regular_columns` and discards the rest, so a storage
-    // engine may skip reading the rest -- but only when the read is not going to populate the row
-    // cache, because a cache holding partially-read rows would then answer later queries for
-    // columns it never read. `BYPASS CACHE` is exactly that condition, so the two are set together
-    // here rather than one implying the other elsewhere: see the note on may_project_columns for
-    // why bypass_cache on its own must not be read as permission.
-    _opts.set_if<query::partition_slice::option::may_project_columns>(_parameters->bypass_cache());
+    // may_project_columns is deliberately NOT set here. It would travel to replicas in the read
+    // command, and enum_set::from_mask() *throws* on a bit it does not know -- so during a rolling
+    // upgrade a new coordinator would break every `SELECT ... BYPASS CACHE` on an old replica. The
+    // permission is derived replica-side instead, in table::query(); see the note there.
     _opts.set_if<query::partition_slice::option::distinct>(_parameters->is_distinct());
     _opts.set_if<query::partition_slice::option::reversed>(_is_reversed);
     detect_range_scan();

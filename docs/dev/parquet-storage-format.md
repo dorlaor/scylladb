@@ -8915,7 +8915,7 @@ Also fixed here: `batch_reader::init()` is public. `schema_mapping()` describes 
 empty until the footer is read — and a consumer needs the mapping to *build* a projection, which
 made the lazy-init version circular.
 
-### 10.47 Projection made client-visible: `SELECT ... BYPASS CACHE` is up to 13× faster — 2026-08-25
+### 10.47 Projection wired to a client query — measured at up to 13×, then disabled — 2026-08-25
 
 §10.45 and §10.46 were both reader-interface numbers: real, but no client could reach them. This
 wires projection into the path a client already uses — the mutation reader — so the gain arrives at
@@ -8926,6 +8926,9 @@ a CQL query.
 | 5 | 98.2 ms | 53.3 ms | 1.84× |
 | 29 | 352.6 ms | 63.3 ms | 5.57× |
 | 65 | 914.9 ms | **69.5 ms** | **13.16×** |
+
+**These are what the capability is worth, not what a client gets. The wiring is disabled — see "Row
+existence" below.**
 
 The projected time is nearly flat — 53 → 70 ms as the table goes from 5 to 65 columns — while the
 unprojected time scales with width. That is the columnar property finally reaching a client, and it
@@ -8949,12 +8952,35 @@ So the permission is explicit: a new slice option, `may_project_columns`, set in
 `select_statement`, and only when the client wrote `BYPASS CACHE`. Storage engines may ignore it;
 the row format does.
 
-**Row existence was checked, not assumed.** The obvious objection is a row written by an `UPDATE`
-that set only an unprojected column: it has no row marker, so its existence rests on that column.
-`test_pq_projection_and_row_existence` builds exactly that row, plus one whose only cell is *dead*,
-and reads both ways: **3 rows either way.** The reason is structural — every row's key leaves are
-written and keys are never projected, so the row set does not depend on which value columns are
-read. Had that come out the other way, this section would say projection is unsafe.
+**Row existence — and this is where the section was wrong.** The claim here used to be that
+projection preserves the row set, on the evidence of `test_pq_projection_and_row_existence`: a row
+written by `UPDATE` with no row marker, plus one whose only cell is dead, both survived, 3 rows
+either way.
+
+**That test measured the wrong layer.** It read through the batch reader and `reassemble()`, which
+returns a row per key — so of course the row set survived. The *mutation* path is what a client goes
+through, and there a clustering row with no marker and no cells is not a row at all.
+`test_parquet_bypass_cache_projection_matches_row_format`, at CQL level, found it immediately:
+`SELECT ck, a ... BYPASS CACHE` returned **5 rows where the row format returned 6**. The missing one
+was written by `UPDATE ... SET b`, which in CQL exists exactly because `b` is live. The row format
+sends every cell, so the query layer sees `b` live, concludes the row exists, and returns it with
+`a = null`. Project `b` away and pq sends nothing, so the layer concludes there is no row.
+
+So a projecting reader must convey **"this row has a live cell somewhere"** — which the row format
+conveys implicitly by sending everything, and which pq's shared channels do not currently say:
+`__ts` covers live *and* dead cells, and CQL row existence needs live. Skipping the read is the easy
+part; preserving that one bit is the actual problem.
+
+**The client-visible derivation in `table::query()` is therefore disabled.** The reader capability
+stays and is exercised by the explicit `may_project_columns` option in the sstable tests and the
+benchmark, so the figures above stand as *what this is worth once row liveness is solved* — not as
+something a client gets today. Nothing sets the option in production.
+
+Two lessons, both cheap to state and expensive to learn. A test that reads through a different layer
+than the one being changed can prove the wrong proposition confidently; the unit test and the
+end-to-end test disagreed, and the end-to-end one was right. And this is the second time in this
+investigation that a projection-shaped change looked correct and was not — the first was matching
+static columns by name.
 
 **A real bug this found, worth recording because the fix looks less correct than the bug.** The
 first version matched slice columns to value columns *by name*, which is wrong: `columns_of()` renames

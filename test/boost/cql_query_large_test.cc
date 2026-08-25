@@ -327,3 +327,94 @@ SEASTAR_TEST_CASE(test_insert_large_collection_values) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// `SELECT ... BYPASS CACHE` on a parquet table returns the same answers with projection pushdown as
+// without it.
+//
+// This is the end-to-end guard for design doc 10.47. The unit tests for projection set
+// may_project_columns on the slice directly, which proves the *reader* honours it and proves nothing
+// about the wiring: the permission is derived replica-side in table::query(), deliberately, because
+// putting it in the read command would make enum_set::from_mask() throw on an older replica during a
+// rolling upgrade. Nothing below sets the option, so if that derivation is wrong -- or if it fires
+// somewhere it should not -- this is what notices.
+//
+// Compares against the same table declared with the row format, because the interesting failure is
+// not "an error" but "a plausible wrong answer": a dropped static, a missing row, or a null where a
+// value should be.
+SEASTAR_THREAD_TEST_CASE(test_parquet_bypass_cache_projection_matches_row_format) {
+    do_with_cql_env_thread([](cql_test_env& e) {
+        for (const char* fmt : {"sstable", "parquet"}) {
+            const sstring t = sstring("t_") + fmt;
+            e.execute_cql(seastar::format(
+                    "create table {} (pk int, ck int, st int static, a int, b text, c double,"
+                    " primary key (pk, ck)) with storage_format = '{}'", t, fmt)).get();
+            e.execute_cql(seastar::format(
+                    "insert into {} (pk, st) values (1, 7)", t)).get();
+            for (int i = 0; i < 5; ++i) {
+                e.execute_cql(seastar::format(
+                        "insert into {} (pk, ck, a, b, c) values (1, {}, {}, 'v{}', {}.5)",
+                        t, i, i * 10, i, i)).get();
+            }
+            // A row created by UPDATE: no row marker, and only `b` set. Reading `a` must still
+            // return this row, with a null -- which is the case that would break if projecting
+            // away `b` lost the row's existence.
+            e.execute_cql(seastar::format("update {} set b = 'only-b' where pk = 1 and ck = 99",
+                                          t)).get();
+            // A deleted cell must keep shadowing rather than reappearing.
+            e.execute_cql(seastar::format("delete c from {} where pk = 1 and ck = 2", t)).get();
+            // Flushed inline rather than through this file's flush() helper, which the compiler
+            // resolves to ::fflush from here.
+            e.db().invoke_on_all([] (replica::database& dbi) {
+                return dbi.flush_all_memtables();
+            }).get();
+        }
+
+        auto rows_of = [&] (const sstring& cql) {
+            auto msg = e.execute_cql(cql).get();
+            auto res = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
+            BOOST_REQUIRE(res);
+            std::vector<std::vector<std::optional<bytes>>> out;
+            for (const auto& r : res->rs().result_set().rows()) {
+                std::vector<std::optional<bytes>> row;
+                for (const auto& cell : r) {
+                    row.push_back(cell ? std::optional<bytes>(to_bytes(*cell)) : std::nullopt);
+                }
+                out.push_back(std::move(row));
+            }
+            return out;
+        };
+
+        // Each of these is a different projection shape: one regular column, a static plus a
+        // regular, everything, and the column whose row has no marker.
+        for (const char* cols : {"ck, a", "ck, st, a", "*", "ck, b", "ck, c"}) {
+            const auto want = rows_of(seastar::format(
+                    "select {} from t_sstable where pk = 1 bypass cache", cols));
+            const auto got = rows_of(seastar::format(
+                    "select {} from t_parquet where pk = 1 bypass cache", cols));
+            BOOST_TEST_CONTEXT("columns: " << cols) {
+                BOOST_REQUIRE_EQUAL(got.size(), want.size());
+                for (size_t i = 0; i < got.size(); ++i) {
+                    BOOST_REQUIRE_EQUAL(got[i].size(), want[i].size());
+                    for (size_t j = 0; j < got[i].size(); ++j) {
+                        BOOST_REQUIRE_EQUAL(got[i][j].has_value(), want[i][j].has_value());
+                        if (got[i][j] && want[i][j]) {
+                            BOOST_REQUIRE_EQUAL(*got[i][j], *want[i][j]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // And without BYPASS CACHE, where no projection is permitted at all.
+        for (const char* cols : {"ck, a", "*"}) {
+            const auto want = rows_of(seastar::format("select {} from t_sstable where pk = 1", cols));
+            const auto got = rows_of(seastar::format("select {} from t_parquet where pk = 1", cols));
+            BOOST_TEST_CONTEXT("cached, columns: " << cols) {
+                BOOST_REQUIRE_EQUAL(got.size(), want.size());
+                for (size_t i = 0; i < got.size(); ++i) {
+                    BOOST_REQUIRE(got[i] == want[i]);
+                }
+            }
+        }
+    }).get();
+}
