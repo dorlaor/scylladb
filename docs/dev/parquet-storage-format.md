@@ -8284,6 +8284,69 @@ RF=1, minio rather than real S3, no Scylla Manager in the path — this verifies
 and the plumbing, not a production backup workflow.
 
 
+### 10.36 The AWS crash conditions, reproduced locally and surviving — 2026-08-25
+
+§10.33 fixed the compaction-cancel fault but explicitly declined to claim it closed the AWS
+occurrence: that backtrace was `compacting_reader::fill_buffer` at `si_addr 0x10`, and the
+reproduction was the writer at `0x8`. The cluster was gone, so the original signature could not be
+re-tested — until the conditions were rebuilt on the lab box.
+
+Four nodes at `127.0.0.11-14`, RF=3, tablets, `pq` under TWCS, compaction throttled to 1 MB/s, and
+TRUNCATE issued while a compaction of the table was **mid-read** (344 of 1 893 keys, 18.17 %, with
+ten more pending). Result:
+
+    truncate ok
+    n1..n4  rest=200   segv/abort lines=0
+    7 x "compaction_manager - Stopping 1 tasks for 1 ongoing compactions
+         for table cc.ts compaction_group=N due to truncate"   across all four nodes, shards 0 and 1
+
+So the cancel path is exercised on every node and both shards, on the same table shape, and nothing
+faults. **This is evidence that the AWS occurrence is covered, not proof.** What differs: 4 M rows
+here against a billion there, so the compactions are ~1 900 keys rather than the deep pipelines a
+1 B-row table produces; the AWS fault was on shard 2 and these nodes run `--smp 2`; and the AWS
+build predates both fixes. A fault needing a deeper in-flight pipeline than this could still exist.
+
+Worth recording separately: **TRUNCATE timed out** in the two earlier runs of this test — "Timeout
+during TRUNCATE TABLE" — and succeeded only in the run where a real compaction was cancelled. The
+AWS report also described truncate appearing to hang. That is unexplained and is not the same thing
+as the segfault.
+
+Four setup faults were caught before they could produce a false pass, and they are the reusable part:
+the datacenter is `dc1` not `datacenter1`; a DOWN fourth node in the ring fails TRUNCATE for a
+reason unrelated to the bug; the compaction detector fired on a `system.peers` compaction one second
+after the load started and reported success for a table with no data; and a 25-minute journal window
+spanned previous runs and picked up a shutdown-path abort from the previous node instance. Harness:
+`~/pq-lab/local_cluster_crash.sh`.
+
+### 10.37 B3, and what could not be demonstrated — 2026-08-25
+
+§11.1 B3 is fixed as the entry itself prescribed: both `key_for_read()` call sites now run inside
+`seastar::with_scheduling_group(seastar::default_scheduling_group(), …)`, and
+`classify_request()` maps that group to `request_class::system`
+(`replica/database.cc:1797`), so the nested key lookup admits against the **system** semaphore
+instead of competing with the user permit the reader is holding. `awaits_guard` only ever exempted
+the CPU limit; the count unit was the actual cycle. The write path has always had this for free.
+
+The trade: the provider round trip's CPU is billed to `main` rather than to the user's service level.
+
+**It is not demonstrated, and the attempt is worth recording so nobody repeats it.** A test firing
+120 concurrent scans at a cold provider cache passes *identically* with the fix reverted:
+`replicated_key_provider::_keys` populates in microseconds, so the burst never holds 120 permits
+each awaiting an unresolved key. Neither the encryption path nor the reader has an error-injection
+hook to stall a lookup, so a deterministic reproduction means adding one. The test was deleted rather
+than committed — a test that passes against the bug looks like a guard and is not one.
+
+What is verified: `enc_scan_deadlock.py`, the §10.17a regression, passes on all three arms with this
+change in, so the CPU-limit fix is not regressed.
+
+**B4 is now genuinely verified.** `encryption_rotation.py` passed before this, but its phase 4 issued
+two point reads to warm key A and key B *before* the scan — necessary while a cold-cache scan
+deadlocked, and it made the phase's strongest assertion an encoding of that workaround. The scan now
+runs first, on a cold cache, and passes at 1 200 rows, with the wrong-key controls still failing
+loudly on both the point read and the scan rather than returning empty. One part of B4 is untouched:
+rotation is still exercised only on `ReplicatedKeyProviderFactory`, which logs that it is deprecated.
+
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
