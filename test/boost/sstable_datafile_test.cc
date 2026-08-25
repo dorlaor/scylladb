@@ -18,7 +18,6 @@
 #include <seastar/testing/test_fixture.hh>
 
 #include "sstables/sstables.hh"
-#include "sstables/sstable_directory.hh"
 #include "sstables/writer.hh"
 #include <seastar/core/fstream.hh>
 #include "sstables/compress.hh"
@@ -3689,46 +3688,11 @@ SEASTAR_THREAD_TEST_CASE(test_small_sstable_has_reasonable_memory_usage) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Two regression tests for defects that had none. Both live here rather than in the file each
-// belongs to (sstable_directory_test, and a writer-focused file) because neither of those targets
-// can be built in this configuration -- ninja lists them and then refuses -- and a test that
-// cannot be run is not evidence.
+// A regression test for a defect that had none. It lives here rather than in a writer-focused file
+// because sstable_datafile_test is a standalone binary that can actually be built and run in this
+// configuration; the restore counterpart moved to sstable_directory_test.cc, which is compiled into
+// test/boost/combined_tests.
 // ---------------------------------------------------------------------------------------------
-
-// A malformed name in a restore manifest must be REJECTED, not abort the node.
-//
-// A blank trailing line in a --sstables-file-list parsed as an sstable named "", reached
-// throw_malformed_sstable_exception, and because that honours abort_on_malformed_sstable_error
-// (default true) it took the node down -- the operator saw "Connection reset by peer" from the very
-// node they were restoring with. Aborting is right for corrupt bytes found on disk and wrong for
-// operator input on a recovery path.
-//
-// This asserts on the EXCEPTION, because an abort cannot be caught and asserted on at all, which is
-// exactly why the behaviour went untested.
-SEASTAR_THREAD_TEST_CASE(test_restore_rejects_malformed_toc_names) {
-    BOOST_REQUIRE_NO_THROW(sstables::validate_restore_toc_names(
-            {"me-3h39_0jv6_26nsg2gplzfjtup6vf-big-TOC.txt"}));
-    BOOST_REQUIRE_NO_THROW(sstables::validate_restore_toc_names({}));
-
-    // The exact trigger, and the same list with a good entry beside it.
-    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names({""}), std::invalid_argument);
-    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names(
-            {"me-3h39_0jv6_26nsg2gplzfjtup6vf-big-TOC.txt", ""}), std::invalid_argument);
-
-    // Shapes of nonsense that were never tried when the fix landed.
-    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names({"not-an-sstable"}),
-                        std::invalid_argument);
-    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names({"zz-1-big-TOC.txt"}),
-                        std::invalid_argument);
-
-    // The message must name the offender, or an operator cannot fix their manifest.
-    try {
-        sstables::validate_restore_toc_names({"", "me-3h39_0jv6_26nsg2gplzfjtup6vf-big-TOC.txt"});
-        BOOST_FAIL("expected std::invalid_argument");
-    } catch (const std::invalid_argument& e) {
-        BOOST_REQUIRE(sstring(e.what()).find("restore:") != sstring::npos);
-    }
-}
 
 // Destroying a checksummed_file_writer WITHOUT calling close() must not fault.
 //
