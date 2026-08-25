@@ -5196,6 +5196,243 @@ SEASTAR_THREAD_TEST_CASE(test_pq_batch_reader_projection_reads_less_and_changes_
     }).get();
 }
 
+// Is reader-level projection semantically safe? Asked before plumbing it anywhere.
+//
+// The tempting change is to have pq_reader honour the query slice's column list and skip the rest.
+// reader.cc's own comment refuses that, because the row format "reads every regular column from
+// storage and projects afterwards", and test_pq_restricted_slice_still_returns_every_cell pins the
+// agreement. This test asks the sharper question the comment does not answer: *would* projecting
+// change the answer, and where?
+//
+// The hazard is row existence, not values. A row written by an UPDATE that sets only one column has
+// no row marker, so its existence is carried entirely by that column being present. Project that
+// column away and the row may vanish -- and `SELECT other_col` is supposed to return it with a null,
+// not omit it. Deletions are the same shape: a dead cell has to keep shadowing older data, so losing
+// it is worse than losing a value.
+//
+// Written as an experiment with an assertion, so whichever way it comes out is recorded rather than
+// argued.
+SEASTAR_THREAD_TEST_CASE(test_pq_projection_and_row_existence) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+
+        utils::chunked_vector<mutation> muts;
+        auto pk = partition_key::from_single_value(*s, utf8_type->decompose(sstring("k")));
+        mutation m(s, pk);
+        auto ck = [&] (int i) {
+            return clustering_key::from_single_value(*s, int32_type->decompose(i));
+        };
+        const auto& v_int = *s->get_column_definition(to_bytes("v_int"));
+        const auto& v_dbl = *s->get_column_definition(to_bytes("v_dbl"));
+
+        // Row 0: a marker and v_int. Exists whatever is projected.
+        m.partition().clustered_row(*s, ck(0)).apply(row_marker(1000));
+        m.set_clustered_cell(ck(0), v_int, atomic_cell::make_live(*v_int.type, 1000,
+                                                                 int32_type->decompose(7)));
+        // Row 1: NO marker, and only v_dbl live. Its existence rests on v_dbl alone -- this is the
+        // row an UPDATE produces, and the one projection could lose.
+        m.set_clustered_cell(ck(1), v_dbl, atomic_cell::make_live(*v_dbl.type, 1000,
+                                                                  double_type->decompose(2.5)));
+        // Row 2: NO marker, and v_dbl *dead*. A dead cell must keep shadowing older data.
+        m.set_clustered_cell(ck(2), v_dbl, atomic_cell::make_dead(1000, gc_clock::now()));
+        muts.push_back(std::move(m));
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        // Read everything, then read again projecting v_dbl away, and compare which rows survive.
+        auto rows_for = [&] (bool project_away_v_dbl) {
+            auto br = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit());
+            br->init().get();
+            const auto& ms = br->schema_mapping();
+            std::optional<sstables::parquet::projection> proj;
+            if (project_away_v_dbl) {
+                proj.emplace();
+                proj->want_regular.assign(ms.n_regular, true);
+                // v_dbl is the third regular column of pq_schema; find it by leaf name instead of
+                // trusting the order.
+                for (size_t k = 0; k < ms.n_regular && k < ms.value_leaf.size(); ++k) {
+                    const auto& spec_name = ms.columns[ms.value_leaf[k]].name;
+                    if (spec_name.find("v_dbl") != std::string::npos) {
+                        proj->want_regular[k] = false;
+                    }
+                }
+            }
+            auto r = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit(),
+                                                         std::move(proj));
+            std::vector<sstables::parquet::row> out;
+            while (auto b = r->next().get()) {
+                auto rows = sstables::parquet::reassemble(r->schema_mapping(), r->columns(),
+                                                         b->columns, size_t(b->rows));
+                for (auto&& rw : rows) { out.push_back(std::move(rw)); }
+            }
+            r->close().get();
+            br->close().get();
+            return out;
+        };
+
+        auto all = rows_for(false);
+        auto projected = rows_for(true);
+
+        // The row *count* is what the hazard is about. If projection can drop a row, these differ.
+        testlog.info("projection and row existence: {} rows unprojected, {} projected",
+                     all.size(), projected.size());
+        BOOST_REQUIRE_EQUAL(projected.size(), all.size());
+
+        // And the rows that carry no marker must still be there, in the same order.
+        for (size_t i = 0; i < all.size(); ++i) {
+            BOOST_REQUIRE(projected[i].key == all[i].key);
+        }
+    }).get();
+}
+
+// With may_project_columns, pq skips the columns the query did not ask for -- and the columns it
+// did ask for are unchanged.
+//
+// The contract this operates under is narrow and the test says so. Without the option pq must agree
+// with the row format cell for cell (test_pq_restricted_slice_still_returns_every_cell); with it,
+// pq is permitted to return fewer *columns*, because the only setter is a client SELECT ... BYPASS
+// CACHE, whose result is projected to those columns anyway and which does not populate the row
+// cache. So the assertion is not "identical fragments" -- it is "identical answers for the columns
+// the query asked for, and no extra or missing rows".
+SEASTAR_THREAD_TEST_CASE(test_pq_may_project_columns_skips_unwanted_and_keeps_the_rest) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 40, 8);
+        auto ref = make_sstable_containing(
+                env.make_sstable(s, sstables::get_highest_sstable_version()), muts).get();
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        auto slice_for = [&] (bool allow_projection) {
+            auto sl = partition_slice_builder(*s)
+                    .with_regular_column(to_bytes("v_int"))
+                    .build();
+            if (allow_projection) {
+                sl.options.set<query::partition_slice::option::may_project_columns>();
+            }
+            return sl;
+        };
+
+        // Control: without the option, pq must still match the row format exactly. This is the
+        // existing contract and it must not have moved.
+        {
+            auto sl = slice_for(false);
+            auto fw = fragments_in(ref, s, env.make_reader_permit(),
+                                   query::full_partition_range, sl);
+            auto fg = fragments_in(sst, s, env.make_reader_permit(),
+                                   query::full_partition_range, sl);
+            BOOST_REQUIRE(!fg.empty());
+            BOOST_REQUIRE_EQUAL(fg.size(), fw.size());
+            for (size_t i = 0; i < fg.size(); ++i) {
+                BOOST_REQUIRE_EQUAL(fg[i], fw[i]);
+            }
+        }
+
+        // With the option: the same rows, and the requested column identical. v_int is what was
+        // asked for; the others are free to be absent, which is the whole point.
+        {
+            auto read_all_muts = [&] (shared_sstable from, const query::partition_slice& sl) {
+                std::vector<mutation> out;
+                auto rd = from->make_reader(s, env.make_reader_permit(),
+                                            query::full_partition_range, sl);
+                auto close = deferred_close(rd);
+                while (auto m = read_mutation_from_mutation_reader(rd).get()) {
+                    out.push_back(std::move(*m));
+                }
+                return out;
+            };
+
+            auto sl_proj = slice_for(true);
+            auto sl_plain = slice_for(false);
+            auto want = read_all_muts(ref, sl_plain);
+            auto got = read_all_muts(sst, sl_proj);
+            BOOST_REQUIRE_EQUAL(got.size(), want.size());
+
+            const auto& v_int = *s->get_column_definition(to_bytes("v_int"));
+            size_t compared = 0;
+            for (size_t i = 0; i < got.size(); ++i) {
+                BOOST_REQUIRE(got[i].decorated_key().equal(*s, want[i].decorated_key()));
+                const auto& ga = got[i].partition().clustered_rows();
+                const auto& wa = want[i].partition().clustered_rows();
+                BOOST_REQUIRE_EQUAL(ga.calculate_size(), wa.calculate_size());
+                auto gi = ga.begin();
+                auto wi = wa.begin();
+                for (; gi != ga.end() && wi != wa.end(); ++gi, ++wi) {
+                    BOOST_REQUIRE(gi->key().equal(*s, wi->key()));
+                    const auto* ca = gi->row().cells().find_cell(v_int.id);
+                    const auto* cb = wi->row().cells().find_cell(v_int.id);
+                    BOOST_REQUIRE_EQUAL(bool(ca), bool(cb));
+                    if (ca && cb) {
+                        BOOST_REQUIRE_EQUAL(ca->as_atomic_cell(v_int).timestamp(),
+                                            cb->as_atomic_cell(v_int).timestamp());
+                        BOOST_REQUIRE(ca->as_atomic_cell(v_int).value()
+                                      == cb->as_atomic_cell(v_int).value());
+                        ++compared;
+                    }
+                }
+            }
+            BOOST_REQUIRE_GT(compared, 0u);
+        }
+
+        // A static column the query asked for must survive projection. columns_of() puts statics
+        // among the value columns, so a mask built from `regular_columns` alone would drop them --
+        // which is a wrong answer to a query that selected one, not merely a slower one.
+        {
+            auto ss = schema_builder(1, "ks", "pq_proj_static")
+                .with_column("pk", utf8_type, column_kind::partition_key)
+                .with_column("ck", int32_type, column_kind::clustering_key)
+                .with_column("st", int32_type, column_kind::static_column)
+                .with_column("a", int32_type)
+                .with_column("b", int32_type)
+                .set_storage_format(storage_format_type::parquet)
+                .build();
+
+            auto pk = partition_key::from_single_value(*ss, utf8_type->decompose(sstring("p")));
+            mutation m(ss, pk);
+            const auto& st = *ss->get_column_definition(to_bytes("st"));
+            const auto& a = *ss->get_column_definition(to_bytes("a"));
+            m.set_static_cell(st, atomic_cell::make_live(*st.type, 1000,
+                                                         int32_type->decompose(42)));
+            auto ck0 = clustering_key::from_single_value(*ss, int32_type->decompose(0));
+            m.set_clustered_cell(ck0, a, atomic_cell::make_live(*a.type, 1000,
+                                                                int32_type->decompose(9)));
+            utils::chunked_vector<mutation> sm;
+            sm.push_back(std::move(m));
+            auto ssst = make_sstable_containing(
+                    env.make_sstable(ss, sstable_version_types::pq), std::move(sm)).get();
+
+            auto sl = partition_slice_builder(*ss)
+                    .with_static_column(to_bytes("st"))
+                    .with_regular_column(to_bytes("a"))
+                    .build();
+            // Differential rather than absolute: whether a static arrives at all depends on the
+            // slice options, so the question asked here is only whether *projection* changes it.
+            auto read_static = [&] (bool project) {
+                auto slice = sl;
+                if (project) {
+                    slice.options.template set<
+                            query::partition_slice::option::may_project_columns>();
+                }
+                auto rd = ssst->make_reader(ss, env.make_reader_permit(),
+                                            query::full_partition_range, slice);
+                auto close = deferred_close(rd);
+                auto got = read_mutation_from_mutation_reader(rd).get();
+                BOOST_REQUIRE(got);
+                const auto* c = got->partition().static_row().get().find_cell(st.id);
+                return c ? std::optional<api::timestamp_type>(c->as_atomic_cell(st).timestamp())
+                         : std::nullopt;
+            };
+            const auto plain = read_static(false);
+            const auto projected = read_static(true);
+            BOOST_REQUIRE_EQUAL(plain.has_value(), projected.has_value());
+            if (plain && projected) {
+                BOOST_REQUIRE_EQUAL(*plain, *projected);
+            }
+        }
+    }).get();
+}
+
 // A bigint partition key, end to end: the partition sequence must survive the round trip.
 //
 // The bug this pins is described in full at `test_delta_binary_packed_wide_residual_widths`

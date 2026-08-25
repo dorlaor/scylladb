@@ -35,6 +35,7 @@
 #include "sstables/parquet/reader.hh"
 #include "sstables/parquet/format/parquet_reader.hh"
 #include "sstables/parquet/batch_reader.hh"
+#include "partition_slice_builder.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/sstables.hh"
@@ -663,6 +664,33 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_columnar_scan_floor) {
         std::printf("  headroom from not building mutations: %.2fx floor, %.2fx via batch reader\n",
                     reader_ms / columnar_ms, reader_ms / batch_ms);
         std::printf("  (batches %zu, batch rows %zu)\n", batches, batch_rows);
+        // And through the *mutation* reader with the slice permitting projection -- which is what
+        // a client SELECT ... BYPASS CACHE now gets. Unlike the batch rows above, this still builds
+        // mutations, so it is the number a client would actually see rather than a reader-interface
+        // number.
+        double slice_all_ms = 0, slice_one_ms = 0;
+        {
+            auto one = partition_slice_builder(*s)
+                    .with_regular_column(to_bytes("v_int"))
+                    .build();
+            auto one_proj = one;
+            one_proj.options.set<query::partition_slice::option::may_project_columns>();
+
+            auto timed = [&] (const query::partition_slice& sl) {
+                auto t1 = clk::now();
+                auto rd = sst->make_reader(s, env.make_reader_permit(),
+                                           query::full_partition_range, sl);
+                auto cl = deferred_close(rd);
+                while (auto m = read_mutation_from_mutation_reader(rd).get()) { }
+                return duration<double, std::milli>(clk::now() - t1).count();
+            };
+            slice_all_ms = timed(one);          // one column asked for, every column read
+            slice_one_ms = timed(one_proj);     // one column asked for, one column read
+        }
+        std::printf("  SELECT one column through the mutation reader:"
+                    " %.1f ms without projection, %.1f ms with (%.2fx)\n",
+                    slice_all_ms, slice_one_ms,
+                    slice_one_ms > 0 ? slice_all_ms / slice_one_ms : 0.0);
         std::printf("  projection to 1 of %zu regular columns: %llu -> %llu bytes (%.1f%%),"
                     " %.1f ms\n",
                     n_regular, (unsigned long long)full_bytes, (unsigned long long)narrow_bytes,

@@ -8915,6 +8915,62 @@ Also fixed here: `batch_reader::init()` is public. `schema_mapping()` describes 
 empty until the footer is read — and a consumer needs the mapping to *build* a projection, which
 made the lazy-init version circular.
 
+### 10.47 Projection made client-visible: `SELECT ... BYPASS CACHE` is up to 13× faster — 2026-08-25
+
+§10.45 and §10.46 were both reader-interface numbers: real, but no client could reach them. This
+wires projection into the path a client already uses — the mutation reader — so the gain arrives at
+a CQL query.
+
+| regular columns | `SELECT one_col` today | with projection | gain |
+|---|---|---|---|
+| 5 | 98.2 ms | 53.3 ms | 1.84× |
+| 29 | 352.6 ms | 63.3 ms | 5.57× |
+| 65 | 914.9 ms | **69.5 ms** | **13.16×** |
+
+The projected time is nearly flat — 53 → 70 ms as the table goes from 5 to 65 columns — while the
+unprojected time scales with width. That is the columnar property finally reaching a client, and it
+still builds mutations, so nothing downstream changed: no new consumer, no merge changes, no
+tombstone changes, no result-builder changes.
+
+**Why this was not simply "consult the slice".** `pq_reader` deliberately ignored the slice's column
+list, and reader.cc says why: the row format "reads every regular column from storage and projects
+afterwards", so diverging would make pq answer differently from every other format. Two hazards sit
+behind that, and both had to be dealt with rather than argued away.
+
+- **The cache.** A reader whose output populates the row cache must produce whole rows, or the cache
+  later answers for columns it never read. So projection needs the read to bypass the cache.
+- **`bypass_cache` is not that permission.** It looks like it should be, and it is not:
+  `table::stream_view_replica_updates()` sets it, and a **materialized-view update computed from a
+  partially-read base row produces wrong view rows**. `replica/mutation_dump.cc` and
+  `alternator/ttl.cc` set it too. The flag means "do not use the cache", which is a different
+  question from "may you drop columns".
+
+So the permission is explicit: a new slice option, `may_project_columns`, set in exactly one place —
+`select_statement`, and only when the client wrote `BYPASS CACHE`. Storage engines may ignore it;
+the row format does.
+
+**Row existence was checked, not assumed.** The obvious objection is a row written by an `UPDATE`
+that set only an unprojected column: it has no row marker, so its existence rests on that column.
+`test_pq_projection_and_row_existence` builds exactly that row, plus one whose only cell is *dead*,
+and reads both ways: **3 rows either way.** The reason is structural — every row's key leaves are
+written and keys are never projected, so the row set does not depend on which value columns are
+read. Had that come out the other way, this section would say projection is unsafe.
+
+**A real bug this found, worth recording because the fix looks less correct than the bug.** The
+first version matched slice columns to value columns *by name*, which is wrong: `columns_of()` renames
+a static to `__s_<name>`, so a selected static matched nothing and was projected away — a wrong
+answer, not a slow one. The fix is to use ids: a regular column's `column_id` is already its index
+among the regular columns, which is the order `columns_of()` emits, and statics follow at
+`static_base()`. The test reads a static both ways rather than only asserting the fast path, which
+is the only reason it was caught. A second slip in the same block: `_static_base` is assigned further
+down `init()`, so reading the member there would have silently used zero and marked a regular column
+instead — `static_base(*_schema)` is called directly.
+
+**Scope.** This helps a narrow query on a wide table and does nothing for `SELECT *`, which wants
+every column and gets no mask. It requires `BYPASS CACHE`, so an ordinary cached query is unchanged.
+And it is measured on one shard against one sstable: a real query merges memtables and several
+sstables, and only the pq ones project.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

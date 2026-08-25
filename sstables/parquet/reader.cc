@@ -527,6 +527,9 @@ class pq_reader : public mutation_reader::impl {
     // One entry per leaf, recomputed per row group because it is a property of the chunk
     // statistics rather than of the file.
     std::vector<uint8_t> _elide;
+    // Leaves the *query* does not want, from the slice, when it has said projecting is allowed.
+    // Unioned into _elide, which is already the "do not read this leaf" channel.
+    std::vector<uint8_t> _projection_skip;
     size_t _elide_rg = size_t(-1);
     // Per-reader, never cached: see cached_footer for why the key does not go in the entry.
     std::optional<format::read_crypto> _crypto;
@@ -1094,6 +1097,54 @@ future<> pq_reader::init() {
         rtimer _t{rphase::schema_recover};
         _ms = recover_mapped_schema(_cf->md, _cols);
     }
+    // Projection, when the query has said it projects anyway (see may_project_columns). Built once:
+    // the slice does not change over a reader's life.
+    //
+    // The row format ignores the slice entirely and projects above storage. pq can do better
+    // because a column chunk is its own extent -- but only when told, because a consumer that needs
+    // whole rows (a view update, a mutation dump, compaction, or anything populating the row cache)
+    // must not be handed a partial one. Row *existence* is safe either way: every row's key leaves
+    // are written and keys are never projected, so the row set does not depend on which value
+    // columns are read -- test_pq_projection_and_row_existence pins that, including for a
+    // marker-less row whose only live cell is projected away.
+    if (_slice.options.contains(query::partition_slice::option::may_project_columns)) {
+        // By id, not by name. A regular column's `column_id` is its index among the regular
+        // columns, which is the order columns_of() emits them in, so the id *is* the offset into
+        // the value columns. Statics follow the regulars, starting at static_base().
+        //
+        // Matching by name instead looks more obviously correct and is not: columns_of() renames a
+        // static to "__s_<name>", so a name lookup for a selected static silently found nothing and
+        // projected it away. test_pq_may_project_columns_skips_unwanted_and_keeps_the_rest caught
+        // that, which is why it reads a static both ways rather than only asserting the fast path.
+        std::vector<bool> want(_ms.n_regular, false);
+        bool any_unwanted = false;
+        auto mark_want = [&] (size_t k) {
+            if (k < want.size()) { want[k] = true; }
+        };
+        for (column_id id : _slice.regular_columns) { mark_want(size_t(id)); }
+        // static_base(*_schema) rather than _static_base: that member is assigned further down this
+        // function, so reading it here would silently use zero and mark a *regular* column instead.
+        const size_t sbase = static_base(*_schema);
+        for (column_id id : _slice.static_columns) { mark_want(sbase + size_t(id)); }
+        for (size_t k = 0; k < want.size(); ++k) { if (!want[k]) { any_unwanted = true; break; } }
+        // A `SELECT *` wants everything, so there is nothing to skip and no mask to carry.
+        if (any_unwanted) {
+            _projection_skip = projection_skip_mask(_ms, want);
+        }
+        if (std::getenv("PQ_PROJ_DEBUG")) {
+            std::string w;
+            for (size_t k = 0; k < want.size(); ++k) { w += want[k] ? '1' : '0'; }
+            std::string names;
+            for (size_t k = 0; k < _ms.n_regular && _ms.n_key + k < _cols.size(); ++k) {
+                names += _cols[_ms.n_key + k].name; names += ',';
+            }
+            pqlog.info("proj debug: n_key={} n_regular={} cols={} slice.reg={} slice.static={} "
+                       "want={} value_cols=[{}]",
+                       _ms.n_key, _ms.n_regular, _cols.size(), _slice.regular_columns.size(),
+                       _slice.static_columns.size(), w, names);
+        }
+    }
+
     _n_pk = _schema->partition_key_size();
     _n_ck = _schema->clustering_key_size();
     _static_base = static_base(*_schema);
@@ -1243,6 +1294,12 @@ const std::vector<uint8_t>& pq_reader::elidable_leaves(size_t rg) {
         const auto& cm = *cc.meta;
         if (!cm.stats || !cm.stats->null_count) { continue; }   // no statistics: read it
         if (cm.num_values > 0 && *cm.stats->null_count == cm.num_values) { _elide[c] = 1; }
+    }
+    // The query's projection rides the same channel. Unioned rather than replacing: a leaf the file
+    // proves all-null is skippable whether or not the query wanted it, and a leaf the query does
+    // not want is skippable whether or not it is null.
+    for (size_t c = 0; c < _elide.size() && c < _projection_skip.size(); ++c) {
+        if (_projection_skip[c]) { _elide[c] = 1; }
     }
     return _elide;
 }
