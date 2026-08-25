@@ -176,8 +176,14 @@ public:
     // Since we are exposing a reference to _full_checksum, we delete the move
     // constructor.  If it is moved, the reference will refer to the old
     // location.
+    //
+    // Copying is deleted for exactly the same reason, and stated as `= delete` rather than
+    // `= default`: the base holds an output_stream and declares a move constructor, so it is not
+    // copyable and `= default` was already defined-as-deleted. It merely read as though copying
+    // were permitted, which for a class whose sink holds references to its own members is the
+    // wrong thing for it to look like.
     checksummed_file_writer(checksummed_file_writer&&) = delete;
-    checksummed_file_writer(const checksummed_file_writer&) = default;
+    checksummed_file_writer(const checksummed_file_writer&) = delete;
 
     // Close the stream here, not in ~file_writer().
     //
@@ -212,6 +218,12 @@ public:
         return _full_checksum;
     }
 };
+
+// The sink holds references to _c and _full_checksum, so a copy or move would leave those
+// references pointing into the old object. Asserted rather than trusted: both were already
+// unavailable via the base, and an assertion says so where a reader will see it.
+static_assert(!std::is_copy_constructible_v<checksummed_file_writer<adler32_utils, true>>);
+static_assert(!std::is_move_constructible_v<checksummed_file_writer<adler32_utils, true>>);
 
 using adler32_checksummed_file_writer = checksummed_file_writer<adler32_utils, true>;
 using crc32_checksummed_file_writer = checksummed_file_writer<crc32_utils, true>;

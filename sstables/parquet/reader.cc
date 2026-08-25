@@ -595,8 +595,28 @@ future<format::read_crypto> pq_reader::read_crypto_for(
         // permit and the default cpu_concurrency is 2, which leaves exactly one slot for the
         // nested lookup. A range scan runs two reads at a time and closes that slot, which is
         // why the asymmetry looked like a property of the scan path.
+        // B3: resolve the key on the SYSTEM semaphore, not the user one.
+        //
+        // awaits_guard alone does not close the cycle. It exempts this permit from the CPU limit
+        // (mark_awaits() touches no resources, and awaits_permits is consulted only by
+        // cpu_concurrency_limit_reached()), but an awaiting permit still holds one COUNT unit, and
+        // admission for the nested read still needs has_available_units(base_resources()). At
+        // max_count_concurrent_reads concurrent first-time lookups the deadlock reforms and waits
+        // out the permit's TTL.
+        //
+        // classify_request() keys off the CURRENT SCHEDULING GROUP, and default_scheduling_group()
+        // classifies as request_class::system (replica/database.cc:1797). Running the lookup there
+        // means it admits against the system semaphore, so it no longer competes with the user
+        // permit this reader is holding. The write path has always had this for free: a flush or
+        // compaction is already in a group that classifies as system, which is why its key lookup
+        // never contended with its own permit.
+        //
+        // The trade, stated because it is a policy change and not just a fix: the provider round
+        // trip's CPU is billed to main rather than to the user's service level. It is a rare,
+        // cache-populating call, and it is the same trade the write path already makes.
         reader_permit::awaits_guard awaiting{_permit};
-        rc.key = co_await ksrc->key_for_read(key_opts, key_id);
+        rc.key = co_await seastar::with_scheduling_group(seastar::default_scheduling_group(),
+                [&ksrc, &key_opts, &key_id] { return ksrc->key_for_read(key_opts, key_id); });
     } catch (...) {
         std::throw_with_nested(std::runtime_error(seastar::format(
                 "pq: {} is encrypted, but its key could not be obtained from the key provider "
@@ -669,8 +689,11 @@ future<> pq_reader::resolve_column_keys(
             // each concurrent reader spends in the state that reforms the cycle. The lookups are
             // sequential on purpose: issuing them concurrently would put K nested lookups in flight
             // from a single reader and make the count limit reachable from far fewer readers.
+            // Same reasoning as the footer key above: on the system semaphore, so K column keys
+            // are K round trips that do not contend with the user permit being held.
             reader_permit::awaits_guard awaiting{_permit};
-            ck = co_await ksrc->key_for_read(oi->second, col_key_id);
+            ck = co_await seastar::with_scheduling_group(seastar::default_scheduling_group(),
+                    [&ksrc, &oi, &col_key_id] { return ksrc->key_for_read(oi->second, col_key_id); });
         } catch (...) {
             std::throw_with_nested(std::runtime_error(seastar::format(
                     "pq: {} encrypts column '{}' under its own key, which could not be obtained "
