@@ -48,6 +48,7 @@
 #include "sstables/parquet/format/parquet_reader.hh"
 #include "sstables/parquet/format/encryption.hh"
 #include "sstables/parquet/encryption_keys.hh"
+#include "sstables/parquet/batch_reader.hh"
 #include "sstables/parquet/footer_cache.hh"
 #include "partition_slice_builder.hh"
 #include "mutation/mutation.hh"
@@ -5064,6 +5065,55 @@ SEASTAR_THREAD_TEST_CASE(test_pq_page_extents_are_not_refetched) {
         for (size_t i : sample) { read_one(expected[i]); }
         BOOST_REQUIRE_GT(sstables::parquet::extent_cache_stats_local().populations,
                          before_cold.populations);
+    }).get();
+}
+
+// The batch reader sees exactly what the mutation reader sees.
+//
+// This is the whole reason the batch interface can be built before its consumers exist (design doc
+// 10.44): a columnar scan and a mutation scan of the same file must agree, and that is checkable
+// without touching the query path. `reassemble()` is the bridge -- it is what pq_reader itself uses
+// to turn columns into rows -- so running it over the batches must reproduce as many rows as the
+// mutation path produced.
+//
+// Order is asserted too, via first_row: batches are contiguous and in file order, which for a pq
+// file is partition order, so a consumer can rely on the sequence rather than merely on the set.
+SEASTAR_THREAD_TEST_CASE(test_pq_batch_reader_agrees_with_the_mutation_reader) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        // Several row groups, so batching is exercised rather than degenerating to one.
+        auto muts = make_muts(s, 6000, 2);
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        size_t mutation_rows = 0;
+        {
+            auto rd = sst->make_reader(s, env.make_reader_permit(), query::full_partition_range,
+                                       s->full_slice());
+            auto close = deferred_close(rd);
+            while (auto m = read_mutation_from_mutation_reader(rd).get()) {
+                mutation_rows += m->partition().clustered_rows().calculate_size();
+            }
+        }
+        BOOST_REQUIRE_GT(mutation_rows, 0u);
+
+        auto br = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit());
+        size_t batches = 0, batch_rows = 0, reassembled = 0;
+        int64_t expect_first_row = 0;
+        while (auto b = br->next().get()) {
+            ++batches;
+            BOOST_REQUIRE_EQUAL(b->first_row, expect_first_row);
+            expect_first_row += b->rows;
+            batch_rows += size_t(b->rows);
+            auto rows = sstables::parquet::reassemble(br->schema_mapping(), br->columns(),
+                                                     b->columns, size_t(b->rows));
+            BOOST_REQUIRE_EQUAL(rows.size(), size_t(b->rows));
+            reassembled += rows.size();
+        }
+        br->close().get();
+        BOOST_REQUIRE_GT(batches, 1u);
+        BOOST_REQUIRE_EQUAL(batch_rows, mutation_rows);
+        BOOST_REQUIRE_EQUAL(reassembled, mutation_rows);
     }).get();
 }
 

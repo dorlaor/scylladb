@@ -34,6 +34,7 @@
 #include <map>
 #include "sstables/parquet/reader.hh"
 #include "sstables/parquet/format/parquet_reader.hh"
+#include "sstables/parquet/batch_reader.hh"
 #include "sstables/parquet/format/parquet_metadata.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/sstables.hh"
@@ -600,8 +601,32 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_columnar_scan_floor) {
         }
         const double columnar_ms = duration<double, std::milli>(clk::now() - t0).count();
 
+        // And the same scan through the batch reader -- which, unlike the floor above, reads from
+        // disk a row group at a time exactly as a real consumer would. This is the number a
+        // vectorised consumer would actually see; the floor says how much of the gap is the
+        // interface and how much is still I/O and bookkeeping.
+        size_t batch_rows = 0, batches = 0;
+        double bchecksum = 0;
+        t0 = clk::now();
+        {
+            auto br = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit());
+            while (auto b = br->next().get()) {
+                ++batches;
+                batch_rows += size_t(b->rows);
+                for (const auto& cd : b->columns) {
+                    for (auto v : cd.i32) { bchecksum += double(v); }
+                    for (auto v : cd.i64) { bchecksum += double(v); }
+                    for (auto v : cd.f64) { bchecksum += v; }
+                    for (const auto& v : cd.str) { bchecksum += double(v.size()); }
+                }
+            }
+            br->close().get();
+        }
+        const double batch_ms = duration<double, std::milli>(clk::now() - t0).count();
+
         BOOST_REQUIRE_GT(values, 0u);
         BOOST_REQUIRE_NE(checksum, 0.0);
+        BOOST_REQUIRE_EQUAL(bchecksum, checksum);
 
         const double total_rows = double(n_part) * double(n_rows);
         std::printf("\n=== columnar scan floor: %d partitions x %d rows ===\n", n_part, n_rows);
@@ -609,10 +634,17 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_columnar_scan_floor) {
                     reader_ms, total_rows / reader_ms / 1e3);
         std::printf("  %-34s %10.1f ms  %10.2f M rows/s\n", "columnar decode only (no mutations)",
                     columnar_ms, total_rows / columnar_ms / 1e3);
-        std::printf("  headroom from not building mutations: %.2fx\n", reader_ms / columnar_ms);
+        std::printf("  %-34s %10.1f ms  %10.2f M rows/s\n", "batch reader (reads from disk)",
+                    batch_ms, total_rows / batch_ms / 1e3);
+        std::printf("  headroom from not building mutations: %.2fx floor, %.2fx via batch reader\n",
+                    reader_ms / columnar_ms, reader_ms / batch_ms);
+        std::printf("  (batches %zu, batch rows %zu)\n", batches, batch_rows);
         std::printf("  (partitions via reader %zu, rows via columnar %zu, values %zu)\n",
                     rows_via_reader, rows_via_columnar, values);
-        std::printf("  caveats: excludes read I/O (file pre-read into memory); touching values is\n"
-                    "           not delivering them, so this is a floor, not a target\n\n");
+        std::printf("  caveats: the floor row excludes read I/O (file pre-read into memory); the\n"
+                    "           batch row does not, and costs %.0f%% more, which is what the I/O is\n"
+                    "           worth here. Touching values is not delivering them, so neither row\n"
+                    "           is a target -- a real consumer still has to produce output.\n\n",
+                    (batch_ms / columnar_ms - 1.0) * 100.0);
     }).get();
 }

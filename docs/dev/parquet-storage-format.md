@@ -8816,6 +8816,50 @@ increasing order of what they would return and of difficulty:
 (2) is the next step, because it is the only one of the four that can be built and *proved correct*
 without touching the query path: the same sstable read both ways must yield the same values.
 
+### 10.45 The batch reader: 7.39× on a scan, and it agrees with the mutation reader — 2026-08-25
+
+§10.44 measured the headroom at 8.1× and named a batch-producing reader as the one consumer of it
+that could be *proved* correct without touching the query path. `sstables/parquet/batch_reader.hh`
+is that reader, and the proof is that the same file read both ways agrees.
+
+| | time | rows/s | vs the mutation scan |
+|---|---|---|---|
+| reader full scan, building mutations | 253.9 ms | 0.39 M | — |
+| columnar decode only, file in memory | 30.4 ms | 3.29 M | 8.36× (floor) |
+| **`batch_reader`, reading from disk** | **34.4 ms** | **2.91 M** | **7.39×** |
+
+The batch reader is **13 % off the in-memory floor**, which is what read I/O is worth on this
+corpus — small, because a row group is one sequential extent. So 7.39× is not an idealisation: it is
+a reader that opens a real sstable, reads a row group at a time, and hands back columns.
+
+**What makes it trustworthy.** Two independent checks, both in the committed tests:
+
+- `test_pq_batch_reader_agrees_with_the_mutation_reader` reads the same sstable both ways and
+  requires the same row count, batch by batch, with `first_row` asserted contiguous so a consumer
+  can rely on the *sequence* and not merely the set. `reassemble()` is the bridge — the same
+  function `pq_reader` uses to turn columns into rows — so this compares like with like.
+- The benchmark asserts the batch reader's value checksum equals the in-memory columnar path's,
+  so the two decode identically and not merely to the same count.
+
+**Deliberate limits of this first version**, each a follow-up and none a design choice:
+unencrypted files only (it throws on a PARE footer rather than quietly returning nothing); it
+parses the footer itself rather than using the sstable's footer cache; whole row groups only, so no
+row-range seeking; and every leaf is decoded, so **still no projection pushdown** — worth noting
+twice, because §10.30 found the mutation path does not push projection down either, and a columnar
+interface is what would finally make it possible. A one-column scan of a five-column file should
+read a fifth of the data; today it reads all of it, on both paths.
+
+**What this is not.** It returns columns, so a consumer needing tombstone resolution, cross-sstable
+merging or clustering-order guarantees still wants the mutation path — this does not replace
+`make_full_scan_reader`. And 7.39× is throughput at the *reader* interface, not what a CQL client
+would see: a SELECT still has to build a result, and that cost is now the unmeasured part. The
+remaining consumers from §10.44 are unchanged in difficulty — aggregates and projections first, then
+a pq→pq rewrite, then general CQL scans.
+
+The honest summary of the whole read-path investigation: the point read went from 12.2× the row
+format to 1.6× by removing per-reader repetition, and the scan's 8× was never in the decoder at all
+— it was in the interface, and it took an interface change to reach it.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
