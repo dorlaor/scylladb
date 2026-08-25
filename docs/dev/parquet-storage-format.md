@@ -8568,6 +8568,79 @@ Scope of the claim: this is a point-read result. It does not touch §10.38's fin
 ~two thirds shared mutation-building on both paths, where the ceiling from all parquet decode work
 is 1.19×.
 
+### 10.41 The decompressed-page cache — 3.5× on the point read, 2026-08-25
+
+§10.40 localised the point read's cost to whole-page inflation and named two ways out: smaller
+pages, which costs file size, or a cache of decompressed pages, which costs evictable memory. This
+is the second. It is the largest win in the read-path investigation.
+
+**Measured, A/B inside one process via `PQ_PAGE_CACHE=0`, four interleaved pairs:**
+
+| rep | cache | no cache | gain |
+|---|---|---|---|
+| 1 | 189.3 µs | 646.3 µs | 3.41× |
+| 2 | 155.0 µs | 646.0 µs | 4.17× |
+| 3 | 187.6 µs | 655.2 µs | 3.49× |
+| 4 | 183.7 µs | 645.2 µs | 3.51× |
+
+**median 3.50×**, range 3.41–4.17×. Data-page decompressions over 1 000 point reads fall from
+**8 000 to 144** — exactly one per distinct page, 18 row groups × 8 leaves — a 98.2 % hit rate.
+
+Against the row format, the point read closes from **12.2× to 3.34×**, and the two things that
+must not move did not:
+
+| | before | after |
+|---|---|---|
+| pq point read | 647 µs | **187.8 µs** |
+| point ratio to row format | 12.2× | **3.34×** |
+| `decode_cpu` share | 43–49 % | 12.9 % |
+| file size | 0.320× | **0.320×** |
+| scan | 0.97× | **0.97×** |
+
+So it beats the page-size route (3.14× median over four paired reps) **and costs no file size**,
+which is why it is the one to have.
+
+**Design.** The parsed pages live in the same `cached_footer` entry as the footer and the page
+index: one sstable lifetime, one reclaim policy, no second eviction mechanism (§10.22). Keyed by the
+absolute file offset of a page's value bytes, which names a page uniquely within a file. An
+`unordered_map`, because references to its elements survive a rehash — that is what lets a decode
+hold a pointer into it while another column inserts. `accepts()` is asked before `put()` so that a
+decline costs nothing; without it `put()` would have to take the page by value and hand it back,
+which means copying a page. Full means *stop accepting*, not evict: a 32 MB per-sstable cap, with
+pressure handled by the manager's existing reclaim rather than a competing LRU.
+
+**Two deliberate limits.** It is off for **encrypted** files: the cached form is plaintext, so
+caching it would keep decrypted user data alive long after the read entitled to it — a different
+bargain from the footer cache's, which deliberately keeps key *ids* and not keys. And it is only on
+the **paged** path, never the streaming one: a scan touches each page once, so caching there would
+retain the whole file to serve nothing.
+
+**Where the point read now goes**, and it is a different shape entirely:
+
+| phase | share |
+|---|---|
+| `page_fetch` | **73.1 %** |
+| `decode_cpu` | 12.9 % |
+| `offset_index_io` | 3.0 % |
+
+`page_fetch` is now almost the whole read — and it is fetching compressed bytes that the cache then
+ignores, because the decompressed form of those same pages is already in memory. **1 000 device
+reads per 1 000 point reads are pure waste.** Skipping them needs the fetch planner to consult the
+cache before building its extent list, which means keying by page *start* (what the OffsetIndex
+gives) rather than by value-bytes offset, and handling a partly-cached run of pages — trivial at
+shipping defaults, where a chunk holds one page. The dictionary page has to be cached too, since it
+is still inflated per read (1.8 µs, but its bytes are why the extent is fetched). Per §10.39 the
+share of an I/O phase is not a budget, so this is a lead and not a forecast.
+
+**Test.** `test_pq_decompressed_pages_are_cached` pins the *count* — decompressions stop tracking
+reads — rather than a duration, because a timing assertion on a shared box is a flake generator. It
+fails with `PQ_PAGE_CACHE=0`. Getting it to assert anything at all took three corrections, each
+worth knowing: `next_window()` streams unconditionally when the window covers a whole row group, so
+a point read on the first partition of a single-group file never pages; a file small enough that the
+codec declines to compress has no decode work to cache, so 24 partitions asserted nothing and 6 000
+were needed; and `make_sstable_containing()` validates what it writes, so the cache is already warm
+before the test's first read.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

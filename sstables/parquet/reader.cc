@@ -230,6 +230,25 @@ public:
     // Counted separately because it is added after publication; see sstable::grow_pq_footer_cache.
     mutable size_t oi_retained = 0;
 
+    // Decompressed data pages, by absolute file offset of their value bytes. See
+    // format::page_cache for why this is where a point read's time actually goes.
+    //
+    // unordered_map because references to its elements survive a rehash, which is what lets the
+    // decode hold a pointer into it while another column inserts.
+    //
+    // Full means "stop accepting", not "evict something". A page is only worth keeping while the
+    // read pattern keeps coming back to it, and the entry as a whole is already subject to the
+    // manager's reclaim -- so the useful policy at this level is a cap, and the useful policy for
+    // pressure is the one that already exists. An LRU here would be a second eviction policy
+    // competing with the first, which is what 10.22 decided against.
+    mutable std::unordered_map<int64_t, std::vector<uint8_t>> pages;
+    mutable size_t pages_retained = 0;
+
+    // Per sstable. Sized so that the 20-row-group, 8-leaf shape a point-read workload actually
+    // touches fits with room to spare, while a file with thousands of groups stops well short of
+    // its whole decompressed self.
+    static constexpr size_t page_cache_cap = 32u << 20;
+
     static size_t oi_heap_size(const std::vector<std::optional<format::offset_index>>& v) {
         size_t n = v.capacity() * sizeof(std::optional<format::offset_index>);
         for (const auto& o : v) {
@@ -238,7 +257,9 @@ public:
         return n;
     }
 
-    size_t memory_size() const noexcept override { return _retained + oi_retained; }
+    size_t memory_size() const noexcept override {
+        return _retained + oi_retained + pages_retained;
+    }
 
     // Call once, after filling everything in. Measured rather than estimated: every container is
     // asked for its capacity, so the number does not depend on believing anything about the
@@ -344,6 +365,40 @@ public:
         const auto dt = std::chrono::steady_clock::now() - _t0;
         rprof::ns[size_t(_p)] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count());
         ++rprof::hits[size_t(_p)];
+    }
+};
+
+// Binds the entry's page store to the format layer's interface. Holds the entry by shared_ptr so
+// that the store cannot go away under a decode, and the sstable so that growth can be accounted.
+class entry_page_cache final : public format::page_cache {
+    seastar::shared_ptr<const cached_footer> _cf;
+    sstables::shared_sstable _sst;
+public:
+    entry_page_cache(seastar::shared_ptr<const cached_footer> cf, sstables::shared_sstable sst)
+        : _cf(std::move(cf)), _sst(std::move(sst)) {}
+
+    const std::vector<uint8_t>* get(int64_t off) const noexcept override {
+        auto it = _cf->pages.find(off);
+        if (it == _cf->pages.end()) {
+            ++page_cache_stats_local().misses;
+            return nullptr;
+        }
+        ++page_cache_stats_local().hits;
+        return &it->second;
+    }
+
+    bool accepts(size_t bytes) const noexcept override {
+        return _cf->pages_retained + bytes <= cached_footer::page_cache_cap;
+    }
+
+    const std::vector<uint8_t>* put(int64_t off, std::vector<uint8_t> v) override {
+        const size_t n = v.capacity();
+        auto& slot = _cf->pages[off];
+        slot = std::move(v);
+        _cf->pages_retained += n;
+        _sst->grow_pq_footer_cache(n);
+        ++page_cache_stats_local().populations;
+        return &slot;
     }
 };
 
@@ -1374,6 +1429,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         const int64_t p1 = pages[i1].offset + pages[i1].compressed_page_size;
         want.push_back({c, false, uint64_t(p0), size_t(p1 - p0)});
         in[c].first_row = pages[i0].first_row_index;
+        in[c].pages_file_offset = p0;
     }
 
     std::vector<temporary_buffer<char>> held;
@@ -1397,7 +1453,17 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
     }
 
     rtimer _td{rphase::decode_cpu};
-    co_return format::decode_columns(in, _rgmd, 0, lo, hi, crypto());
+    // The cache only makes sense on this path. A scan streams each page once and moves on, so
+    // caching there would retain the whole file to serve nothing; a point read comes back to the
+    // same page from a fresh reader, which is the case that pays.
+    std::optional<entry_page_cache> pcache;
+    static const bool pages_enabled = [] {
+        const char* e = std::getenv("PQ_PAGE_CACHE");
+        return !(e && *e == '0');
+    }();
+    if (_cf && pages_enabled) { pcache.emplace(_cf, _sst); }
+    co_return format::decode_columns(in, _rgmd, 0, lo, hi, crypto(),
+                                     pcache ? &*pcache : nullptr);
 }
 
 void pq_reader::close_partition() {

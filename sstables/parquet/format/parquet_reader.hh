@@ -101,6 +101,37 @@ struct column_input {
     // flagged `skipped` for the reassembler to treat as all-null. Distinct from an empty `pages`
     // span, which is a caller error.
     bool absent = false;
+    // Absolute file offset that pages[0] sits at, so a page can be named by where it is in the
+    // file rather than by where it landed in this caller's buffer. Only needed to key the page
+    // cache; a caller that passes no cache can leave it zero.
+    int64_t pages_file_offset = 0;
+};
+
+// Decompressed data pages, retained across reads by whoever owns the file.
+//
+// A page is the unit the codec can inflate -- zstd cannot decompress part of a frame -- and at
+// shipping defaults a page is the whole column chunk, so a 5-row point read inflates ~5 000 rows
+// per column at ~31 us each. That is ~38 % of a point read (design doc 10.40), and it is the same
+// bytes every time: 1 000 random point reads over 20 000 partitions touch 20 row groups, so each
+// page is inflated once and then wanted ~50 more times.
+//
+// Keyed by the absolute file offset of the compressed page body, which identifies a page uniquely
+// within a file. The implementation lives next to the sstable that owns the lifetime, so the format
+// layer stays free of sstable types.
+//
+// Contract: a pointer returned by get() or put() stays valid for the rest of the decode. That is
+// cheap to honour because decode_columns() is synchronous -- there is no suspension point inside a
+// decode -- and because an implementation must not evict during one.
+class page_cache {
+public:
+    virtual ~page_cache() = default;
+    virtual const std::vector<uint8_t>* get(int64_t page_body_offset) const noexcept = 0;
+    // Asked before put(), so that a decline costs nothing. Without it put() would have to take the
+    // page by value and hand it back on refusal, which means copying a page -- cheaper than
+    // inflating one, but not by enough to spend on a cache that is full.
+    virtual bool accepts(size_t bytes) const noexcept = 0;
+    // Only called after accepts() returned true, so it takes ownership and never returns null.
+    virtual const std::vector<uint8_t>* put(int64_t page_body_offset, std::vector<uint8_t>) = 0;
 };
 
 // Decode rows [row_lo, row_hi) from per-column byte spans. One entry per leaf,
@@ -108,7 +139,8 @@ struct column_input {
 std::vector<column_data> decode_columns(std::span<const column_input>,
                                         const file_metadata&, size_t row_group_index,
                                         int64_t row_lo, int64_t row_hi,
-                                        const read_crypto* = nullptr);
+                                        const read_crypto* = nullptr,
+                                        page_cache* = nullptr);
 
 // Decode rows [row_lo, row_hi) of one row group. `base_offset` is the file
 // offset that image[0] maps to, so the caller can hand over just the bytes that

@@ -96,4 +96,18 @@ inline offset_index_cache_stats& offset_index_cache_stats_local() noexcept {
     return s;
 }
 
+// Decompressed data pages. Separate counters again, for the same reason the page index has its
+// own: a workload can hit on the index and miss on the pages, and the two say different things
+// about what to change.
+struct page_cache_stats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t populations = 0;
+};
+
+inline page_cache_stats& page_cache_stats_local() noexcept {
+    static thread_local page_cache_stats s;
+    return s;
+}
+
 } // namespace sstables::parquet

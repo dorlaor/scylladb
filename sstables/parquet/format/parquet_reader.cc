@@ -289,7 +289,13 @@ void expand_nulls(column_data& cd, phys_type pt, size_t first, size_t count,
 std::vector<column_data> decode_columns(std::span<const column_input> in,
                                         const file_metadata& md, size_t rg_index,
                                         int64_t row_lo, int64_t row_hi,
-                                        const read_crypto* crypto) {
+                                        const read_crypto* crypto,
+                                        page_cache* pcache) {
+    // Never for an encrypted file. The cached form is plaintext, so caching it would keep decrypted
+    // user data alive long after the read that was entitled to it -- a different bargain from the
+    // one the footer cache makes, which deliberately keeps ids and not keys. Encrypted files pay
+    // the decompression every read until that trade is decided deliberately rather than inherited.
+    if (crypto) { pcache = nullptr; }
     if (rg_index >= md.row_groups.size()) { throw decode_error("row group index out of range"); }
     const auto& rg = md.row_groups[rg_index];
     if (row_lo < 0) { row_lo = 0; }
@@ -535,8 +541,25 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
                 // only the chunk codec makes those pages fail to decode.
                 auto vbody = body.subspan(rl + dl);
                 const size_t uncompressed_values = size_t(ph.uncompressed_page_size) - rl - dl;
-                auto raw = decompress(vbody, h.is_compressed ? cm.compression : codec::uncompressed,
-                                      uncompressed_values);
+                // The value bytes of this page, by absolute file offset. `body_at` is relative to
+                // the caller's span, so the key adds where that span starts in the file; the
+                // + rl + dl keeps V2's uncompressed level block out of the key, since what is
+                // cached is the part the codec produced.
+                const int64_t vkey = ci.pages_file_offset + body_at + int64_t(rl + dl);
+                std::vector<uint8_t> owned;
+                std::span<const uint8_t> raw;
+                if (const auto* hit = pcache ? pcache->get(vkey) : nullptr) {
+                    raw = *hit;
+                } else {
+                    owned = decompress(vbody,
+                                       h.is_compressed ? cm.compression : codec::uncompressed,
+                                       uncompressed_values);
+                    if (pcache && pcache->accepts(owned.size())) {
+                        raw = *pcache->put(vkey, std::move(owned));
+                    } else {
+                        raw = owned;
+                    }
+                }
 
                 const size_t present = optional
                         ? size_t(std::count(levels.begin(), levels.end(), uint64_t(max_def))) : n;
@@ -613,6 +636,7 @@ std::vector<column_data> read_row_range(std::span<const uint8_t> image, int64_t 
         // Whole chunk in one span: the page walk finds the dictionary itself.
         in[c].pages = image.subspan(size_t(start), size_t(end - start));
         in[c].first_row = 0;
+        in[c].pages_file_offset = base_offset + start;
     }
     return decode_columns(in, md, rg_index, row_lo, row_hi, crypto);
 }

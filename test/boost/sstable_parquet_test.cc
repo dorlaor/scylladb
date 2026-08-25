@@ -4938,6 +4938,72 @@ SEASTAR_THREAD_TEST_CASE(test_pq_page_index_is_cached_per_row_group) {
     }).get();
 }
 
+// A decompressed data page is inflated once per page, not once per read.
+//
+// This is the largest single win found in the read-path investigation (design doc 10.41): at
+// shipping defaults a page is the whole column chunk, so answering a 5-row point read inflates
+// ~5 000 rows per column, and zstd cannot decompress part of a frame. The bytes are identical every
+// time, so the second read of a page should do no codec work at all.
+//
+// What this pins is the *count*, not a duration: a timing assertion on a shared machine is a flake
+// generator, while "the number of decompressions stopped tracking the number of reads" is exactly
+// the property being claimed and is exact.
+SEASTAR_THREAD_TEST_CASE(test_pq_decompressed_pages_are_cached) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        // Big enough that pq_reader takes the *paged* path. The cache is deliberately only on that
+        // path -- a scan streams each page once and would retain the whole file to serve nothing --
+        // and paged_fetch_is_not_cheaper() sends a small file down the streaming path instead,
+        // where nothing is cached. At 24 partitions the first version of this test populated
+        // nothing and looked like a broken cache.
+        auto muts = make_muts(s, 6000, 2);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto read_one = [&] (const mutation& want) {
+            auto pr = dht::partition_range::make_singular(want.decorated_key());
+            auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+            auto close = deferred_close(rd);
+            auto got = read_mutation_from_mutation_reader(rd).get();
+            BOOST_REQUIRE(got);
+            assert_that(*got).is_equal_to(want);
+        };
+
+        // Cold, explicitly: make_sstable_containing() validates what it writes, and that read has
+        // already warmed whatever it touched.
+        sst->drop_pq_footer_cache(false);
+
+        // A spread of partitions, twice. The second pass must add hits and must not inflate a
+        // single new page: the first pass has already touched every page these rows live in.
+        //
+        // The warm-up is the whole first pass rather than one read, for two reasons that both
+        // produced a test asserting nothing. next_window() streams unconditionally when the wanted
+        // window covers the whole row group, so a point read on the *first* partition of a
+        // single-group file never pages; and a file small enough that the codec declines to
+        // compress its pages has no decode work to cache at all, which is why this needs 6 000
+        // partitions rather than a couple of dozen.
+        std::vector<size_t> sample;
+        for (size_t i = 0; i < expected.size(); i += 37) { sample.push_back(i); }
+        for (size_t i : sample) { read_one(expected[i]); }
+        const auto after_first_pass = sstables::parquet::page_cache_stats_local();
+        BOOST_REQUIRE_GT(after_first_pass.populations, 0u);
+        for (size_t i : sample) { read_one(expected[i]); }
+        const auto after_second_pass = sstables::parquet::page_cache_stats_local();
+
+        BOOST_REQUIRE_GT(after_second_pass.hits, after_first_pass.hits);
+        BOOST_REQUIRE_EQUAL(after_second_pass.populations, after_first_pass.populations);
+
+        // Dropping the entry takes the pages with it, and the reader falls back to inflating them
+        // again -- same answers.
+        sst->drop_pq_footer_cache(false);
+        const auto before_cold = sstables::parquet::page_cache_stats_local();
+        for (size_t i : sample) { read_one(expected[i]); }
+        BOOST_REQUIRE_GT(sstables::parquet::page_cache_stats_local().populations,
+                         before_cold.populations);
+    }).get();
+}
+
 // A bigint partition key, end to end: the partition sequence must survive the round trip.
 //
 // The bug this pins is described in full at `test_delta_binary_packed_wide_residual_widths`
