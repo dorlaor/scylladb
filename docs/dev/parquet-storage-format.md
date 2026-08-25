@@ -8765,6 +8765,57 @@ Still not measured on a real workload: 2 % is a guess with a knob on it, and the
 that the right fraction is a workload question nobody has answered yet. What is no longer true is
 that the sizing was per-file and unbounded in aggregate.
 
+### 10.44 What a vectorised scan is worth: 8.1×, measured — 2026-08-25
+
+§10.38 established that ~two thirds of a scan is shared mutation-building on *both* formats, and
+that the ceiling from optimising parquet decode is therefore 1.19×. What it could not say is what
+the other side is worth: the cost of building a mutation per row was bounded from below by a
+`perf` bucket, never measured.
+
+`perf_pq_columnar_scan_floor` measures it. Same sstable, same 100 000 rows, decoded straight
+through the format layer — every row group, every value touched, nothing built:
+
+| | time | rows/s |
+|---|---|---|
+| reader full scan, building mutations | 246.1 ms | 0.41 M |
+| columnar decode only | **30.4 ms** | **3.29 M** |
+
+**8.10×.** That is the headroom a vectorised path is competing for, and it is the first number in
+this investigation that is large enough to matter on a scan. For comparison, everything achieved on
+the point read so far — three caches, 7.5× — moved the scan by nothing at all, because the scan's
+cost was never in the places those caches fixed.
+
+Two caveats, both printed by the benchmark itself:
+
+- **It excludes read I/O.** The file is pre-read into memory, so this is a CPU comparison and is
+  flattering by whatever the scan's I/O costs. On this corpus the scan reads ~21 MB and is
+  CPU-bound, so the correction is small — but it is not zero, and on a cluster with cold cache it
+  would not be small.
+- **Touching a value is not delivering it.** A real vectorised path still has to produce output in
+  some form, so 30.4 ms is a floor, not a target. What it rules out is the possibility that
+  mutation-building is *cheap* — 8.1× says the interface, not the decoder, is what a scan spends
+  its time on.
+
+**What this does and does not license.** It justifies building a batch interface; it does not
+promise 8.1× to a CQL client, because a CQL scan today goes columnar → `column_data` → `reassemble`
+→ `mutation_fragment_v2` (cells in a `compact_radix_tree`) → result builder → wire format. A
+vectorised path shortens that chain but cannot delete its ends. The candidate consumers, in
+increasing order of what they would return and of difficulty:
+
+1. **Aggregates and projections** (`count(*)`, single-column scans) — the columnar form is already
+   the right shape; the work is in the query path, not the reader.
+2. **A batch-producing reader API** in `sstables/parquet` — self-contained, testable against the
+   mutation path for equivalence, and the prerequisite for everything else.
+3. **pq → pq compaction** — both sides are columnar, so a rewrite could avoid mutations entirely.
+   Attractive and self-contained within `sstables/`, but tombstone GC, TTL expiry and purge are
+   per-cell decisions, and merging *several* sstables needs the row-level merge that mutations
+   exist to provide. The single-file rewrite case is the tractable half.
+4. **General CQL scans** — the largest prize and the largest change, because it touches result
+   generation.
+
+(2) is the next step, because it is the only one of the four that can be built and *proved correct*
+without touching the query path: the same sstable read both ways must yield the same values.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

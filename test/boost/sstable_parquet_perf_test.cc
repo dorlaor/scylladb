@@ -33,6 +33,8 @@
 
 #include <map>
 #include "sstables/parquet/reader.hh"
+#include "sstables/parquet/format/parquet_reader.hh"
+#include "sstables/parquet/format/parquet_metadata.hh"
 #include "schema/schema_builder.hh"
 #include "sstables/sstables.hh"
 #include "mutation/mutation.hh"
@@ -529,5 +531,88 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_scan_memory_scaling) {
                                     "({} -> {} bytes); a bounded reader is ~1x, so the reader is "
                                     "materialising the sstable", growth, small_peak, large_peak));
         }
+    }).get();
+}
+
+// What a scan would cost if it did not build a mutation per row.
+//
+// This is the number the vectorised-scan question turns on, and until now it had only been
+// inferred: `perf record` says ~two thirds of a scan on *both* formats is shared
+// mutation-building machinery, and that the parquet-specific half is 16.0 % against the row
+// format's 17.8 % (design doc 10.38). From that the ceiling on optimising parquet decode is
+// 1.19x -- but the ceiling on *not building mutations* was never measured, only bounded from
+// the other side.
+//
+// So: decode every row group of the same sstable straight through the format layer, touch every
+// value, and build nothing. The gap to the reader's own full scan is what a vectorised path is
+// competing for. Two honest caveats, both stated in the output. The file is read into memory
+// first, so this excludes read I/O -- fair for a CPU comparison and flattering by however much
+// the scan's I/O costs. And "touch every value" is not "deliver every value to a client": a real
+// vectorised path still has to produce output in some form, so this is a floor and not a target.
+SEASTAR_THREAD_TEST_CASE(perf_pq_columnar_scan_floor) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = perf_schema();
+        const int n_part = [] {
+            if (const char* e = std::getenv("PQ_PERF_PARTITIONS")) {
+                return int(std::max(1L, std::atol(e)));
+            }
+            return 2'000;
+        }();
+        const int n_rows = 5;
+        auto muts = gen(s, n_part, n_rows);
+
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), muts).get();
+
+        // The reader's own scan, for the comparison.
+        size_t rows_via_reader = 0;
+        auto t0 = clk::now();
+        {
+            auto rd = sst->make_reader(s, env.make_reader_permit(), query::full_partition_range,
+                                       s->full_slice());
+            auto close = deferred_close(rd);
+            while (auto m = read_mutation_from_mutation_reader(rd).get()) { ++rows_via_reader; }
+        }
+        const double reader_ms = duration<double, std::milli>(clk::now() - t0).count();
+
+        // The same bytes, decoded columnar, building nothing.
+        const uint64_t len = sst->ondisk_data_size();
+        auto buf = sst->data_read(0, size_t(len), env.make_reader_permit()).get();
+        auto image = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
+
+        size_t values = 0, rows_via_columnar = 0;
+        double checksum = 0;
+        t0 = clk::now();
+        auto md = sstables::parquet::format::parse_footer(image);
+        for (size_t rg = 0; rg < md.row_groups.size(); ++rg) {
+            auto cols = sstables::parquet::format::read_row_group(image, md, rg);
+            rows_via_columnar += size_t(md.row_groups[rg].num_rows);
+            for (const auto& cd : cols) {
+                // Touched, so that none of this is optimised away, and cheaply -- summing is not
+                // the point, decoding is.
+                for (auto v : cd.i32) { checksum += double(v); }
+                for (auto v : cd.i64) { checksum += double(v); }
+                for (auto v : cd.f64) { checksum += v; }
+                for (const auto& v : cd.str) { checksum += double(v.size()); }
+                values += cd.num_values();
+            }
+        }
+        const double columnar_ms = duration<double, std::milli>(clk::now() - t0).count();
+
+        BOOST_REQUIRE_GT(values, 0u);
+        BOOST_REQUIRE_NE(checksum, 0.0);
+
+        const double total_rows = double(n_part) * double(n_rows);
+        std::printf("\n=== columnar scan floor: %d partitions x %d rows ===\n", n_part, n_rows);
+        std::printf("  %-34s %10.1f ms  %10.2f M rows/s\n", "reader full scan (mutations)",
+                    reader_ms, total_rows / reader_ms / 1e3);
+        std::printf("  %-34s %10.1f ms  %10.2f M rows/s\n", "columnar decode only (no mutations)",
+                    columnar_ms, total_rows / columnar_ms / 1e3);
+        std::printf("  headroom from not building mutations: %.2fx\n", reader_ms / columnar_ms);
+        std::printf("  (partitions via reader %zu, rows via columnar %zu, values %zu)\n",
+                    rows_via_reader, rows_via_columnar, values);
+        std::printf("  caveats: excludes read I/O (file pre-read into memory); touching values is\n"
+                    "           not delivering them, so this is a floor, not a target\n\n");
     }).get();
 }
