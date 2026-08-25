@@ -8078,7 +8078,7 @@ which is not something storage can do, and is what exposed it. And a rate window
 
 ### 10.31 The read monitor was never wired up — found by inspection 2026-08-24, and it is not the crash
 
-Chasing the compaction-cancel segfault (§11.1 B-list) by reading the teardown path turned up a
+Chasing the compaction-cancel segfault (§10.33) by reading the teardown path turned up a
 different defect, which is worth separating from the crash rather than filed under it.
 
 `pq_reader` never called `read_monitor::on_read_started()`, and called `on_read_completed()` at the
@@ -8172,6 +8172,116 @@ set to 2 048 once on one schema's evidence and reverted the same day when the co
 +16.7 %; it does not move again on a harness whose size column disagrees with the corpus by 10×.
 What has changed is that the *latency* half is no longer speculative, so the trade is now a real
 trade rather than an argument.
+
+
+### 10.33 The compaction-cancel segfault — reproduced and fixed 2026-08-24/25
+
+Seen first on AWS (2026-08-22, build `8222ffcf4510`): eleven SEGVs over nine crash-restart cycles,
+`si_addr 0x10`, always immediately after the compaction manager logged that it was stopping ongoing
+compactions *"due to truncate"*. The node then resumed the same compaction on restart and died
+again, leaving 779 live sstables for a table reporting 0 rows.
+
+**What did not reproduce it.** Twelve truncate-during-compaction attempts on a 4-shard,
+tablets-enabled node — all *valid*, in the sense that a compaction was confirmed mid-read at
+25–50 % progress and the `"due to truncate"` line was emitted each time — for **both** `parquet` and
+`sstable`. Neither format faulted, so the native arm did not settle attribution either. Those
+compactions were **92–156 keys**.
+
+**What did.** Scale, and nothing else. A test that drives the cancel path directly
+(`test_pq_compaction_aborted_while_reading_does_not_fault`) faults at 16 × 12 000 × 40 = 7.7 M rows
+with the stop landing 5 s into a merge that takes ~10.4 s unaborted:
+
+    si_code=1  si_addr=0x0000000000000008  shard 0, scheduling group main
+
+Note the address: `0x8`, and on the **write** side, not the read side the AWS backtrace named.
+
+    #0  utils::chunked_vector<unsigned,131072>::emplace_back
+    #1  sstables::checksummed_file_data_sink_impl<crc32_utils,true>::put
+    #4  seastar::output_stream<char>::close
+    #5  sstables::file_writer::~file_writer
+    #7  sstables::parquet::pq_writer_impl::~pq_writer_impl
+    #10 std::_Optional_payload_base<compaction::compaction_writer>::_M_destroy
+    #15 compaction::compaction::consume
+
+**Root cause, and it is not pq-specific.** `checksummed_file_writer` holds `checksum _c` and
+`uint32_t _full_checksum` as **derived** members, while the base `file_writer` owns the
+`output_stream` whose sink holds *references* to both. A derived class's members are destroyed
+before the base destructor runs, and `~file_writer()` best-effort auto-closes a stream that was
+never closed — "close() should be called by the owner … it may not be called on exception handling
+paths". That close flushes; the flush appends a CRC to `_c`; `_c` is gone. `0x8` is the
+chunked_vector's first pointer field.
+
+`pq_writer_impl` closes both writers explicitly in `consume_end_of_stream()`, but a **cancelled**
+compaction never calls it — it destroys the `compaction_writer`, and with it the writer.
+
+**Fixed in two places, deliberately.** `pq_writer_impl` gained a destructor that closes any
+still-held writers (`6af8cac5eb`): that is pq honouring the documented contract it was violating.
+And `checksummed_file_writer` gained one too (`e12363b36b`), because the class will do this to *any*
+caller destroyed without `close()` and the other callers are not audited; `file_writer` gained a
+protected `is_closed()` since `close()` asserts on a double close.
+
+**Verification.** Reverting the pq destructor — by checking out `writer_impl.{cc,hh}` from
+`6af8cac5eb^`, not by trusting a `git stash push` that had nothing to stash because the destructor
+is committed — and rerunning the 7.7 M-row case gives `rc=0`: the class-level fix alone prevents it.
+Reverting *both* brings back the identical `si_addr 0x8` at the same `ip 0x203a31d`. The stress
+matrix passes with the cancel landing at 100/1 000/3 000/5 000/8 000 ms (125 → 9 625 keys written at
+the abort).
+
+**Still open, and worth stating rather than assuming.** The AWS backtrace was
+`compacting_reader::fill_buffer` at `si_addr 0x10`; this is the writer at `0x8`. They may be two
+faults from one cancel path or two different bugs. The cluster is terminated, so this cannot be
+re-checked against the original signature, and **§10.33 should not be read as closing the AWS
+occurrence**. Also unrun: `sstable_compaction_test`, the suite most likely to exercise writer
+teardown, has no binary in this tree — ninja lists the target but cannot build it in this
+configuration.
+
+### 10.34 `nodetool restore` aborted the node on a malformed manifest — fixed 2026-08-25
+
+Found while doing the backup/restore check (§10.35). One invalid entry in the restore sstable list
+did not return an error; it **took the node down**:
+
+    api - Restore invoked with ... sstables_count=3
+    ERROR sstable - malformed sstable error (aborting): invalid version for file .
+    Aborting on shard 0, in scheduling group backup.
+      #3 sstables::throw_malformed_sstable_exception
+      #4 sstables::sstable_directory::restore_components_lister::process
+
+The operator sees `Connection reset by peer`, because the node they were talking to died. The
+trigger was a **blank trailing line** in a `--sstables-file-list`, parsed as an sstable named `""`.
+
+The mismatch is one of policy, not a missing check. `throw_malformed_sstable_exception` honours
+`abort_on_malformed_sstable_error`, which defaults to true, and aborting is the **right** call for
+corrupt bytes found on disk: carrying on with data known to be wrong is worse than stopping. But
+these names come from the restore *request*. They are operator input, not evidence of local
+corruption, and a typo in a manifest is a reason to reject the request — not to take a cluster
+member down at the moment someone is restoring from backup.
+
+Names are now validated up front, before any restoring begins, throwing `std::invalid_argument`
+(`c511d77383`). Before: node dead. After: `failed: std::invalid_argument (restore: '' is not a valid
+sstable TOC object name…)`, node answering, zero aborts. Only the empty-name case was observed;
+wrong extensions, absolute paths and names belonging to another table were never tried, though the
+up-front validation covers them by construction.
+
+### 10.35 Backup and restore preserve the parquet format — 2026-08-25, against minio
+
+Parked since 2026-08-22 as "needs Scylla Manager and an AWS bucket". Neither was true: ScyllaDB has
+native `nodetool backup` / `nodetool restore` against a configured object-storage endpoint, and
+minio runs as a plain binary.
+
+The question was never whether bytes copy. It is whether restore **preserves the format** or
+silently rewrites to native — restore goes through the load path, and two of five write paths did
+exactly that before being fixed (boot reshape-on-load and `nodetool refresh`, §9.7). A row-count
+check alone would miss it, so the assertions are on sstable version prefixes.
+
+It preserves it. 7/7 checks: 300 000 rows load as `pq` → 2 `pq` sstables; backup puts 20 objects in
+the bucket with every `Data.db` `pq`-prefixed; drop, recreate empty, restore → 300 000 rows back,
+`versions=['pq']`. The restored generations differ from the backed-up ones
+(`0jv6_26nsg` → `0k48_3nlnk`), so restore **rewrites** the files and still writes `pq`.
+
+API note for anyone repeating it: `restore` requires the TOC object keys, and they are *relative to*
+`--prefix`. Pass them via `--sstables-file-list` rather than as bare arguments. Scope: single node,
+RF=1, minio rather than real S3, no Scylla Manager in the path — this verifies format preservation
+and the plumbing, not a production backup workflow.
 
 
 ## 11. Open questions
