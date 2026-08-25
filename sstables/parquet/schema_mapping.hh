@@ -457,6 +457,23 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
 mapped_schema recover_mapped_schema(const file_metadata&,
                                     const std::vector<cql_column>& cols);
 
+// Which leaves a projection may skip: one byte per leaf, non-zero meaning "do not read".
+//
+// `want_regular` has one entry per regular column, in the order `mapped_schema::value_leaf` uses.
+//
+// Only *per-column* leaves of unwanted columns are skipped. Every key leaf and every **shared**
+// metadata channel is kept, however narrow the projection, and that is not conservatism for its own
+// sake: `__dmask` is what distinguishes a dead cell from an absent one, and the comment on it in
+// this header says plainly that losing the distinction resurrects deleted data. A projection is
+// supposed to make a read cheaper, not change what the surviving columns mean, so the channels that
+// every column depends on are not the projection's to drop.
+//
+// Skipping a leaf makes its column_data come back flagged `skipped`, which reassemble() treats as
+// "no value in this leaf for any row of this window" -- the right answer for a column the caller
+// did not ask for, and the reason this needs no new decode path.
+std::vector<uint8_t> projection_skip_mask(const mapped_schema& ms,
+                                          const std::vector<bool>& want_regular);
+
 // Shred rows into Parquet columns according to `ms`.
 std::vector<column_data> shred(const mapped_schema& ms,
                                const std::vector<cql_column>& cols,

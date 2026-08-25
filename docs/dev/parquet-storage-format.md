@@ -8860,6 +8860,61 @@ The honest summary of the whole read-path investigation: the point read went fro
 format to 1.6× by removing per-reader repetition, and the scan's 8× was never in the decoder at all
 — it was in the interface, and it took an interface change to reach it.
 
+### 10.46 Projection pushdown, and what it is actually worth — 2026-08-25
+
+§10.30 measured that selecting one column of five moved what a pq scan reads by 1.6 %, **in the
+wrong direction**, and called it giving up the format's second largest advantage. The batch reader
+is where it becomes possible, because a column chunk is its own contiguous extent: skipping a column
+can skip its bytes.
+
+`projection_skip_mask()` lives in `schema_mapping.cc`, where the knowledge of what a leaf means
+lives. It skips only the **per-column** leaves of unwanted columns — value (whole group for a
+collection, six leaves for a counter), plus that column's `ts_exc`, `l1_ttl`, `l1_ldt`, `ct_ts`,
+`ct_ldt` and L0 metadata quartet. Every key leaf and every **shared** channel is kept regardless of
+how narrow the projection is, and that is not caution for its own sake: `__dmask` is what
+distinguishes a dead cell from an absent one, and this document already records that losing the
+distinction resurrects deleted data. A projection makes a read cheaper; it does not get to change
+what the surviving columns mean.
+
+**What it is worth depends entirely on table width, and the reason is worth stating.** The projected
+read costs keys + shared metadata + one column, which is a *constant* — so the wider the table, the
+larger the saving:
+
+| regular columns | bytes for a 1-column scan | share of the full read |
+|---|---|---|
+| 5 | 116 506 | 24.2 % |
+| 13 | 116 506 | 18.6 % |
+| 29 | 116 506 | 12.7 % |
+| 65 | 116 506 | **7.4 %** |
+
+116 506 bytes in every row: that is the fixed cost, and it is why a narrow schema gains little. On
+`pq_schema` (4 regular columns, small values) a 1-column projection read **97.2 %** of the bytes —
+the file is almost entirely keys and shared channels, so there was nothing to skip. Anyone quoting a
+projection number without saying how wide the table was is quoting noise.
+
+**At width, it compounds with the batch reader into something large.** 8 000 partitions × 5 rows,
+65 regular columns:
+
+| | time |
+|---|---|
+| reader full scan, building mutations | 1 822.7 ms |
+| batch reader, all columns | 124.4 ms (**14.65×**) |
+| batch reader, 1 of 65 columns | **25.1 ms** |
+
+Two comparisons, and both are honest as long as they are labelled. Same work, all columns:
+**14.65×**. The query a user actually writes — `SELECT one_column` — against what happens today,
+which reads all 65 because neither path pushes projection down: **72.6×**, on 7.4 % of the I/O.
+
+This is the case §10.30's C6 gate and the deck's "compressible, wide, time-series" framing were
+always pointing at. It is also where the honest caveat from §10.45 bites hardest: 25.1 ms is
+throughput at the *reader*, and a CQL client still needs a result built. The gap between 72.6× at
+the reader and whatever a client sees is now the single largest unmeasured quantity in this
+document.
+
+Also fixed here: `batch_reader::init()` is public. `schema_mapping()` describes the file, so it is
+empty until the footer is read — and a consumer needs the mapping to *build* a projection, which
+made the lazy-init version circular.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

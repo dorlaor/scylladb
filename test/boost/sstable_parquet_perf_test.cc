@@ -624,6 +624,30 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_columnar_scan_floor) {
         }
         const double batch_ms = duration<double, std::milli>(clk::now() - t0).count();
 
+        // And the same scan projected down to one regular column, which is what a columnar format
+        // is supposed to make cheap and what 10.30 measured as not working on either path.
+        uint64_t full_bytes = 0, narrow_bytes = 0;
+        double narrow_ms = 0;
+        size_t n_regular = 0;
+        {
+            auto br = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit());
+            br->init().get();
+            n_regular = br->schema_mapping().n_regular;
+            while (auto b = br->next().get()) { }
+            full_bytes = br->bytes_read();
+            br->close().get();
+
+            sstables::parquet::projection proj;
+            proj.want_regular.assign(n_regular, false);
+            if (n_regular) { proj.want_regular[0] = true; }
+            auto t1 = clk::now();
+            auto nr = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit(), proj);
+            while (auto b = nr->next().get()) { }
+            narrow_ms = duration<double, std::milli>(clk::now() - t1).count();
+            narrow_bytes = nr->bytes_read();
+            nr->close().get();
+        }
+
         BOOST_REQUIRE_GT(values, 0u);
         BOOST_REQUIRE_NE(checksum, 0.0);
         BOOST_REQUIRE_EQUAL(bchecksum, checksum);
@@ -639,6 +663,11 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_columnar_scan_floor) {
         std::printf("  headroom from not building mutations: %.2fx floor, %.2fx via batch reader\n",
                     reader_ms / columnar_ms, reader_ms / batch_ms);
         std::printf("  (batches %zu, batch rows %zu)\n", batches, batch_rows);
+        std::printf("  projection to 1 of %zu regular columns: %llu -> %llu bytes (%.1f%%),"
+                    " %.1f ms\n",
+                    n_regular, (unsigned long long)full_bytes, (unsigned long long)narrow_bytes,
+                    full_bytes ? 100.0 * double(narrow_bytes) / double(full_bytes) : 0.0,
+                    narrow_ms);
         std::printf("  (partitions via reader %zu, rows via columnar %zu, values %zu)\n",
                     rows_via_reader, rows_via_columnar, values);
         std::printf("  caveats: the floor row excludes read I/O (file pre-read into memory); the\n"

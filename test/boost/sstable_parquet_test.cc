@@ -5117,6 +5117,85 @@ SEASTAR_THREAD_TEST_CASE(test_pq_batch_reader_agrees_with_the_mutation_reader) {
     }).get();
 }
 
+// Projection: a narrow scan reads less, and the columns it keeps are unchanged.
+//
+// This is the property design doc 10.30 found missing on both paths -- selecting one column of five
+// moved what a pq scan read by 1.6 %, in the wrong direction. A columnar format that cannot skip
+// unread columns is giving up its second largest advantage, so the two halves are asserted
+// separately: the bytes must actually fall, and the surviving values must be bit-identical to what
+// a full read produced.
+//
+// The second half is the one that could go wrong quietly. projection_skip_mask() keeps every key
+// leaf and every shared metadata channel precisely because `__dmask` is what tells a dead cell from
+// an absent one, and dropping it would resurrect deleted data rather than merely returning less.
+SEASTAR_THREAD_TEST_CASE(test_pq_batch_reader_projection_reads_less_and_changes_nothing) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 4000, 2);
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        // Everything, as the reference.
+        auto full = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit());
+        full->init().get();
+        const size_t n_regular = full->schema_mapping().n_regular;
+        BOOST_REQUIRE_GT(n_regular, 1u);
+
+        std::vector<std::vector<sstables::parquet::row>> full_rows;
+        while (auto b = full->next().get()) {
+            full_rows.push_back(sstables::parquet::reassemble(
+                    full->schema_mapping(), full->columns(), b->columns, size_t(b->rows)));
+        }
+        const uint64_t full_bytes = full->bytes_read();
+        full->close().get();
+        BOOST_REQUIRE_GT(full_bytes, 0u);
+        BOOST_REQUIRE(!full_rows.empty());
+
+        // Just the first regular column.
+        sstables::parquet::projection proj;
+        proj.want_regular.assign(n_regular, false);
+        proj.want_regular[0] = true;
+        auto narrow = sstables::parquet::make_batch_reader(sst, s, env.make_reader_permit(), proj);
+
+        size_t batch = 0, compared = 0;
+        while (auto b = narrow->next().get()) {
+            BOOST_REQUIRE_LT(batch, full_rows.size());
+            auto rows = sstables::parquet::reassemble(
+                    narrow->schema_mapping(), narrow->columns(), b->columns, size_t(b->rows));
+            const auto& ref = full_rows[batch];
+            BOOST_REQUIRE_EQUAL(rows.size(), ref.size());
+            for (size_t i = 0; i < rows.size(); ++i) {
+                // The key, and the one projected column's cell, must be exactly what the full read
+                // gave. Everything else is expected to differ -- that is what projecting means.
+                BOOST_REQUIRE(rows[i].key == ref[i].key);
+                auto a = rows[i].cells.find(0);
+                auto b2 = ref[i].cells.find(0);
+                BOOST_REQUIRE_EQUAL(a != rows[i].cells.end(), b2 != ref[i].cells.end());
+                if (a != rows[i].cells.end() && b2 != ref[i].cells.end()) {
+                    BOOST_REQUIRE_EQUAL(a->second.live, b2->second.live);
+                    BOOST_REQUIRE_EQUAL(a->second.timestamp, b2->second.timestamp);
+                    BOOST_REQUIRE(a->second.v.has_value() == b2->second.v.has_value());
+                    if (a->second.v && b2->second.v) {
+                        BOOST_REQUIRE(*a->second.v == *b2->second.v);
+                    }
+                    ++compared;
+                }
+            }
+            ++batch;
+        }
+        const uint64_t narrow_bytes = narrow->bytes_read();
+        narrow->close().get();
+
+        BOOST_REQUIRE_EQUAL(batch, full_rows.size());
+        BOOST_REQUIRE_GT(compared, 0u);
+        // The point of the whole exercise.
+        BOOST_REQUIRE_LT(narrow_bytes, full_bytes);
+        testlog.info("projection: {} bytes for 1 of {} regular columns against {} for all ({:.1f}%)",
+                     narrow_bytes, n_regular, full_bytes,
+                     100.0 * double(narrow_bytes) / double(full_bytes));
+    }).get();
+}
+
 // A bigint partition key, end to end: the partition sequence must survive the round trip.
 //
 // The bug this pins is described in full at `test_delta_binary_packed_wide_residual_widths`

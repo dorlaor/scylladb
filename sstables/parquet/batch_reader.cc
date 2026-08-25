@@ -13,6 +13,7 @@
 #include "schema/schema.hh"
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/when_all.hh>
 
 #include <cstring>
 #include <limits>
@@ -26,6 +27,11 @@ class pq_batch_reader final : public batch_reader {
     shared_sstable _sst;
     schema_ptr _schema;
     reader_permit _permit;
+    std::optional<projection> _projection;
+    // One byte per leaf, non-zero meaning "not wanted". Empty when reading everything.
+    std::vector<uint8_t> _skip;
+    // Bytes actually read, so a projection's saving is observable rather than asserted.
+    uint64_t _bytes_read = 0;
 
     bool _init = false;
     format::file_metadata _md;
@@ -37,47 +43,80 @@ class pq_batch_reader final : public batch_reader {
     size_t _next_rg = 0;
 
 public:
-    pq_batch_reader(shared_sstable sst, schema_ptr s, reader_permit permit)
-        : _sst(std::move(sst)), _schema(std::move(s)), _permit(std::move(permit)) {}
+    pq_batch_reader(shared_sstable sst, schema_ptr s, reader_permit permit,
+                    std::optional<projection> proj)
+        : _sst(std::move(sst)), _schema(std::move(s)), _permit(std::move(permit))
+        , _projection(std::move(proj)) {}
+
+    uint64_t bytes_read() const override { return _bytes_read; }
 
     const mapped_schema& schema_mapping() const override { return _ms; }
     const std::vector<cql_column>& columns() const override { return _cols; }
 
     future<> close() override { return make_ready_future<>(); }
 
+    future<> init() override {
+        if (_init) { return make_ready_future<>(); }
+        return do_init();
+    }
+
     future<std::optional<column_batch>> next() override {
-        if (!_init) { co_await init(); }
+        if (!_init) { co_await do_init(); }
         if (_next_rg >= _md.row_groups.size()) { co_return std::nullopt; }
         const size_t rg = _next_rg++;
         const auto& g = _md.row_groups[rg];
 
-        // The group's own extent: from the first byte of its first chunk to the last byte of its
-        // last. Chunks of a group are contiguous, so this is one sequential read -- the same shape
-        // the mutation reader's streaming path uses, and the reason a scan is not I/O-bound.
-        int64_t lo = std::numeric_limits<int64_t>::max(), hi = 0;
-        for (const auto& cc : g.columns) {
-            if (!cc.meta) { throw std::runtime_error("pq batch: column chunk without metadata"); }
-            const auto& cm = *cc.meta;
+        // One extent per wanted column chunk, rather than one spanning the whole group.
+        //
+        // Reading the group whole is the right shape when every column is wanted -- the chunks are
+        // contiguous, so it is one sequential read. It is the wrong shape for a projection: a
+        // column's chunk is its own extent, so skipping a column can skip its bytes, and that is
+        // the entire point of a columnar format. Unwanted leaves are marked `absent`, which is how
+        // decode_columns() is told not to look at them.
+        std::vector<format::column_input> in(g.columns.size());
+        struct want_extent { size_t col; uint64_t off; size_t len; };
+        std::vector<want_extent> want;
+        want.reserve(g.columns.size());
+        for (size_t c = 0; c < g.columns.size(); ++c) {
+            if (!g.columns[c].meta) {
+                throw std::runtime_error("pq batch: column chunk without metadata");
+            }
+            if (c < _skip.size() && _skip[c]) {
+                in[c].absent = true;
+                continue;
+            }
+            const auto& cm = *g.columns[c].meta;
             const int64_t start = cm.dictionary_page_offset ? *cm.dictionary_page_offset
                                                             : cm.data_page_offset;
-            lo = std::min(lo, start);
-            hi = std::max(hi, start + cm.total_compressed_size);
+            if (cm.total_compressed_size <= 0) {
+                in[c].absent = true;
+                continue;
+            }
+            want.push_back({c, uint64_t(start), size_t(cm.total_compressed_size)});
         }
-        if (lo >= hi) { co_return std::nullopt; }
+        if (want.empty()) { co_return std::nullopt; }
 
-        auto buf = co_await _sst->data_read(uint64_t(lo), size_t(hi - lo), _permit);
-        auto image = std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
+        std::vector<future<temporary_buffer<char>>> fs;
+        fs.reserve(want.size());
+        for (const auto& e : want) { fs.push_back(_sst->data_read(e.off, e.len, _permit)); }
+        auto held = co_await when_all_succeed(fs.begin(), fs.end());
+        for (size_t i = 0; i < want.size(); ++i) {
+            _bytes_read += held[i].size();
+            in[want[i].col].pages = std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(held[i].get()), held[i].size());
+            in[want[i].col].first_row = 0;
+            in[want[i].col].pages_file_offset = int64_t(want[i].off);
+        }
 
         column_batch out;
         out.first_row = _rg_start[rg];
         out.rows = g.num_rows;
-        out.columns = format::read_row_range(image, lo, _md, rg, 0, g.num_rows);
+        out.columns = format::decode_columns(in, _md, rg, 0, g.num_rows);
         co_return std::move(out);
     }
 
 private:
-    future<> init() {
+    future<> do_init() {
         _init = true;
         if (_sst->get_version() != sstable_version_types::pq) {
             throw std::runtime_error("pq batch: not a parquet sstable");
@@ -111,6 +150,10 @@ private:
         _cols = columns_of(*_schema);
         _ms = recover_mapped_schema(_md, _cols);
 
+        if (_projection) {
+            _skip = projection_skip_mask(_ms, _projection->want_regular);
+        }
+
         _rg_start.resize(_md.row_groups.size() + 1, 0);
         for (size_t i = 0; i < _md.row_groups.size(); ++i) {
             _rg_start[i + 1] = _rg_start[i] + _md.row_groups[i].num_rows;
@@ -122,8 +165,10 @@ private:
 } // namespace
 
 std::unique_ptr<batch_reader> make_batch_reader(shared_sstable sst, schema_ptr s,
-                                                reader_permit permit) {
-    return std::make_unique<pq_batch_reader>(std::move(sst), std::move(s), std::move(permit));
+                                                reader_permit permit,
+                                                std::optional<projection> proj) {
+    return std::make_unique<pq_batch_reader>(std::move(sst), std::move(s), std::move(permit),
+                                            std::move(proj));
 }
 
 } // namespace sstables::parquet

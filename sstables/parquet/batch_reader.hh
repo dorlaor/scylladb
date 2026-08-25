@@ -60,15 +60,35 @@ struct column_batch {
 class batch_reader {
 public:
     virtual ~batch_reader() = default;
+    // Reads and parses the footer. Idempotent, and `next()` calls it anyway -- it is public
+    // because `schema_mapping()` and `columns()` describe the *file*, so they are empty until the
+    // footer has been read, and a consumer that wants to know the shape before reading (to build a
+    // projection, say) needs a way to ask.
+    virtual future<> init() = 0;
     // The next batch, or nullopt at end of file.
     virtual future<std::optional<column_batch>> next() = 0;
     virtual future<> close() = 0;
-    // What the columns mean. Stable for the reader's lifetime.
+    // What the columns mean. Valid after init(); stable thereafter.
     virtual const mapped_schema& schema_mapping() const = 0;
     virtual const std::vector<cql_column>& columns() const = 0;
+    // Bytes fetched so far. Exists so a projection's saving is measured rather than claimed.
+    virtual uint64_t bytes_read() const = 0;
+};
+
+// Which regular columns the consumer wants, in mapped_schema::value_leaf order. Empty means all of
+// them, which is what a reader created without a projection gets.
+//
+// This is the thing a columnar format is supposed to be able to do and neither path could: §10.30
+// measured that selecting one column of five moved what a pq scan reads by 1.6 %, in the wrong
+// direction. A projection here skips both the decode *and* the read of the leaves it does not want,
+// because a column chunk is a contiguous extent -- so a narrow scan finally costs less than a wide
+// one.
+struct projection {
+    std::vector<bool> want_regular;
 };
 
 // Throws if the sstable is not `pq`, or if it is encrypted.
-std::unique_ptr<batch_reader> make_batch_reader(shared_sstable, schema_ptr, reader_permit);
+std::unique_ptr<batch_reader> make_batch_reader(shared_sstable, schema_ptr, reader_permit,
+                                                std::optional<projection> = std::nullopt);
 
 } // namespace sstables::parquet

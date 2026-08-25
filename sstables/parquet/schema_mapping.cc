@@ -1092,6 +1092,49 @@ static std::optional<collection_cell> read_collection(
     return out;
 }
 
+std::vector<uint8_t> projection_skip_mask(const mapped_schema& ms,
+                                          const std::vector<bool>& want_regular) {
+    std::vector<uint8_t> skip(ms.leaf_count(), 0);
+    const size_t n = std::min(want_regular.size(), ms.value_leaf.size());
+
+    auto mark = [&] (size_t leaf) {
+        // Never a key leaf. A projection that dropped one would not return fewer columns, it would
+        // return rows it could not identify.
+        if (leaf < ms.n_key || leaf >= skip.size()) { return; }
+        skip[leaf] = 1;
+    };
+    auto mark_opt = [&] (const std::vector<std::optional<size_t>>& v, size_t k) {
+        if (k < v.size() && v[k]) { mark(*v[k]); }
+    };
+
+    for (size_t k = 0; k < n; ++k) {
+        if (want_regular[k]) { continue; }
+
+        // The value. A collection contributes a group of leaves that travel together -- five, or
+        // six for a counter, whose extra `clock` is appended after __ldt -- so the whole group goes
+        // or none of it does.
+        const size_t v = ms.value_leaf[k];
+        size_t span = 1;
+        if (k < ms.value_is_collection.size() && ms.value_is_collection[k]) {
+            span = (k < ms.value_is_counter.size() && ms.value_is_counter[k]) ? 6 : 5;
+        }
+        for (size_t i = 0; i < span; ++i) { mark(v + i); }
+
+        // This column's own metadata leaves. Each is per-column, so dropping it changes only this
+        // column's reconstruction -- which the caller has already said it does not want.
+        mark_opt(ms.ts_exc_index, k);
+        mark_opt(ms.l1_ttl_index, k);
+        mark_opt(ms.l1_ldt_index, k);
+        mark_opt(ms.ct_ts_index, k);
+        mark_opt(ms.ct_ldt_index, k);
+        // L0 gives each column four contiguous metadata leaves.
+        if (k < ms.meta_base_index.size() && ms.meta_base_index[k]) {
+            for (size_t i = 0; i < 4; ++i) { mark(*ms.meta_base_index[k] + i); }
+        }
+    }
+    return skip;
+}
+
 std::vector<row> reassemble(const mapped_schema& ms,
                             const std::vector<cql_column>& cols,
                             const std::vector<column_data>& cd,
