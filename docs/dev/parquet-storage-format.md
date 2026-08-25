@@ -8448,7 +8448,7 @@ format, and the profile says where:
 | phase | share | why it is avoidable |
 |---|---|---|
 | `offset_index` | 43.6 %, 285 µs/read | `load_offset_indexes()` caches on `_oi_rg`, but each point read builds a fresh reader, so an immutable structure is re-read and re-parsed once per read rather than once per row group |
-| `decode_cpu` | 42.8 %, of which `decompress` is 94.7 % | 9 decompressions per read on a 5-leaf schema — about half of them the same dictionary page, re-inflated by every reader |
+| `decode_cpu` | 42.8 %, of which `decompress` is 94.7 % | 9 decompressions per read on a 5-leaf schema. **The "about half of them are the same dictionary page" this row used to claim is measured false in §10.40** — the dictionary is 1 call and 1.2 µs. It is 8 *data* pages at ~31 µs, each one a whole column chunk inflated to answer 5 rows |
 
 Both are per-reader repetitions of work over immutable file content, so both want a cache on the
 *sstable* rather than the reader. Neither is a property of Parquet.
@@ -8502,10 +8502,11 @@ that the remaining reads simply reabsorb. **An I/O phase's share is not a budget
 it will save. A CPU phase's is** — those contain no suspension point.
 
 Which redirects the next step. `decode_cpu` is 49.5 % of a point read and 95.4 % of it is
-`decompress`, and that *is* a CPU phase, so its share can be spent. Nine decompressions per read on
-a 5-leaf schema, roughly half of them the same dictionary page re-inflated by every reader: the same
-per-reader repetition over immutable bytes as this section fixed, in the phase where the share is
-real.
+`decompress`, and that *is* a CPU phase, so its share can be spent. **The guess made here about
+*why* — "roughly half of them the same dictionary page re-inflated by every reader" — is wrong, and
+§10.40 measures it: the dictionary is 0.4 % of page decode.** The cost is eight *data* pages per
+read. Recorded rather than quietly corrected because it is the third time in this section that a
+phase label has been read as a mechanism, and it was wrong all three times.
 
 Kept despite the modest local number, for two reasons. It removes a serialised device round trip,
 and this box has a warm-ish loaded disk rather than a cluster's real device latency and queue depth
@@ -8514,6 +8515,58 @@ and this box has a warm-ish loaded disk rather than a cluster's real device late
 `PQ_OFFSET_INDEX_CACHE=0` and passes with it on. It has to force a cold start, because
 `make_sstable_containing()` validates what it writes and that validation warms the cache — the
 first version of the test asserted a miss and saw a hit.
+
+### 10.40 The point read's real cost is whole-page inflation — 2026-08-25
+
+`decode_cpu` is ~43 % of a point read and `decompress` is ~93 % of that, and §10.38 and §10.39 both
+guessed the dictionary page was about half of it. Splitting the phase says otherwise:
+
+| | calls per read | µs/call | share of page decode |
+|---|---|---|---|
+| `decompress` (data pages) | 8 | 31.0 | **92.5 %** |
+| `decompress_dict` | 1 | 1.2 | 0.4 % |
+
+**The dictionary is free.** Caching it, which is what §10.39 named as the next lever, would be worth
+0.2 % of a point read. That guess is now retracted in both sections.
+
+The cost is eight *data* page decompressions, and the reason each costs 31 µs is that at shipping
+defaults `page_rows` (8 192) exceeds `rows_per_row_group` (5 000), so the writer's
+`min(page_values, rows in group)` makes **a page the whole column chunk**. zstd cannot decompress
+part of a frame, so answering a 5-row point read inflates ~5 000 rows per column. §10.29's "Defect
+2" fixed the *decode* half of this by giving the decoders a leading skip; it could not fix the
+decompression, which is all-or-nothing by construction.
+
+Confirmed by sweeping the page size, which moves the decompression cost per call almost linearly
+with it:
+
+| `page_rows` | point read | `decompress` µs/call | size vs row format |
+|---|---|---|---|
+| default (page = chunk) | 647.3 µs | 30.7 | 0.320× |
+| 2 048 | 342.8 µs | 12.9 | 0.342× |
+| 1 024 | 266.7 µs | 6.8 | 0.361× |
+| 512 | **218.3 µs** | 4.0 | 0.407× |
+
+So **2.97× on the point read is available from page size alone** — the largest single lever found in
+this whole investigation, and it needs no code. It is not free: the file grows 27 % (0.320× → 0.407×,
+still 2.5× smaller than the row format), which is §10.32's size/latency conflict with a mechanism
+attached at last. The default is deliberately not being changed here.
+
+**The better version of the same win is a decompressed-page cache**, because it trades memory —
+which is evictable — instead of file size, which is not. The arithmetic is favourable for exactly
+the workload that hurts today: 1 000 random point reads over 20 000 partitions land in 20 row
+groups, so each page is decompressed once and reused ~50 times. Two independent lines of evidence
+agree on the size of the prize: 8 × 31 µs = 245 µs of a 647 µs read directly, and the page sweep
+independently returning 429 µs when pages shrink tenfold.
+
+It is also the asymmetry with the row format, stated properly. mx decompresses a
+`chunk_length_in_kb` chunk — 4 kB by default — to answer a row. pq decompresses a 5 000-row page.
+Both are "decompress the unit you stored"; the units differ by three orders of magnitude. Nothing
+about Parquet requires the large unit, and the format already carries the OffsetIndex needed to
+address a small one.
+
+Scope of the claim: this is a point-read result. It does not touch §10.38's finding that a scan is
+~two thirds shared mutation-building on both paths, where the ceiling from all parquet decode work
+is 1.19×.
 
 ## 11. Open questions
 

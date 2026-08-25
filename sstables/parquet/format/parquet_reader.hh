@@ -68,7 +68,10 @@ encrypted_footer parse_encrypted_footer(std::span<const uint8_t> image, const en
 // answer before (design doc 10.27, 10.28). Same switch as the reader's own profile,
 // PQ_READER_PROFILE=1, and likewise always compiled.
 enum class dphase : size_t {
-    decompress,     // the codec, on a whole page: zstd cannot decompress part of a frame
+    decompress,      // the codec, on a whole data page: zstd cannot decompress part of a frame
+    decompress_dict, // the same codec on a *dictionary* page, split out because a dictionary is
+                     // shared by every read of its column chunk while a data page is not -- so
+                     // this share is what a cache could remove and the one above is not
     levels,         // repetition and definition level streams, RLE-decoded for the whole page
     values,         // the wanted slice of the page's values, plus any skip the encoding forces
     expand_nulls,   // re-expanding a sparse column to one entry per slot

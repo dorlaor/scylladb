@@ -64,7 +64,7 @@ void decode_profile_reset() {
 std::string decode_profile_report() {
     if (!dprof::enabled) { return {}; }
     static constexpr const char* names[] = {
-        "decompress", "levels", "values", "expand_nulls", "trim", "plan",
+        "decompress", "decompress_dict", "levels", "values", "expand_nulls", "trim", "plan",
     };
     static_assert(std::size(names) == size_t(dphase::_count));
     uint64_t total = 0;
@@ -89,8 +89,9 @@ std::string decode_profile_report() {
 
 namespace {
 
-std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t expected) {
-    dtimer _dt{dphase::decompress};
+std::vector<uint8_t> decompress(std::span<const uint8_t> in, codec c, size_t expected,
+                                dphase phase = dphase::decompress) {
+    dtimer _dt{phase};
     switch (c) {
     case codec::uncompressed:
         return {in.begin(), in.end()};
@@ -373,7 +374,8 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
             if (dph.type != page_type::dictionary_page || !dph.dict) {
                 throw decode_error("dictionary span does not start with a dictionary page");
             }
-            auto raw = decompress(dbody, cm.compression, size_t(dph.uncompressed_page_size));
+            auto raw = decompress(dbody, cm.compression, size_t(dph.uncompressed_page_size),
+                                  dphase::decompress_dict);
             const size_t n = size_t(dph.dict->num_values);
             switch (cm.type) {
             case phys_type::int32:      dict_i32 = decode_plain<int32_t>(raw, n); break;
@@ -454,7 +456,8 @@ std::vector<column_data> decode_columns(std::span<const column_input> in,
 
             if (ph.type == page_type::dictionary_page) {
                 if (!ph.dict) { throw decode_error("dictionary page without header"); }
-                auto raw = decompress(body, cm.compression, size_t(ph.uncompressed_page_size));
+                auto raw = decompress(body, cm.compression, size_t(ph.uncompressed_page_size),
+                                      dphase::decompress_dict);
                 const size_t n = size_t(ph.dict->num_values);
                 switch (cm.type) {
                 case phys_type::int32:      dict_i32 = decode_plain<int32_t>(raw, n); break;
