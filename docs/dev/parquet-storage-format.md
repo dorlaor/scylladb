@@ -8029,7 +8029,9 @@ Scanning 2 % of the token ring — 19.9 M rows — at consistency ONE with `BYPA
 Disk operations: 329 859 against 147 590, so 2.23× fewer as well as 4× smaller. Both arms ran
 through the same Python client, so a client bottleneck would have made them *equal*; the divergence
 is server-side, and for pq it is decode CPU — consistent with §10.29's finding that 94.6 % of page
-decode is zstd inflating whole pages. **The scan advantage is an I/O advantage, not a time
+decode is zstd inflating whole pages. **That attribution is withdrawn by §10.38**: the 94.6 % is a
+point-read figure, and on a scan zstd is 3.6 % of the time. The divergence is real and measured; its
+cause is not decode CPU and is not yet known. **The scan advantage is an I/O advantage, not a time
 advantage.** That is worth having where storage is I/O-bound or billed per byte, and it is a loss
 where CPU is the scarce resource. §10.26's figure is not withdrawn; it stands for its own scale, and
 the two disagree because 8 M rows in one file is not 1 B rows across 2 335 sstables.
@@ -8308,8 +8310,27 @@ build predates both fixes. A fault needing a deeper in-flight pipeline than this
 
 Worth recording separately: **TRUNCATE timed out** in the two earlier runs of this test — "Timeout
 during TRUNCATE TABLE" — and succeeded only in the run where a real compaction was cancelled. The
-AWS report also described truncate appearing to hang. That is unexplained and is not the same thing
-as the segfault.
+AWS report also described truncate appearing to hang.
+
+**Measured, and it is not a hang.** The obvious hypothesis was that a saturating write load was
+what pushed TRUNCATE past the client timeout, since that is what differed between the runs. It is
+wrong, and in the opposite direction. Two arms on the same table and cluster
+(`~/pq-lab/truncate_timeout_probe.sh`):
+
+| arm | result |
+|---|---|
+| TRUNCATE while a `latte` load saturates the cluster | **OK in 27.6 s** |
+| TRUNCATE with the load stopped and the cluster idle | **OK in 132.8 s** |
+
+So TRUNCATE on this cluster costs anywhere from tens of seconds to over two minutes, and the idle
+case was the slow one. 132.8 s against the 150 s client timeout the crash test used is the whole
+explanation for the earlier "timeouts": a normal-but-slow TRUNCATE finishing just inside or just
+outside an arbitrary client deadline. It is not a wedge, and it has nothing to do with cancelling a
+`pq` compaction — the run where a compaction *was* cancelled mid-read was the fast one.
+
+Scope: four nodes on one box at `--smp 2` with compaction throttled to 1 MB/s, and TRUNCATE is a
+global topology operation, so the absolute durations here should not be read as representative of a
+real cluster. What transfers is that load is not the variable and cancellation is not the cause.
 
 Four setup faults were caught before they could produce a false pass, and they are the reusable part:
 the datacenter is `dc1` not `datacenter1`; a DOWN fourth node in the ring fails TRUNCATE for a
@@ -8345,6 +8366,92 @@ deadlocked, and it made the phase's strongest assertion an encoding of that work
 runs first, on a cold cache, and passes at 1 200 rows, with the wrong-key controls still failing
 loudly on both the point read and the scan rather than returning empty. One part of B4 is untouched:
 rotation is still exercised only on `ReplicatedKeyProviderFactory`, which logs that it is deprecated.
+
+### 10.38 Where scan time actually goes, both paths instrumented — 2026-08-25
+
+The scan gap of §10.30 — 2.87× slower at a billion rows — has never been attributed. §10.30 blames
+decode CPU and cites §10.29 for "94.6 % of page decode is zstd inflating whole pages". **That
+citation does not hold.** §10.29 measured *point reads*, and the figure it belongs to is a point
+read: with per-operation profiles the same corpus gives `decompress` **94.7 % of page decode on
+point reads and 65.2 % on the scan** — and on the scan, page decode is only 8.8 ms of a 242 ms
+scan, so zstd is **3.6 % of scan time**, not 94.6 %. A point-read finding was carried into a scan
+claim.
+
+**What the instrumentation needed.** `PQ_READER_PROFILE=1` existed but reported once at the end of
+`perf_pq_vs_default`, so a single table covered the write, both scans and 1 000 point reads at once
+— and the two operations are differently shaped (a scan streams row groups through `rg_fetch` /
+`rg_decode`, a point read fetches pages through `page_fetch` / `decode_cpu`), so the merged report
+showed all four phases and attributed neither. It now resets per operation and prints one block
+each. Three further knobs, all defaulting to present behaviour: `PQ_PERF_SCAN_REPEATS` (a single
+scan is both noisy and invisible under the two writes in a `perf record`), `PQ_PERF_ARM` (a
+symbol-level profile cannot separate two readers sharing one process), and `PQ_PERF_TEXT_BYTES`
+(below).
+
+**The scan, 20 000 partitions × 5 rows, phases:**
+
+| phase | share of instrumented |
+|---|---|
+| `reassemble` | 45.6 % |
+| `rg_fetch` | 40.3 % |
+| `rg_decode` | 13.9 % |
+
+and the instrumented total is **64.2 ms of a 242 ms scan — 73 % of the scan is inside no timer at
+all.** That is where `perf record` on one arm at a time comes in, and it is the important result:
+
+| bucket | pq | row format |
+|---|---|---|
+| mutation/cell machinery | 29.9 % | 33.5 % |
+| key encode/compare | 12.7 % | 11.8 % |
+| bytes/buffers | 10.9 % | 12.3 % |
+| allocator | 10.4 % | 10.2 % |
+| **format-specific read** | **16.0 %** (reader 6.0 + decode 5.9 + zstd 4.1) | **17.8 %** (mx 16.1 + lz4 1.7) |
+
+**Roughly two thirds of a scan, on both paths, is building mutation fragments — code the two
+share.** The format-specific halves are within 1.8 points of each other, which is why the local
+scan is at parity (0.94–0.97×). The consequence for optimisation is a hard ceiling: **zeroing every
+line of parquet decode, zstd included, would make the scan 1.19× faster.** A 5× scan improvement is
+not reachable by optimising the parquet read path, because the parquet read path is not what a scan
+spends its time on. It would take a vectorised path that does not build a mutation per row — which
+is a real opportunity for a columnar format, and a much larger change than tuning a decoder.
+
+**The 2.87× does not reproduce locally, and two candidate explanations are now excluded.** Per row
+the row format agrees across the two environments (2.5 µs local, 3.0 µs cluster) while pq does not
+(2.4 µs local, 8.7 µs cluster), so it is pq that changes, not the harness.
+
+- *Per-sstable fixed cost* — the cluster had 2 335 sstables against one here. Measured per reader:
+  `schema_recover` 8.9 µs + `rg_materialise` 7.9 µs ≈ 17 µs, so 2 335 of them is ~40 ms against a
+  174 s scan. Excluded.
+- *Compressibility* — the local corpus is deliberately compressible (3.9 B/row for the row format
+  against the cluster's 24.9), and a decode-bound format should suffer where there is more real
+  data per row. `PQ_PERF_TEXT_BYTES` makes v_txt2 uniform printable ASCII so neither the zstd
+  dictionary nor Parquet's dictionary encoding finds anything:
+
+  | payload bytes | row format B/row | pq B/row | scan ratio |
+  |---|---|---|---|
+  | 0 (default) | 39.9 | 12.8 | 0.95× |
+  | 16 | 53.1 | 22.9 | 0.98× |
+  | 64 | 102.8 | 63.3 | 1.03× |
+  | 256 | 301.0 | 222.8 | 1.12× |
+
+  It moves the ratio the right way and nowhere near far enough — 1.12× at **301 B/row**, an order
+  of magnitude past the cluster corpus. Excluded as the explanation.
+
+What is left is what this harness does not have: a cold cache against real storage, and 2 335 files
+read concurrently rather than one read sequentially. `rg_fetch` is 40 % of the scan *with a warm
+page cache*, and a row-group read is a large single extent — so the untested hypothesis is I/O
+shape, not decode. Until that is measured the 2.87× stands as an observation without a cause, and
+§10.30's decode-CPU attribution should be read as withdrawn.
+
+**Where a large multiple is actually available: the point read.** Same corpus, pq is 12.2× the row
+format, and the profile says where:
+
+| phase | share | why it is avoidable |
+|---|---|---|
+| `offset_index` | 43.6 %, 285 µs/read | `load_offset_indexes()` caches on `_oi_rg`, but each point read builds a fresh reader, so an immutable structure is re-read and re-parsed once per read rather than once per row group |
+| `decode_cpu` | 42.8 %, of which `decompress` is 94.7 % | 9 decompressions per read on a 5-leaf schema — about half of them the same dictionary page, re-inflated by every reader |
+
+Both are per-reader repetitions of work over immutable file content, so both want a cache on the
+*sstable* rather than the reader. Neither is a property of Parquet.
 
 
 ## 11. Open questions

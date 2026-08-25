@@ -117,6 +117,27 @@ schema_ptr perf_schema() {
 // Values with realistic redundancy: a small vocabulary for the text columns and
 // correlated numerics. Random bytes would make every format look identical
 // because nothing would compress -- the same trap section 9 calls out.
+// Bytes of *incompressible* payload to put in v_txt2, replacing its low-cardinality string.
+//
+// Default 0, which leaves the generated data byte-for-byte what it has always been, because every
+// figure in section 10.4 was measured against it.
+//
+// It exists because the local corpus is deliberately compressible -- eight words and small
+// integers, 3.9 bytes/row for the row format -- while the cluster corpus of section 10.30 is
+// 24.9 bytes/row. That matters for a decode-bound format: a scan that is at parity locally was
+// 2.87x slower there, and per-row the *row format* agrees across the two (2.5 us against 3.0 us)
+// while pq does not (2.4 us against 8.7 us). Compressibility is the largest difference between the
+// two corpora, and this knob is what makes it a variable instead of a confound.
+int text_bytes() {
+    static const int n = [] {
+        if (const char* e = std::getenv("PQ_PERF_TEXT_BYTES")) {
+            return int(std::max(0L, std::atol(e)));
+        }
+        return 0;
+    }();
+    return n;
+}
+
 utils::chunked_vector<mutation> gen(schema_ptr s, int n_part, int n_rows) {
     static const char* WORDS[] = {"active", "pending", "closed", "archived", "error",
                                   "retry", "queued", "done"};
@@ -138,8 +159,17 @@ utils::chunked_vector<mutation> gen(schema_ptr s, int n_part, int n_rows) {
             put("v_big", long_type->decompose(int64_t(p) * 1000 + r));
             put("v_dbl", double_type->decompose(double(rng() % 100000) / 100.0));
             put("v_txt", utf8_type->decompose(sstring(WORDS[rng() % 8])));
-            put("v_txt2", utf8_type->decompose(
-                    sstring(format("{}/{}/{}", WORDS[rng() % 8], p % 997, r))));
+            if (const int tb = text_bytes(); tb > 0) {
+                // Uniform over the printable ASCII range, so neither the zstd dictionary nor the
+                // Parquet dictionary encoding has anything to find. Drawn from the same `rng` the
+                // rest of the row uses, so the corpus stays deterministic.
+                sstring blob(tb, '\0');
+                for (int i = 0; i < tb; ++i) { blob[i] = char(33 + rng() % 94); }
+                put("v_txt2", utf8_type->decompose(blob));
+            } else {
+                put("v_txt2", utf8_type->decompose(
+                        sstring(format("{}/{}/{}", WORDS[rng() % 8], p % 997, r))));
+            }
             // Low-cardinality, like the SMART counters that make real wide tables wide:
             // the point of these columns is their number, not their content.
             for (int i = 0, n = extra_cols(); i < n; ++i) {
@@ -153,6 +183,30 @@ utils::chunked_vector<mutation> gen(schema_ptr s, int n_part, int n_rows) {
         return a.decorated_key().less_compare(*a.schema(), b.decorated_key());
     });
     return muts;
+}
+
+// How many times to repeat each measured scan. Default 1: this test is enrolled in the standard
+// boost suite, so the default has to stay a smoke test.
+int scan_repeats() {
+    static const int n = [] {
+        if (const char* e = std::getenv("PQ_PERF_SCAN_REPEATS")) {
+            return int(std::max(1L, std::atol(e)));
+        }
+        return 1;
+    }();
+    return n;
+}
+
+// Which formats to measure. "both" (default), "pq", or "default". A single-arm run exists for
+// profiling: `perf record` cannot separate two readers running in one process, and the two paths
+// share enough of the mutation-building machinery that a mixed profile cannot be split by symbol
+// either. It reports no ratios, because with one arm there is nothing to divide by.
+bool arm_enabled(const char* which) {
+    static const sstring sel = [] {
+        const char* e = std::getenv("PQ_PERF_ARM");
+        return sstring(e && *e ? e : "both");
+    }();
+    return sel == "both" || sel == which;
 }
 
 struct result {
@@ -171,6 +225,18 @@ struct result {
     uint64_t  bytes = 0;
     int64_t   scan_peak_kb = 0;  // live-memory high-water during the scan
     size_t    rows = 0;
+    // One profile per operation, when PQ_READER_PROFILE is set.
+    //
+    // The counters behind reader_profile_report() are process-global and additive, so a single
+    // report taken at the end of this function covers the write, both scans and every point read
+    // at once. That is unreadable for anything but a point read: at the sizes a measurement uses,
+    // 1 000 point reads and one full scan land in the same table and the larger simply buries the
+    // smaller. Worse, the two are *differently shaped* -- an unbounded scan streams whole row
+    // groups (rg_fetch, rg_decode) while a point read fetches pages (page_fetch, decode_cpu) --
+    // so a merged report shows all four phases at once and attributes neither operation.
+    //
+    // Reset before each operation and snapshot after, so each block describes exactly one thing.
+    sstring   prof_scan, prof_bscan, prof_point;
 };
 
 result measure(sstables::test_env& env, schema_ptr s,
@@ -187,20 +253,30 @@ result measure(sstables::test_env& env, schema_ptr s,
     r.bytes = sst->ondisk_data_size();
 
     // Full scan. Sample live memory as we go so R-13 is measured, not assumed.
+    //
+    // Repeated PQ_PERF_SCAN_REPEATS times, mean reported. One scan is both noisy and, for a
+    // symbol-level profile, unusable: the two writes dominate the process and a `perf record` of
+    // the whole run attributes most of its samples to the writer. Repeating the scan is what makes
+    // the scan the thing being profiled. The rows and the memory high-water are taken from the
+    // first pass, so neither figure changes with the repeat count.
     const auto before = int64_t(memory::stats().allocated_memory());
     int64_t peak = 0;
+    sstables::parquet::reader_profile_reset();
     t0 = clk::now();
-    {
+    for (int pass = 0; pass < scan_repeats(); ++pass) {
+        size_t seen = 0;
         auto rd = sst->make_reader(s, env.make_reader_permit(), query::full_partition_range,
                                    s->full_slice());
         auto close = deferred_close(rd);
         while (auto m = read_mutation_from_mutation_reader(rd).get()) {
-            ++r.rows;
+            ++seen;
             peak = std::max(peak, int64_t(memory::stats().allocated_memory()) - before);
         }
+        if (pass == 0) { r.rows = seen; }
     }
-    r.scan_ms = duration<double, std::milli>(clk::now() - t0).count();
+    r.scan_ms = duration<double, std::milli>(clk::now() - t0).count() / double(scan_repeats());
     r.scan_peak_kb = peak / 1024;
+    r.prof_scan = sstables::parquet::reader_profile_report();
 
     // The same scan again, over a bounded range that spans every partition in the file.
     // `muts` is sorted by decorated key, so [front, back] is the whole ring segment the
@@ -216,6 +292,7 @@ result measure(sstables::test_env& env, schema_ptr s,
     {
         auto pr = dht::partition_range::make({muts.front().decorated_key(), true},
                                              {muts.back().decorated_key(), true});
+        sstables::parquet::reader_profile_reset();
         t0 = clk::now();
         auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
         auto close = deferred_close(rd);
@@ -223,6 +300,7 @@ result measure(sstables::test_env& env, schema_ptr s,
             ++r.bscan_rows;
         }
         r.bscan_ms = duration<double, std::milli>(clk::now() - t0).count();
+        r.prof_bscan = sstables::parquet::reader_profile_report();
     }
 
     // Point reads, each on a fresh reader so nothing is carried over.
@@ -233,6 +311,7 @@ result measure(sstables::test_env& env, schema_ptr s,
     // decompressing a dictionary page -- so a few cheap reads can flatter the mean badly.
     std::vector<double> samples;
     samples.reserve(point_idx.size());
+    sstables::parquet::reader_profile_reset();
     for (size_t i : point_idx) {
         auto pr = dht::partition_range::make_singular(muts[i].decorated_key());
         auto t1 = clk::now();
@@ -246,6 +325,7 @@ result measure(sstables::test_env& env, schema_ptr s,
     for (double v : samples) { sum += v; }
     r.point_us = sum / double(samples.size());
     r.point_n = samples.size();
+    r.prof_point = sstables::parquet::reader_profile_report();
     std::sort(samples.begin(), samples.end());
     auto pct = [&] (double q) {
         return samples[std::min(samples.size() - 1,
@@ -272,7 +352,11 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         // reads on a shared runner. It asserts nothing about latency, so it cannot fail on a
         // loaded machine; it can only be slow. Small default, big when asked:
         //
-        //   PQ_PERF_PARTITIONS=20000 PQ_PERF_POINTS=10000 ./sstable_parquet_perf_test -c1 -m2G
+        //   PQ_PERF_PARTITIONS=20000 PQ_PERF_POINTS=10000 ./sstable_parquet_perf_test -- -c1 -m2G
+        //
+        // The `--` is required and was missing here: Boost.Test parses the whole command line
+        // first and rejects `-c1` as one of its own parameters, so the documented form exited 200
+        // without running anything.
         //
         // which is what width_curve.sh and any figure quoted in section 10.4 must use. The
         // small default is a smoke test of both writers and the point-read path; it is not a
@@ -306,35 +390,58 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         std::shuffle(point_idx.begin(), point_idx.end(), std::mt19937_64(12345));
         if (point_idx.size() > n_points) { point_idx.resize(n_points); }
 
-        auto def = measure(env, s, muts, sstables::get_highest_sstable_version(), "default (me)", point_idx);
-        auto pq  = measure(env, s, muts, sstable_version_types::pq, "pq (parquet)", point_idx);
-
-        BOOST_REQUIRE_EQUAL(def.rows, size_t(n_part));
-        BOOST_REQUIRE_EQUAL(pq.rows, size_t(n_part));
+        const bool want_def = arm_enabled("default"), want_pq = arm_enabled("pq");
+        result def, pq;
+        if (want_def) {
+            def = measure(env, s, muts, sstables::get_highest_sstable_version(), "default (me)", point_idx);
+            BOOST_REQUIRE_EQUAL(def.rows, size_t(n_part));
+        }
+        if (want_pq) {
+            pq = measure(env, s, muts, sstable_version_types::pq, "pq (parquet)", point_idx);
+            BOOST_REQUIRE_EQUAL(pq.rows, size_t(n_part));
+        }
 
         auto line = [] (const result& r) {
             std::printf("  %-14s  %9.0f  %9.0f  %9.0f  %11.1f  %12llu  %10lld\n",
                         r.label.c_str(), r.write_ms, r.scan_ms, r.bscan_ms, r.point_us,
                         (unsigned long long)r.bytes, (long long)r.scan_peak_kb);
         };
-        std::printf("\n=== pq vs default: %d partitions x %d rows = %d rows ===\n",
-                    n_part, n_rows, n_part * n_rows);
+        std::printf("\n=== pq vs default: %d partitions x %d rows = %d rows"
+                    " (scan mean of %d) ===\n",
+                    n_part, n_rows, n_part * n_rows, scan_repeats());
         std::printf("  %-14s  %9s  %9s  %9s  %11s  %12s  %10s\n",
                     "format", "write ms", "scan ms", "bscan ms", "point us", "data bytes",
                     "scan kB");
-        line(def);
-        line(pq);
+        if (want_def) { line(def); }
+        if (want_pq) { line(pq); }
         std::printf("\n  point-read distribution over %zu uniformly random partitions:\n",
-                    def.point_n);
+                    want_def ? def.point_n : pq.point_n);
         std::printf("  %-14s  %10s  %10s  %10s  %10s\n",
                     "format", "mean us", "p50 us", "p95 us", "p99 us");
         for (const auto& r : {def, pq}) {
+            if (r.label.empty()) { continue; }
             std::printf("  %-14s  %10.1f  %10.1f  %10.1f  %10.1f\n",
                         r.label.c_str(), r.point_us, r.point_p50, r.point_p95, r.point_p99);
         }
-        // Where the pq point read went, when PQ_READER_PROFILE is set. Printed next to the
-        // ratios so the attribution and the number being attributed are read together.
-        std::printf("%s", sstables::parquet::reader_profile_report().c_str());
+        // Where each pq operation went, when PQ_READER_PROFILE is set. Printed next to the
+        // ratios so the attribution and the number being attributed are read together. One block
+        // per operation -- see the note on result::prof_scan for why a merged one says nothing.
+        if (!pq.prof_scan.empty()) {
+            std::printf("\n  --- pq unbounded scan (%zu rows in %.0f ms) ---\n",
+                        pq.rows, pq.scan_ms);
+            std::printf("%s", pq.prof_scan.c_str());
+            std::printf("\n  --- pq bounded scan (%zu rows in %.0f ms) ---\n",
+                        pq.bscan_rows, pq.bscan_ms);
+            std::printf("%s", pq.prof_bscan.c_str());
+            std::printf("\n  --- pq point reads (%zu reads, %.1f us mean) ---\n",
+                        pq.point_n, pq.point_us);
+            std::printf("%s", pq.prof_point.c_str());
+            std::printf("\n");
+        }
+        if (!(want_def && want_pq)) {
+            std::printf("  single-arm run (PQ_PERF_ARM); no ratios\n\n");
+            return;
+        }
         std::printf("  point ratios: mean %.1fx  p50 %.1fx  p95 %.1fx  p99 %.1fx\n",
                     pq.point_us / def.point_us, pq.point_p50 / def.point_p50,
                     pq.point_p95 / def.point_p95, pq.point_p99 / def.point_p99);
