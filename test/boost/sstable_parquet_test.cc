@@ -5004,6 +5004,60 @@ SEASTAR_THREAD_TEST_CASE(test_pq_decompressed_pages_are_cached) {
     }).get();
 }
 
+// A paged read issues no I/O for an extent this sstable has already read.
+//
+// Distinct from test_pq_decompressed_pages_are_cached, and the pair is the point: that one stops the
+// *codec* running twice over the same bytes, this one stops the *read* happening twice. After the
+// first, page_fetch was 73 % of a point read -- the reader was still fetching compressed bytes so
+// that the decode could ignore them in favour of the decompressed form already in memory.
+//
+// Pins the count of fetches rather than a duration, for the same reason as its sibling: on a shared
+// machine a timing assertion is a flake generator, and "the fetches stopped tracking the reads" is
+// the claim.
+SEASTAR_THREAD_TEST_CASE(test_pq_page_extents_are_not_refetched) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        // Same sizing as its sibling, and for the same two reasons: a small file streams instead of
+        // paging, and the paged path is the only one that fetches extents.
+        auto muts = make_muts(s, 6000, 2);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto read_one = [&] (const mutation& want) {
+            auto pr = dht::partition_range::make_singular(want.decorated_key());
+            auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+            auto close = deferred_close(rd);
+            auto got = read_mutation_from_mutation_reader(rd).get();
+            BOOST_REQUIRE(got);
+            assert_that(*got).is_equal_to(want);
+        };
+
+        sst->drop_pq_footer_cache(false);
+
+        std::vector<size_t> sample;
+        for (size_t i = 0; i < expected.size(); i += 37) { sample.push_back(i); }
+
+        for (size_t i : sample) { read_one(expected[i]); }
+        const auto first = sstables::parquet::extent_cache_stats_local();
+        BOOST_REQUIRE_GT(first.populations, 0u);
+
+        // Second pass over the same partitions: every extent is already held, so this must add
+        // hits and must not populate anything new.
+        for (size_t i : sample) { read_one(expected[i]); }
+        const auto second = sstables::parquet::extent_cache_stats_local();
+        BOOST_REQUIRE_GT(second.hits, first.hits);
+        BOOST_REQUIRE_EQUAL(second.populations, first.populations);
+
+        // Transparent when dropped: the reader fetches again and the answers are unchanged.
+        sst->drop_pq_footer_cache(false);
+        const auto before_cold = sstables::parquet::extent_cache_stats_local();
+        for (size_t i : sample) { read_one(expected[i]); }
+        BOOST_REQUIRE_GT(sstables::parquet::extent_cache_stats_local().populations,
+                         before_cold.populations);
+    }).get();
+}
+
 // A bigint partition key, end to end: the partition sequence must survive the round trip.
 //
 // The bug this pins is described in full at `test_delta_binary_packed_wide_residual_widths`

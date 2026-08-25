@@ -8641,6 +8641,92 @@ codec declines to compress has no decode work to cache, so 24 partitions asserte
 were needed; and `make_sstable_containing()` validates what it writes, so the cache is already warm
 before the test's first read.
 
+### 10.42 The extent cache — the point read reaches 1.63× the row format, 2026-08-25
+
+§10.41 left `page_fetch` at 73 % of a point read, fetching compressed bytes so that the decode
+could ignore them in favour of the decompressed form already in memory. 1 000 device reads per
+1 000 point reads, for nothing.
+
+**First, the question §10.39 says to ask**: is an I/O phase's share reachable at all, or is it queue
+wait that the remaining reads reabsorb? Here it is reachable, and the way to know beforehand is that
+the cost scales with the number of extents, which the leaf count controls:
+
+| leaves | extents | `page_fetch` |
+|---|---|---|
+| 7 | 14 | 136.9 µs |
+| 15 | 30 | 169.4 µs |
+| 31 | 62 | 324.2 µs |
+
+~82 µs fixed plus ~7.8 µs an extent. Issuing them in one `when_all_succeed` batch does *not* hide
+them, so removing them should pay — unlike the page-index read, whose share was mostly waiting.
+
+**What was cached, and what was deliberately not.** The compressed extents, keyed by offset *and*
+length, so the reader's own fetch planner can skip a read entirely. The alternative was to serve a
+page from its decoded form and skip the page walk, which needs the page header, the levels and the
+values all cached and a second decode path — duplicating the most delicate thirty lines in the
+reader. Caching the bytes the walk reads leaves the walk untouched, at the cost of holding both
+forms, ~1.3× the decompressed size. That trade was taken on purpose.
+
+**Measured**, A/B in one process via `PQ_EXTENT_CACHE=0`, three interleaved pairs: **2.12× median**
+(2.10–2.17×), the tightest spread of any change in this investigation. `page_fetch` calls fall from
+1 000 to **18** — one per row group, not one per read.
+
+**Where the point read has ended up**, against where it started:
+
+| | before any of this | now |
+|---|---|---|
+| pq point read, mean | 647 µs | **87.3 µs** |
+| p50 | ~330 µs | 36.6 µs |
+| p95 | ~2 895 µs | 50.4 µs |
+| ratio to the row format, mean | 12.2× | **1.63×** |
+| ratio at p95 | 83.6× | **1.5×** |
+| file size | 0.320× | **0.320×** |
+| scan | 0.97× | **0.95×** |
+
+**7.5× on the point read**, from three caches that between them stop the reader re-doing work over
+immutable file bytes once per reader: the page index (§10.39), the decompressed pages (§10.41) and
+the compressed extents (this one). None of it changed the format, the file size, or the scan.
+
+**What is left, and it has moved.** `decode_cpu` is 49.9 % again — but of 87 µs, so 32.7 µs of real
+decode, which is now genuinely the largest single cost. Behind it sits a new shape: `schema_recover`
+10.4 µs, `rg_materialise` 7.3 µs and `index_lookup` 3.6 µs are 38 % between them, and all three are
+per-*reader* setup over the same immutable footer — the same pattern these three caches attacked,
+one level up. `offset_index_io` is 9.4 % on 18 calls, which is the cold cost and cannot be removed.
+
+Scope, stated plainly. This is a point-read result on a workload with strong row-group locality:
+1 000 reads over 20 000 partitions touch 18 row groups, so each cached item serves ~50 reads. A
+workload spread over thousands of row groups would exceed both 32 MB caps and get much less. And
+§10.38's scan finding is untouched — ~two thirds of a scan is shared mutation-building on both
+paths, so the ceiling there is still 1.19×.
+
+Both caches are off for encrypted files. §10.41 explains why for plaintext pages; for extents the
+retained bytes are ciphertext, but one rule is simpler than two and no measurement asked for the
+second.
+
+**A caveat on the absolute figures, and it matters.** The table above was measured in one sitting,
+so its ratios are internally consistent — but this box is shared, and re-measuring the same build
+hours later put the row format at 123.8 µs rather than 53.5 µs and pq at ~182 µs rather than 87 µs.
+Both arms move together, and the *ratio* is what survives: 1.5–1.6× mean and 1.6× p50 on re-measure
+against 1.63× above, and the extent cache's own A/B at 2.32–2.39× against 2.10–2.17×. **Quote the
+ratios, not the microseconds.**
+
+**The bug this nearly shipped with, because it is the more useful half of the story.** The first
+working version cached the `temporary_buffer<char>` that `data_read()` returned, which is the
+obvious thing to cache and is wrong: retaining that buffer keeps what backs it alive, and the
+sstable then never finishes closing.
+`test_pq_compaction_aborted_while_reading_does_not_fault` logged its own success lines 14 s in and
+the process then sat in teardown until killed — over ten minutes against 32 s for the whole suite
+once fixed. The fix is to copy the bytes into a plain `std::vector<uint8_t>`, which costs a memcpy
+per *miss* against the device read it replaces.
+
+Two things about how it was found are worth keeping. It presented as "the suite got slow", and the
+first hypothesis — that `adjust_total_reclaimable_memory()` signalling the reclaim fiber once per
+extent instead of once per sstable had made reclaim quadratic — was wrong. Batching that accounting
+to one call per decode is a real improvement and is kept, but it fixed nothing here. What actually
+localised it was reading the log: the test's own completion line was present, and everything after
+it was missing, which says teardown and not the test. A per-test timing would have said only that
+the test was slow.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

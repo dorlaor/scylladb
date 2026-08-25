@@ -110,4 +110,16 @@ inline page_cache_stats& page_cache_stats_local() noexcept {
     return s;
 }
 
+// Compressed extents, i.e. the reads a paged point read would otherwise issue every time.
+struct extent_cache_stats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t populations = 0;
+};
+
+inline extent_cache_stats& extent_cache_stats_local() noexcept {
+    static thread_local extent_cache_stats s;
+    return s;
+}
+
 } // namespace sstables::parquet

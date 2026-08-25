@@ -249,6 +249,34 @@ public:
     // its whole decompressed self.
     static constexpr size_t page_cache_cap = 32u << 20;
 
+    // The *compressed* extents a paged read fetches: one per column for the dictionary, one for
+    // the run of wanted data pages. Cached alongside the decompressed values rather than instead
+    // of them, because the two remove different costs -- this one removes the read, the one above
+    // removes the codec -- and after the codec cost went away the read is what is left:
+    // `page_fetch` is 73 % of a point read once pages are cached (§10.41).
+    //
+    // Holding both forms costs roughly 1.3x the decompressed size. That is the deliberate trade:
+    // serving a page entirely from its decoded form would mean a second decode path that bypasses
+    // the page walk, duplicating the most delicate thirty lines in the reader. Caching the bytes
+    // the walk reads leaves the walk untouched.
+    //
+    // Keyed by offset *and* length: the wanted run of pages depends on which rows a read wants, so
+    // the same offset can be asked for with different lengths. At shipping defaults the run is one
+    // page and the length is stable, but a smaller page_rows makes it vary.
+    // Plain bytes, deliberately, and not the temporary_buffer that data_read() returned.
+    //
+    // Retaining that buffer keeps whatever it is backed by alive, and an sstable then never
+    // finishes closing: the test body of test_pq_compaction_aborted_while_reading_does_not_fault
+    // completed in 14 s and the process then sat in teardown until it was killed. The copy costs a
+    // memcpy per *miss*, against the device read it is replacing.
+    struct cached_extent {
+        size_t len = 0;
+        std::vector<uint8_t> bytes;
+    };
+    mutable std::unordered_map<uint64_t, cached_extent> extents;
+    mutable size_t extents_retained = 0;
+    static constexpr size_t extent_cache_cap = 32u << 20;
+
     static size_t oi_heap_size(const std::vector<std::optional<format::offset_index>>& v) {
         size_t n = v.capacity() * sizeof(std::optional<format::offset_index>);
         for (const auto& o : v) {
@@ -258,7 +286,7 @@ public:
     }
 
     size_t memory_size() const noexcept override {
-        return _retained + oi_retained + pages_retained;
+        return _retained + oi_retained + pages_retained + extents_retained;
     }
 
     // Call once, after filling everything in. Measured rather than estimated: every container is
@@ -368,14 +396,35 @@ public:
     }
 };
 
+bool extent_cache_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PQ_EXTENT_CACHE");
+        return !(e && *e == '0');
+    }();
+    return on;
+}
+
 // Binds the entry's page store to the format layer's interface. Holds the entry by shared_ptr so
 // that the store cannot go away under a decode, and the sstable so that growth can be accounted.
 class entry_page_cache final : public format::page_cache {
     seastar::shared_ptr<const cached_footer> _cf;
     sstables::shared_sstable _sst;
+    // Accumulated here and handed over once, in the destructor, rather than per page.
+    //
+    // Not a micro-optimisation: sstables_manager::adjust_total_reclaimable_memory() signals the
+    // reclaim fiber on every call, so accounting each page separately woke the reclaimer ~16 times
+    // per point read where the footer cache had woken it once per sstable. At 240 row groups across
+    // 10 sstables that turned test_pq_compaction_aborted_while_reading_does_not_fault from seconds
+    // into more than ten minutes -- the reclaimer re-examining the whole sstable set on each
+    // signal. One flush per decode restores the original order of magnitude.
+    size_t _grown = 0;
 public:
     entry_page_cache(seastar::shared_ptr<const cached_footer> cf, sstables::shared_sstable sst)
         : _cf(std::move(cf)), _sst(std::move(sst)) {}
+
+    ~entry_page_cache() {
+        if (_grown) { _sst->grow_pq_footer_cache(_grown); }
+    }
 
     const std::vector<uint8_t>* get(int64_t off) const noexcept override {
         auto it = _cf->pages.find(off);
@@ -396,7 +445,7 @@ public:
         auto& slot = _cf->pages[off];
         slot = std::move(v);
         _cf->pages_retained += n;
-        _sst->grow_pq_footer_cache(n);
+        _grown += n;
         ++page_cache_stats_local().populations;
         return &slot;
     }
@@ -1432,23 +1481,70 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
         in[c].pages_file_offset = p0;
     }
 
+    // Which of these extents this sstable already has in memory. Not merely an optimisation of the
+    // read: it removes the read. `page_fetch` scales with the number of extents -- 137 us at 7
+    // leaves, 324 us at 31, so ~82 us fixed plus ~7.8 us an extent -- so the batch being issued in
+    // parallel does not hide them (§10.42).
+    //
+    // Only ever consulted for an unencrypted file, for the same reason the decompressed-page cache
+    // is: what is retained here is ciphertext, but the key that opens it is not this layer's to
+    // hold, and the simpler rule is one rule.
+    std::vector<std::span<const uint8_t>> spans(want.size());
+    std::vector<size_t> misses;
+    const bool use_extents = _cf && !crypto() && extent_cache_enabled();
+    if (use_extents) {
+        for (size_t i = 0; i < want.size(); ++i) {
+            auto it = _cf->extents.find(want[i].off);
+            if (it != _cf->extents.end() && it->second.len == want[i].len) {
+                spans[i] = std::span<const uint8_t>(it->second.bytes);
+                ++extent_cache_stats_local().hits;
+            } else {
+                ++extent_cache_stats_local().misses;
+                misses.push_back(i);
+            }
+        }
+    } else {
+        for (size_t i = 0; i < want.size(); ++i) { misses.push_back(i); }
+    }
+
     std::vector<temporary_buffer<char>> held;
-    {
+    if (!misses.empty()) {
         rtimer _tf{rphase::page_fetch};
         std::vector<future<temporary_buffer<char>>> fs;
-        fs.reserve(want.size());
-        for (const auto& e : want) {
-            fs.push_back(tracked_read(e.off, e.len));
+        fs.reserve(misses.size());
+        for (size_t i : misses) {
+            fs.push_back(tracked_read(want[i].off, want[i].len));
         }
         held = co_await when_all_succeed(fs.begin(), fs.end());
     }
-    for (size_t i = 0; i < want.size(); ++i) {
-        auto span = std::span<const uint8_t>(
-                reinterpret_cast<const uint8_t*>(held[i].get()), held[i].size());
-        if (want[i].is_dict) {
-            in[want[i].col].dict = span;
+    // Published after the co_await, synchronously, so nothing observes a half-filled map. The map
+    // gives reference stability, so a span into it stays valid for the decode that follows.
+    size_t extents_grown = 0;
+    for (size_t k = 0; k < misses.size(); ++k) {
+        const size_t i = misses[k];
+        if (use_extents
+                && _cf->extents_retained + held[k].size() <= cached_footer::extent_cache_cap) {
+            const size_t n = held[k].size();
+            auto& slot = _cf->extents[want[i].off];
+            slot.len = want[i].len;
+            const auto* p = reinterpret_cast<const uint8_t*>(held[k].get());
+            slot.bytes.assign(p, p + n);
+            _cf->extents_retained += n;
+            // Summed and handed over once below, not per extent: see entry_page_cache::_grown.
+            extents_grown += n;
+            ++extent_cache_stats_local().populations;
+            spans[i] = std::span<const uint8_t>(slot.bytes);
         } else {
-            in[want[i].col].pages = span;
+            spans[i] = std::span<const uint8_t>(
+                    reinterpret_cast<const uint8_t*>(held[k].get()), held[k].size());
+        }
+    }
+    if (extents_grown) { _sst->grow_pq_footer_cache(extents_grown); }
+    for (size_t i = 0; i < want.size(); ++i) {
+        if (want[i].is_dict) {
+            in[want[i].col].dict = spans[i];
+        } else {
+            in[want[i].col].pages = spans[i];
         }
     }
 
