@@ -206,7 +206,39 @@ public:
     // every one of these, which is what §11.1 B3 is about -- see read_crypto_for().
     std::map<std::string, seastar::sstring> column_key_ids;
 
-    size_t memory_size() const noexcept override { return _retained; }
+    // Row group -> the parsed OffsetIndex of each leaf, filled in on first use of that group.
+    //
+    // The point of caching this is *not* the Thrift parse, which is 3.2 us. It is the read: the
+    // page index sits near the end of the file, so fetching it is one device round trip that has
+    // to complete before any data page can be located -- a point read's I/O depth is 2 with a
+    // miss and 1 with a hit, and that first read measured 264 us against 107 us for the nine
+    // parallel page fetches that follow it. Data files are opened O_DIRECT, so there is no page
+    // cache underneath to make the repeat free.
+    //
+    // Lazy, not eager: `md` is parsed in lazy mode and the offset_index offsets live in the
+    // per-column metadata, so filling every group up front would mean materialising every row
+    // group -- the eager parse the lazy mode exists to avoid, and 16 us per group on a file with
+    // thousands of them.
+    //
+    // Mutable behind a shared_ptr<const>, which is safe here and nowhere near as loose as it
+    // looks: entries are only ever *added*, an entry's content is a pure function of immutable
+    // file bytes, the insert itself is synchronous (the fetch happens on the reader's stack and
+    // publishes only after its co_await has returned), and a reader that races another to the
+    // same group produces a value equal to what it overwrites. Readers hold the entry by
+    // shared_ptr, so growth never invalidates a view someone is using.
+    mutable std::unordered_map<size_t, std::vector<std::optional<format::offset_index>>> oi;
+    // Counted separately because it is added after publication; see sstable::grow_pq_footer_cache.
+    mutable size_t oi_retained = 0;
+
+    static size_t oi_heap_size(const std::vector<std::optional<format::offset_index>>& v) {
+        size_t n = v.capacity() * sizeof(std::optional<format::offset_index>);
+        for (const auto& o : v) {
+            if (o) { n += o->pages.capacity() * sizeof(format::page_loc); }
+        }
+        return n;
+    }
+
+    size_t memory_size() const noexcept override { return _retained + oi_retained; }
 
     // Call once, after filling everything in. Measured rather than estimated: every container is
     // asked for its capacity, so the number does not depend on believing anything about the
@@ -277,7 +309,8 @@ enum class rphase : size_t {
     schema_recover, // rebuilding the mapped schema from the footer
     index_lookup,   // partition key -> row ordinal, via the sstable index
     rg_materialise, // one row group's column metadata, decoded out of the retained footer bytes
-    offset_index,   // reading and parsing the OffsetIndex for the projected columns
+    offset_index_io,    // fetching the OffsetIndex blobs: one read covering every projected column
+    offset_index_parse, // Thrift-decoding those blobs into PageLocation vectors
     rg_fetch,       // streaming path: one sequential read of a whole row group
     rg_decode,      // streaming path: decode of that row group's wanted rows
     page_fetch,     // paged path: the data_read calls that pull dictionary and data pages
@@ -358,7 +391,11 @@ class pq_reader : public mutation_reader::impl {
     temporary_buffer<char> _rg_buf;
     int64_t _rg_base = 0;               // file offset of _rg_buf[0]
     size_t _oi_rg = size_t(-1);
+    // Reader-owned storage, used only when there is no footer cache entry to grow.
     std::vector<std::optional<format::offset_index>> _oi;
+    // What every reader of the offset indexes goes through. Points either at `_oi` or into the
+    // cached footer entry, which `_cf` keeps alive. Null until load_offset_indexes() has run.
+    const std::vector<std::optional<format::offset_index>>* _oi_view = nullptr;
     // Leaves of the materialised row group that need not be read at all: see elidable_leaves().
     // One entry per leaf, recomputed per row group because it is a property of the chunk
     // statistics rather than of the file.
@@ -1084,8 +1121,8 @@ const std::vector<uint8_t>& pq_reader::elidable_leaves(size_t rg) {
 }
 
 bool pq_reader::have_page_index() const {
-    if (_oi.size() != columns().size()) { return false; }
-    for (const auto& o : _oi) { if (!o || o->pages.empty()) { return false; } }
+    if (!_oi_view || _oi_view->size() != columns().size()) { return false; }
+    for (const auto& o : *_oi_view) { if (!o || o->pages.empty()) { return false; } }
     return true;
 }
 
@@ -1109,9 +1146,9 @@ bool pq_reader::paged_fetch_is_not_cheaper(int64_t lo, int64_t hi,
             // paging cheaper without making the group's extent smaller, because the chunks are
             // contiguous.
             if (c < elide.size() && elide[c]) { continue; }
-            const auto& pages = _oi[c]->pages;
-            const size_t i0 = _oi[c]->page_for_row(w);
-            const size_t i1 = _oi[c]->page_for_row(wend > w ? wend - 1 : w);
+            const auto& pages = (*_oi_view)[c]->pages;
+            const size_t i0 = (*_oi_view)[c]->page_for_row(w);
+            const size_t i1 = (*_oi_view)[c]->page_for_row(wend > w ? wend - 1 : w);
             if (i0 >= pages.size() || i1 >= pages.size() || i1 < i0) { return true; }
             paged += pages[i1].offset + pages[i1].compressed_page_size - pages[i0].offset;
             if (cols[c].meta->dictionary_page_offset) {
@@ -1206,10 +1243,32 @@ future<bool> pq_reader::next_window() {
 }
 
 future<> pq_reader::load_offset_indexes(size_t rg) {
-    if (_oi_rg == rg) { co_return; }
+    if (_oi_rg == rg && _oi_view) { co_return; }
     need_columns(rg);
-    _oi.assign(columns().size(), std::nullopt);
     _oi_rg = rg;
+    _oi_view = nullptr;
+
+    // Cached from an earlier read of this sstable? Then the whole of this function -- a device
+    // round trip that gates every page fetch behind it -- is skipped. See cached_footer::oi.
+    //
+    // The kill switch exists to measure it. This box is shared, so run-to-run comparison is worth
+    // little; the only trustworthy A/B is one that flips the cache inside a single process while
+    // everything else stays fixed.
+    static const bool cache_enabled = [] {
+        const char* e = std::getenv("PQ_OFFSET_INDEX_CACHE");
+        return !(e && *e == '0');
+    }();
+    if (_cf && cache_enabled) {
+        if (auto it = _cf->oi.find(rg); it != _cf->oi.end()) {
+            _oi_view = &it->second;
+            ++offset_index_cache_stats_local().hits;
+            co_return;
+        }
+    }
+    ++offset_index_cache_stats_local().misses;
+
+    _oi.assign(columns().size(), std::nullopt);
+    _oi_view = &_oi;
 
     // The per-column OffsetIndex blobs sit together near the end of the file, so
     // one read covers all of them.
@@ -1220,8 +1279,12 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
         hi = std::max(hi, *cc.offset_index_offset + *cc.offset_index_length);
     }
     if (lo >= hi) { co_return; }        // file has no page index; caller falls back
-    rtimer _t{rphase::offset_index};
-    auto buf = co_await tracked_read(uint64_t(lo), size_t(hi - lo));
+    temporary_buffer<char> buf;
+    {
+        rtimer _t{rphase::offset_index_io};
+        buf = co_await tracked_read(uint64_t(lo), size_t(hi - lo));
+    }
+    rtimer _tp{rphase::offset_index_parse};
     auto img = std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
     for (size_t c = 0; c < _oi.size(); ++c) {
         const auto& cc = columns()[c];
@@ -1231,6 +1294,21 @@ future<> pq_reader::load_offset_indexes(size_t rg) {
                     img.subspan(size_t(*cc.offset_index_offset - lo), size_t(*cc.offset_index_length)));
         } catch (...) { _oi[c] = std::nullopt; }
     }
+
+    // Publish, so the next reader of this row group does no I/O at all. Only a complete set is
+    // worth keeping: a partial one would send have_page_index() down the fallback path forever
+    // on a file whose index failed to parse, which is a slow answer cached as if it were a fast
+    // one. The insert is synchronous -- the co_await above has already returned -- so no other
+    // reader observes a half-built vector.
+    if (_cf && cache_enabled && have_page_index()) {
+        auto& slot = _cf->oi[rg];
+        slot = _oi;
+        const size_t grew = cached_footer::oi_heap_size(slot);
+        _cf->oi_retained += grew;
+        _sst->grow_pq_footer_cache(grew);
+        _oi_view = &slot;
+        ++offset_index_cache_stats_local().populations;
+    }
 }
 
 future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int64_t lo, int64_t hi) {
@@ -1239,7 +1317,7 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
     const auto& cols = columns();
 
     bool all = true;
-    for (const auto& o : _oi) { if (!o || o->pages.empty()) { all = false; break; } }
+    for (const auto& o : *_oi_view) { if (!o || o->pages.empty()) { all = false; break; } }
     if (!all) {
         // No page index: nothing to seek with, so read the row group whole.
         co_await load_row_group(rg);
@@ -1279,9 +1357,9 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
             continue;
         }
         const auto& cm = *cols[c].meta;
-        const auto& pages = _oi[c]->pages;
-        const size_t i0 = _oi[c]->page_for_row(lo);
-        const size_t i1 = _oi[c]->page_for_row(hi > lo ? hi - 1 : lo);
+        const auto& pages = (*_oi_view)[c]->pages;
+        const size_t i0 = (*_oi_view)[c]->page_for_row(lo);
+        const size_t i1 = (*_oi_view)[c]->page_for_row(hi > lo ? hi - 1 : lo);
         if (i0 >= pages.size() || i1 >= pages.size() || i1 < i0) {
             throw std::runtime_error("pq: OffsetIndex does not cover the requested rows");
         }
@@ -1601,7 +1679,7 @@ std::string reader_profile_report() {
     // In enum order, and every one of them disjoint from the others -- see the note on rphase.
     static constexpr const char* names[] = {
         "footer_io", "footer_parse", "schema_recover", "index_lookup",
-        "rg_materialise", "offset_index",
+        "rg_materialise", "offset_index_io", "offset_index_parse",
         "rg_fetch", "rg_decode",
         "page_fetch", "decode_cpu",
         "reassemble",

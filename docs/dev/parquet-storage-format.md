@@ -8454,6 +8454,67 @@ Both are per-reader repetitions of work over immutable file content, so both wan
 *sstable* rather than the reader. Neither is a property of Parquet.
 
 
+### 10.39 The page-index cache, and why an I/O phase share is not a budget — 2026-08-25
+
+§10.38 put `offset_index` at 43.6 % of a point read and called it the first lever. Splitting the
+phase says the money is not where the label suggested:
+
+| | per read | share |
+|---|---|---|
+| `offset_index_io` | 264 µs | 31.1 % |
+| `offset_index_parse` | 3.2 µs | 0.4 % |
+
+So it was never the Thrift parse. It is a **device round trip**, and a serialised one: the page
+index says where the data pages are, so every page fetch waits behind it. Data files are opened
+O_DIRECT, so there is no page cache underneath to make the repeat free, and a point read's
+dependent I/O depth is 2. `load_offset_indexes()` already cached on `_oi_rg`, but every point read
+builds a fresh reader, so the cache never survived one.
+
+**The fix** puts the parsed index in the *existing* footer cache entry, keyed by row group: same
+sstable lifetime, same reclaim policy, no second eviction mechanism. It is filled in lazily per
+group rather than eagerly for the file, because the offsets live in the per-column metadata and the
+footer is parsed in lazy mode — materialising every group up front is the eager parse that mode
+exists to avoid, 16 µs a group on a file with thousands. Growth after publication needed
+`sstable::grow_pq_footer_cache()`: without it the manager's total would lag the real footprint, and
+`drop_pq_footer_cache()` would subtract more than was ever added.
+
+Readers take a *view* into the entry rather than a copy, which is safe because entries are only
+added to, an entry's content is a pure function of immutable file bytes, the insert is synchronous
+after its `co_await` has returned, and a reader that loses a race publishes a value equal to what
+it overwrites.
+
+**It works structurally and it is worth about 5 %.** Over 1 000 random point reads the page-index
+reads fall from **1 000 to 18** — one per row group touched — and the phase's share from 31.1 % to
+1.0 %. Wall clock, eight interleaved A/B pairs in one process via `PQ_OFFSET_INDEX_CACHE=0`:
+
+| | mean gain | median gain |
+|---|---|---|
+| mean point read | 5.2 % | 5.7 % |
+| p50 point read | 4.0 % | 4.6 % |
+
+with a spread from +33 % to **−23 %** across pairs, on a box other people are using.
+
+**The lesson is the gap between 31 % and 5 %, and it changes how the rest of this profile should be
+read.** `rtimer` warns that an I/O phase spans its `co_await` and therefore includes scheduler and
+queue delay — "an upper bound on the I/O itself". That warning has teeth: deleting 982 of 1 000
+reads did not return 31 % of the time, because most of what the phase was charging for was waiting
+that the remaining reads simply reabsorb. **An I/O phase's share is not a budget for what removing
+it will save. A CPU phase's is** — those contain no suspension point.
+
+Which redirects the next step. `decode_cpu` is 49.5 % of a point read and 95.4 % of it is
+`decompress`, and that *is* a CPU phase, so its share can be spent. Nine decompressions per read on
+a 5-leaf schema, roughly half of them the same dictionary page re-inflated by every reader: the same
+per-reader repetition over immutable bytes as this section fixed, in the phase where the share is
+real.
+
+Kept despite the modest local number, for two reasons. It removes a serialised device round trip,
+and this box has a warm-ish loaded disk rather than a cluster's real device latency and queue depth
+— the environment where a saved round trip is worth the most is the one not measured here. And
+`test_pq_page_index_is_cached_per_row_group` is a real guard: it fails with
+`PQ_OFFSET_INDEX_CACHE=0` and passes with it on. It has to force a cold start, because
+`make_sstable_containing()` validates what it writes and that validation warms the cache — the
+first version of the test asserted a miss and saw a hit.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

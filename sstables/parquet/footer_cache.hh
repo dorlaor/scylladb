@@ -63,6 +63,12 @@ inline void note_footer_cache_populated(size_t bytes) noexcept {
     s.bytes += bytes;
 }
 
+// Bytes added to an entry that is already published. Deliberately not note_footer_cache_populated:
+// that one also counts a population, and a page index filled in later is not a second footer.
+inline void note_footer_cache_grew(size_t bytes) noexcept {
+    footer_cache_stats_local().bytes += bytes;
+}
+
 // `evicted` distinguishes a drop under memory pressure from a drop because the sstable is going
 // away; only the former is something an operator wants to see in the eviction counter.
 inline void note_footer_cache_dropped(size_t bytes, bool evicted) noexcept {
@@ -71,6 +77,23 @@ inline void note_footer_cache_dropped(size_t bytes, bool evicted) noexcept {
         ++s.evictions;
     }
     s.bytes -= std::min(s.bytes, uint64_t(bytes));
+}
+
+// The page-index half of the same entry, counted separately because it is filled in lazily per
+// row group after the entry is published. Exported as `sstables_pq_offset_index_cache_*`.
+//
+// It has its own counters rather than sharing the footer's because the hit rates answer different
+// questions: the footer is fetched once per sstable per read, the page index once per sstable per
+// *row group* touched, so a workload can hit on one and miss on the other all day.
+struct offset_index_cache_stats {
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t populations = 0;
+};
+
+inline offset_index_cache_stats& offset_index_cache_stats_local() noexcept {
+    static thread_local offset_index_cache_stats s;
+    return s;
 }
 
 } // namespace sstables::parquet

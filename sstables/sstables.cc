@@ -2145,6 +2145,15 @@ void sstable::set_pq_footer_cache(parquet::cached_footer_ptr footer) {
     _manager.adjust_total_reclaimable_memory(ssize_t(size) - ssize_t(replaced));
 }
 
+void sstable::grow_pq_footer_cache(size_t delta) noexcept {
+    if (!_pq_footer || !delta) {
+        return;
+    }
+    parquet::note_footer_cache_grew(delta);
+    _total_reclaimable_memory.reset();
+    _manager.adjust_total_reclaimable_memory(ssize_t(delta));
+}
+
 size_t sstable::drop_pq_footer_cache(bool evicted) noexcept {
     if (!_pq_footer) {
         return 0;

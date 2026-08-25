@@ -951,6 +951,11 @@ public:
     void set_pq_footer_cache(parquet::cached_footer_ptr);
     // Drop the cached footer, if any, returning the bytes released.
     size_t drop_pq_footer_cache(bool evicted) noexcept;
+    // Account for an entry that has grown since it was published -- the page index is filled in
+    // per row group as reads touch them, so the entry's size is not known when it is first
+    // handed over. Without this the manager's total would lag the real footprint and, worse,
+    // drop_pq_footer_cache() would return more than was ever added.
+    void grow_pq_footer_cache(size_t delta) noexcept;
     schema_ptr get_schema() const {
         return _schema;
     }

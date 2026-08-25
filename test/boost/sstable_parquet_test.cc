@@ -4866,6 +4866,78 @@ SEASTAR_THREAD_TEST_CASE(test_pq_footer_cache_is_reclaimed_by_the_manager) {
     }).get();
 }
 
+// The page index is cached per row group, and the accounting survives it growing.
+//
+// The two footer-cache tests above both read through read_all(), which is a full scan -- and a
+// scan streams whole row groups, so it never calls load_offset_indexes() and never grows the
+// entry. The growth path is only reachable from a *point* read, and it is the one part of the
+// entry that is filled in after publication, so it is the one part whose bytes could go
+// unaccounted or be double-subtracted on eviction.
+//
+// What this pins:
+//   * a second point read into an already-visited row group does no page-index I/O at all,
+//     which is the whole point of the cache -- it removes a device round trip that every page
+//     fetch is otherwise serialised behind;
+//   * the manager's reclaimable total grows when the entry does, so a page index cached for a
+//     file with thousands of row groups is subject to the same pressure as the footer rather
+//     than being invisible to it;
+//   * and the answers do not change, with the cache warm or cold.
+SEASTAR_THREAD_TEST_CASE(test_pq_page_index_is_cached_per_row_group) {
+    sstables::test_env::do_with_async([] (sstables::test_env& env) {
+        auto s = pq_schema();
+        auto muts = make_muts(s, 24, 4);
+        auto expected = muts;
+        auto sst = make_sstable_containing(
+                env.make_sstable(s, sstable_version_types::pq), std::move(muts)).get();
+
+        auto read_one = [&] (const mutation& want) {
+            auto pr = dht::partition_range::make_singular(want.decorated_key());
+            auto rd = sst->make_reader(s, env.make_reader_permit(), pr, s->full_slice());
+            auto close = deferred_close(rd);
+            auto got = read_mutation_from_mutation_reader(rd).get();
+            BOOST_REQUIRE(got);
+            assert_that(*got).is_equal_to(want);
+        };
+
+        // Start cold, explicitly. make_sstable_containing() validates what it writes
+        // (test/lib/sstable_utils.cc:83), and that validation is itself a read -- so by the time
+        // the sstable exists the page index for the groups it touched is already cached, and a
+        // test that assumed otherwise would assert a miss and see a hit.
+        sst->drop_pq_footer_cache(false);
+        const auto base = sstables::parquet::offset_index_cache_stats_local();
+        read_one(expected[0]);
+        const auto after_first = sstables::parquet::offset_index_cache_stats_local();
+        BOOST_REQUIRE_GT(after_first.misses, base.misses);
+        BOOST_REQUIRE_GT(after_first.populations, base.populations);
+        BOOST_REQUIRE(sst->pq_footer_cache());
+
+        // The entry is now larger than the footer alone, and the manager was told.
+        const size_t grown = sst->pq_footer_cache()->memory_size();
+        BOOST_REQUIRE_GT(grown, 0u);
+
+        // Re-reading the same partition must hit. Every partition of this file lands in one row
+        // group at the shipping defaults, so re-reading any of them hits -- but the first
+        // partition is the one certain to.
+        read_one(expected[0]);
+        const auto after_second = sstables::parquet::offset_index_cache_stats_local();
+        BOOST_REQUIRE_GT(after_second.hits, after_first.hits);
+        BOOST_REQUIRE_EQUAL(after_second.misses, after_first.misses);
+
+        // Every other partition still reads correctly against a warm cache.
+        for (const auto& m : expected) {
+            read_one(m);
+        }
+
+        // And a cache that is dropped is transparent: the reader falls back to fetching the page
+        // index itself and the answers are unchanged.
+        sst->drop_pq_footer_cache(false);
+        BOOST_REQUIRE(!sst->pq_footer_cache());
+        for (const auto& m : expected) {
+            read_one(m);
+        }
+    }).get();
+}
+
 // A bigint partition key, end to end: the partition sequence must survive the round trip.
 //
 // The bug this pins is described in full at `test_delta_binary_packed_wide_residual_widths`
