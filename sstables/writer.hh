@@ -22,6 +22,8 @@
 
 namespace sstables {
 
+extern logging::logger sstlog;
+
 class index_sampling_state;
 class compression;
 class metadata_collector;
@@ -176,6 +178,32 @@ public:
     // location.
     checksummed_file_writer(checksummed_file_writer&&) = delete;
     checksummed_file_writer(const checksummed_file_writer&) = default;
+
+    // Close the stream here, not in ~file_writer().
+    //
+    // _c and _full_checksum are members of THIS class, and the base's output_stream holds
+    // references to both (see the constructors above, and checksummed_file_data_sink_impl). A
+    // derived class's members are destroyed before the base destructor runs, and ~file_writer()
+    // best-effort auto-closes a stream that was never closed -- "close() should be called by the
+    // owner ... it may not be called on exception handling paths". That close flushes, the flush
+    // appends a CRC to _c, and _c is gone: a use-after-free, seen as a near-null write at 0x8
+    // inside chunked_vector::emplace_back when a cancelled compaction destroyed a pq writer
+    // without closing it.
+    //
+    // This destructor body runs BEFORE the members are destroyed, so closing here is safe, and
+    // close() sets _closed so ~file_writer() then does nothing. Callers that close explicitly are
+    // unaffected.
+    virtual ~checksummed_file_writer() {
+        if (is_closed()) {
+            return;
+        }
+        try {
+            file_writer::close();
+        } catch (...) {
+            sstlog.warn("Error while auto-closing checksummed writer: {}. Ignored.",
+                        std::current_exception());
+        }
+    }
 
     checksum& finalize_checksum() {
         return _c;
