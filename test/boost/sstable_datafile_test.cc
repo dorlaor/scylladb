@@ -18,6 +18,9 @@
 #include <seastar/testing/test_fixture.hh>
 
 #include "sstables/sstables.hh"
+#include "sstables/sstable_directory.hh"
+#include "sstables/writer.hh"
+#include <seastar/core/fstream.hh>
 #include "sstables/compress.hh"
 #include "sstables/compressor.hh"
 #include "sstables/sstable_compressor_factory.hh"
@@ -3683,4 +3686,89 @@ SEASTAR_THREAD_TEST_CASE(test_small_sstable_has_reasonable_memory_usage) {
     BOOST_REQUIRE_LT(growth, upper_bound);
     BOOST_REQUIRE_GE(growth, lower_bound);
 #endif
+}
+
+// ---------------------------------------------------------------------------------------------
+// Two regression tests for defects that had none. Both live here rather than in the file each
+// belongs to (sstable_directory_test, and a writer-focused file) because neither of those targets
+// can be built in this configuration -- ninja lists them and then refuses -- and a test that
+// cannot be run is not evidence.
+// ---------------------------------------------------------------------------------------------
+
+// A malformed name in a restore manifest must be REJECTED, not abort the node.
+//
+// A blank trailing line in a --sstables-file-list parsed as an sstable named "", reached
+// throw_malformed_sstable_exception, and because that honours abort_on_malformed_sstable_error
+// (default true) it took the node down -- the operator saw "Connection reset by peer" from the very
+// node they were restoring with. Aborting is right for corrupt bytes found on disk and wrong for
+// operator input on a recovery path.
+//
+// This asserts on the EXCEPTION, because an abort cannot be caught and asserted on at all, which is
+// exactly why the behaviour went untested.
+SEASTAR_THREAD_TEST_CASE(test_restore_rejects_malformed_toc_names) {
+    BOOST_REQUIRE_NO_THROW(sstables::validate_restore_toc_names(
+            {"me-3h39_0jv6_26nsg2gplzfjtup6vf-big-TOC.txt"}));
+    BOOST_REQUIRE_NO_THROW(sstables::validate_restore_toc_names({}));
+
+    // The exact trigger, and the same list with a good entry beside it.
+    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names({""}), std::invalid_argument);
+    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names(
+            {"me-3h39_0jv6_26nsg2gplzfjtup6vf-big-TOC.txt", ""}), std::invalid_argument);
+
+    // Shapes of nonsense that were never tried when the fix landed.
+    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names({"not-an-sstable"}),
+                        std::invalid_argument);
+    BOOST_REQUIRE_THROW(sstables::validate_restore_toc_names({"zz-1-big-TOC.txt"}),
+                        std::invalid_argument);
+
+    // The message must name the offender, or an operator cannot fix their manifest.
+    try {
+        sstables::validate_restore_toc_names({"", "me-3h39_0jv6_26nsg2gplzfjtup6vf-big-TOC.txt"});
+        BOOST_FAIL("expected std::invalid_argument");
+    } catch (const std::invalid_argument& e) {
+        BOOST_REQUIRE(sstring(e.what()).find("restore:") != sstring::npos);
+    }
+}
+
+// Destroying a checksummed_file_writer WITHOUT calling close() must not fault.
+//
+// The class keeps `checksum _c` and `uint32_t _full_checksum` as DERIVED members while the base
+// file_writer owns the output_stream whose sink holds references to both. Derived members are
+// destroyed before the base destructor runs, and ~file_writer() best-effort auto-closes an unclosed
+// stream -- so the flush appended a CRC to a checksum struct that was already gone. A cancelled
+// compaction destroying a pq writer hit exactly this, as a near-null write at 0x8 inside
+// chunked_vector::emplace_back.
+//
+// HONEST LIMITATION, checked rather than assumed: in dev mode this test PASSES with the fix
+// reverted. It was run that way. The bug is undefined behaviour, not a null dereference -- freeing a
+// small chunked_vector and then appending to it touches memory that has not been reused yet, so
+// nothing faults. That is precisely why the original reproduction needed 7.7 M rows of allocation
+// churn, and it means this test is NOT a regression guard on its own in dev.
+//
+// It is a real guard where it matters: seastar turns ASAN on by default for the Debug and Sanitize
+// build types, and ASAN reports a use-after-free here deterministically regardless of size. So this
+// exists to be run under those, and in dev it is a smoke test that the path is exercised at all.
+//
+// There must be BUFFERED DATA at destruction, or the auto-close has nothing to flush and the test
+// cannot detect anything even under a sanitizer.
+SEASTAR_THREAD_TEST_CASE(test_checksummed_file_writer_destroyed_without_close) {
+    tmpdir tmp;
+    auto path = tmp.path() / "unclosed";
+
+    {
+        auto f = open_file_dma(path.native(),
+                               open_flags::wo | open_flags::create | open_flags::truncate).get();
+        auto sink = make_file_data_sink(std::move(f), file_output_stream_options{}).get();
+        // The two-argument overload: component_name holds an sstable reference and cannot be
+        // default-constructed, and naming a component is irrelevant to what this test exercises.
+        sstables::crc32_checksummed_file_writer w(std::move(sink), 4096);
+        // Enough to be buffered but not enough to have been flushed on its own.
+        sstring payload(1024, 'x');
+        w.write(payload.c_str(), payload.size());
+        BOOST_REQUIRE_EQUAL(w.offset(), payload.size());
+        // Deliberately NO w.close(). Leaving this scope is the whole test.
+    }
+
+    // Surviving to here is the assertion. Anything else is a crash, not a failure.
+    BOOST_REQUIRE(file_exists(path.native()).get());
 }

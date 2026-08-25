@@ -444,6 +444,16 @@ future<> sstable_directory::sstables_registry_components_lister::process(sstable
     });
 }
 
+void validate_restore_toc_names(const std::vector<sstring>& toc_filenames) {
+    for (const auto& toc_filename : toc_filenames) {
+        if (auto result = sstables::parse_path(std::filesystem::path{toc_filename}, "", ""); !result) {
+            throw std::invalid_argument(seastar::format(
+                    "restore: '{}' is not a valid sstable TOC object name: {}",
+                    toc_filename, result.error()));
+        }
+    }
+}
+
 future<> sstable_directory::restore_components_lister::process(sstable_directory& directory, process_flags flags) {
     // These TOC names come from the restore REQUEST -- they are operator input, not a listing of
     // files Scylla wrote. That distinction decides how a bad one must be reported.
@@ -458,13 +468,7 @@ future<> sstable_directory::restore_components_lister::process(sstable_directory
     //
     // Validated up front, before any restoring starts, so a bad entry fails the whole operation
     // cleanly instead of half way through a partially-restored table.
-    for (const auto& toc_filename : _toc_filenames) {
-        if (auto result = sstables::parse_path(std::filesystem::path{toc_filename}, "", ""); !result) {
-            throw std::invalid_argument(seastar::format(
-                    "restore: '{}' is not a valid sstable TOC object name: {}",
-                    toc_filename, result.error()));
-        }
-    }
+    validate_restore_toc_names(_toc_filenames);
     co_await coroutine::parallel_for_each(_toc_filenames, [flags, &directory] (sstring toc_filename) -> future<> {
         std::filesystem::path sst_path{toc_filename};
         auto result = sstables::parse_path(sst_path, "", "");
