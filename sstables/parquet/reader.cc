@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
  */
 
+#include <seastar/core/memory.hh>
 #include "sstables/parquet/reader.hh"
 #include "sstables/parquet/encryption_keys.hh"
 
@@ -244,10 +245,14 @@ public:
     mutable std::unordered_map<int64_t, std::vector<uint8_t>> pages;
     mutable size_t pages_retained = 0;
 
-    // Per sstable. Sized so that the 20-row-group, 8-leaf shape a point-read workload actually
-    // touches fits with room to spare, while a file with thousands of groups stops well short of
-    // its whole decompressed self.
-    static constexpr size_t page_cache_cap = 32u << 20;
+    // Releases this entry's share of the shard-wide read-cache budget. Clamped rather than
+    // asserted: an accounting slip should cost a suboptimal caching decision, not a counter that
+    // has wrapped and reads as exabytes held.
+    void on_dropped() const noexcept override {
+        auto& b = read_cache_bytes_local();
+        b.pages -= std::min<uint64_t>(b.pages, pages_retained);
+        b.extents -= std::min<uint64_t>(b.extents, extents_retained);
+    }
 
     // The *compressed* extents a paged read fetches: one per column for the dictionary, one for
     // the run of wanted data pages. Cached alongside the decompressed values rather than instead
@@ -275,7 +280,6 @@ public:
     };
     mutable std::unordered_map<uint64_t, cached_extent> extents;
     mutable size_t extents_retained = 0;
-    static constexpr size_t extent_cache_cap = 32u << 20;
 
     static size_t oi_heap_size(const std::vector<std::optional<format::offset_index>>& v) {
         size_t n = v.capacity() * sizeof(std::optional<format::offset_index>);
@@ -396,6 +400,24 @@ public:
     }
 };
 
+// One budget for both read caches, shard-wide. Default 2 % of this shard's memory: enough that a
+// point-read working set of a few hundred pages fits, small enough that a node is never surprised
+// by it. Overridable because the right fraction is a workload question and nobody has measured it
+// on a real one yet.
+size_t read_cache_cap() {
+    static const size_t cap = [] () -> size_t {
+        if (const char* e = std::getenv("PQ_READ_CACHE_MB")) {
+            return size_t(std::max(0L, std::atol(e))) << 20;
+        }
+        return size_t(double(seastar::memory::stats().total_memory()) * 0.02);
+    }();
+    return cap;
+}
+
+bool read_cache_has_room(size_t bytes) noexcept {
+    return read_cache_bytes_local().total() + bytes <= read_cache_cap();
+}
+
 bool extent_cache_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("PQ_EXTENT_CACHE");
@@ -437,7 +459,7 @@ public:
     }
 
     bool accepts(size_t bytes) const noexcept override {
-        return _cf->pages_retained + bytes <= cached_footer::page_cache_cap;
+        return read_cache_has_room(bytes);
     }
 
     const std::vector<uint8_t>* put(int64_t off, std::vector<uint8_t> v) override {
@@ -445,6 +467,7 @@ public:
         auto& slot = _cf->pages[off];
         slot = std::move(v);
         _cf->pages_retained += n;
+        read_cache_bytes_local().pages += n;
         _grown += n;
         ++page_cache_stats_local().populations;
         return &slot;
@@ -1522,14 +1545,14 @@ future<std::vector<format::column_data>> pq_reader::decode_paged(size_t rg, int6
     size_t extents_grown = 0;
     for (size_t k = 0; k < misses.size(); ++k) {
         const size_t i = misses[k];
-        if (use_extents
-                && _cf->extents_retained + held[k].size() <= cached_footer::extent_cache_cap) {
+        if (use_extents && read_cache_has_room(held[k].size())) {
             const size_t n = held[k].size();
             auto& slot = _cf->extents[want[i].off];
             slot.len = want[i].len;
             const auto* p = reinterpret_cast<const uint8_t*>(held[k].get());
             slot.bytes.assign(p, p + n);
             _cf->extents_retained += n;
+            read_cache_bytes_local().extents += n;
             // Summed and handed over once below, not per extent: see entry_page_cache::_grown.
             extents_grown += n;
             ++extent_cache_stats_local().populations;

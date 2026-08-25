@@ -8727,6 +8727,44 @@ localised it was reading the log: the test's own completion line was present, an
 it was missing, which says teardown and not the test. A per-test timing would have said only that
 the test was slow.
 
+### 10.43 The cache budget was sized for a benchmark, not a node — 2026-08-25
+
+§10.41 and §10.42 each took a 32 MB cap per sstable. That is unremarkable for one file and is
+**64 MB × N sstables** for a node holding thousands, which is not a memory budget — it is an
+absence of one with a number written next to it. Reclaim would eventually take it back, but
+"eventually, under pressure, by dropping whole footer entries" is not a policy you would choose.
+
+Replaced with **one budget shared by both caches, shard-wide**, defaulting to 2 % of the shard's
+memory and overridable with `PQ_READ_CACHE_MB`. Tracked per kind so metrics can say which half is
+holding what, spent from one cap so neither can claim the whole thing.
+
+**The working set turns out to be far smaller than either cap.** Same 20 000-partition point-read
+workload, varying only the budget:
+
+| budget | pq point read | ratio to row format |
+|---|---|---|
+| 2 % of shard (40 MB here) | 93.7 µs | 1.73× |
+| 40 MB | 90.0 µs | 1.53× |
+| 8 MB | 89.0 µs | 1.30× |
+| **2 MB** | **488.7 µs** | 8.50× |
+
+**8 MB holds this workload's entire working set**, and the cliff is between 2 and 8 MB. So the
+original caps were oversized by an order of magnitude, and the number that matters is not the cap
+but what the workload's footprint actually is: (row groups touched) × (leaves) × (decompressed page
++ compressed extent). The 2 MB row is worth keeping in view — it is what a budget that is too small
+looks like, and it is *worse than no cache*, because the misses are paid on top of the bookkeeping.
+
+Releasing the budget needed a hook. An entry can outlive its drop — a reader mid-read holds it by
+`shared_ptr` — but its bytes stop being *reusable* at the drop, so `cached_footer_base::on_dropped()`
+is called from `drop_pq_footer_cache()` rather than from the destructor. Both drop paths matter:
+the reclaimer and an sstable going away. `test_pq_page_extents_are_not_refetched` now asserts the
+shard total is non-zero while cached and **exactly zero** after the drop, because a budget that
+leaks would quietly stop a node caching and never say why.
+
+Still not measured on a real workload: 2 % is a guess with a knob on it, and the honest position is
+that the right fraction is a workload question nobody has answered yet. What is no longer true is
+that the sizing was per-file and unbounded in aggregate.
+
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

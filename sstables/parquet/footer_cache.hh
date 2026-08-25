@@ -34,6 +34,11 @@ namespace sstables::parquet {
 class cached_footer_base {
 public:
     virtual ~cached_footer_base() = default;
+    // Called when the entry stops being reachable for new reads, so that whatever it was holding
+    // against the shard-wide read-cache budget is released. Not the destructor: a reader mid-read
+    // keeps the entry alive past the drop, and the budget should free up at the drop -- the bytes
+    // are no longer *reusable* even though they are briefly still allocated.
+    virtual void on_dropped() const noexcept {}
     // Bytes retained by this entry. Measured from the capacities of the containers that hold it,
     // not estimated from the on-disk footer length -- see cached_footer::retained_bytes().
     virtual size_t memory_size() const noexcept = 0;
@@ -94,6 +99,26 @@ struct offset_index_cache_stats {
 inline offset_index_cache_stats& offset_index_cache_stats_local() noexcept {
     static thread_local offset_index_cache_stats s;
     return s;
+}
+
+// Bytes the read caches hold across *this shard*, not one sstable.
+//
+// The per-sstable cap these replaced was sized against a benchmark's working set and was wrong for
+// a node: 32 MB each for pages and extents is unremarkable for one file and is 64 MB x N sstables
+// for a node holding thousands. Reclaim would eventually take it back, but "eventually, under
+// pressure, by dropping whole footer entries" is not a memory budget.
+//
+// Tracked per kind so the metrics can say which half is holding what, and spent from one shared
+// cap so the two cannot each claim the whole budget.
+struct read_cache_bytes {
+    uint64_t pages = 0;
+    uint64_t extents = 0;
+    uint64_t total() const noexcept { return pages + extents; }
+};
+
+inline read_cache_bytes& read_cache_bytes_local() noexcept {
+    static thread_local read_cache_bytes b;
+    return b;
 }
 
 // Decompressed data pages. Separate counters again, for the same reason the page index has its

@@ -2159,6 +2159,9 @@ size_t sstable::drop_pq_footer_cache(bool evicted) noexcept {
         return 0;
     }
     const size_t size = _pq_footer->memory_size();
+    // Before the pointer goes: the entry may outlive this call in a reader's hands, but its bytes
+    // stop being reusable now, so the shard-wide read-cache budget should free up now too.
+    _pq_footer->on_dropped();
     _pq_footer = nullptr;
     parquet::note_footer_cache_dropped(size, evicted);
     _total_reclaimable_memory.reset();

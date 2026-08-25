@@ -5049,8 +5049,17 @@ SEASTAR_THREAD_TEST_CASE(test_pq_page_extents_are_not_refetched) {
         BOOST_REQUIRE_GT(second.hits, first.hits);
         BOOST_REQUIRE_EQUAL(second.populations, first.populations);
 
-        // Transparent when dropped: the reader fetches again and the answers are unchanged.
+        // The shard-wide budget is holding something, and dropping the entry gives it back.
+        //
+        // This is what stops the budget being a slow leak: entries are dropped by the reclaimer and
+        // by sstables going away, and if either path forgot to release, a node would stop caching
+        // after a while and never say why. Exactly zero is assertable here because this test env
+        // has one sstable with a page index.
+        BOOST_REQUIRE_GT(sstables::parquet::read_cache_bytes_local().total(), 0u);
         sst->drop_pq_footer_cache(false);
+        BOOST_REQUIRE_EQUAL(sstables::parquet::read_cache_bytes_local().total(), 0u);
+
+        // Transparent when dropped: the reader fetches again and the answers are unchanged.
         const auto before_cold = sstables::parquet::extent_cache_stats_local();
         for (size_t i : sample) { read_one(expected[i]); }
         BOOST_REQUIRE_GT(sstables::parquet::extent_cache_stats_local().populations,
