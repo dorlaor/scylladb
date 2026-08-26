@@ -9062,12 +9062,12 @@ other before timing, 65 536 values × 400 passes:
 | 6 | 440 | 3 607 | 3 519 | 8.19× | 7.99× |
 | 8 | 391 | 4 005 | 4 094 | 10.23× | 10.46× |
 
-**The headline is that the middle column is the answer.** Specialising the width at compile time —
-one 64-bit load and eight unrolled shifts, no intrinsics — gets **5–10×**, and AVX2 adds only 2–5 %
-on top of it. What is slow in `rle_bitpack.hh::unpack8()` is not the absence of SIMD: it is the
-inner `while (acc_bits < _bit_width)` byte-feed loop and a runtime-variable shift, per value. The
-gain grows with bit width because that inner loop runs more often. This is what parquet-cpp and
-Arrow do too, and they reach for generated per-width unpackers before they reach for vectors.
+**That conclusion was wrong, and §10.49a corrects it.** It read "specialising the width is the
+answer, AVX2 adds only 2–5 %" — true of the AVX2 kernel measured *here*, which processed 8 values a
+call, and false of the technique Arrow actually uses. What is slow in
+`rle_bitpack.hh::unpack8()` does include the inner `while (acc_bits < _bit_width)` byte-feed loop and
+a runtime-variable shift per value — that part holds, and it is why width specialisation alone is
+worth 5–10×. The claim that vectors add nothing on top of it does not.
 
 **Kernel 2: the delta prefix sum**, which DELTA_BINARY_PACKED needs to turn deltas back into values.
 Here SIMD **lost**, and clearly:
@@ -9104,11 +9104,62 @@ that follows is therefore
 (2) a consumer for the batch reader, and only then
 (3) width-specialised unpacking, at which point it is most of what is left.
 
-**Recommended shape when it is done**: compile-time specialisation for widths 1–8 with a `switch` on
-the runtime width (the benchmark includes that switch, so the figures already pay for it), falling
-back to the present loop for 9–64; AVX2 only where it beat the templated version, which on this
-evidence is barely anywhere. It touches one file, and it is guarded by the existing level
-conformance tests plus a differential test against the current decoder for every width.
+**Recommended shape when it is done**: see §10.49a, which supersedes the sketch this section used
+to end with.
+
+### 10.49a Arrow does vectorise it, and the first measurement was against the wrong kernel — 2026-08-26
+
+**What Arrow actually does**, read out of the installed library rather than from memory.
+`libarrow.so.2500` exports `arrow::internal::bpacking::unpack_avx2<bool,u8,u16,u32,u64>` and
+`unpack_avx512<…>`, and `arrow::util::internal::ByteStreamSplitDecodeSimd<xsimd::avx2,{2,4,8}>`
+alongside `…SimdDispatch` guard variables — so: vectorised bit-unpacking, vectorised byte-stream
+split, runtime dispatch, xsimd as the abstraction. `libparquet.so.2500` adds `FindMinMaxAvx2`,
+`GreaterThanBitmapAvx2` and `FindHashBlockAvx2`. Every other avx2/avx512 symbol in those two
+libraries is OpenSSL's, not Arrow's.
+
+**Arrow's own code could not be benchmarked.** `bpacking.h` is not among the installed headers and
+the shared object carries no DWARF, so `UnpackOptions`' layout is not recoverable; guessing a struct
+ABI across a library boundary yields a crash or a plausible wrong number. What follows implements
+the *technique* — 32 values per call, a 16-byte window broadcast to both 128-bit halves,
+`shuffle_epi8` then `srlv_epi32` then mask — and says so.
+
+| bits | current | width-specialised scalar | **AVX2, 32/call** | best vs current |
+|---|---|---|---|---|
+| 1 | 733 | 3 402 | **7 076** | 9.7× |
+| 4 | 516 | 3 412 | **7 101** | 13.8× |
+| 8 | 377 | 3 561 | **6 903** | 18.3× |
+| 12 | 334 | 2 000 | **10 448** | **31.3×** |
+
+M values/s. **The vectorised kernel is ~2× the width-specialised scalar and up to 31× the current
+reader**, which is the opposite of what §10.49 concluded. The error was the kernel, not the
+arithmetic: the AVX2 version measured there did 8 values a call, so per-call overhead ate the win.
+32 a call amortises it — which is why Arrow's unpackers are shaped that way.
+
+**Two claims from §10.49 that also fall.** The store-bandwidth explanation offered for "AVX2 barely
+helps" is wrong: u32 output measures consistently *slower* than u64 here, so the kernel is not
+store-bound, and Arrow templating on output type is an API convenience rather than a throughput
+choice. And the reader storing levels as `std::vector<uint64_t>` is therefore not the inefficiency
+that section implied.
+
+**The Amdahl answer, however, barely moves, which is why this is still not next.**
+
+| | columnar scan | real scan | warm point read |
+|---|---|---|---|
+| 18× on unpacking, half of `values` | −4.8 % | −0.58 % | −7.4 % |
+| 18× on unpacking, all of `values` | −9.3 % | −1.12 % | — |
+
+Going from 10× to 18× on the kernel moves the end-to-end figure by 0.2 percentage points: at 10× the
+kernel has already stopped being the bottleneck, and `decompress` is 71.4 % of page decode. With the
+page cache warm, decode collapses to ~3.0 ms and unpacking becomes **87–91 %** of what is left — so
+the ordering stands: the liveness bit, then a batch-reader consumer, then this.
+
+**Shape when it is done**: Arrow-style 32-value AVX2 for widths 1–12 (a 16-byte window covers 8
+values only that far), width-specialised scalar for 13–16, present loop above that; `-march=x86-64-v3`
+is already the baseline so no dispatch is needed. One file, guarded by the existing level conformance
+tests plus a differential test against the current decoder at every width — which is what caught both
+bugs in the prototypes: an `_mm256_set1_epi64x` lane mapping that gives low,high,low,high across
+32-bit lanes, and a templated loader reading 8 bytes for 8 values of 10 bits, returning zeros from
+index 7 where the bits ran past the load.
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
