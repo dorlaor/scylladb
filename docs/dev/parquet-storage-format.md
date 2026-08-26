@@ -9216,6 +9216,116 @@ Also added: `PQ_PERF_MARKERS`, default off so every earlier figure against that 
 The generator writes cells without markers, so a projection benchmark against the default corpus
 measures the gate declining rather than the optimisation working — which is how the 0.99 row above
 was produced deliberately.
+### 10.51 On a cluster: the caches are real, and ordinary reads never reach them — 2026-08-26
+
+Everything in §10.38–§10.50 was one shard in a unit-test harness. `~/pq-lab/cluster_validate.sh`
+runs the real binary on four nodes at RF=3, a 60-column INSERT-only `parquet` table against a
+row-format twin, and reads the answers off the nodes' own metrics — which required registering them
+first: only the *footer* cache had ever been exported, so the counters this section quotes
+(`pq_offset_index_cache_*`, `pq_page_cache_*`, `pq_extent_cache_*`, `pq_read_cache_bytes`,
+`pq_projection_groups_*`) are new, and an earlier commit message claiming they existed was wrong.
+
+**Three findings that do not depend on the load completing.**
+
+**1. Projection fires through real CQL.** `groups_projected` rose by 56 and then 111 across runs,
+with `groups_declined` at **0** on an INSERT-only table. The marker gate of §10.50 does not merely
+pass its unit test; it admits real cluster queries.
+
+**2. The cache hit rates hold at cluster scale.** Over 600 random point reads at
+`BYPASS CACHE`, from the nodes' counters:
+
+| cache | hits | misses | hit rate |
+|---|---|---|---|
+| page index | 716 | 31 | **95.9 %** |
+| decompressed pages | 3 535 | 200 | **94.6 %** |
+| compressed extents | 3 535 | 200 | **94.6 %** |
+
+9.7 MB retained against the shard budget, which matches the ~8 MB working set §10.43 measured.
+
+**3. The one that changes where this work applies: without `BYPASS CACHE`, the parquet reader is
+never asked.** 400 point reads on the cached path moved the page cache by **hits +0, misses +0** —
+twice, on two separate runs. The row cache answered every one of them.
+
+That is §10.48's uncomfortable hypothesis confirmed on real nodes rather than argued. The three
+point-read caches — the 7.5×, which is half of this whole effort — sit on a path that ordinary
+cached CQL traffic **does not take**. They are worth having for `BYPASS CACHE` analytics, for tables
+with the cache disabled, and for working sets that do not fit; they are not on the hot path of a
+normal read. Nothing measured earlier is withdrawn — the benchmarks always printed their workload —
+but the applicability is narrower than the figures alone suggest, and it is the projection work,
+which targets `BYPASS CACHE` by construction, that is aimed at the more real target.
+
+**What this run could not measure, and why — three harness bugs, all mine.**
+
+The nat-vs-pq *timings* from these runs are unusable, and the reason is worth recording because each
+bug produced confident output:
+
+- **The readiness probe polled the wrong endpoint.** `/failure_detector/simple_states` on port 10000
+  returned an empty body from every node, so the script reported "NODES DID NOT COME UP" while all
+  four logged `initialization completed`. Fixed by probing `9180/metrics` — and then again, because
+  metrics answer *before* the native transport does and the driver got connection-refused on all
+  four. Readiness now means a TCP connect to 9042 succeeds.
+- **The loader could not finish.** At 512 concurrent writes, and then at 128 with retries, `nat`
+  hit coordinator write timeouts and stopped short: `pq=100000 nat=81395`. Every nat-vs-pq
+  comparison in those runs was between unequal datasets, visible in the output as "145 rows" against
+  "200 rows" in the same scan.
+- **And the guard against exactly that did not fire.** A `verify` step counts both tables and aborts
+  unless they match; it printed `ABORT: tables differ or are short` and the script continued anyway,
+  because `cql verify | tee -a` reports *tee's* status. `set -o pipefail` was missing.
+
+So the corpus is now 8 000 partitions at concurrency 64, the abort actually aborts, and timings are
+taken after a flush and a 90 s settle with warmups and interleaved arms — because untouched, the
+first query of a sequence pays footer and index population, which made pq's narrow scan look four
+times slower than its own wide scan.
+
+**Two more harness bugs after that, both of which produced quotable-looking numbers.** The
+"scan" was `WHERE pk = <one partition>` — five rows a query, so fixed costs dominated and projection
+had nothing to bite on; it reported a 2.53× internal gain against the in-process 11.82×, and the
+difference was the query shape, not the cluster. And the keyspace persisted between runs, so after
+the corpus was cut from 20 000 partitions to 8 000 the tables still held the older, unequal loads:
+a scan swept **100 000 rows from pq against 81 396 from nat**. The sampled verify passed anyway,
+because it only probes `pk < NPART` and both tables are complete there. It now counts every row
+through a key-only range scan and drops the keyspace first.
+
+### 10.51a What the clean cluster run establishes, and what it does not — 2026-08-26
+
+Sixth attempt, `pq=40000 nat=40000` verified by counting every row, full-table range scans at
+`BYPASS CACHE`, best of three interleaved passes.
+
+**Within one phase, caches on:**
+
+| | row format | pq | pq/nat |
+|---|---|---|---|
+| narrow scan, 1 of 60 columns | 683.6 ms | **517.7 ms** | **0.76×** |
+| wide scan, all 60 columns | 8 372.2 ms | 10 615.0 ms | **1.27×** |
+
+**The wide-scan penalty is real and the single-shard harness was hiding it.** In-process that scan
+measured 0.95× — parity — and on a cluster pq is 1.24–1.27× slower, in the same direction as
+§10.30's 2.87× on AWS. Whatever else is true, *a full scan of a pq table is slower than the row
+format*, and no amount of read-path caching changed that.
+
+**Projection has to be reported as two effects, not one.** The row format shows a 12.25× narrow-vs-
+wide gain and it pushes no projection down at all: that is purely the result set and the network
+shrinking from 60 columns to one. pq shows 20.50×. So **storage-level projection contributes about
+1.67× on top of the result-size effect** here, not the 20× the raw ratio suggests. Quoting the ratio
+without the row-format control would overstate this by an order of magnitude.
+
+**What this run cannot measure: the cache A/B.** Phase 5 restarts the nodes with the caches off, and
+pq's narrow scan came out *3.1× faster* that way (517.7 → 166.6 ms) while the control moved 3.5 %.
+That is not the caches: in-process, disabling both changes the same projected scan by **6 %**
+(73.1 → 68.8 ms). It is compaction state across the restart — pq reading one column of sixty is far
+more sensitive to sstable count than the row format reading all sixty. Both attempts at a cluster
+cache A/B are therefore confounded, and the honest position is that **the point-read caches have not
+been A/B'd on a cluster at all.**
+
+**Ranges, not points.** Across the runs that were otherwise valid, storage projection contributed
+1.67×–4.9× and the narrow scan ran 1.32×–3.96× faster than the row format, the spread tracking
+sstable and compaction state rather than anything in the code. The directions are consistent; the
+magnitudes are soft, and this box — shared, 93 % full, other tenants — is not where they get pinned
+down.
+
+**The three findings that held across all six runs** are in §10.51: projection fires through real
+CQL, the cache hit rates are 90–99 %, and ordinary cached reads never reach the parquet reader at
+all.
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
