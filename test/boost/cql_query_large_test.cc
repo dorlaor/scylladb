@@ -16,6 +16,7 @@
 #include <seastar/testing/test_case.hh>
 #include <seastar/testing/thread_test_case.hh>
 #include "test/lib/cql_test_env.hh"
+#include "sstables/parquet/footer_cache.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/test_utils.hh"
 
@@ -416,5 +417,63 @@ SEASTAR_THREAD_TEST_CASE(test_parquet_bypass_cache_projection_matches_row_format
                 }
             }
         }
+    }).get();
+}
+
+// Projection is applied where row existence is carried by the marker, and declined where it is not.
+//
+// The companion to test_parquet_bypass_cache_projection_matches_row_format, which pins that the
+// answers never change. This one pins that the optimisation actually *happens* for the shape it is
+// meant for -- an INSERT-only table, where every row has a marker -- and that it backs off for a
+// table containing a row written by UPDATE, whose existence rests on a cell a projection would drop.
+//
+// Without the second half this would pass just as well if projection had been switched off
+// altogether, which is how the previous version of this feature looked correct while returning 5
+// rows instead of 6.
+SEASTAR_THREAD_TEST_CASE(test_parquet_projection_applies_only_where_markers_carry_existence) {
+    do_with_cql_env_thread([](cql_test_env& e) {
+        auto& st = sstables::parquet::projection_stats_local();
+
+        // INSERT only: every row carries a marker.
+        e.execute_cql("create table ins (pk int, ck int, a int, b text, c double,"
+                      " primary key (pk, ck)) with storage_format = 'parquet'").get();
+        for (int i = 0; i < 40; ++i) {
+            e.execute_cql(seastar::format(
+                    "insert into ins (pk, ck, a, b, c) values (1, {}, {}, 'v{}', {}.5)",
+                    i, i * 10, i, i)).get();
+        }
+        // A row whose existence rests on one cell, with no marker.
+        e.execute_cql("create table upd (pk int, ck int, a int, b text, c double,"
+                      " primary key (pk, ck)) with storage_format = 'parquet'").get();
+        for (int i = 0; i < 40; ++i) {
+            e.execute_cql(seastar::format(
+                    "insert into upd (pk, ck, a, b, c) values (1, {}, {}, 'v{}', {}.5)",
+                    i, i * 10, i, i)).get();
+        }
+        e.execute_cql("update upd set b = 'only-b' where pk = 1 and ck = 99").get();
+        e.db().invoke_on_all([] (replica::database& dbi) {
+            return dbi.flush_all_memtables();
+        }).get();
+
+        auto count_rows = [&] (const sstring& cql) {
+            auto msg = e.execute_cql(cql).get();
+            auto res = dynamic_pointer_cast<cql_transport::messages::result_message::rows>(msg);
+            BOOST_REQUIRE(res);
+            return res->rs().result_set().rows().size();
+        };
+
+        // The INSERT-only table must project.
+        const auto before_ins = st;
+        const size_t n_ins = count_rows("select ck, a from ins where pk = 1 bypass cache");
+        BOOST_REQUIRE_EQUAL(n_ins, 40u);
+        BOOST_REQUIRE_GT(st.groups_projected, before_ins.groups_projected);
+
+        // The table with the marker-less row must not, and must still return every row -- 41,
+        // including ck=99 with a null `a`.
+        const auto before_upd = st;
+        const size_t n_upd = count_rows("select ck, a from upd where pk = 1 bypass cache");
+        BOOST_REQUIRE_EQUAL(n_upd, 41u);
+        BOOST_REQUIRE_GT(st.groups_declined, before_upd.groups_declined);
+        BOOST_REQUIRE_EQUAL(st.groups_projected, before_upd.groups_projected);
     }).get();
 }

@@ -8915,7 +8915,7 @@ Also fixed here: `batch_reader::init()` is public. `schema_mapping()` describes 
 empty until the footer is read — and a consumer needs the mapping to *build* a projection, which
 made the lazy-init version circular.
 
-### 10.47 Projection wired to a client query — measured at up to 13×, then disabled — 2026-08-25
+### 10.47 Projection wired to a client query — measured at up to 13×, then disabled, then gated (§10.50) — 2026-08-25
 
 §10.45 and §10.46 were both reader-interface numbers: real, but no client could reach them. This
 wires projection into the path a client already uses — the mutation reader — so the gain arrives at
@@ -8927,8 +8927,7 @@ a CQL query.
 | 29 | 352.6 ms | 63.3 ms | 5.57× |
 | 65 | 914.9 ms | **69.5 ms** | **13.16×** |
 
-**These are what the capability is worth, not what a client gets. The wiring is disabled — see "Row
-existence" below.**
+**Measured on the unsafe path, before the gate of §10.50 existed. The safe figures are there.**
 
 The projected time is nearly flat — 53 → 70 ms as the table goes from 5 to 65 columns — while the
 unprojected time scales with width. That is the columnar property finally reaching a client, and it
@@ -8971,10 +8970,10 @@ conveys implicitly by sending everything, and which pq's shared channels do not 
 `__ts` covers live *and* dead cells, and CQL row existence needs live. Skipping the read is the easy
 part; preserving that one bit is the actual problem.
 
-**The client-visible derivation in `table::query()` is therefore disabled.** The reader capability
-stays and is exercised by the explicit `may_project_columns` option in the sstable tests and the
-benchmark, so the figures above stand as *what this is worth once row liveness is solved* — not as
-something a client gets today. Nothing sets the option in production.
+**It was disabled for this reason, and §10.50 re-enables it** — not by solving liveness in general,
+but by declining to project the row groups where the question can arise at all. The figures above
+were measured with the option forced on a corpus whose rows have no markers, i.e. on the unsafe
+path; §10.50 has the safe ones.
 
 Two lessons, both cheap to state and expensive to learn. A test that reads through a different layer
 than the one being changed can prove the wrong proposition confidently; the unit test and the
@@ -9160,6 +9159,63 @@ tests plus a differential test against the current decoder at every width — wh
 bugs in the prototypes: an `_mm256_set1_epi64x` lane mapping that gives low,high,low,high across
 32-bit lanes, and a templated loader reading 8 bytes for 8 values of 10 bits, returning zeros from
 index 7 where the bits ran past the load.
+### 10.50 Projection ships, and the format change turned out to be unnecessary — 2026-08-26
+
+§10.47 disabled projection because a row written by `UPDATE` has no row marker, so its existence
+rests on one cell, and projecting that cell away loses the row: 5 rows where the row format returns
+6. The plan was to add a per-row `__live` leaf.
+
+**That plan was wrong, and finding out why is the useful part.** `deletable_row::is_live()` is
+"a live marker, or any live cell" — there is no third channel to put a liveness bit into. Worse,
+**liveness is a merged property**: whether a cell is live depends on tombstones that may sit in
+another sstable or in a memtable, so a bit computed when this file was written cannot decide it. And
+a synthetic row marker invented to carry the bit would not merge correctly against a row tombstone,
+which is the same objection one level down.
+
+**What works needs no format change, because the file already says it.** The row marker is its own
+leaf, and it is a *shared* channel — `projection_skip_mask()` only ever skips per-column leaves — so
+it is read whatever the projection. If every row in a row group has a live marker, every row's
+existence is carried by data the projection keeps, and it merges correctly because it is real data
+rather than something reconstructed. Parquet's own statistics answer it: `null_count == 0` on the
+marker chunk. Two more statistics close the ways a present marker can still fail to be live — the
+marker-TTL and marker-deletion leaves must be entirely null for that group, or the row might be
+alive only through a cell the projection would drop.
+
+`pq_reader::projection_is_safe(rg)` is that check, applied per row group, and
+`table::query()` derives the permission again.
+
+**Measured, and this time on both shapes:**
+
+| corpus, 65 regular columns | `SELECT one_col … BYPASS CACHE` | with projection | |
+|---|---|---|---|
+| INSERT-shaped — every row has a marker | 832.4 ms | **70.4 ms** | **11.82×** |
+| UPDATE-shaped — one marker-less row | 828.5 ms | 840.6 ms | 0.99× — declined |
+
+and by width on the INSERT-shaped corpus: 1.84× at 5 columns, 5.90× at 29, 11.82× at 65.
+
+Two things to read off that table. The gate costs nothing when it declines — 0.99× is the check
+itself, which is three statistics lookups per row group. And **§10.47's 13.16× was measured on the
+unsafe path**, with the option forced on a marker-less corpus; 11.82× is the honest figure for the
+same shape.
+
+**What it means for a user.** An INSERT-only table — which is what a time-series workload is — gets
+the full win. A table maintained by `UPDATE` gets nothing, silently, which is why
+`sstables_pq_projection_*` counts groups projected against groups declined: the difference is
+invisible from the query, and an operator asking "why is my narrow scan not faster" needs an answer
+that is not "read the source".
+
+**Tests.** Two, and the second is the one that matters.
+`test_parquet_bypass_cache_projection_matches_row_format` pins that answers never change, projection
+or not. `test_parquet_projection_applies_only_where_markers_carry_existence` pins that the
+optimisation *happens* on an INSERT-only table and *backs off* on one containing an UPDATE row,
+returning 41 rows including the marker-less one with a null. Without the second half, switching
+projection off entirely would pass the suite — which is exactly how the previous version looked
+correct while dropping a row.
+
+Also added: `PQ_PERF_MARKERS`, default off so every earlier figure against that corpus still stands.
+The generator writes cells without markers, so a projection benchmark against the default corpus
+measures the gate declining rather than the optimisation working — which is how the 0.99 row above
+was produced deliberately.
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of

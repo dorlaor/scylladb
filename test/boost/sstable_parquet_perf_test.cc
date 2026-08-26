@@ -142,6 +142,20 @@ int text_bytes() {
     return n;
 }
 
+// Give every row a marker, i.e. write it the way INSERT does rather than the way UPDATE does.
+//
+// Default off, so every figure measured against this corpus before today still stands. It exists
+// because projection is only applied to a row group whose rows all carry a live marker (see
+// pq_reader::projection_is_safe), and this generator writes cells without one -- so a projection
+// benchmark against the default corpus measures the gate declining, not the optimisation.
+bool with_markers() {
+    static const bool on = [] {
+        const char* e = std::getenv("PQ_PERF_MARKERS");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
 utils::chunked_vector<mutation> gen(schema_ptr s, int n_part, int n_rows) {
     static const char* WORDS[] = {"active", "pending", "closed", "archived", "error",
                                   "retry", "queued", "done"};
@@ -155,6 +169,9 @@ utils::chunked_vector<mutation> gen(schema_ptr s, int n_part, int n_rows) {
         const api::timestamp_type row_ts = 1'700'000'000'000'000LL + p;
         for (int r = 0; r < n_rows; ++r) {
             auto ck = clustering_key::from_single_value(*s, int32_type->decompose(r));
+            if (with_markers()) {
+                m.partition().clustered_row(*s, ck).apply(row_marker(row_ts));
+            }
             auto put = [&] (const char* name, bytes val) {
                 const auto& cd = *s->get_column_definition(to_bytes(name));
                 m.set_clustered_cell(ck, cd, atomic_cell::make_live(*cd.type, row_ts, val));

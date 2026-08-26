@@ -587,6 +587,9 @@ class pq_reader : public mutation_reader::impl {
     // True when every chunk of the materialised row group has a usable OffsetIndex, which is
     // what decode_paged() needs in order to fetch pages rather than the whole group.
     bool have_page_index() const;
+    // Whether this row group's rows all carry their existence in the shared marker channel, which
+    // is what makes dropping their other columns safe. See the definition.
+    bool projection_is_safe(size_t rg) const;
     // Would the paged path fetch at least as many bytes as one sequential read of the row group,
     // to cover group-local rows [lo, hi)? See the long comment at the call site.
     bool paged_fetch_is_not_cheaper(int64_t lo, int64_t hi, std::span<const uint8_t> elide) const;
@@ -1295,13 +1298,66 @@ const std::vector<uint8_t>& pq_reader::elidable_leaves(size_t rg) {
         if (!cm.stats || !cm.stats->null_count) { continue; }   // no statistics: read it
         if (cm.num_values > 0 && *cm.stats->null_count == cm.num_values) { _elide[c] = 1; }
     }
-    // The query's projection rides the same channel. Unioned rather than replacing: a leaf the file
-    // proves all-null is skippable whether or not the query wanted it, and a leaf the query does
-    // not want is skippable whether or not it is null.
-    for (size_t c = 0; c < _elide.size() && c < _projection_skip.size(); ++c) {
-        if (_projection_skip[c]) { _elide[c] = 1; }
+    // The query's projection rides the same channel, but only where it is safe for this group --
+    // see projection_is_safe(). Unioned rather than replacing: a leaf the file proves all-null is
+    // skippable whether or not the query wanted it, and a leaf the query does not want is skippable
+    // whether or not it is null.
+    if (projection_is_safe(rg)) {
+        for (size_t c = 0; c < _elide.size() && c < _projection_skip.size(); ++c) {
+            if (_projection_skip[c]) { _elide[c] = 1; }
+        }
+        ++projection_stats_local().groups_projected;
+    } else if (!_projection_skip.empty()) {
+        ++projection_stats_local().groups_declined;
     }
     return _elide;
+}
+
+// Whether the query's projection may be applied to this row group.
+//
+// The constraint is not about bytes, it is about row existence. `deletable_row::is_live()` is "a
+// live marker, or any live cell" -- there is no third channel -- so a row whose only live cell sits
+// in a projected-away column stops being live, and the query layer drops it. A `SELECT a` that
+// should return that row with `a = null` returns nothing instead, which is what
+// test_parquet_bypass_cache_projection_matches_row_format caught: 5 rows against the row format's 6.
+//
+// A per-row "has a live cell" bit in the file would not fix it either, and that is worth writing
+// down: liveness is a *merged* property. Whether a cell is live depends on tombstones that may live
+// in another sstable or in a memtable, so a bit computed when this file was written cannot decide
+// it, and a synthetic row marker invented to carry it would not merge correctly against a row
+// tombstone either.
+//
+// What does work needs no format change, because the information is already here. The row marker is
+// its own leaf and it is a *shared* channel -- projection_skip_mask() only ever skips per-column
+// leaves -- so it is read whatever the projection. If every row in this group has a marker, every
+// row's existence is carried by data the projection keeps, and it merges correctly because it is
+// real data rather than something reconstructed. Parquet's own statistics answer that: null_count
+// on the marker chunk.
+//
+// The two extra conditions are the ways a present marker can still fail to be live. A marker with a
+// TTL can expire, and a marker can itself be deleted; in either case the row might be alive only
+// through some other cell, which is exactly the cell a projection would drop. Both are statistics
+// questions too -- the TTL and local-deletion-time leaves must be entirely null for this group.
+bool pq_reader::projection_is_safe(size_t rg) const {
+    if (_projection_skip.empty()) { return false; }
+    const auto& cols = columns();
+    auto chunk = [&] (std::optional<size_t> idx) -> const format::column_metadata* {
+        if (!idx || *idx >= cols.size() || !cols[*idx].meta) { return nullptr; }
+        return &*cols[*idx].meta;
+    };
+    // Every row carries a marker.
+    const auto* mk = chunk(_ms.rm_index);
+    if (!mk || !mk->stats || !mk->stats->null_count) { return false; }
+    if (*mk->stats->null_count != 0) { return false; }
+    // No marker in this group expires or is dead: those leaves are entirely absent from it.
+    for (auto idx : {_ms.rm_ttl_index, _ms.rm_ldt_index}) {
+        if (!idx) { continue; }                       // the schema does not materialise it at all
+        const auto* c = chunk(idx);
+        if (!c) { continue; }
+        if (!c->stats || !c->stats->null_count) { return false; }   // cannot prove it, so decline
+        if (*c->stats->null_count != c->num_values) { return false; }
+    }
+    return true;
 }
 
 bool pq_reader::have_page_index() const {

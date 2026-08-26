@@ -147,4 +147,17 @@ inline extent_cache_stats& extent_cache_stats_local() noexcept {
     return s;
 }
 
+// How often a query's projection could actually be applied. Exported so an operator can see the
+// answer for their own data: a table written by INSERT projects, one written by UPDATE does not,
+// and the difference is not visible from the query.
+struct projection_stats {
+    uint64_t groups_projected = 0;
+    uint64_t groups_declined = 0;
+};
+
+inline projection_stats& projection_stats_local() noexcept {
+    static thread_local projection_stats s;
+    return s;
+}
+
 } // namespace sstables::parquet
