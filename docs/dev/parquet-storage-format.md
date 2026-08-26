@@ -9041,6 +9041,74 @@ saved. Reasoning about averages hid that; the 200-group runs are the honest floo
 Nothing here withdraws the earlier figures — they are correct for the workload stated, and that
 workload was always printed alongside them. What is new is the curve, and the curve is what should
 be quoted when someone asks what this is worth.
+### 10.49 SIMD: measured, and the answer is not intrinsics — 2026-08-26
+
+Nothing in this reader is vectorised, and the question is whether it should be. Answered with a
+standalone proof of concept (`~/pq-lab/simd_poc.cc`, also in the session scratchpad) rather than an
+opinion, because the addressable share turns out to decide it.
+
+**The build already targets `-march=x86-64-v3`**, so AVX2 and BMI2 are baseline and no runtime
+dispatch machinery is needed. That removes the usual first objection.
+
+**Kernel 1: bit-unpacking**, used by RLE_DICTIONARY indices, by definition/repetition levels and by
+DELTA_BINARY_PACKED miniblocks. Three implementations, all verified value-for-value against each
+other before timing, 65 536 values × 400 passes:
+
+| bits | current, M values/s | compile-time width | AVX2 | tmpl gain | AVX2 gain |
+|---|---|---|---|---|---|
+| 1 | 698 | 3 542 | 3 626 | 5.07× | 5.19× |
+| 2 | 623 | 3 588 | 3 932 | 5.76× | 6.31× |
+| 4 | 517 | 3 574 | 3 794 | 6.91× | 7.34× |
+| 6 | 440 | 3 607 | 3 519 | 8.19× | 7.99× |
+| 8 | 391 | 4 005 | 4 094 | 10.23× | 10.46× |
+
+**The headline is that the middle column is the answer.** Specialising the width at compile time —
+one 64-bit load and eight unrolled shifts, no intrinsics — gets **5–10×**, and AVX2 adds only 2–5 %
+on top of it. What is slow in `rle_bitpack.hh::unpack8()` is not the absence of SIMD: it is the
+inner `while (acc_bits < _bit_width)` byte-feed loop and a runtime-variable shift, per value. The
+gain grows with bit width because that inner loop runs more often. This is what parquet-cpp and
+Arrow do too, and they reach for generated per-width unpackers before they reach for vectors.
+
+**Kernel 2: the delta prefix sum**, which DELTA_BINARY_PACKED needs to turn deltas back into values.
+Here SIMD **lost**, and clearly:
+
+| | M values/s |
+|---|---|
+| scalar dependent-add chain | 3 537 |
+| AVX2 log-shift scan | 1 257 (**0.36×**) |
+
+A four-lane log-shift scan needs two permutes, two blends, an add and a lane extract to carry into
+the next vector — and the extract serialises it. The scalar loop is a tight dependent add the core
+already runs at ~3.5 G/s. Recorded as a negative result: the naive vectorisation of a scan is worse
+than not vectorising it.
+
+**What it is worth end to end, which is the part that decides priority.** From the measured columnar
+scan: page decode is 10.5 ms of a 29.4 ms decode, and inside it **`decompress` is 71.4 %** — zstd,
+which is already internally vectorised and not ours to improve. `values` is 26.6 % and `levels`
+1.2 %:
+
+| | saved | columnar scan | mutation scan |
+|---|---|---|---|
+| 6× on unpacking (half of `values`) | 1.25 ms | −4.3 % | −0.51 % |
+| 6× on unpacking (all of `values`) | 2.42 ms | −8.2 % | −0.99 % |
+
+So today it is worth **4–8 % of a columnar scan and under 1 % of a real one.** Not nothing, and not
+the lever anyone should reach for first — the same Amdahl arithmetic that makes parquet decode a
+1.19× ceiling on a scan (§10.38) caps this too.
+
+**When it becomes material.** With the decompressed-page cache warm, `decompress` goes to ~0 and
+decode collapses to ~3.0 ms — at which point unpacking is **81–87 % of what remains**. The
+conditional is the point: *SIMD matters after the codec cost is removed, not before.* The ordering
+that follows is therefore
+(1) the row-liveness bit so projection ships (§10.47),
+(2) a consumer for the batch reader, and only then
+(3) width-specialised unpacking, at which point it is most of what is left.
+
+**Recommended shape when it is done**: compile-time specialisation for widths 1–8 with a `switch` on
+the runtime width (the benchmark includes that switch, so the figures already pay for it), falling
+back to the present loop for 9–64; AVX2 only where it beat the templated version, which on this
+evidence is barely anywhere. It touches one file, and it is guarded by the existing level
+conformance tests plus a differential test against the current decoder for every width.
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
