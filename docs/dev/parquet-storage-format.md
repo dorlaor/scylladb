@@ -8997,6 +8997,50 @@ every column and gets no mask. It requires `BYPASS CACHE`, so an ordinary cached
 And it is measured on one shard against one sstable: a real query merges memtables and several
 sstables, and only the pq ones project.
 
+### 10.48 The point-read gain is a hit rate, and here is the exchange rate — 2026-08-26
+
+§10.39, §10.41 and §10.42 all measured the same workload: 1 000 random point reads over 20 000
+partitions, which land in 18 row groups — **about 50 reads per row group**. Every one of those
+figures is therefore a cache *hit-rate* result, and the obvious question is what happens when the
+reads do not share a row group. Measured, by varying reads per row group at a fixed corpus:
+
+| reads per row group | caches on | caches off | gain | decompressions/read |
+|---|---|---|---|---|
+| 50 | 86.4 µs | 696.8 µs | **8.06×** | 0.14 |
+| 10 | 149.4 µs | 727.4 µs | 4.87× | 0.72 |
+| 3 | 229.9 µs | 724.4 µs | 3.15× | 2.0 |
+| 1 (nominal) | 563.5 µs | 960.3 µs | 1.70× | 4.0 |
+
+And with reuse driven to genuinely zero — 20 and 40 reads scattered over **200** row groups, so
+collisions are negligible:
+
+| | caches on | caches off | ratio |
+|---|---|---|---|
+| 20 reads / 200 groups | 947.9 µs | 1 076.6 µs | 1.14× |
+| 40 reads / 200 groups | 1 003.2 µs | 943.1 µs | **0.94×** |
+
+**A cold point read gets nothing, and pays about 6 %** for the bookkeeping: the memcpy into the
+extent cache, the map inserts, the reclaim accounting. Note also that the "1 read per row group" row
+above is *not* the cold case — 20 random reads into 20 groups collide by the birthday effect, so
+~7 of them land in an already-touched group, and 4 of 8 decompressions per read are already being
+saved. Reasoning about averages hid that; the 200-group runs are the honest floor.
+
+**So the headline is an exchange rate, not a constant.** 8× needs ~50 reads per row group; ~5× needs
+10; break-even is around 1. What decides it is how concentrated the access is, and a row group is
+5 000 rows — a large unit, which cuts both ways:
+
+- **Favourable, and not exotic.** Every clustering row of a partition sits in the same row group, so
+  reading or paging through a partition with many rows reuses one cached page set. Time-series reads
+  of recent rows in a partition — the stated target workload — cluster tightly by construction.
+- **Unfavourable.** Uniformly random single-row lookups across a table with thousands of row groups
+  get nothing. Worse, the reads that reach the sstable reader at all are the ones that *missed*
+  Scylla's row cache, and missing the row cache correlates with exactly the poor locality this
+  optimisation needs. The regime where these caches pay may be narrower in production than the
+  benchmark suggests, and that has not been measured on a real workload.
+
+Nothing here withdraws the earlier figures — they are correct for the workload stated, and that
+workload was always printed alongside them. What is new is the curve, and the curve is what should
+be quoted when someone asks what this is worth.
 ## 11. Open questions
 
 > Deferred work is tracked in **[parquet-future-work.md](parquet-future-work.md)** as of
