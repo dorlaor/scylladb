@@ -4203,6 +4203,40 @@ future<> init_metrics() {
         sm::make_gauge("pq_footer_cache_bytes", [] { return parquet::footer_cache_stats_local().bytes; },
             sm::description("Bytes retained by parsed Parquet footers on this shard")),
 
+        // The three read caches, and whether a query's projection could be applied. All four
+        // answer questions an operator cannot get from a query: whether the point-read caches are
+        // paying (their gain is a hit rate, design doc 10.48), and whether narrow scans are being
+        // projected or silently declined because the table's rows lack row markers (10.50).
+        sm::make_counter("pq_offset_index_cache_hits",
+            [] { return parquet::offset_index_cache_stats_local().hits; },
+            sm::description("Page-index reads avoided because the sstable's page index was cached")),
+        sm::make_counter("pq_offset_index_cache_misses",
+            [] { return parquet::offset_index_cache_stats_local().misses; },
+            sm::description("Reads that had to fetch a Parquet page index")),
+        sm::make_counter("pq_page_cache_hits",
+            [] { return parquet::page_cache_stats_local().hits; },
+            sm::description("Page decompressions avoided because the decompressed page was cached")),
+        sm::make_counter("pq_page_cache_misses",
+            [] { return parquet::page_cache_stats_local().misses; },
+            sm::description("Data pages that had to be decompressed")),
+        sm::make_counter("pq_extent_cache_hits",
+            [] { return parquet::extent_cache_stats_local().hits; },
+            sm::description("Page fetches avoided because the compressed extent was cached")),
+        sm::make_counter("pq_extent_cache_misses",
+            [] { return parquet::extent_cache_stats_local().misses; },
+            sm::description("Compressed page extents that had to be read from disk")),
+        sm::make_gauge("pq_read_cache_bytes",
+            [] { return parquet::read_cache_bytes_local().total(); },
+            sm::description("Bytes retained by the Parquet decompressed-page and extent caches on "
+                            "this shard, against the shard-wide budget")),
+        sm::make_counter("pq_projection_groups_projected",
+            [] { return parquet::projection_stats_local().groups_projected; },
+            sm::description("Row groups a query's column projection was applied to")),
+        sm::make_counter("pq_projection_groups_declined",
+            [] { return parquet::projection_stats_local().groups_declined; },
+            sm::description("Row groups a projection was declined for, because their rows do not "
+                            "all carry a live row marker to hold row existence")),
+
         sm::make_counter("partition_writes", [] { return sstables_stats::get_shard_stats().partition_writes; },
             sm::description("Number of partitions written")),
         sm::make_counter("static_row_writes", [] { return sstables_stats::get_shard_stats().static_row_writes; },
