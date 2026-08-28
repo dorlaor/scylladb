@@ -99,7 +99,8 @@ def check(entry):
 
 def main():
     d = pathlib.Path(sys.argv[1])
-    man = json.load(open(d / "manifest.json"))
+    with open(d / "manifest.json") as f:
+        man = json.load(f)
     bad = 0
     for e in man:
         try:
