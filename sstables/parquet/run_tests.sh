@@ -2,7 +2,7 @@
 # Full test suite for sstables/parquet (layer 1 format codec + layer 2 mapping).
 # Standalone by design: no Seastar, no Scylla headers, no libthrift.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 # Test fixtures: real Parquet files from public datasets plus generated
 # conformance cases. Point PARQUET_TEST_DATA at a directory containing
 # nyc_taxi.parquet, hits_0.parquet and conf/*.parquet (see

@@ -40,6 +40,7 @@ target_sources(sstables
     parquet/gain_estimator.cc
     parquet/format/parquet_reader.cc
     parquet/format/encryption.cc
+    parquet/batch_reader.cc
     parquet/encryption_keys.cc
     writer.cc)
 target_include_directories(sstables
