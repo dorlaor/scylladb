@@ -64,11 +64,13 @@ Enough that a point read touches the footer **once, at a known offset, for one r
 | per row group: `num_rows` | 8 | so ordinal → row group needs no footer read at all |
 
 20 bytes per row group plus a small header. At 2 000 groups that is **40 kB**, against a 2.84 MB
-footer — a 71× reduction in bytes touched, and fixed-width records make lookup O(1) rather than a
-walk.
+footer — a 71× reduction in bytes touched, and fixed-width records make each record access O(1)
+rather than a walk.
 
-The cold path becomes: read the side index, binary-search `num_rows` for the ordinal, read one
-~1 420-byte slab plus the schema prefix, decode. **O(1) in row groups.**
+The record stores each group's **cumulative first-row offset**, not its own `num_rows`: a per-group
+count is not monotonic, so it is not a search key. The cold path becomes: read the side index,
+binary-search the first-row offsets for the ordinal — **O(log N) in row groups** — then one O(1)
+fixed-width record access, one ~1 420-byte slab read plus the schema prefix, decode.
 
 ## Where it lives, and why not a new component
 

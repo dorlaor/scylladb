@@ -601,6 +601,7 @@ bool operator==(const schema::user_properties& lhs, const schema::user_propertie
         && lhs.compaction_enabled == rhs.compaction_enabled
         && lhs.storage_engine == rhs.storage_engine
         && lhs.storage_format == rhs.storage_format
+        && lhs.parquet_options == rhs.parquet_options
         && lhs.caching_options == rhs.caching_options
         && lhs.tablet_options == rhs.tablet_options
         && lhs.get_paxos_grace_seconds() == rhs.get_paxos_grace_seconds()
@@ -709,6 +710,7 @@ table_schema_version schema::calculate_digest(const schema::raw_schema& r) {
     feed_hash(h, r._is_counter);
     feed_hash(h, r._props.storage_engine);
     feed_hash(h, r._props.storage_format);
+    feed_hash(h, r._props.parquet_options);
 
     for (auto&& [name, ext] : r._props.extensions) {
         feed_hash(h, name);

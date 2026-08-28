@@ -1703,6 +1703,13 @@ mutation make_scylla_tables_mutation(schema_ptr table, api::timestamp_type times
     // once PARQUET_SSTABLE_FORMAT is enabled (see cf_prop_defs::validate).
     if (!table->parquet_options().empty()) {
         store_map(m, ckey, "parquet", timestamp, table->parquet_options());
+    } else if (table->has_storage_format()) {
+        // Clearing the options must actually clear them: without a tombstone the
+        // previously-stored collection survives and is restored on reload. Same
+        // shape as the `tablets` column above. Gated on has_storage_format() so a
+        // table that never used the feature keeps writing no cell at all.
+        auto& cdef = *scylla_tables()->get_column_definition("parquet");
+        m.set_clustered_cell(ckey, cdef, atomic_cell::make_dead(timestamp, gc_clock::now()));
     }
     if (table->has_storage_format()) {
         m.set_clustered_cell(ckey, "storage_format",

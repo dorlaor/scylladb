@@ -464,6 +464,8 @@ which exited with `malformed sstable error (aborting): invalid version`.
 Downgrade is therefore safe but strictly manual: `ALTER` back to `'sstable'`, `nodetool
 upgradesstables -a` on **every** node, verify per node through
 `GET /column_family/storage_format/{ks:table}` until each reports `converged: native`, then downgrade.
+This procedure is verified for local storage only — on object storage the rewritten objects have no
+version to pin, so downgrade safety there is unverified (see the object-storage note above).
 Two things a plan must not miss: TWCS tables on `'hybrid'` are Parquet even though the property does
 not say `'parquet'`, and **snapshots taken while the table was Parquet still contain `pq` files**, so
 the backup retention window is part of the downgrade window.
@@ -545,7 +547,9 @@ which term binds depends on row *density*, not column count (§10.1f-rg). On den
 byte budget binds and the row count is inert. Harder than it looks: this budget exists to stop a
 shard OOMing (R-13), so it cannot simply be raised for size.
 
-To be clear about what this item is and is not: `row_group_buffer_bytes` is a **guard rail**, not a
+To be clear about what this item is and is not: `row_group_buffer_bytes` is **not implemented** —
+today `rows_per_row_group` alone bounds a group, and this item is the proposal to add the guard.
+It would be a **guard rail**, not a
 tuning dial -- `rows_per_row_group` is the dial (design doc §8.2). The question here is whether the
 guard should be *shape-aware*, because a single 64 MiB figure means very different row counts across
 the corpus and on a dense wide table it silently becomes the thing that cuts. That is a correctness-
