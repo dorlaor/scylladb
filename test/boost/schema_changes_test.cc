@@ -102,3 +102,25 @@ SEASTAR_TEST_CASE(test_schema_changes_mt) {
 SEASTAR_TEST_CASE(test_schema_changes_pq) {
     return test_schema_changes_int(sstable_version_types::pq);
 }
+
+// Changing only a parquet option must change both schema equality and the digest.
+// Both once omitted parquet_options while including storage_format, so an
+// options-only ALTER compared equal and kept the same schema version — the
+// change never propagated. Equality is checked under a pinned version, because
+// two freshly built schemas already differ by their computed versions.
+SEASTAR_THREAD_TEST_CASE(test_parquet_options_affect_schema_equality_and_digest) {
+    auto make = [] (const char* rows) {
+        return schema_builder(1, "ks", "parquet_options_digest")
+            .with_column("pk", int32_type, column_kind::partition_key)
+            .with_column("v", int32_type)
+            .set_storage_format(storage_format_type::parquet)
+            .set_parquet_options({{"rows_per_row_group", rows}})
+            .build();
+    };
+    auto s1 = make("5000");
+    auto s2 = make("9000");
+    BOOST_REQUIRE(s1->version() != s2->version());
+
+    auto s2_pinned = schema_builder(s2).with_version(s1->version()).build();
+    BOOST_REQUIRE(!(*s1 == *s2_pinned));
+}
