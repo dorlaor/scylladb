@@ -396,6 +396,7 @@ done
 
 install -d -m755 "$retc"/scylla "$rprefix/bin" "$rprefix/libexec" "$rprefix/libreloc" "$rprefix/libreloc/fipscheck" "$rprefix/libreloc/pkcs11" "$rprefix/scripts" "$rprefix/bin"
 if ! $without_systemd; then
+    install -m644 dist/common/systemd/scylla-fd-guard.service -Dt "$rsystemd"
     install -m644 dist/common/systemd/scylla-fstrim.service -Dt "$rsystemd"
     install -m644 dist/common/systemd/scylla-housekeeping-daily.service -Dt "$rsystemd"
     install -m644 dist/common/systemd/scylla-housekeeping-restart.service -Dt "$rsystemd"

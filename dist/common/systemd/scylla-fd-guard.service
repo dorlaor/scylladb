@@ -1,0 +1,20 @@
+[Unit]
+Description=Scylla file descriptor guard
+Documentation=https://docs.scylladb.com/manual/master/operating-scylla/admin-tools/scylla-fd-guard.html
+After=scylla-server.service
+
+[Service]
+Type=simple
+ExecStart=/opt/scylladb/scripts/scylla_fd_guard --unit scylla-server.service
+Restart=on-failure
+RestartSec=5
+Slice=scylla-helper.slice
+# Needs CAP_SYS_RESOURCE to raise Scylla's hard RLIMIT_NOFILE via prlimit(2)
+# and CAP_SYS_PTRACE/CAP_DAC_READ_SEARCH to count entries in /proc/<pid>/fd.
+CapabilityBoundingSet=CAP_SYS_RESOURCE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=true
+ProtectHome=read-only
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

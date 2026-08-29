@@ -33,6 +33,7 @@ else
 endif
 	dh_installinit --no-start --name scylla-housekeeping-daily
 	dh_installinit --no-start --name scylla-housekeeping-restart
+	dh_installinit --no-start --name scylla-fd-guard
 	dh_installinit --no-start --name scylla-fstrim
 	dh_installinit --no-start --name scylla-tune-sched
 

@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# Copyright 2026-present ScyllaDB
+#
+
+#
+# SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+
+"""
+scylla-fd-guard: watch how many file descriptors ScyllaDB has open, warn
+when usage approaches RLIMIT_NOFILE, and raise the limit at runtime via
+prlimit(2) before Scylla starts failing with EMFILE ("Too many open files").
+Raising the limit requires neither a reboot nor a Scylla restart.
+
+Scylla already raises its soft limit to the hard limit at startup, so the
+guard mostly matters for the hard limit, which an unprivileged process cannot
+raise for itself; the guard runs privileged (CAP_SYS_RESOURCE) and does it
+from the outside.
+
+See docs/operating-scylla/admin-tools/scylla-fd-guard.rst for details.
+"""
+
+import argparse
+import collections
+import os
+import resource
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+PROG = 'scylla-fd-guard'
+
+# sd-daemon(3) log level prefixes: journald turns these into the message
+# priority (SyslogLevelPrefix= defaults to true), so operators can alert on
+# `journalctl -p warning -u scylla-fd-guard`.
+LOG_ERR = 3
+LOG_WARNING = 4
+LOG_NOTICE = 5
+LOG_INFO = 6
+
+
+def log(prio, msg):
+    print(f'<{prio}>{msg}', file=sys.stderr, flush=True)
+
+
+# event is one of:
+#   'ok'    - usage below every threshold
+#   'warn'  - usage crossed warn_ratio, no action needed yet
+#   'raise' - usage crossed raise_ratio, raise the limit to (new_soft, new_hard)
+#   'cap'   - usage crossed raise_ratio but the limit cannot grow any further
+Decision = collections.namedtuple('Decision', ['event', 'new_soft', 'new_hard'])
+
+
+def read_int_file(path):
+    with open(path) as f:
+        return int(f.read().split()[0])
+
+
+def read_nr_open():
+    return read_int_file('/proc/sys/fs/nr_open')
+
+
+def read_file_nr():
+    """System-wide open files: (allocated, maximum) from fs.file-nr."""
+    with open('/proc/sys/fs/file-nr') as f:
+        fields = f.read().split()
+    return int(fields[0]), int(fields[2])
+
+
+def count_open_fds(pid):
+    with os.scandir(f'/proc/{pid}/fd') as it:
+        return sum(1 for _ in it)
+
+
+def get_nofile_limits(pid):
+    return resource.prlimit(pid, resource.RLIMIT_NOFILE)
+
+
+def plan_action(nr_fds, soft, hard, nr_open, warn_ratio, raise_ratio,
+                raise_factor, cap):
+    """Pure decision function, unit-tested in test/fd_guard.
+
+    Utilization is measured against the soft limit: that is what open()
+    enforces (EMFILE). A limit of RLIM_INFINITY is effectively fs.nr_open,
+    the most any process may have open.
+    """
+    effective_soft = nr_open if soft == resource.RLIM_INFINITY else min(soft, nr_open)
+    effective_hard = nr_open if hard == resource.RLIM_INFINITY else min(hard, nr_open)
+    cap = min(cap, nr_open)
+    if nr_fds < effective_soft * warn_ratio:
+        return Decision('ok', None, None)
+    if nr_fds < effective_soft * raise_ratio:
+        return Decision('warn', None, None)
+    # Grow by raise_factor, but always end up above the current usage even
+    # if it spiked past soft * raise_factor between two polls.
+    target = max(int(effective_soft * raise_factor), nr_fds + 1)
+    new_hard = min(max(effective_hard, target), cap)
+    new_soft = min(target, new_hard)
+    if new_soft <= effective_soft:
+        return Decision('cap', None, None)
+    return Decision('raise', new_soft, new_hard)
+
+
+def apply_raise(pid, soft, hard, new_soft, new_hard, dry_run):
+    """Raise the target's RLIMIT_NOFILE; returns the (soft, hard) now in
+    effect. Raising the hard limit needs CAP_SYS_RESOURCE; without it, fall
+    back to raising the soft limit up to the existing hard limit, which the
+    process owner is always allowed to do."""
+    if dry_run:
+        log(LOG_NOTICE, f'dry-run: would raise NOFILE of pid {pid} from '
+                        f'{soft}:{hard} to {new_soft}:{new_hard}')
+        return soft, hard
+    try:
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (new_soft, new_hard))
+        return new_soft, new_hard
+    except PermissionError:
+        fallback_soft = min(new_soft, hard)
+        if fallback_soft > soft:
+            resource.prlimit(pid, resource.RLIMIT_NOFILE, (fallback_soft, hard))
+            log(LOG_WARNING, f'no CAP_SYS_RESOURCE: raised only the soft limit '
+                             f'of pid {pid} to {fallback_soft} (hard limit '
+                             f'stays {hard}); run {PROG} with CAP_SYS_RESOURCE '
+                             f'to allow raising the hard limit')
+            return fallback_soft, hard
+        raise
+
+
+def persist_limit(unit, persist_path, new_hard, dry_run):
+    """Record the raised limit in a systemd drop-in so it survives a Scylla
+    restart, then reload systemd."""
+    content = (f'# Written by {PROG}: RLIMIT_NOFILE was raised at runtime\n'
+               f'# because {unit or "the watched process"} came close to '
+               f'exhausting its previous limit.\n'
+               f'[Service]\nLimitNOFILE={new_hard}\n')
+    if dry_run:
+        log(LOG_NOTICE, f'dry-run: would persist LimitNOFILE={new_hard} '
+                        f'to {persist_path}')
+        return
+    os.makedirs(os.path.dirname(persist_path), exist_ok=True)
+    tmp = persist_path + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write(content)
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, persist_path)
+    # A drop-in only matters to systemd if it knows about it; skip the
+    # reload when we are not tracking a unit (e.g. --pid mode in tests).
+    if unit and shutil.which('systemctl'):
+        subprocess.run(['systemctl', 'daemon-reload'], check=False, timeout=60)
+    log(LOG_INFO, f'persisted LimitNOFILE={new_hard} to {persist_path}')
+
+
+def run_notify(command, event, info):
+    """Run the user-supplied notification hook with the event details in
+    SCYLLA_FD_GUARD_* environment variables."""
+    env = dict(os.environ)
+    env['SCYLLA_FD_GUARD_EVENT'] = event
+    for key, value in info.items():
+        env[f'SCYLLA_FD_GUARD_{key.upper()}'] = str(value)
+    try:
+        subprocess.run(command, shell=True, env=env, timeout=30)
+    except Exception as e:
+        log(LOG_WARNING, f'notify command failed: {e}')
+
+
+def write_metrics(path, values):
+    """Write Prometheus textfile-collector format, atomically."""
+    lines = []
+    for name, (mtype, help_text, value) in values.items():
+        lines.append(f'# HELP {name} {help_text}')
+        lines.append(f'# TYPE {name} {mtype}')
+        lines.append(f'{name} {value}')
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.rename(tmp, path)
+
+
+def resolve_pid(args):
+    """Return the PID to watch, or None if the target is not running."""
+    if args.pid:
+        return args.pid if os.path.isdir(f'/proc/{args.pid}') else None
+    try:
+        out = subprocess.run(['systemctl', 'show', '-p', 'MainPID', '--value',
+                              args.unit],
+                             capture_output=True, encoding='utf-8', timeout=30)
+        pid = int(out.stdout.strip() or '0')
+    except (ValueError, FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    return pid if pid > 0 and os.path.isdir(f'/proc/{pid}') else None
+
+
+class Guard:
+    def __init__(self, args):
+        self.args = args
+        self.pid = None
+        self.warned = False
+        self.sys_warned = False
+        # None means "never": time.monotonic() starts near zero on a fresh
+        # boot, so comparing against 0.0 would wrongly engage the cooldown.
+        self.cap_error_time = None
+        self.last_raise_time = None
+        self.raises_total = 0
+        self.nr_open = read_nr_open()
+        self.cap = args.max_nofile if args.max_nofile else self.nr_open
+
+    def target_gone(self):
+        if self.pid is not None:
+            log(LOG_INFO, f'watched process {self.pid} exited')
+        self.pid = None
+        self.warned = False
+
+    def describe(self, nr_fds, soft, hard):
+        return (f'pid {self.pid} has {nr_fds} open file descriptors, '
+                f'NOFILE limits soft={soft} hard={hard}')
+
+    def notify_info(self, event, nr_fds, soft, hard, new_soft=None, new_hard=None):
+        return {
+            'pid': self.pid, 'fds': nr_fds, 'soft': soft, 'hard': hard,
+            'new_soft': new_soft if new_soft is not None else soft,
+            'new_hard': new_hard if new_hard is not None else hard,
+            'unit': self.args.unit or '',
+        }
+
+    def check_system_wide(self):
+        allocated, maximum = read_file_nr()
+        if maximum > 0 and allocated >= maximum * self.args.warn_ratio:
+            if not self.sys_warned:
+                log(LOG_ERR, f'system-wide open files ({allocated}) at '
+                             f'{100.0 * allocated / maximum:.0f}% of '
+                             f'fs.file-max ({maximum}); raise fs.file-max')
+                if self.args.notify_command:
+                    run_notify(self.args.notify_command, 'system_warn',
+                               {'sys_open': allocated, 'sys_max': maximum})
+                self.sys_warned = True
+        else:
+            self.sys_warned = False
+        return allocated, maximum
+
+    def tick(self):
+        sys_open, sys_max = self.check_system_wide()
+        if self.pid is None or not os.path.isdir(f'/proc/{self.pid}'):
+            self.pid = resolve_pid(self.args)
+            if self.pid is None:
+                return
+            log(LOG_INFO, f'watching pid {self.pid}'
+                          + (f' (unit {self.args.unit})' if not self.args.pid else ''))
+        try:
+            nr_fds = count_open_fds(self.pid)
+            soft, hard = get_nofile_limits(self.pid)
+        except (FileNotFoundError, ProcessLookupError):
+            self.target_gone()
+            return
+
+        decision = plan_action(nr_fds, soft, hard, self.nr_open,
+                               self.args.warn_ratio, self.args.raise_ratio,
+                               self.args.raise_factor, self.cap)
+
+        if decision.event == 'ok':
+            self.warned = False
+        elif decision.event == 'warn':
+            if not self.warned:
+                log(LOG_WARNING, f'{self.describe(nr_fds, soft, hard)}: usage '
+                                 f'crossed {100 * self.args.warn_ratio:.0f}% '
+                                 f'of the soft limit')
+                if self.args.notify_command:
+                    run_notify(self.args.notify_command, 'warn',
+                               self.notify_info('warn', nr_fds, soft, hard))
+                self.warned = True
+        elif decision.event == 'cap':
+            now = time.monotonic()
+            if (self.cap_error_time is None
+                    or now - self.cap_error_time >= self.args.raise_cooldown):
+                log(LOG_ERR, f'{self.describe(nr_fds, soft, hard)}: limit is '
+                             f'already at its cap ({self.cap}, bounded by '
+                             f'fs.nr_open={self.nr_open}) and cannot be '
+                             f'raised further; Scylla may run out of file '
+                             f'descriptors')
+                if self.args.notify_command:
+                    run_notify(self.args.notify_command, 'cap',
+                               self.notify_info('cap', nr_fds, soft, hard))
+                self.cap_error_time = now
+        elif decision.event == 'raise':
+            now = time.monotonic()
+            if self.args.no_raise:
+                if not self.warned:
+                    log(LOG_ERR, f'{self.describe(nr_fds, soft, hard)}: usage '
+                                 f'crossed {100 * self.args.raise_ratio:.0f}% '
+                                 f'but raising is disabled (--no-raise)')
+                    self.warned = True
+            elif (self.last_raise_time is None
+                    or now - self.last_raise_time >= self.args.raise_cooldown):
+                try:
+                    new_soft, new_hard = apply_raise(
+                        self.pid, soft, hard, decision.new_soft,
+                        decision.new_hard, self.args.dry_run)
+                except (FileNotFoundError, ProcessLookupError):
+                    self.target_gone()
+                    return
+                except PermissionError:
+                    log(LOG_ERR, f'{self.describe(nr_fds, soft, hard)}: usage '
+                                 f'crossed {100 * self.args.raise_ratio:.0f}% '
+                                 f'but raising the limit was denied; run '
+                                 f'{PROG} as root or with CAP_SYS_RESOURCE')
+                    self.last_raise_time = now
+                    return
+                if not self.args.dry_run:
+                    self.raises_total += 1
+                    log(LOG_WARNING, f'{self.describe(nr_fds, soft, hard)}: '
+                                     f'raised NOFILE limits to '
+                                     f'soft={new_soft} hard={new_hard}. A '
+                                     f'raise usually means a leak or an '
+                                     f'under-provisioned limit; investigate.')
+                    if self.args.persist_path and not self.args.no_persist:
+                        persist_limit(self.args.unit, self.args.persist_path,
+                                      new_hard, self.args.dry_run)
+                    if self.args.notify_command:
+                        run_notify(self.args.notify_command, 'raise',
+                                   self.notify_info('raise', nr_fds, soft, hard,
+                                                    new_soft, new_hard))
+                    soft, hard = new_soft, new_hard
+                self.last_raise_time = now
+                self.warned = False
+
+        if self.args.metrics_file:
+            write_metrics(self.args.metrics_file, {
+                'scylla_fd_guard_open_fds':
+                    ('gauge', 'Open file descriptors of the watched process', nr_fds),
+                'scylla_fd_guard_limit_soft':
+                    ('gauge', 'RLIMIT_NOFILE soft limit of the watched process', soft),
+                'scylla_fd_guard_limit_hard':
+                    ('gauge', 'RLIMIT_NOFILE hard limit of the watched process', hard),
+                'scylla_fd_guard_raises_total':
+                    ('counter', 'Times the guard raised RLIMIT_NOFILE', self.raises_total),
+                'scylla_fd_guard_sys_open_files':
+                    ('gauge', 'System-wide allocated file handles (fs.file-nr)', sys_open),
+                'scylla_fd_guard_sys_max_files':
+                    ('gauge', 'System-wide file handle limit (fs.file-max)', sys_max),
+            })
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description='Watch RLIMIT_NOFILE usage of Scylla and raise the limit '
+                    'at runtime before it is exhausted.')
+    parser.add_argument('--unit', default='scylla-server.service',
+                        help='systemd unit whose MainPID to watch '
+                             '(default: scylla-server.service)')
+    parser.add_argument('--pid', type=int,
+                        help='watch this PID instead of a systemd unit')
+    parser.add_argument('--interval', type=float, default=10.0,
+                        help='seconds between checks (default: 10)')
+    parser.add_argument('--warn-ratio', type=float, default=0.8,
+                        help='warn when open fds exceed this fraction of the '
+                             'soft limit (default: 0.8)')
+    parser.add_argument('--raise-ratio', type=float, default=0.9,
+                        help='raise the limit when open fds exceed this '
+                             'fraction of the soft limit (default: 0.9)')
+    parser.add_argument('--raise-factor', type=float, default=2.0,
+                        help='multiply the limit by this factor on each raise '
+                             '(default: 2.0)')
+    parser.add_argument('--max-nofile', type=int,
+                        help='never raise the limit above this value '
+                             '(default: fs.nr_open)')
+    parser.add_argument('--raise-cooldown', type=float, default=60.0,
+                        help='minimum seconds between raises (default: 60)')
+    parser.add_argument('--no-raise', action='store_true',
+                        help='monitor and notify only, never change limits')
+    parser.add_argument('--no-persist', action='store_true',
+                        help='do not write a systemd drop-in after a raise')
+    parser.add_argument('--persist-path',
+                        help='systemd drop-in written after a raise (default: '
+                             '/etc/systemd/system/<unit>.d/99-fd-guard.conf; '
+                             'no persisting in --pid mode unless set)')
+    parser.add_argument('--notify-command',
+                        help='shell command run on warn/raise/cap events; '
+                             'details are passed in SCYLLA_FD_GUARD_* '
+                             'environment variables')
+    parser.add_argument('--metrics-file',
+                        help='write Prometheus textfile-collector metrics '
+                             'here on every check (e.g. under '
+                             'node_exporter\'s --collector.textfile.directory)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='log intended actions without performing them')
+    parser.add_argument('--oneshot', action='store_true',
+                        help='check once and exit (for testing or cron)')
+    args = parser.parse_args(argv)
+
+    if not 0.0 < args.warn_ratio <= args.raise_ratio <= 1.0:
+        parser.error('need 0 < --warn-ratio <= --raise-ratio <= 1')
+    if args.raise_factor <= 1.0:
+        parser.error('--raise-factor must be greater than 1')
+    if args.pid:
+        args.unit = None
+    elif not args.persist_path:
+        args.persist_path = f'/etc/systemd/system/{args.unit}.d/99-fd-guard.conf'
+    return args
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    guard = Guard(args)
+
+    stop = []
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: stop.append(True))
+
+    target = f'pid {args.pid}' if args.pid else f'unit {args.unit}'
+    log(LOG_INFO, f'{PROG} starting: watching {target}, interval '
+                  f'{args.interval}s, warn at {100 * args.warn_ratio:.0f}%, '
+                  f'raise at {100 * args.raise_ratio:.0f}% (factor '
+                  f'{args.raise_factor}, cap {guard.cap})'
+                  + (', dry-run' if args.dry_run else ''))
+    while not stop:
+        guard.tick()
+        if args.oneshot:
+            break
+        # sleep in small steps so SIGTERM is honored promptly
+        deadline = time.monotonic() + args.interval
+        while not stop and time.monotonic() < deadline:
+            time.sleep(min(1.0, args.interval))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
