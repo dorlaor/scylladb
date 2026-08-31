@@ -232,6 +232,15 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
     }
 
     if (has_property(KW_PARQUET)) {
+        // The same gate as KW_STORAGE_FORMAT below, for the same reason: the options land in a
+        // schema cell that a node without the feature cannot read, so publishing them mid-upgrade
+        // splits the schema. The map can be set without storage_format (options first, format
+        // later), so gating only the format property is not enough.
+        if (!db.features().parquet_sstable_format) {
+            throw exceptions::configuration_exception(format(
+                "Cannot set '{}': requires all nodes to support the "
+                "PARQUET_SSTABLE_FORMAT cluster feature", KW_PARQUET));
+        }
         // Constructing it is the validation: parquet_parameters rejects unknown
         // sub-options, out-of-range values, and anything the writer cannot honour, so a
         // bad value is a configuration error here rather than a surprise at write time.

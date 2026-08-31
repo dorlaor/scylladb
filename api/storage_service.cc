@@ -1399,7 +1399,13 @@ rest_estimate_parquet_ratios(http_context& ctx, sharded<service::storage_service
                              std::unique_ptr<http::request> req) {
     auto ks = api::req_param<sstring>(*req, "keyspace", {}).value;
     auto cf = api::req_param<sstring>(*req, "cf", {}).value;
-    const uint64_t max_rows = api::req_param<uint64_t>(*req, "rows", 20000).value;
+    // Clamped: the sample accumulates in memory in the shredder, and the compaction permit is
+    // obtained at unit cost -- so an unbounded value shreds an entire bottom-tier SSTable into
+    // RAM. Ratios converge to well under a percent by ~20k rows (the default), so the cap costs
+    // accuracy nothing; it exists purely to bound the worst case.
+    constexpr uint64_t max_rows_cap = 200'000;
+    const uint64_t max_rows = std::min(
+            api::req_param<uint64_t>(*req, "rows", 20000).value, max_rows_cap);
     apilog.debug("estimate_parquet_ratios: ks={} cf={} rows={}", ks, cf, max_rows);
 
     auto& t = ctx.db.local().find_column_family(ks, cf);

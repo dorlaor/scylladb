@@ -1747,6 +1747,17 @@ future<> validate_encryption(const ::schema& s) {
     if (!pp.encryption_enabled()) {
         co_return;
     }
+    // cf_prop_defs::validate() rejects setting both in one statement, but it sees only that
+    // statement's extensions: two separate ALTERs (one setting scylla_encryption_options, one
+    // setting parquet encryption) merge at the schema builder and meet for the first time here,
+    // on the merged schema. Encrypting the encrypted -- the file-io layer under the format's own
+    // modular encryption -- doubles the cost and makes key rotation ambiguous, so it is refused
+    // wherever it is first visible.
+    if (s.extensions().contains("scylla_encryption_options")) {
+        throw exceptions::configuration_exception(seastar::format(
+                "{}.{}: a table cannot combine scylla_encryption_options with parquet "
+                "encryption; they are separate encryption layers", s.ks_name(), s.cf_name()));
+    }
     auto* ks = key_source_ptr();
     if (!ks) {
         throw exceptions::configuration_exception(seastar::format(

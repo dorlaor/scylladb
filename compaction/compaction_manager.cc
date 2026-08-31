@@ -2617,7 +2617,12 @@ compaction_manager::maybe_split_new_sstable(sstables::shared_sstable sst, compac
         // The format is preserved for the same reason the state is: a split rewrites data that is
         // already in place, so producing native output from a `pq` input would be a silent
         // downgrade of a table that asked for Parquet.
-        if (t.schema()->storage_format() == storage_format_type::parquet) {
+        // Three ways the output must be pq: the table declared 'parquet'; the *input* is already
+        // pq (a hybrid table's converted bottom tier -- rewriting it native would silently undo
+        // the conversion); or the table is hybrid-on-TWCS, which writes Parquet unconditionally.
+        if (t.schema()->storage_format() == storage_format_type::parquet
+                || sst->get_version() == sstables::sstable_version_types::pq
+                || sstables::parquet::writes_parquet_unconditionally(*t.schema())) {
             return t.make_sstable(sst->state(), sstables::sstable_version_types::pq);
         }
         return t.make_sstable(sst->state());
