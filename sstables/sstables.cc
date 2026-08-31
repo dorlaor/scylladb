@@ -272,6 +272,7 @@ const std::unordered_map<sstable_version_types, sstring, enum_hash<sstable_versi
     { sstable_version_types::ms , "ms" },
     { sstable_version_types::mt , "mt" },
     { sstable_version_types::pq , "pq" },
+    { sstable_version_types::lc , "lc" },
 };
 
 const std::unordered_map<sstable_format_types, sstring, enum_hash<sstable_format_types>> format_string = {
@@ -982,7 +983,7 @@ void sstable::generate_toc() {
     // whatever the table's compression settings say. Declaring CompressionInfo
     // and not writing it makes data_size() zero, which silently reads as
     // "end of file" everywhere -- including the index reader.
-    if (_version == sstable_version_types::pq
+    if (is_columnar_format(_version)
             || !_schema->get_compressor_params().compression_enabled()) {
         _recognized_components.insert(component_type::CRC);
     } else {
@@ -3040,6 +3041,7 @@ sstring sstable::component_basename(const sstring& ks, const sstring& cf, versio
     case sstable::version_types::ms:
     case sstable::version_types::mt:
     case sstable::version_types::pq:
+    case sstable::version_types::lc:
         return v + "-" + g + "-" + f + "-" + component;
     }
     on_internal_error(sstlog, seastar::format("invalid version {} for sstable: table={}.{}, generation={}, format={}, component={}",
@@ -3208,7 +3210,7 @@ static std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> ma
     //   la-42-big-Data.db
     //   ka-42-big-Data.db
     //   me-3g8w_00qf_4pbog2i7h2c7am0uoe-big-Data.db
-    static boost::regex la_mx("(la|m[cdest]|pq)-([^-]+)-(\\w+)-(.*)");
+    static boost::regex la_mx("(la|m[cdest]|pq|lc)-([^-]+)-(\\w+)-(.*)");
     static boost::regex ka("(\\w+)-(\\w+)-ka-(\\d+)-(.*)");
 
     // Use non-greedy match so that a snapshot tag that ressembles a name-<uuid> wouldn't match

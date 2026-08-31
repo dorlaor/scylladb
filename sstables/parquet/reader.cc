@@ -12,6 +12,7 @@
 
 #include <array>
 #include <seastar/core/when_all.hh>
+#include <seastar/core/with_scheduling_group.hh>
 #include <chrono>
 #include <cstdlib>
 #include "sstables/parquet/writer_impl.hh"

@@ -18,7 +18,12 @@ namespace sstables {
 // -- the component set, the statistics layout, the index -- follows the `m`
 // family, because only the row encoding changes. See
 // docs/dev/parquet-storage-format.md section 5.2.
-enum class sstable_version_types { ka, la, mc, md, me, ms, mt, pq };
+// `lc` does the same with Lance (https://lance.org/) as the Data encoding --
+// see docs/dev/lance-storage-format.md. Like `pq`, it is a different format,
+// not a newer generation: everything said about `pq` below applies to `lc`
+// unchanged, including the get_highest_sstable_version() and
+// implies_mx_generation() exclusions.
+enum class sstable_version_types { ka, la, mc, md, me, ms, mt, pq, lc };
 enum class sstable_format_types { big };
 
 // `pq` is a member of both arrays as of 2026-08-17: it is a version the node can
@@ -52,7 +57,7 @@ enum class sstable_format_types { big };
 // or after oldest_writable_sstable_format to be writable too. There is also a
 // static_assert on writable_sstable_versions.size() in the conformance test whose whole
 // job is to make someone notice.
-constexpr std::array<sstable_version_types, 8> all_sstable_versions = {
+constexpr std::array<sstable_version_types, 9> all_sstable_versions = {
     sstable_version_types::ka,
     sstable_version_types::la,
     sstable_version_types::mc,
@@ -61,15 +66,17 @@ constexpr std::array<sstable_version_types, 8> all_sstable_versions = {
     sstable_version_types::ms,
     sstable_version_types::mt,
     sstable_version_types::pq,
+    sstable_version_types::lc,
 };
 
-constexpr std::array<sstable_version_types, 6> writable_sstable_versions = {
+constexpr std::array<sstable_version_types, 7> writable_sstable_versions = {
     sstable_version_types::mc,
     sstable_version_types::md,
     sstable_version_types::me,
     sstable_version_types::ms,
     sstable_version_types::mt,
     sstable_version_types::pq,
+    sstable_version_types::lc,
 };
 
 constexpr sstable_version_types oldest_writable_sstable_format = sstable_version_types::mc;
@@ -85,10 +92,16 @@ constexpr sstable_version_types oldest_writable_sstable_format = sstable_version
 // for "the highest version" -- 31 of them, including every test that creates an
 // sstable without naming a version -- silently start writing Parquet.
 inline auto get_highest_sstable_version() {
-    auto v = all_sstable_versions[all_sstable_versions.size() - 1];
-    return v == sstable_version_types::pq
-         ? all_sstable_versions[all_sstable_versions.size() - 2]
-         : v;
+    // Walk back over the non-native formats at the array's tail. `pq` and `lc`
+    // are opt-in per table; the newest *native* version is what "highest" means
+    // to every caller of this.
+    for (size_t i = all_sstable_versions.size(); i-- > 0; ) {
+        auto v = all_sstable_versions[i];
+        if (v != sstable_version_types::pq && v != sstable_version_types::lc) {
+            return v;
+        }
+    }
+    __builtin_unreachable();
 }
 
 sstable_version_types version_from_string(std::string_view s);
@@ -102,7 +115,14 @@ sstable_format_types format_from_string(std::string_view s);
 // pq's ordinal position implies nothing about mt or ms support. Use this for
 // those.
 constexpr bool implies_mx_generation(sstable_version_types v, sstable_version_types at_least) {
-    return v != sstable_version_types::pq && v >= at_least;
+    return v != sstable_version_types::pq && v != sstable_version_types::lc && v >= at_least;
+}
+
+// The columnar formats share sstable mechanics (mc-shaped index carrying row
+// ordinals, CRC component set, no CompressionInfo). Where the sstable layer
+// needs "is this a columnar Data component" rather than "is this pq", ask this.
+constexpr bool is_columnar_format(sstable_version_types v) {
+    return v == sstable_version_types::pq || v == sstable_version_types::lc;
 }
 
 bool has_summary_and_index(sstable_version_types v);
