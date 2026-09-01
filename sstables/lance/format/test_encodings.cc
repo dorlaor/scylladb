@@ -43,7 +43,8 @@ static column_values decode_all(lphys t, const encoded_page& pg) {
     switch (pl.k) {
     case page_layout::kind::miniblock: {
         auto idx = parse_miniblock_index(pg.buffers.at(0), pl.num_items);
-        return decode_miniblock_chunks(t, pl, idx, 0, idx.chunks.size(), pg.buffers.at(1));
+        return decode_miniblock_chunks(t, pl, idx, 0, idx.chunks.size(), pg.buffers.at(1),
+                                       0, pl.num_items);
     }
     case page_layout::kind::fullzip: {
         if (pl.val.k == chan_enc::kind::variable) {
@@ -114,11 +115,11 @@ static void test_miniblock_i64_nullable() {
     size_t c = idx.chunk_for(3210);
     const auto& ch = idx.chunks[c];
     auto slice = std::string_view(pg.buffers[1]).substr(size_t(ch.byte_offset), ch.byte_size);
-    auto got = decode_miniblock_chunks(lphys::i64, pl, idx, c, 1, slice);
-    CHECK(got.i64.size() == ch.values);
-    const size_t rel = size_t(3210 - ch.first_value);
-    CHECK(got.def.at(rel) == v.def[3210]);
-    if (!v.def[3210]) { CHECK(got.i64.at(rel) == v.i64[3210]); }
+    // Chunk-internal slicing: exactly one value comes back.
+    auto got = decode_miniblock_chunks(lphys::i64, pl, idx, c, 1, slice, 3210, 3211);
+    CHECK(got.rows() == 1);
+    CHECK(got.def.at(0) == v.def[3210]);
+    if (!v.def[3210]) { CHECK(got.i64.at(0) == v.i64[3210]); }
 }
 
 static void test_nullable_all_valid_drops_def() {
@@ -238,12 +239,14 @@ static void test_hostile() {
     for (size_t cut = 0; cut < pg.buffers[1].size(); cut += 7) {
         try {
             (void)decode_miniblock_chunks(lphys::i64, pl, idx, 0, idx.chunks.size(),
-                                          std::string_view(pg.buffers[1]).substr(0, cut));
+                                          std::string_view(pg.buffers[1]).substr(0, cut),
+                                          0, pl.num_items);
         } catch (const std::exception&) {
         }
     }
     // Wrong physical type must be refused.
-    CHECK_THROWS(decode_miniblock_chunks(lphys::i32, pl, idx, 0, idx.chunks.size(), pg.buffers[1]));
+    CHECK_THROWS(decode_miniblock_chunks(lphys::i32, pl, idx, 0, idx.chunks.size(), pg.buffers[1],
+                                         0, pl.num_items));
     // A rep-index buffer of impossible size must be refused.
     CHECK_THROWS(fullzip_rep_index_width(13, 5));
 }

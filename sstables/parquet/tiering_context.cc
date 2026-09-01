@@ -40,16 +40,26 @@ bool writes_parquet_unconditionally(const ::schema& s) {
         // there. See the header for the trade this makes.
         return s.compaction_strategy() == compaction::compaction_strategy_type::time_window;
     case storage_format_type::sstable:
+    case storage_format_type::lance:   // lance is its own predicate, writes_lance_unconditionally()
         return false;
     }
     return false;
+}
+
+// The lance twin. Trivial today -- 'lance' has no hybrid mode -- but every
+// write path asks the same one question through the same one function, for
+// the same convergence reason as parquet's.
+bool writes_lance_unconditionally(const ::schema& s) {
+    return s.storage_format() == storage_format_type::lance;
 }
 
 // Same predicate as flush, streaming and compaction -- see the header for why the load path
 // needs no tiering context to answer this.
 sstables::sstable_version_types version_for_rewrite_on_load(const ::schema& s,
                                                             sstables::sstable_version_types native_choice) {
-    return writes_parquet_unconditionally(s) ? sstables::sstable_version_types::pq : native_choice;
+    if (writes_parquet_unconditionally(s)) { return sstables::sstable_version_types::pq; }
+    if (writes_lance_unconditionally(s)) { return sstables::sstable_version_types::lc; }
+    return native_choice;
 }
 
 // Exact, unlike the leaf count it replaces. The number of Parquet *leaves* a table produces
@@ -81,6 +91,10 @@ tiering_decision decide_output_format(const std::vector<sstables::shared_sstable
     switch (s.storage_format()) {
     case storage_format_type::sstable:
         return {tiering_verdict::use_native, "table storage_format is 'sstable'"};
+    case storage_format_type::lance:
+        // The lance format has no hybrid tier and is never decided here --
+        // the compaction manager resolves it before consulting this policy.
+        return {tiering_verdict::use_native, "table storage_format is 'lance'; not a parquet tiering candidate"};
     case storage_format_type::parquet:
         // Explicit opt-in: the eligibility gate still applies, because writing a
         // 4 KiB flush as Parquet helps nobody.

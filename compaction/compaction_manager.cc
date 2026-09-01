@@ -417,8 +417,14 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
     // inside the creator because the creator is synchronous and C6 -- the only
     // criterion that is measured rather than derived -- needs to read data.
     bool write_parquet = false;
+    bool write_lance = false;
     switch (t.schema()->storage_format()) {
     case storage_format_type::sstable:
+        break;
+    case storage_format_type::lance:
+        // Like an explicit 'parquet': the operator named the format, so it is
+        // taken at face value. No hybrid mode exists for lance in v1.
+        write_lance = true;
         break;
     case storage_format_type::parquet:
         // An explicit opt-in is taken at face value. The criteria exist to make the
@@ -493,12 +499,16 @@ future<compaction_result> compaction_task_executor::compact_sstables(compaction_
         }
     }
 
-    descriptor.creator = [&t, write_parquet] (shard_id) {
+    descriptor.creator = [&t, write_parquet, write_lance] (shard_id) {
         // All compaction types going through this path will work on normal input sstables only.
         // Off-strategy, for example, waits until the sstables move out of staging state.
         if (write_parquet) {
             return t.make_sstable(sstables::sstable_state::normal,
                                   sstables::sstable_version_types::pq);
+        }
+        if (write_lance) {
+            return t.make_sstable(sstables::sstable_state::normal,
+                                  sstables::sstable_version_types::lc);
         }
         return t.make_sstable(sstables::sstable_state::normal);
     };
@@ -2625,6 +2635,12 @@ compaction_manager::maybe_split_new_sstable(sstables::shared_sstable sst, compac
                 || sst->get_version() == sstables::sstable_version_types::pq
                 || sstables::parquet::writes_parquet_unconditionally(*t.schema())) {
             return t.make_sstable(sst->state(), sstables::sstable_version_types::pq);
+        }
+        // Same protection for lance: a rewrite must not silently downgrade the
+        // format of a table that asked for it, nor of an input already in it.
+        if (t.schema()->storage_format() == storage_format_type::lance
+                || sst->get_version() == sstables::sstable_version_types::lc) {
+            return t.make_sstable(sst->state(), sstables::sstable_version_types::lc);
         }
         return t.make_sstable(sst->state());
     };

@@ -171,12 +171,19 @@ struct miniblock_index {
 miniblock_index parse_miniblock_index(std::string_view chunk_meta_buf, uint64_t num_items,
                                       const metadata_limits& = {});
 
-// Decodes chunks [first_chunk, first_chunk + n) from `chunk_bytes`, which
-// must hold exactly those chunks' bytes (the caller fetched them using the
-// miniblock_index). Values come back in order; the caller slices rows.
+// Decodes values [keep_from, keep_to) -- ordinals within the page -- from
+// chunks [first_chunk, first_chunk + n), whose bytes the caller fetched using
+// the miniblock_index. Decoding is sliced INSIDE each chunk: a point read of
+// five rows out of a 4096-value chunk materialises five values (flat values
+// by arithmetic, variable ones through the chunk's own offsets), not the
+// chunk -- which is the format's random-access story, and measurably the
+// difference between a point read and a small scan. Block-compressed (zstd)
+// chunks still decompress whole; the slicing then avoids the value
+// materialisation, which for strings is the larger cost.
 column_values decode_miniblock_chunks(lphys, const page_layout&, const miniblock_index&,
                                       size_t first_chunk, size_t n_chunks,
-                                      std::string_view chunk_bytes);
+                                      std::string_view chunk_bytes,
+                                      uint64_t keep_from, uint64_t keep_to);
 
 // ---------------------------------------------------------------- fullzip
 

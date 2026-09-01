@@ -186,8 +186,9 @@ enum class storage_engine_type {
 // docs/dev/parquet-storage-format.md section 6.1.
 enum class storage_format_type {
     sstable,    // the native row format (default)
-    parquet,    // columnar, every SSTable
+    parquet,    // columnar (Parquet), every SSTable
     hybrid,     // native in the upper LSM tiers, columnar in the bottom tier
+    lance,      // columnar (Lance), every SSTable -- docs/dev/lance-storage-format.md
 };
 
 inline sstring storage_format_type_to_sstring(storage_format_type t) {
@@ -195,6 +196,7 @@ inline sstring storage_format_type_to_sstring(storage_format_type t) {
     case storage_format_type::sstable: return "sstable";
     case storage_format_type::parquet: return "parquet";
     case storage_format_type::hybrid:  return "hybrid";
+    case storage_format_type::lance:   return "lance";
     }
     throw std::invalid_argument(format("unknown storage format type: {:d}\n", uint8_t(t)));
 }
@@ -203,8 +205,9 @@ inline storage_format_type sstring_to_storage_format_type(std::string_view s) {
     if (s == "sstable") { return storage_format_type::sstable; }
     if (s == "parquet") { return storage_format_type::parquet; }
     if (s == "hybrid")  { return storage_format_type::hybrid; }
+    if (s == "lance")   { return storage_format_type::lance; }
     throw std::invalid_argument(format("unknown storage format '{}' "
-        "(expected one of: sstable, parquet, hybrid)", s));
+        "(expected one of: sstable, parquet, hybrid, lance)", s));
 }
 
 inline sstring storage_engine_type_to_sstring(storage_engine_type t) {
@@ -814,7 +817,11 @@ public:
     }
     // True when any SSTable of this table may be Parquet-encoded.
     bool uses_parquet_format() const {
-        return storage_format() != storage_format_type::sstable;
+        return storage_format() == storage_format_type::parquet
+            || storage_format() == storage_format_type::hybrid;
+    }
+    bool uses_lance_format() const {
+        return storage_format() == storage_format_type::lance;
     }
     storage_engine_type storage_engine() const {
         return _raw._props.storage_engine;

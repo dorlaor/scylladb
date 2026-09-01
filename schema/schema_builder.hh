@@ -310,6 +310,12 @@ public:
 
     column_definition& find_column(const cql3::column_identifier&);
     bool has_column(const cql3::column_identifier&);
+    // All columns added so far. Read-only, for property validation that
+    // depends on column types (storage_format='lance' rejects non-frozen
+    // collections and counters -- cf_prop_defs::apply_to_builder).
+    const utils::chunked_vector<column_definition>& current_columns() const {
+        return _raw._columns;
+    }
     schema_builder& with_column_ordered(const column_definition& c);
     schema_builder& with_column(bytes name, data_type type, column_kind kind = column_kind::regular_column, column_view_virtual view_virtual = column_view_virtual::no);
     schema_builder& with_computed_column(bytes name, data_type type, column_kind kind, column_computation_ptr computation);

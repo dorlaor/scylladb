@@ -218,16 +218,18 @@ int scan_repeats() {
     return n;
 }
 
-// Which formats to measure. "both" (default), "pq", or "default". A single-arm run exists for
-// profiling: `perf record` cannot separate two readers running in one process, and the two paths
-// share enough of the mutation-building machinery that a mixed profile cannot be split by symbol
-// either. It reports no ratios, because with one arm there is nothing to divide by.
+// Which formats to measure. "all" (default: native, pq and lc), "both" (the
+// original native+pq pair), or a single arm: "default", "pq", "lc". Single-arm
+// runs exist for profiling: `perf record` cannot separate readers running in
+// one process. Fewer than two arms reports no ratios.
 bool arm_enabled(const char* which) {
     static const sstring sel = [] {
         const char* e = std::getenv("PQ_PERF_ARM");
-        return sstring(e && *e ? e : "both");
+        return sstring(e && *e ? e : "all");
     }();
-    return sel == "both" || sel == which;
+    if (sel == "all") { return true; }
+    if (sel == "both") { return sstring(which) != "lc"; }
+    return sel == which;
 }
 
 struct result {
@@ -412,7 +414,8 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         if (point_idx.size() > n_points) { point_idx.resize(n_points); }
 
         const bool want_def = arm_enabled("default"), want_pq = arm_enabled("pq");
-        result def, pq;
+        const bool want_lc = arm_enabled("lc");
+        result def, pq, lc;
         if (want_def) {
             def = measure(env, s, muts, sstables::get_highest_sstable_version(), "default (me)", point_idx);
             BOOST_REQUIRE_EQUAL(def.rows, size_t(n_part));
@@ -420,6 +423,10 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
         if (want_pq) {
             pq = measure(env, s, muts, sstable_version_types::pq, "pq (parquet)", point_idx);
             BOOST_REQUIRE_EQUAL(pq.rows, size_t(n_part));
+        }
+        if (want_lc) {
+            lc = measure(env, s, muts, sstable_version_types::lc, "lc (lance)", point_idx);
+            BOOST_REQUIRE_EQUAL(lc.rows, size_t(n_part));
         }
 
         auto line = [] (const result& r) {
@@ -435,11 +442,12 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
                     "scan kB");
         if (want_def) { line(def); }
         if (want_pq) { line(pq); }
+        if (want_lc) { line(lc); }
         std::printf("\n  point-read distribution over %zu uniformly random partitions:\n",
                     want_def ? def.point_n : pq.point_n);
         std::printf("  %-14s  %10s  %10s  %10s  %10s\n",
                     "format", "mean us", "p50 us", "p95 us", "p99 us");
-        for (const auto& r : {def, pq}) {
+        for (const auto& r : {def, pq, lc}) {
             if (r.label.empty()) { continue; }
             std::printf("  %-14s  %10.1f  %10.1f  %10.1f  %10.1f\n",
                         r.label.c_str(), r.point_us, r.point_p50, r.point_p95, r.point_p99);
@@ -459,24 +467,43 @@ SEASTAR_THREAD_TEST_CASE(perf_pq_vs_default) {
             std::printf("%s", pq.prof_point.c_str());
             std::printf("\n");
         }
-        if (!(want_def && want_pq)) {
+        if (int(want_def) + int(want_pq) + int(want_lc) < 2) {
             std::printf("  single-arm run (PQ_PERF_ARM); no ratios\n\n");
             return;
         }
-        std::printf("  point ratios: mean %.1fx  p50 %.1fx  p95 %.1fx  p99 %.1fx\n",
-                    pq.point_us / def.point_us, pq.point_p50 / def.point_p50,
-                    pq.point_p95 / def.point_p95, pq.point_p99 / def.point_p99);
-        std::printf("  ratios (pq/default): write %.2fx  scan %.2fx  bscan %.2fx  point %.2fx"
-                    "  size %.3fx\n",
-                    pq.write_ms / def.write_ms, pq.scan_ms / def.scan_ms,
-                    pq.bscan_ms / def.bscan_ms,
-                    pq.point_us / def.point_us, double(pq.bytes) / double(def.bytes));
+        auto ratios = [&] (const result& a, const char* name) {
+            if (!want_def || a.label.empty()) { return; }
+            std::printf("  %s point ratios vs default: mean %.1fx  p50 %.1fx  p95 %.1fx  p99 %.1fx\n",
+                        name,
+                        a.point_us / def.point_us, a.point_p50 / def.point_p50,
+                        a.point_p95 / def.point_p95, a.point_p99 / def.point_p99);
+            std::printf("  ratios (%s/default): write %.2fx  scan %.2fx  bscan %.2fx  point %.2fx"
+                        "  size %.3fx\n",
+                        name,
+                        a.write_ms / def.write_ms, a.scan_ms / def.scan_ms,
+                        a.bscan_ms / def.bscan_ms,
+                        a.point_us / def.point_us, double(a.bytes) / double(def.bytes));
+        };
+        if (want_pq) { ratios(pq, "pq"); }
+        if (want_lc) { ratios(lc, "lc"); }
+        if (want_pq && want_lc) {
+            std::printf("  ratios (lc/pq): write %.2fx  scan %.2fx  bscan %.2fx  point %.2fx"
+                        "  size %.3fx\n",
+                        lc.write_ms / pq.write_ms, lc.scan_ms / pq.scan_ms,
+                        lc.bscan_ms / pq.bscan_ms,
+                        lc.point_us / pq.point_us, double(lc.bytes) / double(pq.bytes));
+        }
         // What the bound costs each format on its own terms. The row format's index makes a
-        // bounded range no harder than an unbounded one; pq's fork makes it a different reader.
-        std::printf("  bounded/unbounded, same rows: default %.2fx  pq %.2fx"
-                    "  (rows %zu vs %zu)\n\n",
-                    def.bscan_ms / def.scan_ms, pq.bscan_ms / pq.scan_ms,
-                    pq.rows, pq.bscan_rows);
+        // bounded range no harder than an unbounded one; the columnar forks make it a
+        // different reader.
+        if (want_def && want_pq) {
+            sstring lc_part = want_lc
+                    ? seastar::format("  lc {:.2f}x", lc.bscan_ms / lc.scan_ms)
+                    : sstring();
+            std::printf("  bounded/unbounded, same rows: default %.2fx  pq %.2fx%s\n\n",
+                        def.bscan_ms / def.scan_ms, pq.bscan_ms / pq.scan_ms,
+                        lc_part.c_str());
+        }
     }).get();
 }
 

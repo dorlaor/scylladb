@@ -105,8 +105,8 @@ column_values lance_file_view::read_rows(size_t c, lphys t, uint64_t lo, uint64_
             auto chunk_bytes = buffer(pg.buffers[1]).substr(
                     size_t(first.byte_offset),
                     size_t(last.byte_offset + last.byte_size - first.byte_offset));
-            part = decode_miniblock_chunks(t, pl, idx, c_lo, c_hi - c_lo + 1, chunk_bytes);
-            slice_values(part, pg.priority + first.first_value, page_lo, page_hi);
+            part = decode_miniblock_chunks(t, pl, idx, c_lo, c_hi - c_lo + 1, chunk_bytes,
+                                           page_lo - pg.priority, page_hi - pg.priority);
             break;
         }
         case page_layout::kind::fullzip: {

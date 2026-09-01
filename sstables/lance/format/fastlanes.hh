@@ -66,4 +66,35 @@ inline void fastlanes_unpack(std::span<const T> words, unsigned w, T* out) {
     }
 }
 
+// The inverse: packs 1024 T-bit values at `w` bits each into 1024*w/bits(T)
+// words. `out` must hold that many elements, zero-initialised by this
+// function.
+template <typename T>
+inline void fastlanes_pack(const T* values, unsigned w, std::span<T> out) {
+    constexpr unsigned t = sizeof(T) * 8;
+    constexpr size_t lanes = fastlanes_chunk / t;
+    if (w == 0 || w > t) {
+        throw std::runtime_error("fastlanes: bad packed width");
+    }
+    if (out.size() < fastlanes_chunk * w / t) {
+        throw std::runtime_error("fastlanes: output buffer too small");
+    }
+    std::memset(out.data(), 0, out.size() * sizeof(T));
+    const T mask = w == t ? T(~T(0)) : T((T(1) << w) - 1);
+    for (size_t lane = 0; lane < lanes; ++lane) {
+        for (unsigned row = 0; row < t; ++row) {
+            const size_t idx = fl_order[row / 8] * 16 + (row % 8) * 128 + lane;
+            const T v = T(values[idx] & mask);
+            const size_t bitpos = size_t(row) * w;
+            const size_t word = bitpos / t;
+            const unsigned off = unsigned(bitpos % t);
+            out[lanes * word + lane] = T(out[lanes * word + lane] | T(v << off));
+            if (off + w > t) {
+                out[lanes * (word + 1) + lane] =
+                        T(out[lanes * (word + 1) + lane] | T(v >> (t - off)));
+            }
+        }
+    }
+}
+
 } // namespace sstables::lance::format

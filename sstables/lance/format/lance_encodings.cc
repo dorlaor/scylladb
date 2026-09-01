@@ -9,6 +9,8 @@
 #include "lance_encodings.hh"
 #include "fastlanes.hh"
 
+#include <span>
+
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -410,6 +412,31 @@ static bool any_nulls(const column_values& v) {
     return std::any_of(v.def.begin(), v.def.end(), [](uint8_t d) { return d != 0; });
 }
 
+// One chunk's definition levels, out-of-line fastlanes-packed at one bit per
+// value (the official writer's own choice at any real size). Full 1024-value
+// chunks pack; the tail packs when >= 64 values remain and is stored raw
+// below that -- the same cost rule as the reference writer, biased to "pack"
+// at exact equality so the reader's size-based inference stays unambiguous.
+static std::string encode_def_ool(const uint8_t* def, size_t n) {
+    std::string out;
+    constexpr size_t words_per_chunk = fastlanes_chunk * 1 / 16;   // W=1, T=16
+    size_t at = 0;
+    while (at < n) {
+        const size_t rem = std::min(n - at, fastlanes_chunk);
+        uint16_t vals[fastlanes_chunk] = {};
+        for (size_t i = 0; i < rem; ++i) { vals[i] = def[at + i]; }
+        if (rem == fastlanes_chunk || rem >= 64) {
+            uint16_t packed[words_per_chunk];
+            fastlanes_pack<uint16_t>(vals, 1, std::span<uint16_t>(packed, words_per_chunk));
+            out.append(reinterpret_cast<const char*>(packed), sizeof(packed));
+        } else {
+            out.append(reinterpret_cast<const char*>(vals), rem * 2);
+        }
+        at += rem;
+    }
+    return out;
+}
+
 // Builds one chunk's bytes: header u16s, then def, then the value
 // sub-buffer, each 8-byte padded.
 static std::string encode_chunk(lphys t, const column_values& v, size_t first, size_t n,
@@ -444,15 +471,22 @@ static std::string encode_chunk(lphys t, const column_values& v, size_t first, s
     }
     if (values.size() > 0xFFFF) { throw lance_error("chunk value sub-buffer over 64 KiB"); }
 
+    std::string def_bytes;
+    if (with_def) {
+        if (v.def.empty()) {
+            std::vector<uint8_t> zeros(n, 0);
+            def_bytes = encode_def_ool(zeros.data(), n);
+        } else {
+            def_bytes = encode_def_ool(v.def.data() + first, n);
+        }
+    }
     std::string chunk;
     put_u16(chunk, uint16_t(with_def ? n : 0));   // num_levels
-    if (with_def) { put_u16(chunk, uint16_t(n * 2)); }
+    if (with_def) { put_u16(chunk, uint16_t(def_bytes.size())); }
     put_u16(chunk, uint16_t(values.size()));
     pad_to(chunk, 8, chunk_pad);
     if (with_def) {
-        for (size_t i = 0; i < n; ++i) {
-            put_u16(chunk, v.def.empty() ? 0 : uint16_t(v.def[first + i]));
-        }
+        chunk.append(def_bytes);
         pad_to(chunk, 8, chunk_pad);
     }
     chunk.append(values);
@@ -464,7 +498,7 @@ static std::string encode_chunk(lphys t, const column_values& v, size_t first, s
 static encoded_page encode_miniblock(lphys t, const column_values& v, const encode_options& opt) {
     const size_t rows = v.rows();
     const bool with_def = opt.nullable && any_nulls(v);
-    const size_t per_value_meta = with_def ? 2 : 0;
+    const size_t per_value_meta = with_def ? 1 : 0;   // packed def ~1/8 B/value; round up
 
     std::string chunk_meta;
     std::string chunks;
@@ -495,7 +529,14 @@ static encoded_page encode_miniblock(lphys t, const column_values& v, const enco
     }
 
     pb_writer mb;
-    if (with_def) { mb.len(2, ce_flat(16)); }
+    if (with_def) {
+        pb_writer ool;   // OutOfLineBitpacking{uncompressed=16, values: Flat{1}}
+        ool.varint(1, 16);
+        ool.len(3, ce_flat(1));
+        pb_writer ce;
+        ce.msg(4, ool);
+        mb.len(2, ce.str());
+    }
     std::string vce = t == lphys::bytes ? ce_variable(32) : ce_flat(bits_of(t));
     if (opt.zstd_level > 0) { vce = ce_general_zstd(std::move(vce), opt.zstd_level); }
     mb.len(3, vce);
@@ -700,14 +741,19 @@ static std::vector<T> inline_unpack(std::string_view buf, size_t n) {
     return out;
 }
 
-// Decodes a def sub-buffer of `n` levels into 0/1 bytes appended to out.def.
-static void decode_def_channel(const chan_enc& e, std::string_view buf, size_t n, column_values& out) {
+// Decodes levels [a, b) of a def sub-buffer holding `n` levels, appended to
+// out.def. Bitpacked forms unpack whole 1024-value blocks (128 bytes each --
+// cheap) and then slice; flat u16 slices directly.
+static void decode_def_channel(const chan_enc& e, std::string_view buf, size_t n,
+                               size_t a, size_t b, column_values& out) {
     std::vector<uint16_t> levels;
+    size_t base = 0;   // index of levels[0] within the chunk's n
     switch (e.k) {
     case chan_enc::kind::flat:
         if (buf.size() < n * 2) { throw lance_error("def sub-buffer truncated"); }
-        levels.resize(n);
-        std::memcpy(levels.data(), buf.data(), n * 2);
+        levels.resize(b - a);
+        std::memcpy(levels.data(), buf.data() + a * 2, (b - a) * 2);
+        base = a;
         break;
     case chan_enc::kind::ool_bp:
         if (e.logical_bits != 16) { throw lance_error("unsupported def element width"); }
@@ -720,7 +766,8 @@ static void decode_def_channel(const chan_enc& e, std::string_view buf, size_t n
     default:
         throw lance_error("unsupported def-level encoding");
     }
-    for (auto d : levels) {
+    for (size_t i = a; i < b; ++i) {
+        uint16_t d = levels.at(i - base);
         if (d > 1) { throw lance_error("def level above 1 in a flat page"); }
         out.def.push_back(uint8_t(d));
     }
@@ -740,9 +787,9 @@ static void append_flat(lphys t, std::string_view values, size_t n, column_value
     else { app(out.f64); }
 }
 
-// Decodes a value sub-buffer of `n` values.
+// Decodes values [a, b) of a value sub-buffer holding `n` values.
 static void decode_value_channel(lphys t, const chan_enc& e, std::string_view values, size_t n,
-                                 column_values& out) {
+                                 size_t a, size_t b, column_values& out) {
     switch (e.k) {
     case chan_enc::kind::variable: {
         if (t != lphys::bytes) { throw lance_error("variable values on a fixed-width column"); }
@@ -758,18 +805,21 @@ static void decode_value_channel(lphys t, const chan_enc& e, std::string_view va
             std::memcpy(&o, values.data() + i * 8, 8);
             return o;
         };
-        for (size_t i = 0; i < n; ++i) {
-            uint64_t a = offset_at(i), b = offset_at(i + 1);
-            if (a > b || b > values.size()) { throw lance_error("variable offsets out of range"); }
-            out.str.emplace_back(values.substr(size_t(a), size_t(b - a)));
+        for (size_t i = a; i < b; ++i) {
+            uint64_t x = offset_at(i), y = offset_at(i + 1);
+            if (x > y || y > values.size()) { throw lance_error("variable offsets out of range"); }
+            out.str.emplace_back(values.substr(size_t(x), size_t(y - x)));
         }
         return;
     }
-    case chan_enc::kind::flat:
+    case chan_enc::kind::flat: {
         if (t == lphys::bytes) { throw lance_error("flat values on a bytes column"); }
         if (e.bits != bits_of(t)) { throw lance_error("value width disagrees with the schema"); }
-        append_flat(t, values, n, out);
+        const size_t w = e.bits / 8;
+        if (values.size() < n * w) { throw lance_error("flat sub-buffer truncated"); }
+        append_flat(t, values.substr(a * w), b - a, out);
         return;
+    }
     case chan_enc::kind::inline_bp:
     case chan_enc::kind::ool_bp: {
         if (t == lphys::bytes || t == lphys::f64) {
@@ -780,12 +830,12 @@ static void decode_value_channel(lphys t, const chan_enc& e, std::string_view va
             auto vals = e.k == chan_enc::kind::inline_bp
                     ? inline_unpack<uint32_t>(values, n)
                     : ool_unpack<uint32_t>(values, n, e.packed_bits);
-            for (auto v : vals) { out.i32.push_back(int32_t(v)); }
+            for (size_t i = a; i < b; ++i) { out.i32.push_back(int32_t(vals.at(i))); }
         } else {
             auto vals = e.k == chan_enc::kind::inline_bp
                     ? inline_unpack<uint64_t>(values, n)
                     : ool_unpack<uint64_t>(values, n, e.packed_bits);
-            for (auto v : vals) { out.i64.push_back(int64_t(v)); }
+            for (size_t i = a; i < b; ++i) { out.i64.push_back(int64_t(vals.at(i))); }
         }
         return;
     }
@@ -795,12 +845,19 @@ static void decode_value_channel(lphys t, const chan_enc& e, std::string_view va
 
 column_values decode_miniblock_chunks(lphys t, const page_layout& pl, const miniblock_index& idx,
                                       size_t first_chunk, size_t n_chunks,
-                                      std::string_view chunk_bytes) {
+                                      std::string_view chunk_bytes,
+                                      uint64_t keep_from, uint64_t keep_to) {
     column_values out;
     if (first_chunk + n_chunks > idx.chunks.size()) { throw lance_error("chunk range out of bounds"); }
     const uint64_t base_off = idx.chunks[first_chunk].byte_offset;
     for (size_t c = first_chunk; c < first_chunk + n_chunks; ++c) {
         const auto& ch = idx.chunks[c];
+        // The requested slice, in this chunk's local coordinates.
+        const uint64_t lo = std::max(keep_from, ch.first_value);
+        const uint64_t hi = std::min<uint64_t>(keep_to, ch.first_value + ch.values);
+        if (lo >= hi) { continue; }
+        const size_t a = size_t(lo - ch.first_value);
+        const size_t b = size_t(hi - ch.first_value);
         const size_t start = size_t(ch.byte_offset - base_off);
         if (start + ch.byte_size > chunk_bytes.size()) { throw lance_error("chunk bytes truncated"); }
         auto chunk = chunk_bytes.substr(start, ch.byte_size);
@@ -820,7 +877,7 @@ column_values decode_miniblock_chunks(lphys t, const page_layout& pl, const mini
                 throw lance_error("def level count disagrees with chunk values");
             }
             if (at + def_len > chunk.size()) { throw lance_error("def sub-buffer truncated"); }
-            decode_def_channel(pl.defs, chunk.substr(at, def_len), ch.values, out);
+            decode_def_channel(pl.defs, chunk.substr(at, def_len), ch.values, a, b, out);
             at += def_len;
             at = (at + 7) & ~size_t(7);
         }
@@ -831,7 +888,10 @@ column_values decode_miniblock_chunks(lphys t, const page_layout& pl, const mini
             plain = zstd_decompress_block(values, chunk_hard_cap * 8);
             values = plain;
         }
-        decode_value_channel(t, pl.val, values, ch.values, out);
+        decode_value_channel(t, pl.val, values, ch.values, a, b, out);
+    }
+    if (out.rows() != keep_to - keep_from) {
+        throw lance_error("miniblock slice not fully covered by the fetched chunks");
     }
     // A page without a def channel decodes as all-valid: leave def empty.
     return out;
@@ -851,7 +911,7 @@ column_values decode_fullzip_fixed(lphys t, const page_layout& pl, uint64_t lo, 
             if (d > 1) { throw lance_error("full-zip def above 1 in a flat page"); }
             out.def.push_back(d);
         }
-        decode_value_channel(t, pl.val, rec.substr(ctrl), 1, out);
+        decode_value_channel(t, pl.val, rec.substr(ctrl), 1, 0, 1, out);
     }
     return out;
 }

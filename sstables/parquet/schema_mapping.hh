@@ -26,6 +26,7 @@
 #include "format/parquet_metadata.hh"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <string>
@@ -456,6 +457,14 @@ mapped_schema map_schema(const std::vector<cql_column>& cols,
 // tolerated.
 mapped_schema recover_mapped_schema(const file_metadata&,
                                     const std::vector<cql_column>& cols);
+
+// The format-independent half of the above: recovery from a leaf-name list
+// and a key/value metadata getter. The Lance reader recovers through this,
+// so both columnar formats share one definition of the layout.
+mapped_schema recover_mapped_schema_from_leaves(
+        const std::vector<std::string>& leaves,
+        const std::function<const std::string*(const std::string&)>& kv,
+        const std::vector<cql_column>& cols);
 
 // Which leaves a projection may skip: one byte per leaf, non-zero meaning "do not read".
 //

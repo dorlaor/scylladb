@@ -52,6 +52,7 @@ bool schema_is_parquet_eligible(const ::schema&);
 // The single home for this rule matters: it is consulted by compaction, by memtable flush and by
 // streaming, and a table whose flushes disagree with its compactions never converges.
 bool writes_parquet_unconditionally(const ::schema&);
+bool writes_lance_unconditionally(const ::schema&);
 
 // The version that reshard and reshape **on load** must write for this table.
 //

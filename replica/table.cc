@@ -306,6 +306,9 @@ static std::optional<sstables::sstable_version_types> streaming_version_for(cons
     if (sstables::parquet::writes_parquet_unconditionally(s)) {
         return sstables::sstable_version_types::pq;
     }
+    if (sstables::parquet::writes_lance_unconditionally(s)) {
+        return sstables::sstable_version_types::lc;
+    }
     return std::nullopt;
 }
 
@@ -542,6 +545,9 @@ sstables::shared_sstable table::make_sstable(sstables::sstable_state state) {
     auto& sstm = get_sstables_manager();
     if (sstables::parquet::writes_parquet_unconditionally(*_schema)) {
         return make_sstable(state, sstables::sstable_version_types::pq);
+    }
+    if (sstables::parquet::writes_lance_unconditionally(*_schema)) {
+        return make_sstable(state, sstables::sstable_version_types::lc);
     }
     return make_sstable(state, sstm.get_preferred_sstable_version());
 }

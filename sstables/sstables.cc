@@ -79,6 +79,7 @@
 #include "kl/reader.hh"
 #include "mx/reader.hh"
 #include "sstables/parquet/reader.hh"
+#include "sstables/lance/reader.hh"
 #include "utils/bit_cast.hh"
 #include "utils/cached_file.hh"
 #include "tombstone_gc.hh"
@@ -3135,6 +3136,21 @@ sstable::make_reader(
         return parquet::make_reader(shared_from_this(), std::move(query_schema),
                 std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr, mon);
     }
+    if (_version == version_types::lc) {
+        if (reversed) {
+            auto rd = make_reversing_reader(
+                    lance::make_reader(shared_from_this(), query_schema->make_reversed(),
+                            permit, range, reverse_slice(*query_schema, slice),
+                            trace_state, streamed_mutation::forwarding::no, fwd_mr, mon),
+                    permit.max_result_size());
+            if (fwd) {
+                rd = make_forwardable(std::move(rd));
+            }
+            return rd;
+        }
+        return lance::make_reader(shared_from_this(), std::move(query_schema),
+                std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr, mon);
+    }
 
     auto index_caching = use_caching(global_cache_index_pages && !slice.options.contains(query::partition_slice::option::bypass_cache));
     auto index_reader = make_index_reader(permit, trace_state, index_caching, range.is_singular());
@@ -3197,6 +3213,10 @@ sstable::make_full_scan_reader(
     // Before the `>= mc` test: pq sorts after mc but is not an mx file.
     if (_version == version_types::pq) {
         return parquet::make_full_scan_reader(shared_from_this(), std::move(schema),
+                std::move(permit), std::move(trace_state), monitor);
+    }
+    if (_version == version_types::lc) {
+        return lance::make_full_scan_reader(shared_from_this(), std::move(schema),
                 std::move(permit), std::move(trace_state), monitor);
     }
     if (_version >= version_types::mc) {

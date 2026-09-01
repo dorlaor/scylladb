@@ -639,11 +639,25 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
     for (size_t i = 1; i < fm.schema.size(); ++i) {
         if (fm.schema[i].is_leaf()) { leaves.push_back(fm.schema[i].name); }
     }
+    return recover_mapped_schema_from_leaves(leaves,
+            [&] (const std::string& k) { return fm.kv(k); }, cols);
+}
+
+// The format-independent half of recovery: everything below works off the
+// file's leaf names and its key/value metadata, which both columnar formats
+// carry (Parquet in the footer, Lance in the schema global buffer). Factored
+// out so the Lance reader recovers the same layout through the same code --
+// two copies of this logic would drift, and a drifted copy reads the wrong
+// column into the wrong field.
+mapped_schema recover_mapped_schema_from_leaves(
+        const std::vector<std::string>& leaves,
+        const std::function<const std::string*(const std::string&)>& kv,
+        const std::vector<cql_column>& cols) {
     auto has = [&] (const std::string& n) {
         return std::find(leaves.begin(), leaves.end(), n) != leaves.end();
     };
 
-    const std::string* lvl = fm.kv("scylla.folding_level");
+    const std::string* lvl = kv("scylla.folding_level");
     if (!lvl) {
         throw std::runtime_error("parquet: file has no scylla.folding_level; "
                                  "not written by this mapping");
@@ -720,7 +734,7 @@ mapped_schema recover_mapped_schema(const file_metadata& fm,
         f.any_rtc        = has("__rtc_w");
     } else if (level == folding_level::uniform) {
         f.all_same_ts = true;
-        const std::string* u = fm.kv("scylla.uniform_timestamp");
+        const std::string* u = kv("scylla.uniform_timestamp");
         if (!u) { throw std::runtime_error("parquet: L2 file without scylla.uniform_timestamp"); }
         f.single_ts = int64_t(std::stoll(*u));
     }

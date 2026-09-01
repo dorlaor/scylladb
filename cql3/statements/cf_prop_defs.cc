@@ -254,9 +254,9 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
 
     if (has_property(KW_STORAGE_FORMAT)) {
         auto sf = get_string(KW_STORAGE_FORMAT, "");
-        if (sf != "sstable" && sf != "parquet" && sf != "hybrid") {
+        if (sf != "sstable" && sf != "parquet" && sf != "hybrid" && sf != "lance") {
             throw exceptions::configuration_exception(format(
-                "Invalid value '{}' for '{}'; expected one of: sstable, parquet, hybrid",
+                "Invalid value '{}' for '{}'; expected one of: sstable, parquet, hybrid, lance",
                 sf, KW_STORAGE_FORMAT));
         }
         // Setting a non-default format has to wait for every node to understand
@@ -268,6 +268,20 @@ void cf_prop_defs::validate(const data_dictionary::database db, sstring ks_name,
             throw exceptions::configuration_exception(format(
                 "Cannot set '{}' to '{}': requires all nodes to support the "
                 "PARQUET_SSTABLE_FORMAT cluster feature", KW_STORAGE_FORMAT, sf));
+        }
+        if (sf == "lance") {
+            if (!db.features().lance_sstable_format) {
+                throw exceptions::configuration_exception(format(
+                    "Cannot set '{}' to 'lance': requires all nodes to support the "
+                    "LANCE_SSTABLE_FORMAT cluster feature", KW_STORAGE_FORMAT));
+            }
+            // The lance format takes no options map in v1
+            // (docs/dev/lance-storage-format.md 4), and the `parquet` map
+            // configures the other codec -- combining them is a category error.
+            if (auto opts = get_map(KW_PARQUET); opts && !opts->empty()) {
+                throw exceptions::configuration_exception(
+                    "storage_format = 'lance' does not take the 'parquet' option map");
+            }
         }
     }
     if (has_property(KW_STORAGE_ENGINE)) {
@@ -526,8 +540,22 @@ void cf_prop_defs::apply_to_builder(schema_builder& builder, schema::extensions_
         builder.set_parquet_options(*opts);
     }
     if (has_property(KW_STORAGE_FORMAT)) {
-        builder.set_storage_format(
-                sstring_to_storage_format_type(get_string(KW_STORAGE_FORMAT, "sstable")));
+        const auto sft = sstring_to_storage_format_type(get_string(KW_STORAGE_FORMAT, "sstable"));
+        if (sft == storage_format_type::lance) {
+            // v1 scope (docs/dev/lance-storage-format.md 4): the lance mapping
+            // has no repeated leaves, so the constructs that need them are
+            // refused here, where the columns are visible, rather than failing
+            // the first flush.
+            for (const auto& cdef : builder.current_columns()) {
+                if (cdef.type->is_multi_cell() || cdef.type->is_counter()) {
+                    throw exceptions::configuration_exception(seastar::format(
+                        "storage_format = 'lance' does not support non-frozen collections or "
+                        "counters yet; column '{}' is one (freeze it or keep the table on "
+                        "'sstable'/'parquet')", cdef.name_as_text()));
+                }
+            }
+        }
+        builder.set_storage_format(sft);
     }
     if (has_property(KW_STORAGE_ENGINE)) {
         auto storage_engine = get_string(KW_STORAGE_ENGINE, "");

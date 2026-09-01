@@ -23,6 +23,7 @@
 // That also lets the whole path be driven from a unit test without an sstable.
 
 #include "sstables/parquet/schema_mapping.hh"
+#include "sstables/lance/format/lance_writer.hh"
 #include <map>
 #include <set>
 #include <seastar/core/sstring.hh>
@@ -40,6 +41,13 @@
 #include <vector>
 
 namespace sstables::parquet {
+
+// Which columnar container the writer emits. The whole pipeline above the
+// file image -- shredding, folding, index ordinals, statistics, large-data
+// accounting -- is identical for both, so the codec is a late switch in this
+// writer rather than a second writer_impl (docs/dev/lance-storage-format.md
+// 3.1). `lance` is selected by the `lc` sstable version.
+enum class file_codec { parquet, lance };
 
 struct pq_writer_config {
     folding_level      level = folding_level::row_folded;
@@ -105,6 +113,14 @@ struct pq_writer_config {
     // another 26 % of size. Per-table override via the `parquet` property (5.5a, 8.2).
     size_t rows_per_row_group     = 5'000;
     size_t row_group_buffer_bytes = 64u << 20;
+
+    // See file_codec above. For `lance`, `lance_wopt` replaces `wopt`, and
+    // rows_per_row_group degrades to a batching knob: Lance has no row
+    // groups, so the cut cadence only bounds shredder memory (the page
+    // geometry comes from lance_wopt.page_target_bytes) -- the byte budget
+    // stays the real guard rail either way.
+    file_codec codec = file_codec::parquet;
+    ::sstables::lance::format::writer_options lance_wopt{};
 };
 
 // The user-facing `parquet = {...}` table property (design doc 8.2), parsed and
@@ -542,6 +558,19 @@ private:
     // rows not yet seen, so it becomes the conservative one (design doc 5.5a).
     std::optional<mapped_schema> _ms;
     std::unique_ptr<format::parquet_file_writer> _pq;
+    // The Lance twin of _pq: exactly one of the two is ever created,
+    // selected by _pcfg.codec at the first cut.
+    std::unique_ptr<::sstables::lance::format::lance_file_writer> _lc;
+    // Unit-test sink path only: the Lance writer streams through a sink by
+    // design, so when the test wants the image in one piece it collects here.
+    std::string _lc_buf;
+    // Creates _lc if this is the first flush. `ls` is conservative from a
+    // mid-stream cut and derived from a whole-stream one-shot, exactly like
+    // the two Parquet paths.
+    void ensure_lance_writer(leaf_set ls);
+    // Serialised (pre-codec) bytes handed to the Lance writer, for the
+    // compression-ratio statistic _pq derives from its own footer.
+    uint64_t _lc_uncompressed = 0;
     // Rows already flushed into earlier row groups. The index entry is a file-global
     // row ordinal (option A), so it cannot come from the shredder's own size once the
     // shredder is being cleared at each cut.

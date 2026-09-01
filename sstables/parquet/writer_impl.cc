@@ -7,6 +7,7 @@
  */
 
 #include "sstables/parquet/writer_impl.hh"
+#include "sstables/lance/glue.hh"
 #include "sstables/parquet/encryption_keys.hh"
 
 #include "exceptions/exceptions.hh"
@@ -1296,8 +1297,57 @@ void pq_writer_impl::collect_marker(const row_marker& marker) {
 // (row group, ordinal) instead of a bare ordinal, and a point read spanning row groups --
 // complexity paid on every read to bound a rare case. The budget is a target, not a
 // guarantee; see design doc 5.5a for the residual exposure.
+void pq_writer_impl::ensure_lance_writer(leaf_set ls) {
+    if (_lc) { return; }
+    _ms.emplace(map_schema(_shredder.columns(), _pcfg.level, _shredder.rows(),
+                           _pcfg.exc, ls, _pcfg.column_encodings));
+    if (!folding_is_lossless(_ms->level)) {
+        throw std::invalid_argument(
+                std::string("folding level ") + to_string(_ms->level) +
+                " discards cell metadata and cannot be used as a storage format");
+    }
+    auto specs = ::sstables::lance::specs_of(*_ms);
+    ::sstables::lance::format::lance_file_writer::sink sink;
+    if (_data_writer && !_sink) {
+        // Stream straight into the Data component; the Lance writer flushes
+        // pages as their columns fill, so peak memory is one page per column
+        // rather than the whole file. Safe for the same reason as _pq's
+        // sink: the index carries row ordinals, not byte offsets.
+        _streaming = true;
+        sink = [this] (std::string_view bytes) {
+            _data_writer->write(bytes.data(), bytes.size());
+            _pos += bytes.size();
+        };
+    } else {
+        sink = [this] (std::string_view bytes) { _lc_buf.append(bytes); };
+    }
+    _lc = std::make_unique<::sstables::lance::format::lance_file_writer>(
+            std::move(specs), _pcfg.lance_wopt, std::move(sink));
+}
+
+// Logical (pre-codec) bytes of one shredded batch, for the compression-ratio
+// statistic. The Parquet path reads the equivalent from its own footer.
+static uint64_t batch_logical_bytes(const std::vector<format::column_data>& cols) {
+    uint64_t n = 0;
+    for (const auto& c : cols) {
+        n += c.i32.size() * 4 + c.i64.size() * 8 + c.f64.size() * 8;
+        for (const auto& s : c.str) { n += s.size() + 4; }
+        n += (c.def_levels.size() + c.rep_levels.size() + 7) / 8;
+    }
+    return n;
+}
+
 void pq_writer_impl::cut_row_group() {
     if (_shredder.size() == 0) { return; }
+    if (_pcfg.codec == file_codec::lance) {
+        ensure_lance_writer(leaf_set::conservative);
+        auto data = shred(*_ms, _shredder.columns(), _shredder.rows());
+        _lc_uncompressed += batch_logical_bytes(data);
+        _lc->add_batch(::sstables::lance::to_lance_batch(*_ms, std::move(data)));
+        _rows_flushed += _shredder.size();
+        _shredder.clear();
+        return;
+    }
     if (!_pq) {
         // First cut. Parquet fixes one leaf set for the whole file, and we are only a
         // prefix of the way through the rows, so it has to cover every case a later row
@@ -1520,6 +1570,48 @@ void pq_writer_impl::consume_end_of_stream() {
     // writer produced before row-group cutting existed. Only once a cut has forced the
     // conservative leaf set does the streaming path take over.
     std::vector<uint8_t> img;
+    if (_pcfg.codec == file_codec::lance) {
+        // One flow, unlike Parquet's two: the Lance writer streams by design,
+        // so the only fork is which leaf set the schema was fixed with. A
+        // whole stream still in the shredder gets the derived set.
+        if (!_lc && _shredder.size() > 0) {
+            ensure_lance_writer(leaf_set::derived);
+        }
+        if (!_lc) {
+            // An empty stream still needs a valid (zero-row) file.
+            ensure_lance_writer(leaf_set::conservative);
+        }
+        cut_row_group();
+        std::map<std::string, std::string> meta;
+        meta["scylla.folding_level"] = to_string(_ms->level);
+        if (_ms->uniform_ts) {
+            meta["scylla.uniform_timestamp"] = std::to_string(*_ms->uniform_ts);
+        }
+        _lc->finish(meta);
+        if (!_streaming) {
+            img.assign(_lc_buf.begin(), _lc_buf.end());
+            _lc_buf.clear();
+            _pos = img.size();
+        }
+        if (_lc_uncompressed > 0 && _pos > 0) {
+            _collector.add_compression_ratio(_pos, _lc_uncompressed);
+        }
+        if (_sink) {
+            _sink(std::move(img));
+            return;
+        }
+        finish_open_partition();
+        if (!_streaming) {
+            _data_writer->write(reinterpret_cast<const char*>(img.data()), img.size());
+        }
+        _data_writer->close();
+        _sst.write_digest(_data_writer->full_checksum());
+        _sst.write_crc(_data_writer->finalize_checksum());
+        _data_writer.reset();
+        _cfg.monitor->on_data_write_completed();
+        write_components();
+        return;
+    }
     if (_pq) {
         cut_row_group();            // the tail
         img = _pq->finish();        // empty when streaming: already in the Data component
@@ -1653,6 +1745,19 @@ std::unique_ptr<sstables::sstable_writer::writer_impl> make_writer(
         const sstables::sstable_writer_config& cfg,
         encoding_stats enc_stats,
         shard_id shard) {
+    // The `lc` version selects the Lance codec on the same writer. It takes
+    // the defaults -- there is deliberately no `lance = {...}` property in v1
+    // (docs/dev/lance-storage-format.md 4) -- so nothing below the codec
+    // switch applies: no per-column encodings, no modular encryption.
+    if (sst.get_version() == sstable_version_types::lc) {
+        pq_writer_config lcfg;
+        lcfg.codec = file_codec::lance;
+        // zstd on the chunk value buffers, mirroring the parquet default of
+        // zstd level 3. Definition levels are fastlanes-bitpacked either way.
+        lcfg.lance_wopt.enc.zstd_level = 3;
+        return std::make_unique<pq_writer_impl>(sst, s, estimated_partitions, cfg,
+                                                std::move(lcfg), enc_stats, shard, nullptr);
+    }
     // From the table's `parquet = {...}` property. Already validated at CREATE/ALTER
     // time, so anything stored here parses; an empty map yields the defaults.
     pq_writer_config pcfg = parquet_parameters(s.parquet_options()).config();

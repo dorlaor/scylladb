@@ -167,11 +167,18 @@ SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_mt_large) {
 }
 
 // This SCYLLA_ASSERT makes sure we don't miss writable vertions
-static_assert(writable_sstable_versions.size() == 6);
+static_assert(writable_sstable_versions.size() == 7);
 
 SEASTAR_TEST_CASE(test_sstable_conforms_to_mutation_source_pq_small) {
     return test_sstable_conforms_to_mutation_source(sstable_version_types::pq, block_sizes[0]);
 }
+
+// `lc` is deliberately NOT enrolled here: the random schema generator produces
+// non-frozen collections, which the lance v1 mapping refuses by design
+// (docs/dev/lance-storage-format.md 4 -- DDL rejects such tables, and the
+// writer backstops). Scalar-schema round-trip coverage for lc lives in
+// test/boost/sstable_lance_test.cc; extend this suite instead when repeated
+// leaves land.
 
 // `keys` may contain repetitions.
 // The generated position ranges are non-empty. The start of each range in the vector is greater than the end of the previous range.

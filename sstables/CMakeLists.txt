@@ -42,6 +42,12 @@ target_sources(sstables
     parquet/format/encryption.cc
     parquet/batch_reader.cc
     parquet/encryption_keys.cc
+    lance/format/lance_metadata.cc
+    lance/format/lance_encodings.cc
+    lance/format/lance_writer.cc
+    lance/format/lance_reader.cc
+    lance/glue.cc
+    lance/reader.cc
     writer.cc)
 target_include_directories(sstables
   PUBLIC
