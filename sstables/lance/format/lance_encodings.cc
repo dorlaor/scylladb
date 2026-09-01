@@ -946,6 +946,50 @@ column_values decode_fullzip_variable(const page_layout& pl, uint64_t lo, uint64
     return out;
 }
 
+std::pair<std::string, std::string> split_miniblock_chunk(const page_layout& pl, uint32_t n_values,
+                                                          std::string_view chunk) {
+    size_t at = 0;
+    const uint16_t num_levels = get_u16(chunk, at);
+    at += 2;
+    uint16_t def_len = 0;
+    if (pl.has_def) {
+        def_len = get_u16(chunk, at);
+        at += 2;
+    }
+    const uint16_t val_len = get_u16(chunk, at);
+    at += 2;
+    at = (at + 7) & ~size_t(7);
+    std::string def;
+    if (pl.has_def) {
+        if (num_levels != n_values) { throw lance_error("def level count disagrees with chunk values"); }
+        if (at + def_len > chunk.size()) { throw lance_error("def sub-buffer truncated"); }
+        def = std::string(chunk.substr(at, def_len));
+        at += def_len;
+        at = (at + 7) & ~size_t(7);
+    }
+    if (at + val_len > chunk.size()) { throw lance_error("value sub-buffer truncated"); }
+    std::string values(chunk.substr(at, val_len));
+    if (pl.val.general_scheme == 2) {
+        values = zstd_decompress_block(values, chunk_hard_cap * 8);
+    }
+    return {std::move(def), std::move(values)};
+}
+
+column_values decode_plain_chunk(lphys t, const page_layout& pl, std::string_view def,
+                                 std::string_view values, uint32_t n_values,
+                                 size_t a, size_t b) {
+    if (a > b || b > n_values) { throw lance_error("plain-chunk slice out of range"); }
+    column_values out;
+    if (pl.has_def) {
+        decode_def_channel(pl.defs, def, n_values, a, b, out);
+    }
+    // The zstd wrapping was already undone by split_miniblock_chunk.
+    chan_enc plain_val = pl.val;
+    plain_val.general_scheme = 0;
+    decode_value_channel(t, plain_val, values, n_values, a, b, out);
+    return out;
+}
+
 uint32_t fullzip_rep_index_width(uint64_t buffer_size, uint64_t rows) {
     for (uint32_t w : {1u, 2u, 4u, 8u}) {
         if (buffer_size == (rows + 1) * w) { return w; }

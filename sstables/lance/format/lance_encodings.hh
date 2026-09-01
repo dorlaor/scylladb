@@ -27,6 +27,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace sstables::lance::format {
@@ -184,6 +185,15 @@ column_values decode_miniblock_chunks(lphys, const page_layout&, const miniblock
                                       size_t first_chunk, size_t n_chunks,
                                       std::string_view chunk_bytes,
                                       uint64_t keep_from, uint64_t keep_to);
+
+// Splits one chunk's bytes into its (def, values) sub-buffers with any zstd
+// wrapping already undone -- the cacheable form: raw bytes, no decoded-value
+// overhead. `decode_plain_chunk` then slice-decodes values [a, b) from it.
+std::pair<std::string, std::string> split_miniblock_chunk(const page_layout&, uint32_t n_values,
+                                                          std::string_view chunk);
+column_values decode_plain_chunk(lphys, const page_layout&, std::string_view def,
+                                 std::string_view values, uint32_t n_values,
+                                 size_t a, size_t b);
 
 // ---------------------------------------------------------------- fullzip
 

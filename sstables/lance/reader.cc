@@ -169,15 +169,19 @@ public:
             return std::tie(col, page, chunk) < std::tie(o.col, o.page, o.chunk);
         }
     };
-    mutable std::map<chunk_key, format::column_values> chunk_cache;
+    // One cached chunk: the def sub-buffer as stored (bitpacked, ~128 B) and
+    // the value sub-buffer already de-zstd'd. Raw bytes, not decoded values:
+    // a decoded 4096-string chunk costs ~30x its raw size in std::string
+    // overhead alone, which turned the first version of this cache into a
+    // thrash loop at any real row count. Probes slice-decode from the raw
+    // bytes, which is exactly the cheap operation the format designed for.
+    struct plain_chunk {
+        std::string def;
+        std::string values;
+    };
+    mutable std::map<chunk_key, plain_chunk> chunk_cache;
     mutable size_t chunk_cache_bytes = 0;
-    static constexpr size_t chunk_cache_cap = 8u << 20;
-
-    static size_t values_bytes(const format::column_values& v) {
-        size_t n = v.def.size() + v.i32.size() * 4 + v.i64.size() * 8 + v.f64.size() * 8;
-        for (const auto& x : v.str) { n += x.size() + sizeof(std::string); }
-        return n;
-    }
+    static constexpr size_t chunk_cache_cap = 32u << 20;
 
     size_t memory_size() const noexcept override {
         size_t n = sizeof(*this);
@@ -446,35 +450,36 @@ future<format::column_values> lc_reader::read_leaf_rows(size_t leaf, uint64_t lo
             const size_t c_hi = idx->chunk_for(page_hi - 1 - pg.priority);
             if (c_lo == c_hi) {
                 // The point-read shape: everything wanted lives in one chunk.
-                // Serve the decode from the sstable's chunk cache; a miss
-                // fetches and decodes the whole chunk once so the next probe
-                // of anything in it is free.
+                // A miss fetches the chunk and stores its sub-buffers with the
+                // zstd already undone; hits and misses alike then slice-decode
+                // just the requested values.
                 cached_lance_meta::chunk_key ckey{leaf, p, c_lo};
                 auto& pstats = parquet::page_cache_stats_local();
+                const auto& ch = idx->chunks[c_lo];
                 auto it = _cm->chunk_cache.find(ckey);
                 if (it == _cm->chunk_cache.end()) {
                     ++pstats.misses;
-                    const auto& ch = idx->chunks[c_lo];
                     auto chunk_bytes = co_await tracked_read(
                             pg.buffers[1].offset + ch.byte_offset, ch.byte_size);
-                    auto whole = format::decode_miniblock_chunks(
-                            lphys_of(_ms.columns[leaf]), pl, *idx, c_lo, 1,
-                            std::string_view(chunk_bytes.get(), chunk_bytes.size()),
-                            ch.first_value, ch.first_value + ch.values);
-                    const size_t sz = cached_lance_meta::values_bytes(whole);
+                    auto plain = format::split_miniblock_chunk(pl, ch.values,
+                            std::string_view(chunk_bytes.get(), chunk_bytes.size()));
+                    const size_t sz = 64 + plain.first.size() + plain.second.size();
                     if (_cm->chunk_cache_bytes + sz > cached_lance_meta::chunk_cache_cap) {
                         _cm->chunk_cache.clear();
                         _cm->chunk_cache_bytes = 0;
                     }
                     _cm->chunk_cache_bytes += sz;
                     ++pstats.populations;
-                    it = _cm->chunk_cache.emplace(ckey, std::move(whole)).first;
+                    it = _cm->chunk_cache.emplace(ckey,
+                            cached_lance_meta::plain_chunk{std::move(plain.first),
+                                                           std::move(plain.second)}).first;
                 } else {
                     ++pstats.hits;
                 }
-                const auto& ch = idx->chunks[c_lo];
-                part = it->second;   // copy of the decoded chunk
-                format::slice_values(part, pg.priority + ch.first_value, page_lo, page_hi);
+                part = format::decode_plain_chunk(lphys_of(_ms.columns[leaf]), pl,
+                        it->second.def, it->second.values, ch.values,
+                        size_t(page_lo - pg.priority - ch.first_value),
+                        size_t(page_hi - pg.priority - ch.first_value));
                 break;
             }
             const auto& first = idx->chunks[c_lo];
