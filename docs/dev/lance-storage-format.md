@@ -364,8 +364,64 @@ node-level run below adds the bypass-verified and cold-restart controls.
 caching + BYPASS CACHE, bypass verified, min estimator, canary,
 interleaved arms, cold pass after restart) over three arms and two table
 shapes: the 4M-row synthetic time series (pro-Parquet by design) and a
-200k-row ~1 KB-payload table (pro-Lance by design). Results land here when
-the run completes.
+200k-row ~1 KB-payload table (pro-Lance by design). Single node, the lab
+machine at load average ~20, --smp 1, dev build; the python client floor
+(canary) sat at ~250 us, so point-read differences of ~100 us here are at
+the edge of resolution -- 7.2's in-process numbers are the latency
+evidence, these are the end-to-end validation plus the size/scan truth.
+
+Time series (4M rows, 20k partitions, latte-loaded, ICS, major-compacted;
+all sstables verified `me`/`pq`/`lc` on disk):
+
+| arm | Data.db bytes | vs native | bypass min us | cold min us | scan s |
+|---|---|---|---|---|---|
+| native | 122 710 761 | 1.00 | 498 | 522 | 4.93 |
+| pq | 11 332 974 | **0.092** | 398 | 427 | **3.08** |
+| lc | 58 842 176 | 0.48 | 512 | 587 | 6.03 |
+
+Exactly the 2 prediction for the pro-Parquet shape: sorted timestamps and
+low-cardinality strings are DELTA/dictionary territory, pq crushes size
+(10.8x smaller than native; lc "only" 2.1x smaller), and at these sizes
+pq's whole working set fits its internal caches, so it wins the bounded
+probes too. Write throughput was equal across arms (71/76/81 s loads).
+
+Blob shape (200k rows x ~1 KB payload): first run, before per-value zstd
+landed in full-zip, lc was 209 MB (raw values) against pq 10.1 MB and
+native 23.6 MB, with lc bypass point reads at 379 us against native 477
+(pq's 287 was flagged SUSPECT -- its 10 MB file serves from internal
+caches, the bypass-slower-than-warm check failed). Re-measured with
+per-value zstd in full-zip (writer takes it per page only when it shrinks
+the bytes; incompressible payloads stay raw):
+
+| arm | Data.db bytes | vs native | bypass min us | cold min us | scan s |
+|---|---|---|---|---|---|
+| native | 23 579 921 | 1.00 | 459 | 469 | 0.53 |
+| pq | 10 122 705 | 0.43 | 285 (SUSPECT) | 293 | 0.39 |
+| lc | 19 189 811 | 0.81 | 484 | 480 | 0.85 |
+
+lc dropped 10.9x (209 MB -> 19.2 MB) for a scan tax (0.85 s vs 0.53) --
+the transparent-compression trade in one row: every value decompresses
+alone (point reads keep their 1-2 IOPs), so a scan pays one small zstd
+frame per value. Point reads sit at native parity within the 26% canary
+spread; pq's bypass number failed its own validity check both runs (the
+10 MB file lives in its internal caches), so it measures those caches, not
+the format.
+
+### 7.4 (2026-09-01) Verdict so far
+
+The 2 table holds up against measurement:
+
+- **Point-read-heavy, mixed or fat-payload schemas: lc.** In-process,
+  0.75x native / 0.57x pq mean latency with the best tail; at node level,
+  native parity through a ~250 us client floor.
+- **Scan-dominant sorted time series: pq**, and it is not close on size
+  (0.092x native vs lc's 0.48x on the synthetic corpus) -- DELTA +
+  dictionary encodings are exactly what that shape wants and lc v1 does
+  not have them.
+- **Native** keeps the smallest write amplification surface and the best
+  cold single-row economics on narrow rows (one contiguous read vs one
+  window per column), and remains the only format for
+  collection/counter-heavy schemas until lc grows repeated leaves.
 
 ## 8. Risks and open questions
 
