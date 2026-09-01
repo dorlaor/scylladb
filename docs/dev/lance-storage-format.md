@@ -297,7 +297,77 @@ approaching native; lc size between native-zstd and pq (worse than pq on
 time series for the §2 reasons, competitive on fat-payload tables); scans
 within the same order as pq.
 
-## 7. Risks and open questions
+## 7. Results
+
+Dated, like the parquet doc's 10. Environment for everything below: the
+shared 32-core lab machine, dev-mode build, single shard.
+
+### 7.1 (2026-09-01) Implementation landed; conformance is bidirectional
+
+Phases 1-5 of 5 are done on the `lance` branch. The container and the
+structural encodings were verified against pylance 11.0.0 in both
+directions: the official reader decodes our files value-exact (plain and
+zstd, miniblock and full-zip, nullable and all-null pages, multi-page
+columns), and our reader decodes pylance-written files byte-identically to
+pylance's own decode -- including the FastLanes-bitpacked definition levels
+and integers the official writer emits unconditionally at any real size
+(`sstables/lance/run_tests.sh`, suites 4 and 5). Two deliberate reader
+gaps, both rejected loudly rather than misread: FSST (the official writer
+picks it for compressible strings; ours never emits it) and dictionary
+miniblocks.
+
+pylance also opens the Data component of a real `lc` sstable and sees the
+CQL columns plus the folded metadata channels (`__ts`, `__tsx_mask`,
+`__tsx_vals`) -- external readability holds end to end, losslessness is
+pinned by `test/boost/sstable_lance_test.cc` (tombstones, TTLs, statics,
+range tombstones, multi-page files, point reads), and the pq suites stay
+green on the same tree.
+
+Three writer/reader decisions measured on the way (7.2):
+
+- Definition levels are FastLanes-bitpacked (1 bit/value), not flat u16.
+  Flat def was 16x the bytes and put `lc` at 1.9x the size of the
+  *uncompressed native* format on the smoke corpus; packed def plus zstd
+  chunk values brought it to 0.55x.
+- Decoding slices INSIDE miniblock chunks: a five-row point read
+  materialises five values, not a 4096-value chunk. For string chunks the
+  value materialisation dominated the read.
+- The sstable's metadata entry carries a raw-chunk cache (def + de-zstd'd
+  value sub-buffers, 32 MB cap) -- the lc equivalent of pq's decompressed
+  page cache. Caching *decoded* values instead was a measured mistake:
+  std::string overhead made a 4096-string chunk ~30x its raw size, the cap
+  thrashed, and point reads got slower than no cache at all.
+
+### 7.2 (2026-09-01) In-tree three-way: point reads beat native, size between
+
+`sstable_parquet_perf_test`, 20 000 partitions x 5 rows, 5 000 uniformly
+random point reads, same mutations in one process, dev build:
+
+| format | write ms | scan ms | point mean us | point p50 | point p99 | bytes |
+|---|---|---|---|---|---|---|
+| native (me) | 991 | 255 | 56.7 | 23.6 | 1579 | 3 994 586 |
+| pq | 1 065 | 247 | 74.7 | 34.5 | 2233 | 1 277 040 |
+| lc | 1 153 | 282 | **42.8** | **19.4** | **811** | 2 112 343 |
+
+Ratios: lc/native point **0.75x** (pq: 1.32x), lc size 0.53x native
+(pq: 0.32x), lc scan 1.11x native. The format's thesis -- random access --
+shows up exactly where claimed, and the costs land exactly where 2
+predicted: pq keeps a ~1.65x size edge over lc (delta + dictionary
+encodings lc v1 does not have), lc gives up ~11% on scans and wins point
+reads outright, including the tail. Both columnar arms benefit from their
+internal caches here (as does native from the OS page cache); the
+node-level run below adds the bypass-verified and cold-restart controls.
+
+### 7.3 (2026-09-01) Node-level three-way
+
+`~/pq-lab/three_way.py` -- pointread_v2.py's methodology (production
+caching + BYPASS CACHE, bypass verified, min estimator, canary,
+interleaved arms, cold pass after restart) over three arms and two table
+shapes: the 4M-row synthetic time series (pro-Parquet by design) and a
+200k-row ~1 KB-payload table (pro-Lance by design). Results land here when
+the run completes.
+
+## 8. Risks and open questions
 
 - **Byte-level layout fidelity.** Miniblock chunk internals and fullzip
   control words are specified by the Rust implementation + prose docs,
