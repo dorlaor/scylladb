@@ -376,7 +376,12 @@ page_layout parse_page_layout(std::string_view any_bytes, const metadata_limits&
                     pl.val.bits = bits_per_value;
                 }
             }
-            if (pl.val.general_scheme) { throw lance_error("compressed full-zip values not supported"); }
+            // General on full-zip means per-VALUE compression (transparent),
+            // which decode_fullzip_variable handles; fixed-width full-zip
+            // with it would break the stride arithmetic, so that stays out.
+            if (pl.val.general_scheme && pl.val.k != chan_enc::kind::variable) {
+                throw lance_error("compressed fixed-width full-zip values not supported");
+            }
             if (pl.val.k == chan_enc::kind::variable) {
                 if (bits_per_offset) { pl.val.bits = bits_per_offset; }
                 if (pl.val.bits != 32 && pl.val.bits != 64) {
@@ -558,22 +563,48 @@ static encoded_page encode_fullzip_bytes(const column_values& v, const encode_op
     const size_t rows = v.rows();
     const bool with_def = opt.nullable && any_nulls(v);
 
-    std::string zipped;
-    std::vector<uint64_t> row_offsets;
-    row_offsets.reserve(rows + 1);
-    for (size_t i = 0; i < rows; ++i) {
+    // Zip the values, optionally with each value zstd-framed. Per-value
+    // compression stays transparent -- one value decompresses alone -- so it
+    // is the only kind full-zip permits; whether it pays is decided per page
+    // by measuring, not modelling.
+    auto zip = [&] (bool compress, std::vector<uint64_t>& row_offsets) {
+        std::string zipped;
+        row_offsets.clear();
+        row_offsets.reserve(rows + 1);
+        for (size_t i = 0; i < rows; ++i) {
+            row_offsets.push_back(zipped.size());
+            const bool null = !v.def.empty() && v.def[i] != 0;
+            if (with_def) { zipped.push_back(null ? 1 : 0); }
+            if (!null) {
+                std::string framed;
+                std::string_view bytes = v.str[i];
+                if (compress) {
+                    framed = zstd_compress_block(bytes, opt.zstd_level);
+                    bytes = framed;
+                }
+                uint32_t len = uint32_t(bytes.size());
+                char b[4];
+                std::memcpy(b, &len, 4);
+                zipped.append(b, 4);
+                zipped.append(bytes);
+            }
+        }
         row_offsets.push_back(zipped.size());
-        const bool null = !v.def.empty() && v.def[i] != 0;
-        if (with_def) { zipped.push_back(null ? 1 : 0); }
-        if (!null) {
-            uint32_t len = uint32_t(v.str[i].size());
-            char b[4];
-            std::memcpy(b, &len, 4);
-            zipped.append(b, 4);
-            zipped.append(v.str[i]);
+        return zipped;
+    };
+
+    std::vector<uint64_t> row_offsets;
+    std::string zipped = zip(false, row_offsets);
+    bool compressed = false;
+    if (opt.zstd_level > 0) {
+        std::vector<uint64_t> c_offsets;
+        std::string c_zipped = zip(true, c_offsets);
+        if (double(c_zipped.size()) < double(zipped.size()) * opt.fullzip_zstd_max_ratio) {
+            zipped = std::move(c_zipped);
+            row_offsets = std::move(c_offsets);
+            compressed = true;
         }
     }
-    row_offsets.push_back(zipped.size());
 
     // Rep index: byte-packed to the narrowest of {1,2,4,8} that holds the
     // total; the reader infers the width from buffer size / (rows + 1).
@@ -593,7 +624,9 @@ static encoded_page encode_fullzip_bytes(const column_values& v, const encode_op
     fz.varint(4, 32);                    // bits_per_offset
     fz.varint(5, rows);                  // num_items
     fz.varint(6, rows);                  // num_visible_items
-    fz.len(7, ce_variable(32));          // value_compression
+    std::string vce = ce_variable(32);
+    if (compressed) { vce = ce_general_zstd(std::move(vce), opt.zstd_level); }
+    fz.len(7, vce);                      // value_compression
     uint32_t layer = with_def ? repdef_nullable_item : repdef_all_valid_item;
     fz.packed_u32(8, std::span<const uint32_t>(&layer, 1));
     pb_writer layout;
@@ -940,7 +973,13 @@ column_values decode_fullzip_variable(const page_layout& pl, uint64_t lo, uint64
         std::memcpy(&len, zipped.data() + at, ow);
         at += ow;
         if (at + len > zipped.size()) { throw lance_error("full-zip value truncated"); }
-        out.str.emplace_back(zipped.substr(at, size_t(len)));
+        if (pl.val.general_scheme == 2) {
+            // Per-value compression: each value is its own framed zstd block,
+            // so a single value stays independently readable.
+            out.str.push_back(zstd_decompress_block(zipped.substr(at, size_t(len)), 64u << 20));
+        } else {
+            out.str.emplace_back(zipped.substr(at, size_t(len)));
+        }
         at += len;
     }
     return out;

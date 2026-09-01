@@ -82,10 +82,15 @@ struct encode_options {
     // values per chunk (power of two, absolute max 4096 in 2.1 defaults).
     size_t chunk_target_bytes = 8u << 10;
     size_t max_chunk_values = 4096;
-    // zstd on each miniblock chunk's value sub-buffer via General wrapping.
-    // 0 = plain. Full-zip values are never block-compressed (transparency
-    // rule: a single value must be independently readable).
+    // zstd via General wrapping. On miniblock it compresses each chunk's
+    // value sub-buffer; on full-zip it compresses EACH VALUE separately --
+    // still transparent (any one value decompresses alone), which is how the
+    // reference writer keeps big values compressed without giving up the
+    // 1-2 IOP lookup. 0 = plain.
     int zstd_level = 0;
+    // Per-page decision for full-zip: values are stored compressed only when
+    // doing so actually shrinks the page below this fraction of plain.
+    double fullzip_zstd_max_ratio = 0.9;
 };
 
 // The encoded form of one page: buffers in Lance page-buffer order, plus the
